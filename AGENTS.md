@@ -14,6 +14,8 @@ skills, generated snapshots, or historical plans.
 - When the development goal is unchanged, use Codex-native resume/steer
   behavior. ZDecision must not introduce a coordinator or task scheduler for
   that case.
+- Use the exact app-server operation mapping in `docs/architecture.md`; do not
+  emulate task lifecycle with a new local conversation runtime.
 
 ## Boundaries
 
@@ -28,7 +30,8 @@ skills, generated snapshots, or historical plans.
 ## Development rules
 
 - Implement one vertical slice at a time; prove its user-visible scenario
-  before adding another abstraction.
+  before adding another abstraction. The three slices are delivery checkpoints
+  for the complete V1 architecture, not a throwaway validation version.
 - Prefer direct data structures and standard-library code in V1.
 - Do not add distributed coordination, generalized workflow engines,
   multi-stage approval systems, or speculative migration layers.
