@@ -50,6 +50,12 @@ The app-server adapter owns protocol details and capability checks. Domain
 components receive typed results; they do not construct JSON-RPC requests or
 infer business decisions from protocol events.
 
+In the Codex App V1, that adapter is the host's native task-tool surface used
+by the repository Skill. ZDecision does not launch a second app-server process
+or keep a parallel conversation runtime. Python services accept only typed
+operation records from the Skill. If the host does not expose a required task
+capability, the workflow stops explicitly instead of emulating it locally.
+
 The routing rule is simple:
 
 - Same development goal: use native resume/steer.
@@ -214,7 +220,7 @@ The intended package boundaries are:
 
 ```text
 src/zdecision/
-  app_server/      protocol adapter and Task Gateway
+  app_server/      typed host-operation contracts and Task Gateway boundary
   capture/         Capture and Candidate review
   private_store/   user-local state
   registry/        formal model, Promotion, and Git adapter

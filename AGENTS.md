@@ -16,6 +16,8 @@ skills, generated snapshots, or historical plans.
   that case.
 - Use the exact app-server operation mapping in `docs/architecture.md`; do not
   emulate task lifecycle with a new local conversation runtime.
+- In V1, invoke those operations through Codex App's native task tools. Do not
+  launch another app-server process or add a persistent task daemon.
 
 ## Boundaries
 
