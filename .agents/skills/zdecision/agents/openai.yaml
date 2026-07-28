@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZDecision"
+  short_description: "Capture and reuse reviewed Codex decisions"
+  default_prompt: "Use $zdecision to capture confirmed decisions from an existing Codex task."
