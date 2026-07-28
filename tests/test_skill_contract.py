@@ -37,6 +37,12 @@ class ZDecisionSkillContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
+    def test_capture_reference_respects_native_read_page_limit(self) -> None:
+        text = (SKILL_ROOT / "references" / "capture.md").read_text("utf-8")
+
+        self.assertIn('"turnLimit": 10', text)
+        self.assertNotIn('"turnLimit": 20', text)
+
     def test_capture_reference_orders_fork_attachment_before_extraction(self) -> None:
         text = (SKILL_ROOT / "references" / "capture.md").read_text("utf-8")
 

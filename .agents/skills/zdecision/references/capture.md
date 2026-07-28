@@ -32,7 +32,7 @@ substitute an alias because it participates in stable operation identity.
 ## Exact sequence
 
 1. Call `read_thread` with
-   `{"threadId": "SOURCE_TASK_ID", "turnLimit": 20}`. Follow its older-page
+   `{"threadId": "SOURCE_TASK_ID", "turnLimit": 10}`. Follow its older-page
    `cursor` with another `read_thread` call until the latest completed Turn is
    unambiguous. Use that completed Turn ID as the checkpoint. An active
    unfinished Turn is intentionally outside the fork and must never be used as
@@ -84,7 +84,7 @@ substitute an alias because it participates in stable operation identity.
 5. Verify the fork boundary and reconcile before starting a Turn:
 
    - Call `read_thread` with
-     `{"threadId": "FORK_TASK_ID", "turnLimit": 20}` and page older history as
+     `{"threadId": "FORK_TASK_ID", "turnLimit": 10}` and page older history as
      needed. Establish the inherited source boundary: before the first exact
      `extraction_prompt` Turn when replaying, or the latest completed inherited
      Turn on a fresh fork. Its Turn ID must equal the selected checkpoint. This
