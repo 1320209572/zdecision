@@ -134,11 +134,18 @@ or ordinary summary is not confirmation.
 ### 4.2 Review and publish
 
 Candidates are private and editable. The user may accept, narrow, edit, reject,
-or skip each Candidate.
+or skip each Candidate. One user Review Turn may classify multiple numbered
+Candidates; ZDecision still records one result per Candidate inside an atomic,
+append-only private Review batch.
 
 Accepted Candidate does not mean published Decision. ZDecision shows the exact
-formal content to be written and requires explicit confirmation before changing
-Git.
+formal content and target paths for every accepted item in an immutable batch
+publication preview. Only a later user Turn whose complete instruction is
+`确认发布` authorizes that currently displayed preview. One confirmation creates
+one commit containing the batch's independent Decision files and product
+indexes, then pushes that commit to `origin/main`. A newer Review or preview
+invalidates the older unpublished preview; ordinary assent such as “认可” or
+“可以” never publishes.
 
 The formal Decision model stays small:
 
@@ -214,11 +221,12 @@ retry does not create an obvious duplicate. It is not shared project memory.
 
 ### 5.5 Promotion Service
 
-Promotion is the only application boundary that can convert an accepted
-Candidate into a Registry mutation. It reloads the reviewed Candidate, renders
-the exact formal Decision, binds explicit user confirmation to that preview,
-and then asks the Registry to publish. A caller cannot bypass review by sending
-an arbitrary Decision payload directly to Git.
+Promotion is the only application boundary that can convert an accepted Review
+batch into a Registry mutation. It reloads the frozen effective content of each
+accepted item, renders the exact formal Decisions, binds one explicit user
+confirmation to that immutable batch preview, and then asks the Registry to
+publish. A caller cannot bypass Review by sending an arbitrary Decision payload
+directly to Git.
 
 ### 5.6 Decision Registry
 
@@ -226,6 +234,11 @@ The Registry owns formal Decision identity, immutable revisions, lifecycle,
 relations, and minimal provenance. Its V1 adapter reads and writes only
 `decision-registry/` in the canonical repository on `main`. Git is the storage
 adapter and audit history; commit hashes are not Decision identity.
+
+Registry storage is partitioned by a path-safe, deterministic product ID. The
+root index lists products only; each product owns its metadata, Decision index,
+and independently versioned Decision directories. Human product names never
+become raw path components.
 
 ### 5.7 Applicability Engine
 
@@ -311,6 +324,14 @@ zdecision/
   AGENTS.md
   src/zdecision/
   decision-registry/
+    registry.json
+    products/
+      prod_<stable-id>/
+        product.json
+        registry.json
+        decisions/
+          dec_<stable-id>/
+            r0001.json
   docs/architecture.md
 ```
 
@@ -345,6 +366,12 @@ Private state lives in user-local application data outside this repository.
   retire or supersede a formal Decision.
 - Git writes are restricted to `decision-registry/` and never include unrelated
   workspace changes.
+- Publication preview performs no Registry write. Confirmation requires the
+  previewed `main` and Registry state to remain unchanged; otherwise the preview
+  is stale and needs a new `确认发布` Turn.
+- If the publication commit succeeds but its push fails, the exact commit is
+  retained as pending publication. Retry reconciles or pushes that same commit;
+  it never generates replacement Decision identities or a second commit.
 - Capture validates the complete Stage 1 Inventory Result before starting Stage
   2. More than 100 signals or an encoded inventory above 256 KiB fails visibly
   and does not start Stage 2.
