@@ -173,19 +173,35 @@ def _record_data(record: CaptureRecord) -> dict[str, object]:
     return record.public_dict()
 
 
+def _decode_utf8(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeError:
+        raise _InvalidJson(
+            "Stage output was not valid JSON",
+            hashlib.sha256(raw).hexdigest(),
+        ) from None
+
+
 def _read_json_text(input_name: str, stdin: TextIO) -> tuple[str, str]:
     if input_name == "-":
-        text = stdin.read()
-        raw = text.encode("utf-8")
+        byte_stream = getattr(stdin, "buffer", None)
+        if byte_stream is not None:
+            raw = byte_stream.read()
+            text = _decode_utf8(raw)
+        else:
+            text = stdin.read()
+            try:
+                raw = text.encode("utf-8")
+            except UnicodeError:
+                raw = text.encode("utf-8", errors="surrogatepass")
+                raise _InvalidJson(
+                    "Stage output was not valid JSON",
+                    hashlib.sha256(raw).hexdigest(),
+                ) from None
     else:
         raw = Path(input_name).read_bytes()
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raise _InvalidJson(
-                "Stage output was not valid JSON",
-                hashlib.sha256(raw).hexdigest(),
-            ) from None
+        text = _decode_utf8(raw)
     return text, hashlib.sha256(raw).hexdigest()
 
 
@@ -196,7 +212,7 @@ def _reject_json_constant(_: str) -> None:
 def _decode_json(text: str) -> object:
     try:
         return json.loads(text, parse_constant=_reject_json_constant)
-    except (json.JSONDecodeError, _InvalidJson):
+    except ValueError:
         raise _InvalidJson("Stage output was not valid JSON") from None
 
 
@@ -228,8 +244,8 @@ def _complete_stage(
     return "capture.completed", _record_data(record)
 
 
-def _load_candidates(
-    record: CaptureRecord | LegacyCaptureRecord,
+def _load_legacy_candidates(
+    record: LegacyCaptureRecord,
     store: FilePrivateStore,
 ) -> list[object]:
     candidates: list[object] = []
@@ -253,14 +269,15 @@ def _show_data(
         return {
             "record": {**record.to_dict(), "record_version": record.record_version},
             "legacy": True,
-            "candidates": _load_candidates(record, store),
+            "candidates": _load_legacy_candidates(record, store),
         }
     inventory = service.get_inventory(operation_id)
+    candidates = service.get_candidates(operation_id)
     return {
         "record": record.public_dict(),
         "template": _template_data(record),
         "known_gaps": list(inventory.coverage.known_gaps) if inventory else [],
-        "candidates": _load_candidates(record, store),
+        "candidates": [candidate.to_dict() for candidate in candidates],
     }
 
 

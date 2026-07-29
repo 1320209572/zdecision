@@ -98,6 +98,9 @@ class FilePrivateStore:
             raise PrivateStateCorrupt("captures", operation_id) from None
 
     def put_candidate(self, candidate: Candidate) -> None:
+        if not isinstance(candidate, Candidate):
+            raise TypeError("Only validated Candidate values may be written")
+        Candidate.from_dict(candidate.to_dict())
         atomic_write_json(
             self._object_path("candidates", candidate.candidate_id),
             candidate.to_dict(),

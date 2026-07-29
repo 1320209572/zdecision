@@ -164,9 +164,28 @@ Before attachment after an uncertain `turn/start` result, reconcile only a singl
 It must be in the attached fork with that exact prompt and the correct immediate boundary and order.
 Zero or multiple plausible matches is ambiguous and must stop without sending another Turn.
 
+Apply the following decision table immediately after any attempt to start a
+stage. Do not assume that every native start call creates a Turn.
+
+### Native start-result decisions
+
+| Native observation | Required evidence | Required action |
+| --- | --- | --- |
+| `definite pre-Turn native unavailable` | The native start result explicitly reports that the required capability is unavailable and confirms that no Turn was created. | Call `fail-stage --stage STAGE --code native_unavailable`; this records the fixed sanitized pre-Turn failure and stops the operation. |
+| `uncertain turn/start result` | The start result provides no definite Turn ID or terminal outcome. | You must not call `fail-stage`; leave the eligible state unchanged and reconcile the exact prompt and immediate boundary before any later send. |
+| `post-attachment terminal result` | A stored stage Turn ID exists and identifies the attached Turn. | Use `read_thread` or `wait_threads` and apply the stored-Turn evidence rules below; only then record an evidenced terminal failure. |
+
+The pre-Turn unavailable branch is terminal because the native result is
+explicit about both unavailability and the absence of a created Turn. An
+unknown, missing, or ambiguous start result is the uncertain branch, even when
+the capability might be unavailable; keep reconciling and never infer a
+failure from uncertainty.
+
+### Post-attachment failure evidence
+
 Before completing either stage, reconcile the stored Turn ID against the
 matching Turn and accept only that Turn's final response. A `wait_threads`
-timeout or uncertain native result is not a definite model failure: keep
+timeout or uncertain result from the native tool is not a definite model failure: keep
 reconciling the same Turn, leave the operation running for reconciliation, and
 must not call `fail-stage` with `model_timeout`. Never create a replacement
 fork or Turn merely because a wait expired.
@@ -175,16 +194,19 @@ The only allowed `fail-stage` codes are:
 
 - `model_refusal` when the attached model Turn definitely refuses;
 - `model_timeout` only for a definite terminal native Turn timeout, never a controller wait timeout;
-- `native_unavailable` when the stored native Turn's terminal reason explicitly
-  reports unavailable; and
+- `native_unavailable` for either the definite pre-Turn branch above or when an
+  attached stored Turn's terminal reason explicitly reports unavailable; and
 - `model_contract_violation` when the Turn uses tools or produces non-final
   processing output instead of its one final JSON object.
 
-A failure is definite only when `read_thread` or `wait_threads` identifies the
-stored stage Turn as terminal and the allowed code is directly evidenced. Its native terminal reason explicitly reports timeout or unavailable for those
+For post-attachment failures, use this scoped rule. A failure is definite only when
+`read_thread` or `wait_threads` identifies the stored stage Turn as terminal
+and the allowed code is directly evidenced. Its native terminal reason explicitly reports timeout or unavailable for those
 codes, or its final response is an explicit model refusal. A terminal
 `model_contract_violation` requires recorded tool use or non-final processing
-output. A controller wait timeout, missing snapshot, commentary, or uncertain result never qualifies; leave the operation running for reconciliation.
+output. These stored-Turn evidence requirements apply only after a Turn ID
+exists. A controller wait timeout, missing snapshot, commentary, or uncertain
+result never qualifies; leave the operation running for reconciliation.
 
 Record a definite terminal failure once and stop. Arbitrary failure codes and messages are forbidden.
 Use the internal command's fixed sanitized message. Do not repair, retry with

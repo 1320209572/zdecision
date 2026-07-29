@@ -35,3 +35,9 @@ def capture_operation_id(
         }
     )
     return f"cap_{hashlib.sha256(payload).hexdigest()[:32]}"
+
+
+def capture_candidate_id(operation_id: str, ordinal: int) -> str:
+    """Return the deterministic Candidate id for one V2 Capture ordinal."""
+
+    return f"cand_{operation_id.removeprefix('cap_')}_{ordinal:02d}"

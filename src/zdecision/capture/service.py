@@ -24,13 +24,15 @@ from zdecision.capture.models import (
     SourceCheckpoint,
     StageFailure,
     StageName,
+    stage_failure_message,
 )
 from zdecision.capture.templates import TemplateCatalog
-from zdecision.ids import capture_operation_id
+from zdecision.ids import capture_candidate_id, capture_operation_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.private_store.filesystem import (
     FilePrivateStore,
     PrivateStateConflict,
+    PrivateStateCorrupt,
 )
 
 
@@ -42,12 +44,14 @@ _CANDIDATE_FIELDS = frozenset(
 )
 _SCOPE_FIELDS = frozenset(("summary", "repositories", "paths"))
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FAILURE_MESSAGES = {
-    "model_refusal": "Stage model refused the request",
-    "model_timeout": "Stage model did not complete before the timeout",
-    "native_unavailable": "Required native task capability was unavailable",
-    "model_contract_violation": "Stage model violated the output contract",
-}
+_EXPLICIT_FAILURE_CODES = frozenset(
+    (
+        "model_refusal",
+        "model_timeout",
+        "native_unavailable",
+        "model_contract_violation",
+    )
+)
 
 
 class CaptureError(Exception):
@@ -126,6 +130,20 @@ def _output_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _persisted_extraction_candidate(candidate: Candidate) -> dict[str, object]:
+    return {
+        "product": candidate.content.product,
+        "claim": candidate.content.claim,
+        "future_action": candidate.content.future_action,
+        "scope": {
+            "summary": candidate.content.scope_summary,
+            "repositories": list(candidate.content.repositories),
+            "paths": list(candidate.content.paths),
+        },
+        "invalidation_conditions": list(candidate.content.invalidation_conditions),
+    }
+
+
 class CaptureService:
     """Own the private prepare, native attachment, and completion boundary."""
 
@@ -166,8 +184,7 @@ class CaptureService:
 
     def resume(self, operation_id: str) -> CapturePlan:
         record = self._required_v2_capture(operation_id)
-        if record.inventory_sha256 is not None:
-            self._verified_inventory(record)
+        self._verified_replay_record(record)
         return CapturePlan(
             record,
             record.template.inventory_prompt,
@@ -183,7 +200,7 @@ class CaptureService:
         record = self._required_v2_capture(operation_id)
         if record.fork_thread_id is not None:
             if record.fork_thread_id == fork_thread_id:
-                return record
+                return self._verified_replay_record(record)
             raise CaptureForkConflict(
                 f"Capture {operation_id} is already attached to a different fork"
             )
@@ -228,11 +245,14 @@ class CaptureService:
         stage: StageName,
         output_sha256: str,
     ) -> CaptureRecord:
+        message = stage_failure_message(stage, "invalid_json")
+        if message is None:
+            raise CaptureStateError("Capture stage is invalid")
         return self._fail(
             operation_id,
             stage,
             "invalid_json",
-            "Stage output was not valid JSON",
+            message,
             output_sha256,
         )
 
@@ -248,13 +268,16 @@ class CaptureService:
         ],
         output_sha256: str | None = None,
     ) -> CaptureRecord:
-        if code not in _FAILURE_MESSAGES:
+        if code not in _EXPLICIT_FAILURE_CODES:
             raise CaptureStateError("Capture failure code is invalid")
+        message = stage_failure_message(stage, code)
+        if message is None:
+            raise CaptureStateError("Capture stage is invalid")
         return self._fail(
             operation_id,
             stage,
             code,
-            _FAILURE_MESSAGES[code],
+            message,
             output_sha256,
         )
 
@@ -265,6 +288,10 @@ class CaptureService:
         record = self._required_v2_capture(operation_id)
         return self._verified_inventory(record)
 
+    def get_candidates(self, operation_id: str) -> tuple[Candidate, ...]:
+        record = self._required_v2_capture(operation_id)
+        return self._verified_candidates(record)
+
     def _replayed_plan(
         self, record: CaptureRecord | LegacyCaptureRecord
     ) -> CapturePlan:
@@ -272,8 +299,7 @@ class CaptureService:
             raise CaptureStateError("Legacy Capture records are read-only")
         if record.status == "prepared":
             raise CaptureForkAmbiguous(record.operation_id)
-        if record.inventory_sha256 is not None:
-            self._verified_inventory(record)
+        self._verified_replay_record(record)
         return CapturePlan(
             record,
             record.template.inventory_prompt,
@@ -294,7 +320,7 @@ class CaptureService:
         )
         if existing_turn_id is not None:
             if existing_turn_id == turn_id:
-                return record
+                return self._verified_replay_record(record)
             raise CaptureTurnConflict(
                 f"Capture {record.operation_id} stage {stage} is already attached "
                 "to a different Turn"
@@ -332,8 +358,7 @@ class CaptureService:
         output: object,
     ) -> CaptureRecord:
         if record.inventory_sha256 is not None:
-            self._verified_inventory(record)
-            return record
+            return self._verified_replay_record(record)
         if record.status != "inventory_running":
             raise CaptureStateError(
                 f"Capture {record.operation_id} requires a running inventory Turn"
@@ -375,8 +400,7 @@ class CaptureService:
         record: CaptureRecord,
         output: object,
     ) -> CandidateSet:
-        if record.inventory_sha256 is not None:
-            self._verified_inventory(record)
+        self._verified_replay_record(record)
         if record.status == "completed":
             assert record.extraction_sha256 is not None
             return CandidateSet(
@@ -521,6 +545,49 @@ class CaptureService:
             )
         return inventory
 
+    def _verified_replay_record(self, record: CaptureRecord) -> CaptureRecord:
+        if record.inventory_sha256 is not None:
+            self._verified_inventory(record)
+        if record.status == "completed":
+            self._verified_candidates(record)
+        return record
+
+    def _verified_candidates(self, record: CaptureRecord) -> tuple[Candidate, ...]:
+        if record.status != "completed":
+            return ()
+        expected_ids = tuple(
+            capture_candidate_id(record.operation_id, ordinal)
+            for ordinal in range(1, len(record.candidate_ids) + 1)
+        )
+        if len(record.candidate_ids) > _MAX_CANDIDATES or (
+            record.candidate_ids != expected_ids
+        ):
+            raise PrivateStateCorrupt("captures", record.operation_id)
+
+        candidates: list[Candidate] = []
+        for ordinal, candidate_id in enumerate(expected_ids, start=1):
+            candidate = self.store.get_candidate(candidate_id)
+            if candidate is None:
+                raise PrivateStateCorrupt("candidates", candidate_id)
+            if (
+                candidate.capture_id != record.operation_id
+                or candidate.ordinal != ordinal
+                or candidate.source != record.source
+                or candidate.content.product != record.product
+            ):
+                raise PrivateStateCorrupt("candidates", candidate_id)
+            candidates.append(candidate)
+
+        extraction = {
+            "candidates": [
+                _persisted_extraction_candidate(candidate)
+                for candidate in candidates
+            ]
+        }
+        if _output_digest(extraction) != record.extraction_sha256:
+            raise PrivateStateCorrupt("captures", record.operation_id)
+        return tuple(candidates)
+
     def _validated_candidates(
         self,
         record: CaptureRecord,
@@ -576,9 +643,7 @@ class CaptureService:
                     "A Candidate exceeds 16 KiB",
                 )
 
-            candidate_id = (
-                f"cand_{operation_id_suffix(record.operation_id)}_{ordinal:02d}"
-            )
+            candidate_id = capture_candidate_id(record.operation_id, ordinal)
             validated.append(
                 Candidate(
                     candidate_id=candidate_id,
@@ -597,9 +662,3 @@ class CaptureService:
                 )
             )
         return tuple(validated)
-
-
-def operation_id_suffix(operation_id: str) -> str:
-    """Return the digest portion used by deterministic Candidate ids."""
-
-    return operation_id.removeprefix("cap_")

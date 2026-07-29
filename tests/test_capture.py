@@ -195,7 +195,7 @@ class CaptureModelTests(unittest.TestCase):
             failure=api.StageFailure(
                 stage="inventory",
                 code="invalid_inventory",
-                message="Inventory output did not match the required schema",
+                message="Inventory output does not match the required schema",
                 output_sha256="3" * 64,
             ),
         )
@@ -209,6 +209,71 @@ class CaptureModelTests(unittest.TestCase):
         self.assertNotIn("raw_messages", serialized)
         self.assertNotIn("transcript", serialized)
         self.assertNotIn("model_payload", serialized)
+
+    def test_v2_capture_loading_rejects_unsanitized_failure_combinations(
+        self,
+    ) -> None:
+        api = self.capture_api()
+        store = api.FilePrivateStore(self.state_dir)
+        snapshot = self.snapshot(api)
+        operation_id = api.capture_operation_id(
+            "thread-a", "turn-failure-tamper", "anheng", snapshot
+        )
+        failed = replace(
+            api.CaptureRecord.started(
+                operation_id,
+                api.SourceCheckpoint("thread-a", "turn-failure-tamper"),
+                "anheng",
+                snapshot,
+            ),
+            status="failed",
+            fork_thread_id="thread-fork",
+            inventory_turn_id="turn-inventory",
+            failure=api.StageFailure(
+                stage="inventory",
+                code="invalid_inventory",
+                message="Inventory output does not match the required schema",
+                output_sha256="3" * 64,
+            ),
+        )
+        invalid_failures = (
+            {
+                "stage": "inventory",
+                "code": "MODEL_SECRET_CODE",
+                "message": "MODEL_SECRET_MESSAGE",
+                "output_sha256": "3" * 64,
+            },
+            {
+                "stage": "inventory",
+                "code": "invalid_inventory",
+                "message": "MODEL_SECRET_MESSAGE",
+                "output_sha256": "3" * 64,
+            },
+            {
+                "stage": "inventory",
+                "code": "invalid_extraction",
+                "message": "Extraction output does not match the required schema",
+                "output_sha256": "3" * 64,
+            },
+            {
+                "stage": "inventory",
+                "code": "invalid_json",
+                "message": "Stage output was not valid JSON",
+                "output_sha256": None,
+            },
+        )
+
+        for failure in invalid_failures:
+            with self.subTest(failure=failure):
+                payload = failed.to_dict()
+                payload["failure"] = failure
+                api.atomic_write_json(
+                    self.state_dir / "captures" / f"{operation_id}.json",
+                    payload,
+                )
+
+                with self.assertRaises(api.PrivateStateCorrupt):
+                    store.get_capture(operation_id)
 
     def test_capture_record_rejects_unknown_persisted_fields(self) -> None:
         """Catch silent acceptance of unowned V2 state."""
@@ -514,6 +579,90 @@ class CaptureModelTests(unittest.TestCase):
             store.get_candidate(requested_id)
         self.assertEqual("candidates", raised.exception.collection)
         self.assertEqual(requested_id, raised.exception.object_id)
+
+    def test_candidate_reader_rejects_empty_fields_and_nonpositive_ordinal(
+        self,
+    ) -> None:
+        api = self.capture_api()
+        store = api.FilePrivateStore(self.state_dir)
+        candidate_id = "cand_" + "a" * 32 + "_01"
+        candidate = api.Candidate(
+            candidate_id=candidate_id,
+            capture_id="cap_" + "a" * 32,
+            ordinal=1,
+            content=api.CandidateContent(
+                product="anheng",
+                claim="Keep object fields non-empty.",
+                future_action="Reject corrupt persisted Candidates.",
+                scope_summary="private state",
+                repositories=("https://example.com/zdecision.git",),
+                paths=("decision-registry/",),
+                invalidation_conditions=("The contract changes.",),
+            ),
+            source=api.SourceCheckpoint("thread-a", "turn-a"),
+        )
+        invalid_paths = (
+            (("capture_id",), ""),
+            (("ordinal",), -7),
+            (("content", "claim"), ""),
+            (("source", "turn_id"), ""),
+        )
+
+        for field_path, invalid_value in invalid_paths:
+            with self.subTest(field_path=field_path):
+                payload = json.loads(json.dumps(candidate.to_dict()))
+                target = payload
+                for field in field_path[:-1]:
+                    target = target[field]
+                target[field_path[-1]] = invalid_value
+                api.atomic_write_json(
+                    self.state_dir / "candidates" / f"{candidate_id}.json",
+                    payload,
+                )
+
+                with self.assertRaises(api.PrivateStateCorrupt):
+                    store.get_candidate(candidate_id)
+
+    def test_v2_completed_capture_rejects_invalid_candidate_reference_sets(
+        self,
+    ) -> None:
+        api = self.capture_api()
+        store = api.FilePrivateStore(self.state_dir)
+        snapshot = self.snapshot(api)
+        operation_id = api.capture_operation_id(
+            "thread-a", "turn-reference-tamper", "anheng", snapshot
+        )
+        completed = replace(
+            api.CaptureRecord.started(
+                operation_id,
+                api.SourceCheckpoint("thread-a", "turn-reference-tamper"),
+                "anheng",
+                snapshot,
+            ),
+            status="completed",
+            fork_thread_id="thread-fork",
+            inventory_turn_id="turn-inventory",
+            extraction_turn_id="turn-extraction",
+            inventory_sha256="1" * 64,
+            extraction_sha256="2" * 64,
+        )
+        prefix = f"cand_{operation_id[4:]}_"
+        invalid_sets = (
+            ("cand_old_01",),
+            (f"{prefix}02", f"{prefix}01"),
+            (f"{prefix}01", f"{prefix}01"),
+            tuple(f"{prefix}{ordinal:02d}" for ordinal in range(1, 22)),
+        )
+
+        for candidate_ids in invalid_sets:
+            with self.subTest(candidate_ids=candidate_ids):
+                payload = replace(completed, candidate_ids=candidate_ids).to_dict()
+                api.atomic_write_json(
+                    self.state_dir / "captures" / f"{operation_id}.json",
+                    payload,
+                )
+                with self.assertRaises(api.PrivateStateCorrupt):
+                    store.get_capture(operation_id)
 
     def test_private_store_rejects_unsafe_object_id(self) -> None:
         """Catch private-state paths escaping their owned directory."""
@@ -992,6 +1141,52 @@ class CaptureServiceTests(unittest.TestCase):
 
         self.assertEqual(completed, replay)
         self.assertEqual(2, len(tuple((self.state_dir / "candidates").iterdir())))
+
+    def test_completed_replays_verify_candidate_digest_before_returning(self) -> None:
+        from zdecision.jsonio import atomic_write_json
+
+        operation_id = self.extraction_running()
+        self.service.complete_extraction(
+            operation_id,
+            {"candidates": [valid_candidate()]},
+        )
+        record = self.service.get(operation_id)
+        candidate_id = record.candidate_ids[0]
+        candidate = self.store.get_candidate(candidate_id)
+        assert candidate is not None
+        payload = candidate.to_dict()
+        payload["content"]["claim"] = "Tampered but still valid Candidate text."
+        atomic_write_json(
+            self.state_dir / "candidates" / f"{candidate_id}.json",
+            payload,
+        )
+
+        replay_actions = (
+            lambda: self.service.resume(operation_id),
+            lambda: self.service.prepare(
+                record.source.thread_id,
+                record.source.turn_id,
+                record.product,
+                record.template.template_id,
+            ),
+            lambda: self.service.complete_extraction(
+                operation_id, {"candidates": []}
+            ),
+            lambda: self.service.attach_fork(operation_id, "thread-fork"),
+            lambda: self.service.attach_stage_turn(
+                operation_id, "inventory", "turn-inventory"
+            ),
+            lambda: self.service.attach_stage_turn(
+                operation_id, "extraction", "turn-extraction"
+            ),
+            lambda: self.service.complete_inventory(
+                operation_id, VALID_INVENTORY
+            ),
+        )
+        for replay in replay_actions:
+            with self.subTest(replay=replay):
+                with self.assertRaises(self.PrivateStateCorrupt):
+                    replay()
 
     def test_candidate_ids_follow_validated_result_order(self) -> None:
         operation_id = self.extraction_running()

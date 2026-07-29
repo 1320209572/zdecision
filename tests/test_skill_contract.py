@@ -137,6 +137,58 @@ class ZDecisionSkillContractTests(unittest.TestCase):
             with self.subTest(insufficient_evidence=insufficient_evidence):
                 self.assertIn(insufficient_evidence, text)
 
+    def test_native_start_result_table_distinguishes_all_three_semantic_branches(
+        self,
+    ) -> None:
+        text = self.capture_text()
+        heading = "### Native start-result decisions"
+        self.assertIn(heading, text)
+        section = text.split(heading, 1)[1].split("\n### ", 1)[0]
+        rows: dict[str, tuple[str, str]] = {}
+        for line in section.splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = tuple(cell.strip() for cell in line.strip("|").split("|"))
+            if len(cells) != 3 or cells[0] in (
+                "Native observation",
+                "---",
+            ):
+                continue
+            rows[cells[0].strip("`")] = (cells[1], cells[2])
+
+        self.assertEqual(
+            {
+                "definite pre-Turn native unavailable",
+                "uncertain turn/start result",
+                "post-attachment terminal result",
+            },
+            set(rows),
+        )
+        preturn_evidence, preturn_action = rows[
+            "definite pre-Turn native unavailable"
+        ]
+        self.assertIn("no Turn was created", preturn_evidence)
+        self.assertNotIn("stored stage Turn", preturn_evidence + preturn_action)
+        self.assertIn("fail-stage", preturn_action)
+        self.assertIn("native_unavailable", preturn_action)
+        self.assertIn("fixed sanitized pre-Turn failure", preturn_action)
+
+        uncertain_evidence, uncertain_action = rows[
+            "uncertain turn/start result"
+        ]
+        self.assertIn("no definite Turn ID or terminal outcome", uncertain_evidence)
+        self.assertIn("must not call `fail-stage`", uncertain_action)
+        self.assertIn("leave the eligible state unchanged", uncertain_action)
+        self.assertIn("reconcile", uncertain_action)
+
+        attached_evidence, attached_action = rows[
+            "post-attachment terminal result"
+        ]
+        self.assertIn("stored stage Turn ID exists", attached_evidence)
+        self.assertIn("read_thread", attached_action)
+        self.assertIn("wait_threads", attached_action)
+        self.assertIn("stored-Turn evidence rules", attached_action)
+
     def test_turn_reconciliation_uses_exact_attached_or_unique_pre_attach_match(
         self,
     ) -> None:

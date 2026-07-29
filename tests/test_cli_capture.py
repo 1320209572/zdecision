@@ -855,6 +855,76 @@ class CaptureCliTests(unittest.TestCase):
         candidate_path.write_text("{" + secret, "utf-8")
         self._assert_private_state_invalid(candidate_operation, secret)
 
+    def test_show_rejects_secret_failure_code_and_message_without_leaking(self) -> None:
+        code_secret = "MODEL_SECRET_CODE_8c51"
+        message_secret = "MODEL_SECRET_MESSAGE_2ef4"
+        operation_id = self.inventory_running()
+        failed = self.run_capture(
+            [
+                "capture",
+                "fail-stage",
+                "--operation-id",
+                operation_id,
+                "--stage",
+                "inventory",
+                "--code",
+                "model_refusal",
+            ]
+        )
+        self.assertEqual(0, failed[0])
+        capture_path = self.state_dir / "captures" / f"{operation_id}.json"
+        payload = json.loads(capture_path.read_text("utf-8"))
+        payload["failure"]["code"] = code_secret
+        payload["failure"]["message"] = message_secret
+        capture_path.write_text(json.dumps(payload), "utf-8")
+
+        shown = self.run_capture(
+            ["capture", "show", "--operation-id", operation_id]
+        )
+
+        self.assertEqual(3, shown[0])
+        self.assertEqual("private_state_invalid", shown[1]["error"]["code"])
+        self.assertNotIn(code_secret, shown[2] + shown[3])
+        self.assertNotIn(message_secret, shown[2] + shown[3])
+        self.assert_one_envelope(shown)
+
+    def test_v2_show_rejects_candidate_ownership_and_digest_tampering(self) -> None:
+        tamper_cases = (
+            (("capture_id",), "cap_" + "f" * 32),
+            (("ordinal",), 2),
+            (("source", "turn_id"), "turn-other"),
+            (("content", "product"), "other-product"),
+            (("content", "claim"), "Tampered but valid Candidate text."),
+        )
+
+        for field_path, changed_value in tamper_cases:
+            with self.subTest(field_path=field_path):
+                operation_id = self.complete(
+                    {"candidates": [valid_candidate()]}
+                )
+                shown = self.run_capture(
+                    ["capture", "show", "--operation-id", operation_id]
+                )
+                candidate_id = shown[1]["data"]["record"]["candidate_ids"][0]
+                candidate_path = (
+                    self.state_dir / "candidates" / f"{candidate_id}.json"
+                )
+                payload = json.loads(candidate_path.read_text("utf-8"))
+                target = payload
+                for field in field_path[:-1]:
+                    target = target[field]
+                target[field_path[-1]] = changed_value
+                candidate_path.write_text(json.dumps(payload), "utf-8")
+
+                result = self.run_capture(
+                    ["capture", "show", "--operation-id", operation_id]
+                )
+                self.assertEqual(3, result[0])
+                self.assertEqual(
+                    "private_state_invalid", result[1]["error"]["code"]
+                )
+                self.assert_one_envelope(result)
+
     def _assert_private_state_invalid(self, operation_id: str, secret: str) -> None:
         result = self.run_capture(["capture", "show", "--operation-id", operation_id])
         self.assertEqual(3, result[0])
@@ -963,6 +1033,56 @@ class CaptureCliTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("capture.prepared", json.loads(result.stdout)["kind"])
         self.assertEqual(1, len(result.stdout.strip().splitlines()))
+
+    def test_module_entry_normalizes_decoder_failures_and_records_raw_digest(
+        self,
+    ) -> None:
+        environment = os.environ.copy()
+        environment["ZDECISION_STATE_DIR"] = str(self.state_dir)
+        invalid_inputs = (
+            ("large_integer", b"9" * 5000),
+            ("invalid_utf8", b"\xff\xfeMODEL_SECRET_UTF8_67ea"),
+        )
+
+        for name, raw in invalid_inputs:
+            with self.subTest(name=name):
+                operation_id = self.inventory_running()
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "zdecision",
+                        "capture",
+                        "complete-inventory",
+                        "--operation-id",
+                        operation_id,
+                        "--input",
+                        "-",
+                    ],
+                    input=raw,
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                )
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                stderr = result.stderr.decode("utf-8", errors="replace")
+
+                self.assertEqual(2, result.returncode, stderr)
+                self.assertEqual(1, len(stdout.strip().splitlines()))
+                payload = json.loads(stdout)
+                self.assertEqual("invalid_json", payload["error"]["code"])
+                self.assertNotIn("Traceback", stdout + stderr)
+                self.assertNotIn("MODEL_SECRET_UTF8_67ea", stdout + stderr)
+                shown = self.run_capture(
+                    ["capture", "show", "--operation-id", operation_id]
+                )
+                failure = shown[1]["data"]["record"]["failure"]
+                self.assertEqual("failed", shown[1]["data"]["record"]["status"])
+                self.assertEqual("invalid_json", failure["code"])
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(),
+                    failure["output_sha256"],
+                )
 
 
 if __name__ == "__main__":

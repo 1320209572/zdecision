@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Literal, Mapping
 
 from zdecision.capture.templates import TemplateSnapshot
-from zdecision.ids import capture_operation_id
+from zdecision.ids import capture_candidate_id, capture_operation_id
 
 
 def _require_keys(
@@ -48,8 +48,13 @@ class SourceCheckpoint:
         )
         thread_id = value["thread_id"]
         turn_id = value["turn_id"]
-        if not isinstance(thread_id, str) or not isinstance(turn_id, str):
-            raise ValueError("SourceCheckpoint ids must be strings")
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id.strip()
+            or not isinstance(turn_id, str)
+            or not turn_id.strip()
+        ):
+            raise ValueError("SourceCheckpoint ids must be non-empty strings")
         return cls(thread_id=thread_id, turn_id=turn_id)
 
 
@@ -97,8 +102,13 @@ class CandidateContent:
             "future_action",
             "scope_summary",
         )
-        if any(not isinstance(value[field], str) for field in scalar_fields):
-            raise ValueError("CandidateContent scalar fields must be strings")
+        if any(
+            not isinstance(value[field], str) or not value[field].strip()
+            for field in scalar_fields
+        ):
+            raise ValueError(
+                "CandidateContent scalar fields must be non-empty strings"
+            )
         return cls(
             product=value["product"],
             claim=value["claim"],
@@ -142,10 +152,19 @@ class Candidate:
         ordinal = value["ordinal"]
         content = value["content"]
         source = value["source"]
-        if not isinstance(candidate_id, str) or not isinstance(capture_id, str):
-            raise ValueError("Candidate ids must be strings")
-        if not isinstance(ordinal, int) or isinstance(ordinal, bool):
-            raise ValueError("Candidate ordinal must be an integer")
+        if (
+            not isinstance(candidate_id, str)
+            or not candidate_id.strip()
+            or not isinstance(capture_id, str)
+            or not capture_id.strip()
+        ):
+            raise ValueError("Candidate ids must be non-empty strings")
+        if (
+            not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < 1
+        ):
+            raise ValueError("Candidate ordinal must be a positive integer")
         if not isinstance(content, Mapping) or not isinstance(source, Mapping):
             raise ValueError("Candidate content and source must be objects")
         return cls(
@@ -167,6 +186,39 @@ CaptureStatus = Literal[
     "failed",
 ]
 StageName = Literal["inventory", "extraction"]
+
+_SHARED_FAILURE_MESSAGES = {
+    "invalid_json": "Stage output was not valid JSON",
+    "model_refusal": "Stage model refused the request",
+    "model_timeout": "Stage model did not complete before the timeout",
+    "native_unavailable": "Required native task capability was unavailable",
+    "model_contract_violation": "Stage model violated the output contract",
+}
+_STAGE_FAILURE_MESSAGES = {
+    "inventory": {
+        **_SHARED_FAILURE_MESSAGES,
+        "invalid_inventory": "Inventory output does not match the required schema",
+        "inventory_signal_limit_exceeded": (
+            "Inventory contains more than 100 signals"
+        ),
+        "inventory_output_too_large": "Inventory output exceeds 256 KiB",
+    },
+    "extraction": {
+        **_SHARED_FAILURE_MESSAGES,
+        "invalid_extraction": "Extraction output does not match the required schema",
+        "candidate_limit_exceeded": (
+            "Extraction contains more than 20 Candidates"
+        ),
+        "candidate_item_too_large": "A Candidate exceeds 16 KiB",
+    },
+}
+
+
+def stage_failure_message(stage: StageName, code: str) -> str | None:
+    """Return the one sanitized persisted message for a stage/code pair."""
+
+    stage_messages = _STAGE_FAILURE_MESSAGES.get(stage)
+    return None if stage_messages is None else stage_messages.get(code)
 
 _CAPTURE_FIELDS = frozenset(
     (
@@ -243,17 +295,21 @@ class StageFailure:
         message = value["message"]
         if stage not in ("inventory", "extraction"):
             raise ValueError("StageFailure stage is invalid")
-        if not isinstance(code, str) or not code:
-            raise ValueError("StageFailure code must be a non-empty string")
-        if not isinstance(message, str) or not message:
-            raise ValueError("StageFailure message must be a non-empty string")
+        if not isinstance(code, str) or not isinstance(message, str):
+            raise ValueError("StageFailure code and message must be strings")
+        expected_message = stage_failure_message(stage, code)
+        if expected_message is None or message != expected_message:
+            raise ValueError("StageFailure code or message is invalid")
+        output_sha256 = _optional_digest(
+            value["output_sha256"], "StageFailure output_sha256"
+        )
+        if code == "invalid_json" and output_sha256 is None:
+            raise ValueError("StageFailure invalid_json requires an output digest")
         return cls(
             stage=stage,
             code=code,
             message=message,
-            output_sha256=_optional_digest(
-                value["output_sha256"], "StageFailure output_sha256"
-            ),
+            output_sha256=output_sha256,
         )
 
 
@@ -414,6 +470,16 @@ class CaptureRecord:
         extraction_digest = self.extraction_sha256 is not None
         failed = self.failure is not None
         candidates = bool(self.candidate_ids)
+
+        if self.status == "completed":
+            if len(self.candidate_ids) > 20:
+                raise ValueError("CaptureRecord has too many Candidate references")
+            expected_candidate_ids = tuple(
+                capture_candidate_id(self.operation_id, ordinal)
+                for ordinal in range(1, len(self.candidate_ids) + 1)
+            )
+            if self.candidate_ids != expected_candidate_ids:
+                raise ValueError("CaptureRecord Candidate references are invalid")
 
         valid = False
         if self.status == "prepared":
