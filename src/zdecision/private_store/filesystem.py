@@ -14,9 +14,14 @@ from zdecision.capture.models import (
     LEGACY_CAPTURE_FIELDS,
     Candidate,
     CaptureRecord,
+    ExtractionManifest,
     LegacyCaptureRecord,
 )
-from zdecision.jsonio import atomic_write_json, canonical_json_bytes
+from zdecision.jsonio import (
+    atomic_create_json,
+    atomic_write_json,
+    canonical_json_bytes,
+)
 
 
 _SAFE_OBJECT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -101,9 +106,17 @@ class FilePrivateStore:
         if not isinstance(candidate, Candidate):
             raise TypeError("Only validated Candidate values may be written")
         Candidate.from_dict(candidate.to_dict())
-        atomic_write_json(
-            self._object_path("candidates", candidate.candidate_id),
-            candidate.to_dict(),
+        path = self._object_path("candidates", candidate.candidate_id)
+        if atomic_create_json(path, candidate.to_dict()):
+            return
+        existing = self.get_candidate(candidate.candidate_id)
+        if existing is not None and path.read_bytes() == canonical_json_bytes(
+            candidate.to_dict()
+        ):
+            return
+        raise PrivateStateConflict(
+            f"Private Candidate {candidate.candidate_id!r} already has "
+            "different content"
         )
 
     def get_candidate(self, candidate_id: str) -> Candidate | None:
@@ -120,6 +133,62 @@ class FilePrivateStore:
             return candidate
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             raise PrivateStateCorrupt("candidates", candidate_id) from None
+
+    def put_extraction_manifest(self, manifest: ExtractionManifest) -> None:
+        if not isinstance(manifest, ExtractionManifest):
+            raise TypeError("Only validated ExtractionManifest values may be written")
+        ExtractionManifest.from_dict(manifest.to_dict())
+        path = self._object_path("extraction_manifests", manifest.operation_id)
+        if not path.exists() and self.candidate_ids_for_capture(
+            manifest.operation_id
+        ):
+            raise PrivateStateConflict(
+                f"Capture {manifest.operation_id!r} has unowned Candidate state"
+            )
+        if atomic_create_json(path, manifest.to_dict()):
+            return
+        existing = self.get_extraction_manifest(manifest.operation_id)
+        if existing is not None and canonical_json_bytes(
+            existing.to_dict()
+        ) == canonical_json_bytes(manifest.to_dict()):
+            return
+        raise PrivateStateConflict(
+            f"Private extraction manifest {manifest.operation_id!r} already "
+            "has different content"
+        )
+
+    def get_extraction_manifest(
+        self, operation_id: str
+    ) -> ExtractionManifest | None:
+        path = self._object_path("extraction_manifests", operation_id)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Extraction manifest must be a JSON object")
+            manifest = ExtractionManifest.from_dict(value)
+            if manifest.operation_id != operation_id:
+                raise ValueError("Extraction manifest identity mismatch")
+            return manifest
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt("extraction_manifests", operation_id) from None
+
+    def candidate_ids_for_capture(self, operation_id: str) -> tuple[str, ...]:
+        self._object_path("captures", operation_id)
+        directory = self.root / "candidates"
+        if not directory.exists():
+            return ()
+        prefix = f"cand_{operation_id.removeprefix('cap_')}_"
+        return tuple(
+            sorted(
+                path.stem
+                for path in directory.iterdir()
+                if path.is_file()
+                and path.suffix == ".json"
+                and path.stem.startswith(prefix)
+            )
+        )
 
     def put_inventory(
         self,

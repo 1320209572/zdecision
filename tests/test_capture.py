@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.test_inventory import VALID_INVENTORY
 
@@ -210,6 +211,61 @@ class CaptureModelTests(unittest.TestCase):
         self.assertNotIn("transcript", serialized)
         self.assertNotIn("model_payload", serialized)
 
+    def test_payload_validation_failures_require_a_digest_on_construction_and_load(
+        self,
+    ) -> None:
+        """Catch typed invalid payload failures being persisted without provenance."""
+        api = self.capture_api()
+        cases = (
+            ("inventory", "invalid_json", "Stage output was not valid JSON"),
+            (
+                "inventory",
+                "invalid_inventory",
+                "Inventory output does not match the required schema",
+            ),
+            (
+                "inventory",
+                "inventory_signal_limit_exceeded",
+                "Inventory contains more than 100 signals",
+            ),
+            (
+                "inventory",
+                "inventory_output_too_large",
+                "Inventory output exceeds 256 KiB",
+            ),
+            ("extraction", "invalid_json", "Stage output was not valid JSON"),
+            (
+                "extraction",
+                "invalid_extraction",
+                "Extraction output does not match the required schema",
+            ),
+            (
+                "extraction",
+                "candidate_limit_exceeded",
+                "Extraction contains more than 20 Candidates",
+            ),
+            (
+                "extraction",
+                "candidate_item_too_large",
+                "A Candidate exceeds 16 KiB",
+            ),
+        )
+
+        for stage, code, message in cases:
+            with self.subTest(stage=stage, code=code, boundary="construction"):
+                with self.assertRaises(ValueError):
+                    api.StageFailure(stage, code, message, None)
+            with self.subTest(stage=stage, code=code, boundary="load"):
+                with self.assertRaises(ValueError):
+                    api.StageFailure.from_dict(
+                        {
+                            "stage": stage,
+                            "code": code,
+                            "message": message,
+                            "output_sha256": None,
+                        }
+                    )
+
     def test_v2_capture_loading_rejects_unsanitized_failure_combinations(
         self,
     ) -> None:
@@ -383,7 +439,11 @@ class CaptureModelTests(unittest.TestCase):
                     failure=api.StageFailure(
                         stage=stage,
                         code=f"invalid_{stage}",
-                        message="Sanitized validation failure",
+                        message=(
+                            "Inventory output does not match the required schema"
+                            if stage == "inventory"
+                            else "Extraction output does not match the required schema"
+                        ),
                         output_sha256="2" * 64,
                     ),
                     **fields,
@@ -472,6 +532,78 @@ class CaptureModelTests(unittest.TestCase):
         )
         with self.assertRaises(api.PrivateStateConflict):
             store.put_inventory(operation_id, changed)
+
+    def test_candidate_store_is_idempotent_but_never_replaces_content(self) -> None:
+        """Catch crash recovery replacing an already-owned Candidate ordinal."""
+        api = self.capture_api()
+        store = api.FilePrivateStore(self.state_dir)
+        candidate_id = "cand_" + "a" * 32 + "_01"
+        candidate = api.Candidate(
+            candidate_id=candidate_id,
+            capture_id="cap_" + "a" * 32,
+            ordinal=1,
+            content=api.CandidateContent(
+                product="anheng",
+                claim="Keep the original Candidate bytes.",
+                future_action="Reject a different retry payload.",
+                scope_summary="private state",
+                repositories=(),
+                paths=(),
+                invalidation_conditions=(),
+            ),
+            source=api.SourceCheckpoint("thread-a", "turn-a"),
+        )
+        path = self.state_dir / "candidates" / f"{candidate_id}.json"
+
+        store.put_candidate(candidate)
+        original_bytes = path.read_bytes()
+        original_inode = path.stat().st_ino
+        store.put_candidate(candidate)
+
+        self.assertEqual(original_bytes, path.read_bytes())
+        self.assertEqual(original_inode, path.stat().st_ino)
+        changed = replace(
+            candidate,
+            content=replace(
+                candidate.content,
+                claim="A different Candidate must never replace the original.",
+            ),
+        )
+        with self.assertRaises(api.PrivateStateConflict):
+            store.put_candidate(changed)
+        self.assertEqual(original_bytes, path.read_bytes())
+        self.assertEqual(original_inode, path.stat().st_ino)
+
+    def test_candidate_store_rejects_different_bytes_for_the_same_typed_value(
+        self,
+    ) -> None:
+        """Catch non-canonical bytes being accepted as an identical Candidate."""
+        api = self.capture_api()
+        store = api.FilePrivateStore(self.state_dir)
+        candidate_id = "cand_" + "b" * 32 + "_01"
+        candidate = api.Candidate(
+            candidate_id=candidate_id,
+            capture_id="cap_" + "b" * 32,
+            ordinal=1,
+            content=api.CandidateContent(
+                product="anheng",
+                claim="Bind idempotency to exact persisted bytes.",
+                future_action="Reject any byte-level difference.",
+                scope_summary="private state",
+                repositories=(),
+                paths=(),
+                invalidation_conditions=(),
+            ),
+            source=api.SourceCheckpoint("thread-b", "turn-b"),
+        )
+        path = self.state_dir / "candidates" / f"{candidate_id}.json"
+        store.put_candidate(candidate)
+        path.write_text(json.dumps(candidate.to_dict()), "utf-8")
+        different_bytes = path.read_bytes()
+
+        with self.assertRaises(api.PrivateStateConflict):
+            store.put_candidate(candidate)
+        self.assertEqual(different_bytes, path.read_bytes())
 
     def test_corrupt_private_objects_raise_only_the_sanitized_boundary(self) -> None:
         api = self.capture_api()
@@ -1141,6 +1273,162 @@ class CaptureServiceTests(unittest.TestCase):
 
         self.assertEqual(completed, replay)
         self.assertEqual(2, len(tuple((self.state_dir / "candidates").iterdir())))
+
+    def test_same_retry_recovers_from_manifest_only_crash(self) -> None:
+        """Catch Stage 2 writing a Candidate before atomically owning its payload."""
+        operation_id = self.extraction_running()
+        extraction = extraction_with_two_candidates()
+
+        with patch.object(
+            self.store,
+            "put_candidate",
+            side_effect=OSError("simulated crash before the first Candidate"),
+        ):
+            with self.assertRaises(OSError):
+                self.service.complete_extraction(operation_id, extraction)
+
+        manifest_path = (
+            self.state_dir / "extraction_manifests" / f"{operation_id}.json"
+        )
+        self.assertTrue(manifest_path.is_file())
+        self.assertFalse((self.state_dir / "candidates").exists())
+        self.assertEqual("extraction_running", self.service.get(operation_id).status)
+
+        completed = self.service.complete_extraction(operation_id, extraction)
+
+        self.assertEqual("completed", completed.status)
+        self.assertEqual(2, len(completed.candidate_ids))
+
+    def test_same_retry_recovers_from_partial_candidate_crash(self) -> None:
+        """Catch an identical retry rejecting or replacing a partial Candidate set."""
+        operation_id = self.extraction_running()
+        extraction = extraction_with_two_candidates()
+        original_put_candidate = self.store.put_candidate
+        write_count = 0
+
+        def crash_after_first(candidate) -> None:
+            nonlocal write_count
+            if write_count == 1:
+                raise OSError("simulated crash after the first Candidate")
+            original_put_candidate(candidate)
+            write_count += 1
+
+        with patch.object(
+            self.store,
+            "put_candidate",
+            side_effect=crash_after_first,
+        ):
+            with self.assertRaises(OSError):
+                self.service.complete_extraction(operation_id, extraction)
+
+        first_id = f"cand_{operation_id[4:]}_01"
+        first_path = self.state_dir / "candidates" / f"{first_id}.json"
+        original_bytes = first_path.read_bytes()
+        original_inode = first_path.stat().st_ino
+
+        completed = self.service.complete_extraction(operation_id, extraction)
+
+        self.assertEqual("completed", completed.status)
+        self.assertEqual(original_bytes, first_path.read_bytes())
+        self.assertEqual(original_inode, first_path.stat().st_ino)
+
+    def test_same_retry_recovers_after_all_candidates_precede_capture_record(self) -> None:
+        """Catch a final Capture write failure making a valid Stage 2 unrecoverable."""
+        operation_id = self.extraction_running()
+        extraction = extraction_with_two_candidates()
+        original_put_capture = self.store.put_capture
+
+        def crash_on_completed_record(record) -> None:
+            if record.status == "completed":
+                raise OSError("simulated crash before the completed Capture record")
+            original_put_capture(record)
+
+        with patch.object(
+            self.store,
+            "put_capture",
+            side_effect=crash_on_completed_record,
+        ):
+            with self.assertRaises(OSError):
+                self.service.complete_extraction(operation_id, extraction)
+
+        self.assertTrue(
+            (
+                self.state_dir
+                / "extraction_manifests"
+                / f"{operation_id}.json"
+            ).is_file()
+        )
+        self.assertEqual(2, len(tuple((self.state_dir / "candidates").iterdir())))
+        self.assertEqual("extraction_running", self.service.get(operation_id).status)
+
+        completed = self.service.complete_extraction(operation_id, extraction)
+
+        self.assertEqual("completed", completed.status)
+
+    def test_different_retry_lengths_conflict_without_mutating_partial_state(self) -> None:
+        """Catch any changed retry adopting or orphaning deterministic ordinals."""
+        operation_id = self.extraction_running()
+        original = extraction_with_two_candidates()
+        original_put_candidate = self.store.put_candidate
+        write_count = 0
+
+        def crash_after_first(candidate) -> None:
+            nonlocal write_count
+            if write_count == 1:
+                raise OSError("simulated crash after the first Candidate")
+            original_put_candidate(candidate)
+            write_count += 1
+
+        with patch.object(
+            self.store,
+            "put_candidate",
+            side_effect=crash_after_first,
+        ):
+            with self.assertRaises(OSError):
+                self.service.complete_extraction(operation_id, original)
+
+        manifest_path = (
+            self.state_dir / "extraction_manifests" / f"{operation_id}.json"
+        )
+        first_id = f"cand_{operation_id[4:]}_01"
+        first_path = self.state_dir / "candidates" / f"{first_id}.json"
+        original_manifest = manifest_path.read_bytes()
+        original_candidate = first_path.read_bytes()
+        original_manifest_inode = manifest_path.stat().st_ino
+        original_candidate_inode = first_path.stat().st_ino
+        changed_same_length = extraction_with_two_candidates()
+        changed_same_length["candidates"][0]["claim"] = (
+            "Reject formal decisions on main."
+        )
+        retries = (
+            ("same_length", changed_same_length),
+            ("shorter", {"candidates": original["candidates"][:1]}),
+            (
+                "longer",
+                {
+                    "candidates": [
+                        *original["candidates"],
+                        valid_candidate(claim="A third Candidate is a conflict."),
+                    ]
+                },
+            ),
+        )
+
+        for name, retry in retries:
+            with self.subTest(name=name):
+                with self.assertRaises(self.CaptureStateError):
+                    self.service.complete_extraction(operation_id, retry)
+                self.assertEqual(original_manifest, manifest_path.read_bytes())
+                self.assertEqual(original_candidate, first_path.read_bytes())
+                self.assertEqual(original_manifest_inode, manifest_path.stat().st_ino)
+                self.assertEqual(original_candidate_inode, first_path.stat().st_ino)
+                self.assertEqual(
+                    [f"{first_id}.json"],
+                    sorted(path.name for path in first_path.parent.iterdir()),
+                )
+                self.assertEqual(
+                    "extraction_running", self.service.get(operation_id).status
+                )
 
     def test_completed_replays_verify_candidate_digest_before_returning(self) -> None:
         from zdecision.jsonio import atomic_write_json

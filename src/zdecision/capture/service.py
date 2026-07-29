@@ -20,6 +20,7 @@ from zdecision.capture.models import (
     CandidateSet,
     CapturePlan,
     CaptureRecord,
+    ExtractionManifest,
     LegacyCaptureRecord,
     SourceCheckpoint,
     StageFailure,
@@ -130,6 +131,23 @@ def _output_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _output_digest_with_fallback(
+    value: object,
+    raw_output_sha256: str | None,
+) -> str:
+    try:
+        return _output_digest(value)
+    except (TypeError, ValueError):
+        if (
+            not isinstance(raw_output_sha256, str)
+            or _SHA256.fullmatch(raw_output_sha256) is None
+        ):
+            raise CaptureStateError(
+                "Capture output cannot be assigned a valid digest"
+            ) from None
+        return raw_output_sha256
+
+
 def _persisted_extraction_candidate(candidate: Candidate) -> dict[str, object]:
     return {
         "product": candidate.content.product,
@@ -229,14 +247,30 @@ class CaptureService:
             raise CaptureStateError("Capture stage is invalid")
         return self._attach_stage_turn(record, stage, turn_id)
 
-    def complete_inventory(self, operation_id: str, output: object) -> CaptureRecord:
+    def complete_inventory(
+        self,
+        operation_id: str,
+        output: object,
+        *,
+        raw_output_sha256: str | None = None,
+    ) -> CaptureRecord:
         return self._complete_inventory(
-            self._required_v2_capture(operation_id), output
+            self._required_v2_capture(operation_id),
+            output,
+            raw_output_sha256,
         )
 
-    def complete_extraction(self, operation_id: str, output: object) -> CandidateSet:
+    def complete_extraction(
+        self,
+        operation_id: str,
+        output: object,
+        *,
+        raw_output_sha256: str | None = None,
+    ) -> CandidateSet:
         return self._complete_extraction(
-            self._required_v2_capture(operation_id), output
+            self._required_v2_capture(operation_id),
+            output,
+            raw_output_sha256,
         )
 
     def record_invalid_json(
@@ -356,6 +390,7 @@ class CaptureService:
         self,
         record: CaptureRecord,
         output: object,
+        raw_output_sha256: str | None,
     ) -> CaptureRecord:
         if record.inventory_sha256 is not None:
             return self._verified_replay_record(record)
@@ -364,10 +399,7 @@ class CaptureService:
                 f"Capture {record.operation_id} requires a running inventory Turn"
             )
 
-        try:
-            output_sha256 = _output_digest(output)
-        except (TypeError, ValueError):
-            output_sha256 = None
+        output_sha256 = _output_digest_with_fallback(output, raw_output_sha256)
         try:
             inventory = validate_inventory(output)
         except InventoryValidationError as exc:
@@ -399,6 +431,7 @@ class CaptureService:
         self,
         record: CaptureRecord,
         output: object,
+        raw_output_sha256: str | None,
     ) -> CandidateSet:
         self._verified_replay_record(record)
         if record.status == "completed":
@@ -414,10 +447,7 @@ class CaptureService:
                 f"Capture {record.operation_id} requires a running extraction Turn"
             )
 
-        try:
-            output_sha256 = _output_digest(output)
-        except (TypeError, ValueError):
-            output_sha256 = None
+        output_sha256 = _output_digest_with_fallback(output, raw_output_sha256)
         try:
             candidates = self._validated_candidates(record, output)
         except ExtractionValidationError as exc:
@@ -430,11 +460,25 @@ class CaptureService:
             )
             raise
 
-        assert output_sha256 is not None
-        for candidate in candidates:
-            self.store.put_candidate(candidate)
-
         candidate_ids = tuple(candidate.candidate_id for candidate in candidates)
+        assert record.extraction_turn_id is not None
+        manifest = ExtractionManifest(
+            manifest_version=1,
+            operation_id=record.operation_id,
+            extraction_turn_id=record.extraction_turn_id,
+            extraction_sha256=output_sha256,
+            candidate_ids=candidate_ids,
+        )
+        try:
+            self.store.put_extraction_manifest(manifest)
+            for candidate in candidates:
+                self.store.put_candidate(candidate)
+        except PrivateStateConflict as exc:
+            raise CaptureStateError(
+                f"Capture {record.operation_id} has conflicting extraction state"
+            ) from exc
+        self._verified_extraction_artifacts(record, manifest)
+
         completed = replace(
             record,
             status="completed",
@@ -555,14 +599,31 @@ class CaptureService:
     def _verified_candidates(self, record: CaptureRecord) -> tuple[Candidate, ...]:
         if record.status != "completed":
             return ()
-        expected_ids = tuple(
-            capture_candidate_id(record.operation_id, ordinal)
-            for ordinal in range(1, len(record.candidate_ids) + 1)
-        )
-        if len(record.candidate_ids) > _MAX_CANDIDATES or (
-            record.candidate_ids != expected_ids
+        if (
+            record.extraction_turn_id is None
+            or record.extraction_sha256 is None
         ):
             raise PrivateStateCorrupt("captures", record.operation_id)
+        manifest = ExtractionManifest(
+            manifest_version=1,
+            operation_id=record.operation_id,
+            extraction_turn_id=record.extraction_turn_id,
+            extraction_sha256=record.extraction_sha256,
+            candidate_ids=record.candidate_ids,
+        )
+        return self._verified_extraction_artifacts(record, manifest)
+
+    def _verified_extraction_artifacts(
+        self,
+        record: CaptureRecord,
+        expected_manifest: ExtractionManifest,
+    ) -> tuple[Candidate, ...]:
+        manifest = self.store.get_extraction_manifest(record.operation_id)
+        if manifest is None or manifest != expected_manifest:
+            raise PrivateStateCorrupt("extraction_manifests", record.operation_id)
+        expected_ids = manifest.candidate_ids
+        if self.store.candidate_ids_for_capture(record.operation_id) != expected_ids:
+            raise PrivateStateCorrupt("candidates", record.operation_id)
 
         candidates: list[Candidate] = []
         for ordinal, candidate_id in enumerate(expected_ids, start=1):
@@ -584,8 +645,8 @@ class CaptureService:
                 for candidate in candidates
             ]
         }
-        if _output_digest(extraction) != record.extraction_sha256:
-            raise PrivateStateCorrupt("captures", record.operation_id)
+        if _output_digest(extraction) != manifest.extraction_sha256:
+            raise PrivateStateCorrupt("extraction_manifests", record.operation_id)
         return tuple(candidates)
 
     def _validated_candidates(
@@ -637,7 +698,11 @@ class CaptureService:
                 },
                 "invalidation_conditions": list(invalidation_conditions),
             }
-            if len(canonical_json_bytes(encoded_candidate)) > _MAX_CANDIDATE_BYTES:
+            try:
+                encoded_size = len(canonical_json_bytes(encoded_candidate))
+            except (TypeError, ValueError):
+                raise _invalid_extraction() from None
+            if encoded_size > _MAX_CANDIDATE_BYTES:
                 raise ExtractionValidationError(
                     "candidate_item_too_large",
                     "A Candidate exceeds 16 KiB",

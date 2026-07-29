@@ -235,9 +235,17 @@ def _complete_stage(
         service.record_invalid_json(operation_id, stage, output_sha256)
         raise
     if stage == "inventory":
-        record = service.complete_inventory(operation_id, output)
+        record = service.complete_inventory(
+            operation_id,
+            output,
+            raw_output_sha256=output_sha256,
+        )
         return "capture.inventory_completed", _record_data(record)
-    service.complete_extraction(operation_id, output)
+    service.complete_extraction(
+        operation_id,
+        output,
+        raw_output_sha256=output_sha256,
+    )
     record = service.get(operation_id)
     if not isinstance(record, CaptureRecord):
         raise CaptureStateError("Legacy Capture records are read-only")

@@ -252,6 +252,17 @@ LEGACY_CAPTURE_FIELDS = frozenset(
     )
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PAYLOAD_FAILURE_CODES = frozenset(
+    (
+        "invalid_json",
+        "invalid_inventory",
+        "inventory_signal_limit_exceeded",
+        "inventory_output_too_large",
+        "invalid_extraction",
+        "candidate_limit_exceeded",
+        "candidate_item_too_large",
+    )
+)
 
 
 def _optional_string(value: object, field_name: str) -> str | None:
@@ -275,6 +286,22 @@ class StageFailure:
     message: str
     output_sha256: str | None
 
+    def __post_init__(self) -> None:
+        if self.stage not in ("inventory", "extraction"):
+            raise ValueError("StageFailure stage is invalid")
+        if not isinstance(self.code, str) or not isinstance(self.message, str):
+            raise ValueError("StageFailure code and message must be strings")
+        expected_message = stage_failure_message(self.stage, self.code)
+        if expected_message is None or self.message != expected_message:
+            raise ValueError("StageFailure code or message is invalid")
+        digest = _optional_digest(
+            self.output_sha256, "StageFailure output_sha256"
+        )
+        if self.code in _PAYLOAD_FAILURE_CODES and digest is None:
+            raise ValueError(
+                "StageFailure payload validation requires an output digest"
+            )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "stage": self.stage,
@@ -293,23 +320,84 @@ class StageFailure:
         stage = value["stage"]
         code = value["code"]
         message = value["message"]
-        if stage not in ("inventory", "extraction"):
-            raise ValueError("StageFailure stage is invalid")
-        if not isinstance(code, str) or not isinstance(message, str):
-            raise ValueError("StageFailure code and message must be strings")
-        expected_message = stage_failure_message(stage, code)
-        if expected_message is None or message != expected_message:
-            raise ValueError("StageFailure code or message is invalid")
-        output_sha256 = _optional_digest(
-            value["output_sha256"], "StageFailure output_sha256"
-        )
-        if code == "invalid_json" and output_sha256 is None:
-            raise ValueError("StageFailure invalid_json requires an output digest")
         return cls(
             stage=stage,
             code=code,
             message=message,
-            output_sha256=output_sha256,
+            output_sha256=value["output_sha256"],
+        )
+
+
+@dataclass(frozen=True)
+class ExtractionManifest:
+    """Immutable ownership claim for one complete Stage 2 payload."""
+
+    manifest_version: Literal[1]
+    operation_id: str
+    extraction_turn_id: str
+    extraction_sha256: str
+    candidate_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.manifest_version != 1 or isinstance(self.manifest_version, bool):
+            raise ValueError("ExtractionManifest manifest_version must be 1")
+        if (
+            not isinstance(self.operation_id, str)
+            or not self.operation_id
+            or not isinstance(self.extraction_turn_id, str)
+            or not self.extraction_turn_id
+        ):
+            raise ValueError("ExtractionManifest ids must be non-empty strings")
+        if _optional_digest(
+            self.extraction_sha256, "ExtractionManifest extraction_sha256"
+        ) is None:
+            raise ValueError("ExtractionManifest requires an extraction digest")
+        if (
+            not isinstance(self.candidate_ids, tuple)
+            or len(self.candidate_ids) > 20
+            or any(
+                not isinstance(candidate_id, str) or not candidate_id
+                for candidate_id in self.candidate_ids
+            )
+        ):
+            raise ValueError("ExtractionManifest Candidate references are invalid")
+        expected_ids = tuple(
+            capture_candidate_id(self.operation_id, ordinal)
+            for ordinal in range(1, len(self.candidate_ids) + 1)
+        )
+        if self.candidate_ids != expected_ids:
+            raise ValueError("ExtractionManifest Candidate references are invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "manifest_version": self.manifest_version,
+            "operation_id": self.operation_id,
+            "extraction_turn_id": self.extraction_turn_id,
+            "extraction_sha256": self.extraction_sha256,
+            "candidate_ids": list(self.candidate_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> ExtractionManifest:
+        _require_keys(
+            value,
+            frozenset(
+                (
+                    "manifest_version",
+                    "operation_id",
+                    "extraction_turn_id",
+                    "extraction_sha256",
+                    "candidate_ids",
+                )
+            ),
+            "ExtractionManifest",
+        )
+        return cls(
+            manifest_version=value["manifest_version"],
+            operation_id=value["operation_id"],
+            extraction_turn_id=value["extraction_turn_id"],
+            extraction_sha256=value["extraction_sha256"],
+            candidate_ids=_strings(value["candidate_ids"], "candidate_ids"),
         )
 
 

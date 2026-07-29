@@ -1084,6 +1084,71 @@ class CaptureCliTests(unittest.TestCase):
                     failure["output_sha256"],
                 )
 
+    def test_module_entry_uses_raw_digest_when_decoded_payload_is_not_utf8_encodable(
+        self,
+    ) -> None:
+        """Catch escaped surrogates dropping typed invalid-payload provenance."""
+        environment = os.environ.copy()
+        environment["ZDECISION_STATE_DIR"] = str(self.state_dir)
+        secret = b"MODEL_SECRET_SURROGATE_9a31"
+        cases = (
+            (
+                "inventory",
+                self.inventory_running,
+                "complete-inventory",
+                "invalid_inventory",
+                b'{"signals":[],"coverage":{"reviewed_retained_context":"earliest_to_latest","known_gaps":["'
+                + secret
+                + b'\\ud800"]}}',
+            ),
+            (
+                "extraction",
+                self.extraction_running,
+                "complete-extraction",
+                "invalid_extraction",
+                b'{"candidates":[{"product":"anheng","claim":"'
+                + secret
+                + b'\\ud800","future_action":"Use the user-local private store.","scope":{"summary":"ZDecision","repositories":[],"paths":[]},"invalidation_conditions":[]}]}',
+            ),
+        )
+
+        for stage, start, action, expected_code, raw in cases:
+            with self.subTest(stage=stage):
+                operation_id = start()
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "zdecision",
+                        "capture",
+                        action,
+                        "--operation-id",
+                        operation_id,
+                        "--input",
+                        "-",
+                    ],
+                    input=raw,
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                )
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                stderr = result.stderr.decode("utf-8", errors="replace")
+
+                self.assertEqual(2, result.returncode, stderr)
+                self.assertEqual(1, len(stdout.strip().splitlines()))
+                self.assertEqual(expected_code, json.loads(stdout)["error"]["code"])
+                self.assertNotIn(secret.decode("ascii"), stdout + stderr)
+                shown = self.run_capture(
+                    ["capture", "show", "--operation-id", operation_id]
+                )
+                failure = shown[1]["data"]["record"]["failure"]
+                self.assertEqual(expected_code, failure["code"])
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(),
+                    failure["output_sha256"],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
