@@ -203,6 +203,37 @@ class ZDecisionSkillContractTests(unittest.TestCase):
         self.assertIn("zero or multiple plausible matches", text.lower())
         self.assertIn("must stop without sending another Turn", text)
 
+    def test_native_prompt_matching_normalizes_only_the_codex_delegation_envelope(
+        self,
+    ) -> None:
+        text = self.capture_text()
+
+        self.assertIn("`<codex_delegation>`", text)
+        self.assertIn("`<input>`", text)
+        self.assertIn("XML-decode", text)
+        self.assertIn("exactly equal the frozen stage prompt", text)
+        self.assertIn("direct raw prompt", text)
+        self.assertIn("Never use substring matching", text)
+        self.assertIn("unknown wrapper", text)
+
+    def test_stage_json_handoff_uses_a_no_echo_tty_and_explicit_eof(self) -> None:
+        text = self.capture_text()
+
+        self.assertIn("`tty: true`", text)
+        self.assertIn("`stty -echo`", text)
+        self.assertIn("`write_stdin`", text)
+        self.assertIn("U+0004", text)
+        self.assertIn("second EOF", text)
+        self.assertIn("non-TTY", text)
+        for forbidden_transport in (
+            "command argument",
+            "environment variable",
+            "temporary file",
+            "here-document",
+        ):
+            with self.subTest(forbidden_transport=forbidden_transport):
+                self.assertIn(forbidden_transport, text)
+
     def test_invalid_or_corrupt_inventory_never_starts_stage_two(self) -> None:
         text = self.capture_text()
 

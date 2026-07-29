@@ -22,6 +22,25 @@ internal CLI.
 - Reuse a working repository environment. Do not depend on a globally installed
   `zdecision` left by another checkout.
 
+### Private stage-output handoff
+
+The current Codex terminal tool closes a delayed non-TTY stdin before
+`write_stdin` can deliver data. For live Capture on macOS/Linux, pass each
+model stage's final JSON to the internal command through a no-echo PTY.
+`stty -echo` disables terminal echo before any private bytes are sent:
+
+1. Start the matching completion command with `tty: true` and prefix the
+   command with `stty -echo;`, while keeping `--input -`.
+2. Send only the exact final JSON through `write_stdin`, immediately followed
+   by the EOF character U+0004. Do not append commentary or a newline.
+3. If the PTY remains open after it has consumed the buffered JSON, send a
+   second EOF (U+0004) and read the command's one JSON response.
+
+Never place a private stage payload in a command argument, environment variable,
+temporary file, or here-document. Never use a non-TTY delayed stdin handoff.
+Do not run live Capture on a platform until an equivalent tested no-echo stdin
+transport is available there.
+
 ## Inputs
 
 Obtain the source task ID and one product identifier. If the product identifier
@@ -163,6 +182,22 @@ A same-prompt Turn with a different ID or in another fork never matches.
 Before attachment after an uncertain `turn/start` result, reconcile only a single unique Turn.
 It must be in the attached fork with that exact prompt and the correct immediate boundary and order.
 Zero or multiple plausible matches is ambiguous and must stop without sending another Turn.
+
+`send_message_to_thread` receives the direct raw prompt verbatim, but
+`read_thread` may represent that user message in a native
+`<codex_delegation>` envelope and XML-escape its `<input>` text. Normalize only
+these two representations when proving a prompt match:
+
+- A direct raw prompt matches only by exact string equality.
+- Otherwise, require one well-formed `<codex_delegation>` root containing
+  exactly one non-empty `<source_thread_id>` and exactly one `<input>`, with no
+  extra elements or non-whitespace wrapper text. XML-decode only the `<input>`
+  text, then require it to be exactly equal the frozen stage prompt.
+
+Never use substring matching, generic tag stripping, or whole-message HTML
+unescaping. A malformed or unknown wrapper, multiple `<input>` elements, or a
+decoded value that differs by even one character is not a match and must stop
+without sending another Turn.
 
 Apply the following decision table immediately after any attempt to start a
 stage. Do not assume that every native start call creates a Turn.
