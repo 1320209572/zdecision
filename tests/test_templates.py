@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -151,6 +154,51 @@ class TemplateCatalogTests(unittest.TestCase):
                     with self.assertRaisesRegex(TemplateValidationError, "path"):
                         self.catalog(copied).render("business", "安恒")
 
+    def test_policy_roles_must_reference_distinct_files(self) -> None:
+        references = (
+            ("inventory.md", "inventory.md"),
+            ("manifest.json", "manifest.json"),
+            ("inventory.md", "./inventory.md"),
+        )
+        for inventory_filename, extraction_filename in references:
+            with self.subTest(
+                inventory_filename=inventory_filename,
+                extraction_filename=extraction_filename,
+            ):
+                with tempfile.TemporaryDirectory() as directory:
+                    copied = Path(directory) / "decision-templates"
+                    shutil.copytree(TEMPLATE_ROOT, copied)
+                    self.update_manifest(
+                        copied,
+                        {
+                            "inventory_template": inventory_filename,
+                            "extraction_template": extraction_filename,
+                        },
+                    )
+
+                    with self.assertRaisesRegex(TemplateValidationError, "distinct"):
+                        self.catalog(copied).render("business", "安恒")
+
+    def test_hard_linked_policy_roles_are_not_distinct_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / "decision-templates"
+            shutil.copytree(TEMPLATE_ROOT, copied)
+            alias = copied / "business" / "inventory-alias.md"
+            os.link(copied / "business" / "inventory.md", alias)
+            self.update_manifest(copied, {"extraction_template": alias.name})
+
+            with self.assertRaisesRegex(TemplateValidationError, "distinct"):
+                self.catalog(copied).render("business", "安恒")
+
+    def test_manifest_resource_cannot_be_used_as_one_policy_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / "decision-templates"
+            shutil.copytree(TEMPLATE_ROOT, copied)
+            self.update_manifest(copied, {"inventory_template": "manifest.json"})
+
+            with self.assertRaisesRegex(TemplateValidationError, "policy file"):
+                self.catalog(copied).render("business", "安恒")
+
     def test_nested_policy_path_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             copied = Path(directory) / "decision-templates"
@@ -171,6 +219,34 @@ class TemplateCatalogTests(unittest.TestCase):
 
             with self.assertRaisesRegex(TemplateValidationError, "missing"):
                 self.catalog(copied).render("business", "安恒")
+
+    def test_non_regular_policy_file_is_rejected_before_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / "decision-templates"
+            shutil.copytree(TEMPLATE_ROOT, copied)
+            policy = copied / "business" / "inventory.md"
+            policy_body = policy.read_text("utf-8")
+            policy.unlink()
+            os.mkfifo(policy)
+            writer = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; import sys; "
+                        "Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')"
+                    ),
+                    str(policy),
+                    policy_body,
+                ]
+            )
+            try:
+                with self.assertRaisesRegex(TemplateValidationError, "regular file"):
+                    self.catalog(copied).render("business", "安恒")
+            finally:
+                if writer.poll() is None:
+                    writer.terminate()
+                writer.wait(timeout=5)
 
     def test_invalid_utf8_policy_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

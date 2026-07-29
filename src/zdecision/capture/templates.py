@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping
@@ -223,6 +224,19 @@ class TemplateCatalog:
             manifest.extraction_template,
             "extraction",
         )
+        manifest_path = manifest.directory / "manifest.json"
+        inventory_path = manifest.directory / manifest.inventory_template
+        extraction_path = manifest.directory / manifest.extraction_template
+        if inventory_path.samefile(manifest_path) or extraction_path.samefile(
+            manifest_path
+        ):
+            raise TemplateValidationError(
+                "manifest policy paths must reference policy files"
+            )
+        if inventory_path.samefile(extraction_path):
+            raise TemplateValidationError(
+                "manifest policy paths must reference distinct files"
+            )
         return manifest, inventory_policy, extraction_policy
 
     def _load_catalog(self) -> dict[str, _Manifest]:
@@ -284,6 +298,10 @@ class TemplateCatalog:
             extraction_template, str
         ):
             raise TemplateValidationError("manifest policy paths must be strings")
+        if Path(inventory_template) == Path(extraction_template):
+            raise TemplateValidationError(
+                "manifest policy paths must reference distinct files"
+            )
 
         return _Manifest(
             template_id=template_id,
@@ -468,6 +486,14 @@ class TemplateCatalog:
     ) -> str:
         if path.is_symlink():
             raise TemplateValidationError(f"{label} must not be a symlink")
+        try:
+            file_status = path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise TemplateValidationError(f"{label} is missing") from exc
+        except OSError as exc:
+            raise TemplateValidationError(f"unable to inspect {label}") from exc
+        if not stat.S_ISREG(file_status.st_mode):
+            raise TemplateValidationError(f"{label} must be a regular file")
         try:
             raw = path.read_bytes()
         except (FileNotFoundError, IsADirectoryError) as exc:
