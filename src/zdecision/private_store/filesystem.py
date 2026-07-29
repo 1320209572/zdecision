@@ -426,6 +426,16 @@ class FilePrivateStore:
         expected: PublicationRecord,
         replacement: PublicationRecord,
     ) -> None:
+        if (
+            expected.publication_approval is not None
+            and replacement.publication_approval != expected.publication_approval
+        ):
+            raise PrivateStateConflict("Publication approval is immutable")
+        if (
+            expected.commit_sha is not None
+            and replacement.commit_sha != expected.commit_sha
+        ):
+            raise PrivateStateConflict("Publication commit is immutable")
         mutable_fields = frozenset(
             ("state", "publication_approval", "commit_sha")
         )

@@ -29,7 +29,11 @@ from zdecision.registry.catalog import (
     DecisionUpdateNotSupported,
     RegistryCatalog,
 )
-from zdecision.registry.git import GitRegistryAdapter, RegistryOutOfSync
+from zdecision.registry.git import (
+    GitRegistryAdapter,
+    PublicationGitAmbiguous,
+    RegistryOutOfSync,
+)
 from zdecision.registry.publication import (
     CandidatePublicationReceipt,
     PublicationFile,
@@ -38,6 +42,9 @@ from zdecision.registry.publication import (
 )
 from zdecision.registry.service import (
     NoPublishableItems,
+    PublicationApprovalConflict,
+    PublicationConfirmationRequired,
+    PublicationStale,
     PromotionService,
     ReviewSuperseded,
 )
@@ -548,6 +555,291 @@ class PublicationPreviewTests(unittest.TestCase):
         with self.assertRaises(RegistryOutOfSync):
             self.service.preview(batch.review_batch_id)
         self.assertFalse((self.state_dir / "publications").exists())
+
+
+class _InjectedCrash(RuntimeError):
+    pass
+
+
+class PublicationConfirmationTests(unittest.TestCase):
+    git = PublicationPreviewTests.git
+    complete_capture = PublicationPreviewTests.complete_capture
+    mixed_review = PublicationPreviewTests.mixed_review
+    status = PublicationPreviewTests.status
+
+    def setUp(self) -> None:
+        PublicationPreviewTests.setUp(self)
+
+    def preview(self) -> PublicationRecord:
+        return self.service.preview(self.mixed_review().review_batch_id)
+
+    def confirm(self, preview_id: str):
+        return self.service.confirm(
+            preview_id,
+            "thread-publish",
+            "turn-publish",
+        )
+
+    def test_confirmation_persists_approval_before_exact_batch_commit_and_push(self) -> None:
+        preview = self.preview()
+        exact_files = preview.changed_file_bytes()
+        original_write = self.catalog.write_exact
+        observed_states: list[str] = []
+
+        def guarded_write(files):
+            observed_states.append(self.service.get(preview.preview_id).state)
+            original_write(files)
+
+        self.catalog.write_exact = guarded_write
+        result = self.confirm(preview.preview_id)
+
+        self.assertEqual("completed", result.status)
+        self.assertEqual(preview.decision_ids, result.decision_ids)
+        completed = self.service.get(preview.preview_id)
+        self.assertEqual("completed", completed.state)
+        self.assertEqual(result.commit_sha, completed.commit_sha)
+        self.assertEqual(["confirmed"], observed_states)
+        self.assertEqual("thread-publish", completed.publication_approval.thread_id)
+        self.assertEqual("turn-publish", completed.publication_approval.turn_id)
+        self.assertEqual("2026-07-29T00:03:02Z", completed.publication_approval.recorded_at)
+        self.assertEqual(b"", self.status())
+        for path, expected in exact_files.items():
+            self.assertEqual(expected, (self.repository / path).read_bytes())
+        remote = self.git(
+            self.root,
+            "git",
+            "--git-dir",
+            str(self.origin),
+            "rev-parse",
+            "refs/heads/main",
+        ).stdout.decode("ascii").strip()
+        self.assertEqual(result.commit_sha, remote)
+        for candidate_id, decision_id_value in zip(
+            preview.candidate_ids,
+            preview.decision_ids,
+            strict=True,
+        ):
+            receipt = self.store.get_candidate_receipt(candidate_id)
+            self.assertIsNotNone(receipt)
+            self.assertEqual(decision_id_value, receipt.decision_id)
+            self.assertEqual(result.commit_sha, receipt.commit_sha)
+
+    def test_newer_review_changed_main_and_changed_registry_are_stale_before_approval(self) -> None:
+        scenarios = ("review", "main", "registry")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                self.tearDown()
+                self.setUp()
+                preview = self.preview()
+                if scenario == "review":
+                    self.review_service.record(
+                        self.capture_id,
+                        (ReviewSelection(self.candidate_ids[0], "reject"),),
+                        "thread-review",
+                        "turn-review-2",
+                    )
+                elif scenario == "main":
+                    (self.repository / "source.txt").write_text("ahead\n", "utf-8")
+                    self.git(self.repository, "git", "add", "source.txt")
+                    self.git(self.repository, "git", "commit", "-m", "ahead")
+                else:
+                    (self.repository / "decision-registry" / "registry.json").write_text(
+                        "{}\n", "utf-8"
+                    )
+
+                with self.assertRaises(PublicationStale):
+                    self.confirm(preview.preview_id)
+                stored = self.service.get(preview.preview_id)
+                self.assertEqual("previewed", stored.state)
+                self.assertIsNone(stored.publication_approval)
+
+    def test_retry_requires_original_confirmation_identity(self) -> None:
+        preview = self.preview()
+        first = self.confirm(preview.preview_id)
+
+        replay = self.confirm(preview.preview_id)
+        self.assertEqual(first, replay)
+        with self.assertRaises(PublicationApprovalConflict):
+            self.service.confirm(
+                preview.preview_id,
+                "thread-publish",
+                "turn-publish-other",
+            )
+        approval = self.service.get(preview.preview_id).publication_approval
+        self.assertEqual("turn-publish", approval.turn_id)
+
+    def test_resume_rejects_an_unconfirmed_preview(self) -> None:
+        preview = self.preview()
+
+        with self.assertRaises(PublicationConfirmationRequired):
+            self.service.resume(preview.preview_id)
+        self.assertEqual("previewed", self.service.get(preview.preview_id).state)
+
+    def test_crash_after_confirmed_retries_without_new_approval(self) -> None:
+        preview = self.preview()
+        original_write = self.catalog.write_exact
+
+        def crash_before_write(files):
+            raise _InjectedCrash("after confirmed")
+
+        self.catalog.write_exact = crash_before_write
+        with self.assertRaises(_InjectedCrash):
+            self.confirm(preview.preview_id)
+        confirmed = self.service.get(preview.preview_id)
+        self.assertEqual("confirmed", confirmed.state)
+        self.assertEqual(b"", self.status())
+
+        self.catalog.write_exact = original_write
+        result = self.service.resume(preview.preview_id)
+        self.assertEqual("completed", result.status)
+        self.assertEqual(
+            confirmed.publication_approval,
+            self.service.get(preview.preview_id).publication_approval,
+        )
+        self.assertEqual(2, self.publication_clock.calls)
+
+    def test_crash_after_file_writes_reuses_only_exact_leftovers(self) -> None:
+        preview = self.preview()
+        original_commit = self.git_adapter.commit_exact
+
+        def crash_before_commit(base_commit, message, changed_files):
+            raise _InjectedCrash("after files")
+
+        self.git_adapter.commit_exact = crash_before_commit
+        with self.assertRaises(_InjectedCrash):
+            self.confirm(preview.preview_id)
+        self.assertEqual("confirmed", self.service.get(preview.preview_id).state)
+        self.assertNotEqual(b"", self.status())
+
+        self.git_adapter.commit_exact = original_commit
+        result = self.service.resume(preview.preview_id)
+        self.assertEqual("completed", result.status)
+        self.assertEqual(b"", self.status())
+
+    def test_crash_after_commit_adopts_the_unique_exact_child(self) -> None:
+        preview = self.preview()
+        original_receipt = self.store.put_candidate_receipt
+
+        def crash_before_receipt(receipt):
+            raise _InjectedCrash("after commit")
+
+        self.store.put_candidate_receipt = crash_before_receipt
+        with self.assertRaises(_InjectedCrash):
+            self.confirm(preview.preview_id)
+        confirmed = self.service.get(preview.preview_id)
+        commit_sha = self.git(
+            self.repository, "git", "rev-parse", "HEAD"
+        ).stdout.decode("ascii").strip()
+        self.assertEqual("confirmed", confirmed.state)
+        self.assertNotEqual(preview.base_commit, commit_sha)
+
+        self.store.put_candidate_receipt = original_receipt
+        result = self.service.resume(preview.preview_id)
+        self.assertEqual(commit_sha, result.commit_sha)
+        self.assertEqual("completed", result.status)
+
+    def test_pending_retry_handles_failure_before_and_after_remote_push(self) -> None:
+        for push_succeeded in (False, True):
+            with self.subTest(push_succeeded=push_succeeded):
+                self.tearDown()
+                self.setUp()
+                preview = self.preview()
+                original_push = self.git_adapter.push_exact
+
+                def crash_push(commit_sha, base_commit):
+                    if push_succeeded:
+                        original_push(commit_sha, base_commit)
+                    raise _InjectedCrash("at push boundary")
+
+                self.git_adapter.push_exact = crash_push
+                with self.assertRaises(_InjectedCrash):
+                    self.confirm(preview.preview_id)
+                pending = self.service.get(preview.preview_id)
+                self.assertEqual("committed_pending_push", pending.state)
+                self.assertIsNotNone(pending.commit_sha)
+
+                self.git_adapter.push_exact = original_push
+                result = self.service.resume(preview.preview_id)
+                self.assertEqual("completed", result.status)
+                self.assertEqual(pending.commit_sha, result.commit_sha)
+
+    def test_wrong_child_commit_is_ambiguous_and_never_replaced(self) -> None:
+        preview = self.preview()
+        original_write = self.catalog.write_exact
+
+        def crash_before_write(files):
+            raise _InjectedCrash("after confirmed")
+
+        self.catalog.write_exact = crash_before_write
+        with self.assertRaises(_InjectedCrash):
+            self.confirm(preview.preview_id)
+        self.catalog.write_exact = original_write
+        original_write(preview.changed_file_bytes())
+        self.git(self.repository, "git", "add", "decision-registry")
+        self.git(self.repository, "git", "commit", "-m", "wrong publication")
+        wrong_head = self.git(
+            self.repository, "git", "rev-parse", "HEAD"
+        ).stdout.decode("ascii").strip()
+
+        with self.assertRaises(PublicationGitAmbiguous):
+            self.service.resume(preview.preview_id)
+        self.assertEqual("confirmed", self.service.get(preview.preview_id).state)
+        current_head = self.git(
+            self.repository, "git", "rev-parse", "HEAD"
+        ).stdout.decode("ascii").strip()
+        self.assertEqual(wrong_head, current_head)
+
+    def test_preview_reconciles_approved_publication_before_receipt_check(self) -> None:
+        first_preview = self.preview()
+        original_receipt = self.store.put_candidate_receipt
+
+        def crash_before_receipt(receipt):
+            raise _InjectedCrash("commit identified before receipt")
+
+        self.store.put_candidate_receipt = crash_before_receipt
+        with self.assertRaises(_InjectedCrash):
+            self.confirm(first_preview.preview_id)
+        self.assertEqual(
+            "confirmed", self.service.get(first_preview.preview_id).state
+        )
+        self.assertIsNone(
+            self.store.get_candidate_receipt(first_preview.candidate_ids[0])
+        )
+        self.store.put_candidate_receipt = original_receipt
+        newer = self.review_service.record(
+            self.capture_id,
+            (ReviewSelection(self.candidate_ids[0], "accept"),),
+            "thread-review",
+            "turn-review-2",
+        )
+
+        with self.assertRaises(DecisionUpdateNotSupported):
+            self.service.preview(newer.review_batch_id)
+        self.assertEqual(
+            "completed", self.service.get(first_preview.preview_id).state
+        )
+
+    def test_unconfirmed_older_preview_does_not_mutate_git(self) -> None:
+        first_preview = self.preview()
+        candidate = self.store.get_candidate(self.candidate_ids[0])
+        edited = replace(candidate.content, claim="使用新的正式业务规则。")
+        newer = self.review_service.record(
+            self.capture_id,
+            (ReviewSelection(self.candidate_ids[0], "edit_accept", edited),),
+            "thread-review",
+            "turn-review-2",
+        )
+        before_head = self.git(
+            self.repository, "git", "rev-parse", "HEAD"
+        ).stdout
+
+        second_preview = self.service.preview(newer.review_batch_id)
+
+        self.assertNotEqual(first_preview.preview_id, second_preview.preview_id)
+        self.assertEqual(before_head, self.git(
+            self.repository, "git", "rev-parse", "HEAD"
+        ).stdout)
+        self.assertEqual("previewed", self.service.get(first_preview.preview_id).state)
 
 
 if __name__ == "__main__":

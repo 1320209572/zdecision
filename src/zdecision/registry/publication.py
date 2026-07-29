@@ -513,3 +513,11 @@ class PublicationResult:
         if self.status not in ("committed_pending_push", "completed"):
             raise ValueError("Publication result status is invalid")
         _id(self.commit_sha, _GIT_COMMIT, "Publication result commit")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "preview_id": self.preview_id,
+            "decision_ids": list(self.decision_ids),
+            "status": self.status,
+            "commit_sha": self.commit_sha,
+        }

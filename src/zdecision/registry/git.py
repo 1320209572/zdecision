@@ -165,6 +165,28 @@ class GitRegistryAdapter:
             return ReconciledCommit(head, False)
         raise PublicationGitAmbiguous("Publication Git state is ambiguous")
 
+    def publication_remote_state(
+        self,
+        commit_sha: str,
+        base_commit: str,
+    ) -> str:
+        """Return ``contains`` or ``base`` for the only safe remote states."""
+
+        self._validated_commit(commit_sha, "Publication commit")
+        self._validated_commit(base_commit, "Publication base")
+        self._require_origin_and_main(fetch=True)
+        remote = self._revision(
+            "refs/remotes/origin/main",
+            PublicationGitAmbiguous,
+        )
+        if self._is_ancestor(commit_sha, remote):
+            return "contains"
+        if remote == base_commit and self._commit_parents(commit_sha) == (
+            base_commit,
+        ):
+            return "base"
+        raise PublicationGitAmbiguous("Publication remote state is ambiguous")
+
     def push_exact(self, commit_sha: str, base_commit: str) -> None:
         self._validated_commit(commit_sha, "Publication commit")
         self._validated_commit(base_commit, "Publication base")
