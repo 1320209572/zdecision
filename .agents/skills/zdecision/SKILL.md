@@ -1,6 +1,6 @@
 ---
 name: zdecision
-description: Capture confirmed decisions from an existing Codex task, review and publish them to the ZDecision Registry, or start a new Codex task with applicable formal decisions.
+description: Use when a user wants to capture, review, publish, or apply durable decisions from Codex tasks with a local ZDecision repository.
 ---
 
 # ZDecision
@@ -20,8 +20,10 @@ internal command boundary.
   as display metadata, never as an alias.
 - For the same ongoing development goal, continue or steer the existing Codex
   task. Do not Capture merely because the task is long.
-- Review/Publish and Preflight/New Task are product intents, but their commands
-  are not part of the current Capture slice. Never invent or expose an
+- For Review or Publish intent after a completed Capture, read
+  [references/review-publish.md](references/review-publish.md) completely and
+  follow it. Review acceptance and publication authorization are separate.
+- Preflight/New Task remains outside the implemented slice. Never invent an
   unimplemented command.
 
 ## Preserve the boundaries

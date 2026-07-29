@@ -11,6 +11,7 @@ describe what you want in natural language—for example:
 - “用模板 ID `architecture` 处理任务 `<task-id>`。” selects that hypothetical
   `architecture` template only after you copy or install it locally.
 - “审核刚才提取的候选决策。”
+- 在 Codex 展示完整发布预览后，单独回复“确认发布”才会授权正式发布。
 - “带上安恒项目现有决策，开始一个新的开发任务。”
 
 V1 selects templates by stable ID. A template's title is display metadata, not
@@ -32,6 +33,26 @@ Repository instructions for Codex are in [AGENTS.md](AGENTS.md).
 Source code and formal decisions share this repository and its `main` branch.
 Formal decisions are isolated under `decision-registry/`. Raw conversations,
 candidate decisions, and private review state never enter that subtree.
+
+Each product has its own formal partition. The root index points to product
+metadata and that product's Decision index; every Decision remains an
+independent revision document:
+
+```text
+decision-registry/
+├── registry.json
+└── products/
+    └── prod_<stable-id>/
+        ├── product.json
+        ├── registry.json
+        └── decisions/
+            └── dec_<stable-id>/
+                └── r0001.json
+```
+
+Review is private and batched. Preview is read-only and shows the exact formal
+documents and paths. Review acceptance does not publish: publication requires
+a later user message whose complete trimmed content is exactly `确认发布`.
 
 The implementation lives under `src/zdecision/`. Legacy execution paths are
 not retained; extractor-v1 completed records remain display-only so existing

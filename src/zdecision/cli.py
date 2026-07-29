@@ -14,6 +14,14 @@ from typing import TextIO
 
 from zdecision.capture.inventory import InventoryValidationError
 from zdecision.capture.models import CapturePlan, CaptureRecord, LegacyCaptureRecord
+from zdecision.capture.review_service import (
+    CaptureNotReviewable,
+    InvalidReview,
+    ReviewConflict,
+    ReviewNotFound,
+    ReviewService,
+)
+from zdecision.capture.reviews import ReviewSelection
 from zdecision.capture.service import (
     CaptureForkAmbiguous,
     CaptureForkConflict,
@@ -28,8 +36,33 @@ from zdecision.jsonio import canonical_json_bytes
 from zdecision.private_store.filesystem import (
     FilePrivateStore,
     InvalidPrivateObjectId,
+    PrivateStateConflict,
     PrivateStateCorrupt,
     private_state_root,
+)
+from zdecision.registry.catalog import (
+    DecisionUpdateNotSupported,
+    RegistryCatalog,
+    RegistryConflict,
+    RegistryInvalid,
+    RegistryStale,
+)
+from zdecision.registry.git import (
+    CANONICAL_ORIGIN_URL,
+    GitRegistryAdapter,
+    PublicationGitAmbiguous,
+    RegistryGitConflict,
+    RegistryOutOfSync,
+    RegistryPushFailed,
+)
+from zdecision.registry.service import (
+    NoPublishableItems,
+    PromotionService,
+    PublicationApprovalConflict,
+    PublicationConfirmationRequired,
+    PublicationNotFound,
+    PublicationStale,
+    ReviewSuperseded,
 )
 
 
@@ -121,6 +154,53 @@ def _parser() -> argparse.ArgumentParser:
 
     show = capture_commands.add_parser("show")
     show.add_argument("--operation-id", type=_nonempty_argument, required=True)
+
+    review = commands.add_parser("review")
+    review_commands = review.add_subparsers(dest="action", required=True)
+
+    record_review = review_commands.add_parser("record")
+    record_review.add_argument(
+        "--operation-id", type=_nonempty_argument, required=True
+    )
+    record_review.add_argument(
+        "--approval-thread-id", type=_nonempty_argument, required=True
+    )
+    record_review.add_argument(
+        "--approval-turn-id", type=_nonempty_argument, required=True
+    )
+    record_review.add_argument("--input", choices=("-",), required=True)
+
+    show_review = review_commands.add_parser("show")
+    show_review.add_argument(
+        "--review-batch-id", type=_nonempty_argument, required=True
+    )
+
+    publish = commands.add_parser("publish")
+    publish_commands = publish.add_subparsers(dest="action", required=True)
+
+    preview = publish_commands.add_parser("preview")
+    preview.add_argument(
+        "--review-batch-id", type=_nonempty_argument, required=True
+    )
+
+    show_publication = publish_commands.add_parser("show")
+    show_publication.add_argument(
+        "--preview-id", type=_nonempty_argument, required=True
+    )
+
+    confirm = publish_commands.add_parser("confirm")
+    confirm.add_argument("--preview-id", type=_nonempty_argument, required=True)
+    confirm.add_argument(
+        "--approval-thread-id", type=_nonempty_argument, required=True
+    )
+    confirm.add_argument(
+        "--approval-turn-id", type=_nonempty_argument, required=True
+    )
+
+    resume_publication = publish_commands.add_parser("resume")
+    resume_publication.add_argument(
+        "--preview-id", type=_nonempty_argument, required=True
+    )
     return parser
 
 
@@ -347,9 +427,92 @@ def _run_capture(
     raise _ArgumentError(f"Unsupported capture action: {arguments.action!r}")
 
 
+def _review_selections(stdin: TextIO) -> tuple[ReviewSelection, ...]:
+    try:
+        text, _ = _read_json_text("-", stdin)
+        value = _decode_json(text)
+        if (
+            not isinstance(value, Mapping)
+            or frozenset(value) != frozenset(("items",))
+            or not isinstance(value["items"], list)
+        ):
+            raise ValueError("Review input shape is invalid")
+        selections: list[ReviewSelection] = []
+        for item in value["items"]:
+            if not isinstance(item, Mapping):
+                raise ValueError("Review item is invalid")
+            selections.append(ReviewSelection.from_dict(item))
+        return tuple(selections)
+    except (_InvalidJson, TypeError, ValueError):
+        raise InvalidReview("Review input is invalid") from None
+
+
+def _run_review(
+    arguments: argparse.Namespace,
+    service: ReviewService,
+    stdin: TextIO,
+) -> tuple[str, Mapping[str, object]]:
+    if arguments.action == "record":
+        batch = service.record(
+            arguments.operation_id,
+            _review_selections(stdin),
+            arguments.approval_thread_id,
+            arguments.approval_turn_id,
+        )
+        return "review.recorded", batch.to_dict()
+    if arguments.action == "show":
+        return "review.shown", service.get(arguments.review_batch_id).to_dict()
+    raise _ArgumentError(f"Unsupported review action: {arguments.action!r}")
+
+
+def _run_publish(
+    arguments: argparse.Namespace,
+    service: PromotionService,
+) -> tuple[str, Mapping[str, object]]:
+    if arguments.action == "preview":
+        record = service.preview(arguments.review_batch_id)
+        return "publication.previewed", record.to_dict()
+    if arguments.action == "show":
+        return "publication.shown", service.get(arguments.preview_id).to_dict()
+    if arguments.action == "confirm":
+        result = service.confirm(
+            arguments.preview_id,
+            arguments.approval_thread_id,
+            arguments.approval_turn_id,
+        )
+        return f"publication.{result.status}", result.to_dict()
+    if arguments.action == "resume":
+        result = service.resume(arguments.preview_id)
+        return f"publication.{result.status}", result.to_dict()
+    raise _ArgumentError(f"Unsupported publish action: {arguments.action!r}")
+
+
 def _template_root(environ: Mapping[str, str]) -> Path:
     override = environ.get("ZDECISION_TEMPLATE_ROOT")
     return Path(override) if override else _REPOSITORY_ROOT / "decision-templates"
+
+
+def _repository_root(environ: Mapping[str, str]) -> Path:
+    override = environ.get("ZDECISION_REPOSITORY_ROOT")
+    return Path(override) if override else _REPOSITORY_ROOT
+
+
+def _promotion_service(
+    store: FilePrivateStore,
+    environ: Mapping[str, str],
+) -> PromotionService:
+    repository_root = _repository_root(environ)
+    expected_origin = environ.get(
+        "ZDECISION_EXPECTED_ORIGIN",
+        CANONICAL_ORIGIN_URL,
+    )
+    review_service = ReviewService(store)
+    return PromotionService(
+        store,
+        review_service,
+        RegistryCatalog(repository_root),
+        GitRegistryAdapter(repository_root, expected_origin=expected_origin),
+    )
 
 
 def main(
@@ -369,9 +532,31 @@ def main(
     try:
         arguments = _parser().parse_args(argv)
         store = FilePrivateStore(private_state_root(actual_environ))
-        catalog = TemplateCatalog(_template_root(actual_environ), _ENVELOPE_ROOT)
-        service = CaptureService(store, catalog)
-        kind, data = _run_capture(arguments, service, store, actual_stdin)
+        if arguments.domain == "capture":
+            catalog = TemplateCatalog(
+                _template_root(actual_environ),
+                _ENVELOPE_ROOT,
+            )
+            capture_service = CaptureService(store, catalog)
+            kind, data = _run_capture(
+                arguments,
+                capture_service,
+                store,
+                actual_stdin,
+            )
+        elif arguments.domain == "review":
+            kind, data = _run_review(
+                arguments,
+                ReviewService(store),
+                actual_stdin,
+            )
+        elif arguments.domain == "publish":
+            kind, data = _run_publish(
+                arguments,
+                _promotion_service(store, actual_environ),
+            )
+        else:
+            raise _ArgumentError(f"Unsupported domain: {arguments.domain!r}")
         _emit(actual_stdout, _success(kind, data))
         return 0
     except _InvalidJson as exc:
@@ -447,6 +632,123 @@ def main(
             actual_stderr,
             4,
             "capture_action_required",
+            exc,
+        )
+    except InvalidReview as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            2,
+            "invalid_review",
+            exc,
+        )
+    except ReviewNotFound as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            3,
+            "review_not_found",
+            exc,
+        )
+    except CaptureNotReviewable as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            4,
+            "capture_not_reviewable",
+            exc,
+        )
+    except ReviewConflict as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            5,
+            "review_conflict",
+            exc,
+        )
+    except PublicationNotFound as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            3,
+            "publication_not_found",
+            exc,
+        )
+    except RegistryInvalid as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            3,
+            "registry_invalid",
+            exc,
+        )
+    except NoPublishableItems as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            4,
+            "no_publishable_items",
+            exc,
+        )
+    except ReviewSuperseded as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            4,
+            "review_superseded",
+            exc,
+        )
+    except DecisionUpdateNotSupported as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            4,
+            "decision_update_not_supported",
+            exc,
+        )
+    except RegistryOutOfSync as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            4,
+            "registry_out_of_sync",
+            exc,
+        )
+    except (
+        PublicationStale,
+        PublicationApprovalConflict,
+        PublicationConfirmationRequired,
+        RegistryStale,
+    ) as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            4,
+            "publication_stale",
+            exc,
+        )
+    except (RegistryGitConflict, RegistryConflict, PrivateStateConflict) as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            5,
+            "publication_git_conflict",
+            exc,
+        )
+    except PublicationGitAmbiguous as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            5,
+            "publication_git_ambiguous",
+            exc,
+        )
+    except RegistryPushFailed as exc:
+        return _emit_error(
+            actual_stdout,
+            actual_stderr,
+            5,
+            "publication_push_pending",
             exc,
         )
 

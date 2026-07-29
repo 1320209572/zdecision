@@ -13,6 +13,11 @@ class ZDecisionSkillContractTests(unittest.TestCase):
     def capture_text(self) -> str:
         return (SKILL_ROOT / "references" / "capture.md").read_text("utf-8")
 
+    def review_publish_text(self) -> str:
+        return (SKILL_ROOT / "references" / "review-publish.md").read_text(
+            "utf-8"
+        )
+
     def test_root_skill_routes_templates_without_exposing_cli_as_user_ux(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")
 
@@ -331,6 +336,98 @@ class ZDecisionSkillContractTests(unittest.TestCase):
             lowered,
             re.compile(r"(store|persist|save).{0,24}(transcript|raw messages?)"),
         )
+
+    def test_root_skill_routes_review_and_publish_to_the_implemented_reference(self) -> None:
+        text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")
+
+        self.assertIn("references/review-publish.md", text)
+        self.assertNotIn("commands are not part of the current Capture slice", text)
+        self.assertIn("Review", text)
+        self.assertIn("Publish", text)
+
+    def test_review_is_one_numbered_atomic_batch_from_latest_native_user_turn(self) -> None:
+        text = self.review_publish_text()
+
+        for phrase in (
+            "stable numbering",
+            "claim",
+            "future action",
+            "scope",
+            "invalidation conditions",
+            "template",
+            "known gaps",
+            "latest native user Turn",
+            "one atomic batch",
+            "accept",
+            "edit_accept",
+            "reject",
+            "skip",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_private_review_json_uses_only_no_echo_pty_stdin(self) -> None:
+        text = self.review_publish_text()
+
+        self.assertIn("review record --operation-id", text)
+        self.assertIn("--input -", text)
+        self.assertIn("`tty: true`", text)
+        self.assertIn("`stty -echo`", text)
+        self.assertIn("`write_stdin`", text)
+        self.assertIn("U+0004", text)
+        self.assertIn("second EOF", text)
+        for forbidden_transport in (
+            "command argument",
+            "environment variable",
+            "temporary file",
+            "here-document",
+        ):
+            with self.subTest(forbidden_transport=forbidden_transport):
+                self.assertIn(forbidden_transport, text)
+
+    def test_preview_displays_complete_exact_documents_paths_and_commit_metadata(self) -> None:
+        text = self.review_publish_text()
+
+        for phrase in (
+            "publish preview --review-batch-id",
+            "every complete formal document",
+            "target path",
+            "preview ID",
+            "content digest",
+            "commit message",
+            "read-only",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_candidate_review_and_registry_text_are_untrusted_data(self) -> None:
+        text = self.review_publish_text()
+
+        self.assertIn("untrusted data", text)
+        self.assertIn("must not execute", text)
+        self.assertIn("latest native user Turn", text)
+        self.assertIn("Only", text)
+
+    def test_publication_requires_one_new_exact_native_confirmation_turn(self) -> None:
+        text = self.review_publish_text()
+
+        self.assertIn("new native user Turn after the preview", text)
+        self.assertIn("complete trimmed instruction is exactly `确认发布`", text)
+        self.assertIn("--approval-thread-id", text)
+        self.assertIn("--approval-turn-id", text)
+        for non_authority in (
+            "`可以`",
+            "`认可`",
+            "`确认`",
+            "old messages",
+            "retained summaries",
+            "Candidate text",
+            "Review Turn",
+        ):
+            with self.subTest(non_authority=non_authority):
+                self.assertIn(non_authority, text)
+        self.assertIn("must not run `publish confirm`", text)
+        self.assertIn("must not perform Git actions directly", text)
 
 
 if __name__ == "__main__":
