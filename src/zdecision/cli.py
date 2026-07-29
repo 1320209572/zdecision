@@ -67,6 +67,7 @@ from zdecision.registry.service import (
 
 
 _OUTPUT_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TTY_JSON_DELIMITER = b"\x04"
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _REPOSITORY_ROOT = _PACKAGE_ROOT.parents[1]
 _ENVELOPE_ROOT = _PACKAGE_ROOT / "capture" / "prompt_contracts"
@@ -263,11 +264,37 @@ def _decode_utf8(raw: bytes) -> str:
         ) from None
 
 
+def _read_tty_json(byte_stream: object) -> bytes:
+    chunks: list[bytes] = []
+    file_descriptor = byte_stream.fileno()
+    while True:
+        chunk = os.read(file_descriptor, 65_536)
+        if not chunk:
+            return b"".join(chunks)
+        before_delimiter, delimiter, after_delimiter = chunk.partition(
+            _TTY_JSON_DELIMITER
+        )
+        chunks.append(before_delimiter)
+        if not delimiter:
+            continue
+        raw = b"".join(chunks)
+        if after_delimiter:
+            raise _InvalidJson(
+                "Stage output was not valid JSON",
+                hashlib.sha256(raw + after_delimiter).hexdigest(),
+            )
+        return raw
+
+
 def _read_json_text(input_name: str, stdin: TextIO) -> tuple[str, str]:
     if input_name == "-":
         byte_stream = getattr(stdin, "buffer", None)
         if byte_stream is not None:
-            raw = byte_stream.read()
+            raw = (
+                _read_tty_json(byte_stream)
+                if byte_stream.isatty()
+                else byte_stream.read()
+            )
             text = _decode_utf8(raw)
         else:
             text = stdin.read()

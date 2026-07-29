@@ -26,15 +26,16 @@ internal CLI.
 
 The current Codex terminal tool closes a delayed non-TTY stdin before
 `write_stdin` can deliver data. For live Capture on macOS/Linux, pass each
-model stage's final JSON to the internal command through a no-echo PTY.
-`stty -echo` disables terminal echo before any private bytes are sent:
+model stage's final JSON to the internal command through a noncanonical,
+no-echo PTY. `stty -echo -icanon` prevents private-byte echo and avoids the
+terminal's bounded canonical line buffer:
 
 1. Start the matching completion command with `tty: true` and prefix the
-   command with `stty -echo;`, while keeping `--input -`.
+   command with `stty -echo -icanon min 1 time 0;`, while keeping `--input -`.
 2. Send only the exact final JSON through `write_stdin`, immediately followed
-   by the EOF character U+0004. Do not append commentary or a newline.
-3. If the PTY remains open after it has consumed the buffered JSON, send a
-   second EOF (U+0004) and read the command's one JSON response.
+   by one U+0004 byte as the single EOT delimiter. Do not append commentary,
+   a newline, or a second EOF. The CLI consumes that delimiter and returns its
+   one JSON response.
 
 Never place a private stage payload in a command argument, environment variable,
 temporary file, or here-document. Never use a non-TTY delayed stdin handoff.

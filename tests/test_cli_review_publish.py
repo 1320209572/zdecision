@@ -3,10 +3,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import pty
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
 import unittest
 from pathlib import Path
 
@@ -99,10 +101,15 @@ class ReviewPublishCliTests(unittest.TestCase):
             check=True,
         )
 
-    def complete_capture(self) -> str:
+    def complete_capture(
+        self,
+        *,
+        candidate_count: int = 4,
+        source_turn_id: str = "turn-source",
+    ) -> str:
         plan = self.capture_service.prepare(
             "thread-source",
-            "turn-source",
+            source_turn_id,
             PRODUCT,
             "business",
         )
@@ -116,7 +123,7 @@ class ReviewPublishCliTests(unittest.TestCase):
             operation_id, "extraction", "turn-extraction"
         )
         candidates = []
-        for ordinal in range(1, 5):
+        for ordinal in range(1, candidate_count + 1):
             candidates.append(
                 {
                     "product": PRODUCT,
@@ -328,6 +335,70 @@ class ReviewPublishCliTests(unittest.TestCase):
         self.assertEqual("invalid_review", payload["error"]["code"])
         self.assertNotIn(secret, result.stdout + result.stderr)
         self.assertFalse((self.state_dir / "review_batches").exists())
+
+    def test_noncanonical_no_echo_pty_accepts_review_larger_than_max_canon(self) -> None:
+        operation_id = self.complete_capture(
+            candidate_count=14,
+            source_turn_id="turn-source-pty",
+        )
+        candidate_ids = self.store.get_capture(operation_id).candidate_ids
+        raw = json.dumps(
+            {
+                "items": [
+                    {"candidate_id": candidate_id, "action": "accept"}
+                    for candidate_id in candidate_ids
+                ]
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertGreater(len(raw), 1024)
+        master_fd, slave_fd = pty.openpty()
+        attributes = termios.tcgetattr(slave_fd)
+        attributes[3] &= ~(termios.ECHO | termios.ICANON)
+        attributes[6][termios.VMIN] = 1
+        attributes[6][termios.VTIME] = 0
+        termios.tcsetattr(slave_fd, termios.TCSANOW, attributes)
+        child_environ = {**os.environ, **self.environ}
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "zdecision",
+                "review",
+                "record",
+                "--operation-id",
+                operation_id,
+                "--approval-thread-id",
+                "thread-review",
+                "--approval-turn-id",
+                "turn-review-pty",
+                "--input",
+                "-",
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=child_environ,
+            stdin=slave_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(slave_fd)
+        try:
+            os.write(master_fd, raw + b"\x04")
+            try:
+                stdout, stderr = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                self.fail("CLI did not consume the noncanonical PTY EOT delimiter")
+        finally:
+            os.close(master_fd)
+
+        payload = json.loads(stdout.decode("utf-8"))
+        self.assertEqual(0, process.returncode, (stdout, stderr))
+        self.assertEqual("review.recorded", payload["kind"])
+        self.assertEqual(14, len(payload["data"]["items"]))
+        self.assertEqual(b"", stderr)
 
     def test_review_parser_rejects_non_object_extra_root_and_non_stdin_input(self) -> None:
         cases = (

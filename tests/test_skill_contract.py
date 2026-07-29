@@ -225,10 +225,10 @@ class ZDecisionSkillContractTests(unittest.TestCase):
         text = self.capture_text()
 
         self.assertIn("`tty: true`", text)
-        self.assertIn("`stty -echo`", text)
+        self.assertIn("`stty -echo -icanon`", text)
         self.assertIn("`write_stdin`", text)
         self.assertIn("U+0004", text)
-        self.assertIn("second EOF", text)
+        self.assertIn("single EOT delimiter", text)
         self.assertIn("non-TTY", text)
         for forbidden_transport in (
             "command argument",
@@ -372,10 +372,10 @@ class ZDecisionSkillContractTests(unittest.TestCase):
         self.assertIn("review record --operation-id", text)
         self.assertIn("--input -", text)
         self.assertIn("`tty: true`", text)
-        self.assertIn("`stty -echo`", text)
+        self.assertIn("`stty -echo -icanon`", text)
         self.assertIn("`write_stdin`", text)
         self.assertIn("U+0004", text)
-        self.assertIn("second EOF", text)
+        self.assertIn("single EOT delimiter", text)
         for forbidden_transport in (
             "command argument",
             "environment variable",

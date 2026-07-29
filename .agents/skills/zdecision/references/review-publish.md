@@ -38,10 +38,12 @@ Encode the private payload as exactly `{"items":[...]}` and run:
 ```
 
 Use the same private no-echo PTY stdin transport as Capture: start with
-`tty: true`, prefix the command with `stty -echo`, send only the JSON through
-`write_stdin`, then send U+0004. If the PTY remains open, send a second EOF
-(U+0004). Never place Review JSON in a command argument, environment variable,
-temporary file, or here-document.
+`tty: true`; `stty -echo -icanon` is the required terminal mode. Prefix the
+command with `stty -echo -icanon min 1 time 0`, send only the JSON through
+`write_stdin`, and immediately append one U+0004 byte as the single EOT delimiter.
+Do not send a newline or a second EOF. Noncanonical mode avoids the
+terminal's bounded line buffer. Never place Review JSON in a command argument,
+environment variable, temporary file, or here-document.
 
 Show the stored result with:
 
