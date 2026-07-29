@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import json
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
-from zdecision.capture.models import CandidateContent
+from tests.test_inventory import VALID_INVENTORY
+from zdecision.capture.models import CandidateContent, LegacyCaptureRecord, SourceCheckpoint
+from zdecision.capture.review_service import (
+    CaptureNotReviewable,
+    InvalidReview,
+    ReviewConflict,
+    ReviewNotFound,
+    ReviewService,
+)
 from zdecision.capture.reviews import (
     ApprovalRef,
     ReviewBatch,
@@ -17,6 +29,13 @@ from zdecision.ids import (
     review_batch_id,
     review_item_id,
 )
+from zdecision.jsonio import atomic_write_json, canonical_json_bytes
+from zdecision.private_store.filesystem import (
+    FilePrivateStore,
+    InvalidPrivateObjectId,
+    PrivateStateConflict,
+    PrivateStateCorrupt,
+)
 
 
 CAPTURE_ID = "cap_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -24,6 +43,11 @@ CANDIDATE_ID = "cand_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_01"
 REVIEW_BATCH_ID = "rvb_39a385f527e697a9e40ce1105a7dd8b0"
 REVIEW_ID = "rvi_a36b19360a8986f487bca806900ac678"
 PRODUCT_ID = "prod_4d7b16e1616dd4cd1aeb2411836fd687"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+TEMPLATE_ROOT = REPOSITORY_ROOT / "decision-templates"
+ENVELOPE_ROOT = (
+    REPOSITORY_ROOT / "src" / "zdecision" / "capture" / "prompt_contracts"
+)
 
 
 def _content_dict() -> dict[str, object]:
@@ -357,6 +381,371 @@ class ReviewValueTests(unittest.TestCase):
                 approval=_approval(),
                 items=items,
             )
+
+
+class _SequenceClock:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> str:
+        self.calls += 1
+        return f"2026-07-29T00:00:{self.calls:02d}Z"
+
+
+class ReviewServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from zdecision.capture.service import CaptureService
+        from zdecision.capture.templates import TemplateCatalog
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.state_dir = self.root / "state"
+        self.template_root = self.root / "templates"
+        shutil.copytree(TEMPLATE_ROOT, self.template_root)
+        self.store = FilePrivateStore(self.state_dir)
+        self.capture_service = CaptureService(
+            self.store,
+            TemplateCatalog(self.template_root, ENVELOPE_ROOT),
+        )
+        self.clock = _SequenceClock()
+        self.service = ReviewService(self.store, clock=self.clock)
+        self.capture_counter = 0
+
+    def complete_capture(self, product: str = "安恒") -> str:
+        self.capture_counter += 1
+        suffix = self.capture_counter
+        plan = self.capture_service.prepare(
+            "thread-source",
+            f"turn-source-{suffix}",
+            product,
+            "business",
+        )
+        operation_id = plan.record.operation_id
+        self.capture_service.attach_fork(operation_id, f"thread-fork-{suffix}")
+        self.capture_service.attach_stage_turn(
+            operation_id,
+            "inventory",
+            f"turn-inventory-{suffix}",
+        )
+        self.capture_service.complete_inventory(operation_id, VALID_INVENTORY)
+        self.capture_service.attach_stage_turn(
+            operation_id,
+            "extraction",
+            f"turn-extraction-{suffix}",
+        )
+        self.capture_service.complete_extraction(
+            operation_id,
+            {
+                "candidates": [
+                    {
+                        "product": product,
+                        "claim": "正式决策按产品隔离保存。",
+                        "future_action": "新增决策时写入对应产品目录。",
+                        "scope": {
+                            "summary": "ZDecision Registry 的正式存储布局",
+                            "repositories": [
+                                "https://github.com/1320209572/zdecision.git"
+                            ],
+                            "paths": ["decision-registry/"],
+                        },
+                        "invalidation_conditions": [
+                            "产品隔离策略被新的正式决策替代"
+                        ],
+                    },
+                    {
+                        "product": product,
+                        "claim": "候选决策在发布前保持私有。",
+                        "future_action": "只把审核后的正式决策写入 Git。",
+                        "scope": {
+                            "summary": "ZDecision 的私有与正式存储边界",
+                            "repositories": [],
+                            "paths": ["decision-registry/"],
+                        },
+                        "invalidation_conditions": [
+                            "正式存储边界被新的产品决策替代"
+                        ],
+                    },
+                ]
+            },
+        )
+        return operation_id
+
+    def candidate_ids(self, capture_id: str) -> tuple[str, str]:
+        record = self.store.get_capture(capture_id)
+        assert record is not None
+        first, second = record.candidate_ids
+        return first, second
+
+    def test_records_one_atomic_mixed_batch_with_frozen_effective_content(
+        self,
+    ) -> None:
+        capture_id = self.complete_capture()
+        first, second = self.candidate_ids(capture_id)
+
+        batch = self.service.record(
+            capture_id,
+            (
+                ReviewSelection(first, "accept"),
+                ReviewSelection(second, "reject"),
+            ),
+            "thread-review",
+            "turn-review-1",
+        )
+
+        self.assertEqual(1, batch.sequence)
+        self.assertEqual((first, second), tuple(item.candidate_id for item in batch.items))
+        self.assertEqual("安恒", batch.items[0].content.product)
+        self.assertIsNone(batch.items[1].content)
+        self.assertEqual(batch, self.store.get_review_batch(batch.review_batch_id))
+        self.assertEqual((batch.review_batch_id,), self.store.review_batch_ids_for_capture(capture_id))
+
+    def test_edit_accept_freezes_complete_content_but_cannot_move_product(
+        self,
+    ) -> None:
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        edited = CandidateContent.from_dict(
+            {
+                **_content_dict(),
+                "product": "  安恒  ",
+                "claim": "正式决策必须按稳定产品 ID 隔离保存。",
+            }
+        )
+
+        batch = self.service.record(
+            capture_id,
+            (ReviewSelection(first, "edit_accept", edited),),
+            "thread-review",
+            "turn-review-1",
+        )
+
+        self.assertEqual("安恒", batch.items[0].content.product)
+        self.assertEqual(
+            "正式决策必须按稳定产品 ID 隔离保存。",
+            batch.items[0].content.claim,
+        )
+
+        other_capture = self.complete_capture()
+        other_first, _ = self.candidate_ids(other_capture)
+        wrong_product = CandidateContent.from_dict(
+            {**_content_dict(), "product": "其他产品"}
+        )
+        with self.assertRaises(InvalidReview):
+            self.service.record(
+                other_capture,
+                (ReviewSelection(other_first, "edit_accept", wrong_product),),
+                "thread-review",
+                "turn-review-2",
+            )
+
+    def test_batch_rejects_duplicates_missing_and_foreign_candidates_before_write(
+        self,
+    ) -> None:
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        other_capture = self.complete_capture()
+        foreign, _ = self.candidate_ids(other_capture)
+
+        invalid_selections = (
+            (ReviewSelection(first, "accept"), ReviewSelection(first, "skip")),
+            (
+                ReviewSelection(
+                    "cand_ffffffffffffffffffffffffffffffff_01",
+                    "accept",
+                ),
+            ),
+            (ReviewSelection(foreign, "accept"),),
+        )
+        for ordinal, selections in enumerate(invalid_selections, start=1):
+            with self.subTest(ordinal=ordinal):
+                with self.assertRaises(InvalidReview):
+                    self.service.record(
+                        capture_id,
+                        selections,
+                        "thread-review",
+                        f"turn-invalid-{ordinal}",
+                    )
+
+        self.assertEqual((), self.store.review_batch_ids_for_capture(capture_id))
+
+    def test_corrupt_completed_candidate_set_never_produces_a_review(self) -> None:
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        candidate_path = self.state_dir / "candidates" / f"{first}.json"
+        value = json.loads(candidate_path.read_text("utf-8"))
+        value["content"]["claim"] = "tampered but structurally valid"
+        atomic_write_json(candidate_path, value)
+
+        with self.assertRaises(PrivateStateCorrupt):
+            self.service.record(
+                capture_id,
+                (ReviewSelection(first, "accept"),),
+                "thread-review",
+                "turn-review-corrupt",
+            )
+        self.assertEqual((), self.store.review_batch_ids_for_capture(capture_id))
+
+    def test_only_completed_v2_capture_is_reviewable(self) -> None:
+        prepared = self.capture_service.prepare(
+            "thread-source",
+            "turn-prepared",
+            "安恒",
+            "business",
+        ).record.operation_id
+        selection = ReviewSelection(
+            "cand_ffffffffffffffffffffffffffffffff_01",
+            "skip",
+        )
+
+        with self.assertRaises(CaptureNotReviewable):
+            self.service.record(
+                prepared,
+                (selection,),
+                "thread-review",
+                "turn-review-prepared",
+            )
+
+        legacy = LegacyCaptureRecord(
+            operation_id="legacy-capture",
+            source=SourceCheckpoint("thread-source", "turn-legacy"),
+            product="安恒",
+            status="completed",
+            fork_thread_id="thread-fork",
+            candidate_ids=(),
+            created_at="2026-07-29T00:00:00Z",
+            updated_at="2026-07-29T00:00:00Z",
+        )
+        atomic_write_json(
+            self.state_dir / "captures" / "legacy-capture.json",
+            legacy.to_dict(),
+        )
+        with self.assertRaises(CaptureNotReviewable):
+            self.service.record(
+                "legacy-capture",
+                (selection,),
+                "thread-review",
+                "turn-review-legacy",
+            )
+
+    def test_identical_retry_reuses_batch_timestamp_and_clock_call(self) -> None:
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        selections = (ReviewSelection(first, "accept"),)
+
+        first_result = self.service.record(
+            capture_id,
+            selections,
+            "thread-review",
+            "turn-review-1",
+        )
+        replay = self.service.record(
+            capture_id,
+            selections,
+            "thread-review",
+            "turn-review-1",
+        )
+
+        self.assertEqual(first_result, replay)
+        self.assertEqual("2026-07-29T00:00:01Z", replay.approval.recorded_at)
+        self.assertEqual(1, self.clock.calls)
+
+    def test_one_approval_turn_cannot_authorize_different_review_bytes_or_capture(
+        self,
+    ) -> None:
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        self.service.record(
+            capture_id,
+            (ReviewSelection(first, "accept"),),
+            "thread-review",
+            "turn-review-1",
+        )
+
+        with self.assertRaises(ReviewConflict):
+            self.service.record(
+                capture_id,
+                (ReviewSelection(first, "reject"),),
+                "thread-review",
+                "turn-review-1",
+            )
+
+        other_capture = self.complete_capture()
+        other_first, _ = self.candidate_ids(other_capture)
+        with self.assertRaises(ReviewConflict):
+            self.service.record(
+                other_capture,
+                (ReviewSelection(other_first, "accept"),),
+                "thread-review",
+                "turn-review-1",
+            )
+        self.assertEqual(1, self.clock.calls)
+
+    def test_later_batch_gets_next_sequence_and_latest_item_wins(self) -> None:
+        capture_id = self.complete_capture()
+        first, second = self.candidate_ids(capture_id)
+        initial = self.service.record(
+            capture_id,
+            (ReviewSelection(first, "accept"), ReviewSelection(second, "skip")),
+            "thread-review",
+            "turn-review-1",
+        )
+        later = self.service.record(
+            capture_id,
+            (ReviewSelection(first, "reject"),),
+            "thread-review",
+            "turn-review-2",
+        )
+
+        latest = self.service.latest_items(capture_id)
+
+        self.assertEqual(1, initial.sequence)
+        self.assertEqual(2, later.sequence)
+        self.assertEqual("reject", latest[first].action)
+        self.assertEqual("skip", latest[second].action)
+        self.assertEqual(
+            tuple(sorted((initial.review_batch_id, later.review_batch_id))),
+            self.store.review_batch_ids_for_capture(capture_id),
+        )
+
+    def test_missing_review_and_corrupt_private_review_are_sanitized(self) -> None:
+        with self.assertRaises(ReviewNotFound):
+            self.service.get("rvb_ffffffffffffffffffffffffffffffff")
+        with self.assertRaises(InvalidPrivateObjectId):
+            self.store.get_review_batch("../outside")
+
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        batch = self.service.record(
+            capture_id,
+            (ReviewSelection(first, "accept"),),
+            "thread-review",
+            "turn-review-1",
+        )
+        path = self.state_dir / "review_batches" / f"{batch.review_batch_id}.json"
+        path.write_text("{", "utf-8")
+
+        with self.assertRaises(PrivateStateCorrupt) as raised:
+            self.store.get_review_batch(batch.review_batch_id)
+        self.assertNotIn("正式决策", str(raised.exception))
+
+    def test_review_store_replays_only_identical_canonical_bytes(self) -> None:
+        capture_id = self.complete_capture()
+        first, _ = self.candidate_ids(capture_id)
+        batch = self.service.record(
+            capture_id,
+            (ReviewSelection(first, "accept"),),
+            "thread-review",
+            "turn-review-1",
+        )
+
+        self.store.put_review_batch(batch)
+        path = self.state_dir / "review_batches" / f"{batch.review_batch_id}.json"
+        self.assertEqual(canonical_json_bytes(batch.to_dict()), path.read_bytes())
+        path.write_text(json.dumps(batch.to_dict(), ensure_ascii=False), "utf-8")
+
+        with self.assertRaises(PrivateStateConflict):
+            self.store.put_review_batch(batch)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from zdecision.capture.models import (
     ExtractionManifest,
     LegacyCaptureRecord,
 )
+from zdecision.capture.reviews import ReviewBatch
 from zdecision.jsonio import (
     atomic_create_json,
     atomic_write_json,
@@ -219,6 +220,88 @@ class FilePrivateStore:
             return validate_inventory(value)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             raise PrivateStateCorrupt("inventories", operation_id) from None
+
+    def put_review_batch(self, batch: ReviewBatch) -> None:
+        if not isinstance(batch, ReviewBatch):
+            raise TypeError("Only validated ReviewBatch values may be written")
+        ReviewBatch.from_dict(batch.to_dict())
+        path = self._object_path("review_batches", batch.review_batch_id)
+        if atomic_create_json(path, batch.to_dict()):
+            return
+        existing = self.get_review_batch(batch.review_batch_id)
+        if existing is not None and path.read_bytes() == canonical_json_bytes(
+            batch.to_dict()
+        ):
+            return
+        raise PrivateStateConflict(
+            f"Private Review batch {batch.review_batch_id!r} already has "
+            "different content"
+        )
+
+    def get_review_batch(self, batch_id: str) -> ReviewBatch | None:
+        path = self._object_path("review_batches", batch_id)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Review batch private state must be an object")
+            batch = ReviewBatch.from_dict(value)
+            if batch.review_batch_id != batch_id:
+                raise ValueError("Review batch object identity mismatch")
+            return batch
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt("review_batches", batch_id) from None
+
+    def review_batch_ids_for_capture(self, capture_id: str) -> tuple[str, ...]:
+        self._object_path("captures", capture_id)
+        return tuple(
+            batch_id
+            for batch_id in self._review_batch_ids()
+            if self._required_review_batch(batch_id).capture_id == capture_id
+        )
+
+    def review_batch_for_approval(
+        self,
+        thread_id: str,
+        turn_id: str,
+    ) -> ReviewBatch | None:
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("Review approval thread id must not be empty")
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("Review approval turn id must not be empty")
+        matched: ReviewBatch | None = None
+        for batch_id in self._review_batch_ids():
+            batch = self._required_review_batch(batch_id)
+            if (
+                batch.approval.thread_id != thread_id
+                or batch.approval.turn_id != turn_id
+            ):
+                continue
+            if matched is not None:
+                raise PrivateStateCorrupt("review_batches", "approval")
+            matched = batch
+        return matched
+
+    def _review_batch_ids(self) -> tuple[str, ...]:
+        directory = self.root / "review_batches"
+        if not directory.exists():
+            return ()
+        return tuple(
+            sorted(
+                path.stem
+                for path in directory.iterdir()
+                if path.is_file()
+                and path.suffix == ".json"
+                and re.fullmatch(r"rvb_[0-9a-f]{32}", path.stem) is not None
+            )
+        )
+
+    def _required_review_batch(self, batch_id: str) -> ReviewBatch:
+        batch = self.get_review_batch(batch_id)
+        if batch is None:
+            raise PrivateStateCorrupt("review_batches", batch_id)
+        return batch
 
     def _object_path(self, collection: str, object_id: str) -> Path:
         if not object_id or not _SAFE_OBJECT_ID.fullmatch(object_id):
