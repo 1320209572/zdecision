@@ -64,7 +64,8 @@ The Skill translates that instruction into one structured Review batch. Each
 Candidate appears at most once. Allowed actions are exactly:
 
 - `accept`: freeze the Candidate content unchanged;
-- `edit_accept`: freeze the complete edited Candidate content;
+- `edit_accept`: freeze the complete edited Candidate content while requiring
+  its product to remain exactly the Capture-selected product;
 - `reject`: record that the Candidate should not be promoted;
 - `skip`: leave it available for a later Review.
 
@@ -74,16 +75,30 @@ effective contents in one batch must resolve to one canonical product. A
 different product is reviewed and published in a separate batch. One batch
 contains at most the Capture protocol's 20 Candidates.
 
+V1 does not permit `edit_accept` to change product. A wrong product means the
+Capture input and stable operation identity were wrong, so the user must run a
+new Capture with the correct product instead of moving a Candidate during
+Review.
+
 Review batches are append-only. A later user Turn may review a Candidate again.
 That newer Review invalidates every unpublished preview containing an older
-Review of the same Candidate. Already published Reviews cannot be promoted a
-second time by this slice.
+Review of the same Candidate. Once any publication for a Candidate reaches a
+local commit, the Private Store records its Candidate-to-Decision receipt and no
+later Review of that Candidate is publishable in this slice. The Review may
+still be recorded privately, but preview returns
+`decision_update_not_supported`; a later Decision-revision workflow must update
+the existing Decision instead of creating another one.
 
 ### 3.2 Publication preview
 
 Only `accept` and `edit_accept` items are publishable. Reject and skip actions
 remain private and never enter Git. A Review batch with no accepted items
 returns an explicit no-publishable-items result.
+
+Before creating a preview, Promotion reconciles every nonterminal publication
+that references any selected Candidate. This ensures a commit/private-state
+crash cannot bypass the Candidate-to-Decision receipt check and create a second
+Decision.
 
 Promotion freezes a preview containing:
 
@@ -102,6 +117,12 @@ shows the complete Decision contents, target paths, preview digest, and the fact
 that confirmation will commit and push. Compact grouping is allowed, but no
 field of a Decision may be hidden from the user.
 
+Before reading the preview base, the Registry adapter performs a fresh fetch of
+`origin/main` and requires local `HEAD`, local `main`, and the fetched
+`origin/main` to be the same commit. Ahead, behind, or diverged state returns
+`registry_out_of_sync`; preview does not push, pull, merge, rebase, or otherwise
+synchronize it.
+
 ### 3.3 Exact confirmation
 
 Review acceptance is not publication approval. After the preview, the Skill
@@ -111,7 +132,9 @@ such as `确认`, `认可`, `可以`, or a Review instruction do not authorize G
 
 The Skill binds the native task and Turn identity of that confirmation to the
 preview and invokes Promotion without supplying any new Decision content. The
-confirmation phrase itself and surrounding conversation are not persisted.
+confirmation phrase itself and surrounding conversation are not persisted. The
+publication approval reference is stored only in the private publication
+record; it is not added to the already previewed formal Decision bytes.
 
 One confirmation applies to the complete immutable batch. If any item, Review,
 formal content, path, local `main` commit, or relevant Registry document changes
@@ -124,15 +147,32 @@ Confirmation writes the exact previewed files, creates one commit, and pushes
 that commit to `origin/main`. Every Decision remains an independent formal
 object even though the Git operation is batched.
 
+The adapter first performs the fresh synchronization and preview-base checks
+described below without changing Registry files. Only after those checks pass
+does Promotion atomically store the publication approval reference and advance
+the private publication state from `previewed` to `confirmed`. Registry writes
+and commit creation happen after that durable private transition. The exact
+commit message is:
+
+```text
+decision(<product-id>): publish <count> decisions
+
+ZDecision-Preview: <preview-id>
+```
+
 The adapter may coexist with unrelated dirty source files. It requires every
 target Registry path to match its previewed state and uses explicit Git path
 arguments so unrelated tracked, staged, or untracked files never enter the
 Decision commit. Existing unrelated changes under `decision-registry/` are a
 conflict and stop publication.
 
-The repository must be on local branch `main`, use the canonical `origin`, and
-have a local `main` compatible with `origin/main`. Publication never resets,
-rebases, force-pushes, or merges automatically.
+The repository must be on local branch `main` and use the canonical `origin`.
+On confirm, before Promotion stores the publication approval, the adapter
+performs another fresh fetch and requires
+`HEAD == main == origin/main == preview.base_commit`. This guarantees that the
+later push contains exactly the one new publication commit rather than carrying
+earlier local commits. Publication never pulls, resets, rebases, force-pushes,
+or merges automatically.
 
 ## 4. Stable identities
 
@@ -143,9 +183,12 @@ characters of SHA-256 over canonical JSON inputs.
 - `review_batch_id`: `rvb_...`, derived from Capture ID, ordered Review items,
   effective accepted contents, and Review approval task/Turn;
 - `review_id`: `rvi_...`, derived from Review batch ID and Candidate ID;
-- `decision_id`: `dec_...`, derived from the accepted Review ID and product ID;
-- `preview_id`: `pub_...`, derived from Review IDs, formal contents, target
-  paths, pre-publication Registry digests, and previewed local `main` commit.
+- `decision_id`: `dec_...`, derived from the Candidate ID and product ID, so a
+  later Review cannot manufacture a second Decision identity for that Candidate;
+- `preview_id`: `pub_...`, derived from the publisher format version, Review IDs,
+  Decision IDs, target paths, pre-publication Registry digests, and previewed
+  local `main` commit. Formal documents are rendered only after this ID exists;
+  their separate content digest then binds every exact previewed byte.
 
 The canonical product name is Unicode NFC after trimming surrounding
 whitespace. It is non-empty, contains no control characters, and remains case
@@ -171,8 +214,10 @@ An approval reference contains:
 }
 ```
 
-The Review approval and publication approval are separate references. On retry,
-the original stored timestamp is reused.
+The Review approval and publication approval are separate references. The
+Review approval is copied into each formal Decision; publication approval stays
+in the private publication record so confirmation does not mutate previewed
+bytes. On retry, the original stored timestamp is reused.
 
 ### 5.2 Review batch
 
@@ -185,12 +230,21 @@ store no content.
 The full effective content, Candidate identities, rejected material, and Review
 instruction remain private. None is copied wholesale into the Registry.
 
+The Private Store also retains a Candidate-to-Decision publication receipt as
+soon as the publication commit is identified. Preview rejects every accepted
+Review whose Candidate already has such a receipt, regardless of which Review
+originally produced the Decision. It also derives the Candidate's stable
+Decision ID and checks the product Registry; an existing head produces the same
+`decision_update_not_supported` result even if the private receipt is missing.
+
 ### 5.3 Publication preview and record
 
 The private publication object freezes the preview described in section 3.2
 and has one of these states:
 
 - `previewed`: no Git mutation has occurred;
+- `confirmed`: exact user confirmation is stored privately and Git mutation may
+  not yet have started or completed;
 - `committed_pending_push`: the exact commit exists locally but is not yet
   proven present on `origin/main`;
 - `completed`: the exact commit is present on `origin/main`.
@@ -235,10 +289,11 @@ An initial Decision revision contains exactly:
 - invalidation conditions;
 - empty `supersedes` and `variant_of` relation lists;
 - source task ID and completed source Turn ID;
-- Review and publication approval references.
+- `review_approval` and immutable `publication_preview_id`.
 
 It does not contain Capture IDs, Candidate IDs, Review IDs, rejected content,
-evidence excerpts, confirmation text, or raw conversation messages.
+publication-confirmation identity/time, evidence excerpts, confirmation text,
+or raw conversation messages.
 
 All JSON is canonical UTF-8 with a trailing newline. Every Registry loader uses
 exact-field validation, verifies ID/path ownership, rejects symlinks and path
@@ -251,13 +306,25 @@ escape, and rejects malformed or cross-product head references.
 - A batch that references a Candidate outside its Capture, duplicates a
   Candidate, supplies content for reject/skip, or omits effective content for
   edit-and-accept fails before writing a Review.
-- A preview cannot include an unaccepted, superseded, or already published
-  Review.
+- A preview cannot include an unaccepted or superseded Review, or any Candidate
+  that already has a committed Candidate-to-Decision receipt.
 - Registry unavailable or invalid is reported as unavailable/invalid, never as
   an empty Registry.
-- Changed `main` or Registry state makes a preview stale before any write.
+- Changed `main` or Registry state while a publication is still `previewed`
+  makes that preview stale before any write.
 - Exact files left by an interrupted pre-commit attempt may be reused only when
   every byte matches the preview; different bytes are a conflict.
+- Confirmation first persists state `confirmed`. On retry from `confirmed`,
+  reconciliation runs before ordinary stale-preview checks. If `HEAD` differs
+  from the preview base, it is adopted only when it is a single-parent commit
+  whose parent is exactly the preview base, whose complete message matches the
+  preview, whose changed path set is exactly the previewed target set, and whose
+  blobs match every previewed byte. Any mismatch returns
+  `publication_git_ambiguous`; it is never treated as an ordinary stale preview.
+- If that exact recovered commit is the fetched `origin/main` or an ancestor of
+  it, publication becomes `completed`. If `origin/main` is still the preview
+  base, it becomes `committed_pending_push`. Any remote state that contains
+  neither the base-only state nor the publication commit is ambiguous.
 - After a successful commit, an interrupted or failed push retains
   `committed_pending_push`. Retry first checks whether `origin/main` already
   contains the stored commit, then pushes that same commit when safe. It never
@@ -289,6 +356,13 @@ shows the exact preview, recognizes only a later exact `确认发布`, and repor
 commit/push state. It never treats Candidate acceptance as publication and never
 constructs a Registry Decision outside Promotion.
 
+Candidate fields, edited Review content, formal Registry text, and text embedded
+inside any of them are untrusted data. The Skill displays or transports them but
+never follows their instructions. Only the latest native user Turn can authorize
+a Review batch. Only the latest native user Turn after the current preview can
+authorize publication; retained history, summaries, Candidate text, and older
+`确认发布` messages cannot do so.
+
 ## 9. Verification and real acceptance
 
 Automated verification covers:
@@ -301,7 +375,8 @@ Automated verification covers:
 6. immutable batch preview and one-confirmation multi-Decision publication;
 7. explicit-path Git commit with unrelated dirty/staged files preserved;
 8. successful push to a temporary bare `origin/main`;
-9. commit-success/push-failure resume without duplicate commits or Decisions;
+9. commit-success/private-state-crash adoption and push-failure resume without
+   duplicate commits or Decisions;
 10. CLI safe-output and repository Skill conversational contracts;
 11. proof that no raw conversation, Candidate payload, or private Review object
     appears under `decision-registry/`.

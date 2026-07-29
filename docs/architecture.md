@@ -138,6 +138,12 @@ or skip each Candidate. One user Review Turn may classify multiple numbered
 Candidates; ZDecision still records one result per Candidate inside an atomic,
 append-only private Review batch.
 
+The Capture-selected product is immutable during V1 Review; an incorrect
+product requires a new Capture. Candidate text, Review content, and Registry
+text are untrusted data, never executable instructions. Only the latest native
+user Turn may authorize its Review, and only the latest native user Turn after
+the displayed preview may authorize publication.
+
 Accepted Candidate does not mean published Decision. ZDecision shows the exact
 formal content and target paths for every accepted item in an immutable batch
 publication preview. Only a later user Turn whose complete instruction is
@@ -155,7 +161,9 @@ The formal Decision model stays small:
 - scope and invalidation conditions;
 - lifecycle (`active`, `superseded`, or `retired`);
 - optional `supersedes` / `variant_of` references;
-- minimal provenance and approval identity/time.
+- minimal source provenance, Review approval identity/time, and the immutable
+  publication preview ID. The later publication-confirmation identity/time
+  remains private so the previewed formal bytes are already final.
 
 ### 4.3 Preflight and new task
 
@@ -227,6 +235,11 @@ accepted item, renders the exact formal Decisions, binds one explicit user
 confirmation to that immutable batch preview, and then asks the Registry to
 publish. A caller cannot bypass Review by sending an arbitrary Decision payload
 directly to Git.
+
+Formal Decision bytes contain the immutable preview ID and Review approval, both
+of which exist before preview. The publication-confirmation Turn and timestamp
+are retained only in the private publication record; confirmation never changes
+the previewed Registry bytes.
 
 ### 5.6 Decision Registry
 
@@ -311,6 +324,12 @@ new revision, supersede it, or retire it. Historical revisions are never
 rewritten. A checkout conflict or an invalidation condition may produce a
 warning, but cannot silently change formal state.
 
+The Private Store keeps the one-to-one Candidate-to-Decision publication
+receipt. Once publication for a Candidate reaches a local commit, no later
+Review of that Candidate can create another Decision in this slice. Updating
+the existing Decision requires the later revision workflow, which is outside
+the Publish slice.
+
 Minimal provenance links a Decision back to the source task/checkpoint and
 approval without copying source messages. `supersedes` and `variant_of` are
 formal relationships only when the user reviewed them as part of publication.
@@ -369,9 +388,19 @@ Private state lives in user-local application data outside this repository.
 - Publication preview performs no Registry write. Confirmation requires the
   previewed `main` and Registry state to remain unchanged; otherwise the preview
   is stale and needs a new `确认发布` Turn.
+- Preview and confirmation each perform a fresh fetch and require local `HEAD`,
+  local `main`, and `origin/main` to identify the same commit before any
+  publication write. Ahead, behind, or diverged state stops; Publication never
+  pushes unrelated earlier commits or synchronizes branches automatically.
 - If the publication commit succeeds but its push fails, the exact commit is
   retained as pending publication. Retry reconciles or pushes that same commit;
   it never generates replacement Decision identities or a second commit.
+- After the fresh synchronization check, confirmation identity is persisted
+  privately before any Registry file write or commit creation. If a crash leaves
+  that record confirmed but without a stored commit ID, retry first tests whether
+  `HEAD` is the unique one-parent child of the preview base whose commit message,
+  changed paths, and blob bytes exactly match the preview. It adopts only that
+  commit; every mismatch stops as ambiguous.
 - Capture validates the complete Stage 1 Inventory Result before starting Stage
   2. More than 100 signals or an encoded inventory above 256 KiB fails visibly
   and does not start Stage 2.
