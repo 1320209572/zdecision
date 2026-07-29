@@ -1,4 +1,4 @@
-"""Canonical JSON encoding and atomic private-state writes."""
+"""Canonical JSON encoding and atomic filesystem writes."""
 
 from __future__ import annotations
 
@@ -24,6 +24,14 @@ def canonical_json_bytes(value: object) -> bytes:
 def atomic_write_json(path: Path, value: object) -> None:
     """Replace *path* with one durable canonical JSON document."""
 
+    atomic_write_bytes(path, canonical_json_bytes(value))
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Replace *path* with exact durable bytes."""
+
+    if not isinstance(content, bytes):
+        raise TypeError("Atomic file content must be bytes")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -34,10 +42,11 @@ def atomic_write_json(path: Path, value: object) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            stream.write(canonical_json_bytes(value))
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
