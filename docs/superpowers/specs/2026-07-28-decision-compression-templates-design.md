@@ -1,6 +1,6 @@
 # Decision compression templates design
 
-**Status:** Draft for final review; direction approved
+**Status:** Approved for implementation
 
 **Date:** 2026-07-28
 

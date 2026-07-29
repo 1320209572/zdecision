@@ -100,6 +100,26 @@ minimal source references. Raw conversation text remains private.
 
 Zero Candidates is a valid result.
 
+#### Decision compression templates
+
+Capture selects one versioned Decision Compression Template before creating
+native task work. The default is `business` revision 1, titled
+“业务决策压缩模板.” A template contributes two editable decision-policy bodies;
+renderer-owned envelopes retain the source, privacy, product, output-contract,
+and Review boundaries.
+
+Capture runs exactly two Turns in one fresh Capture fork. The inventory Turn
+scans retained fork context from earliest to latest and returns typed signals
+plus concrete known gaps. After complete validation, the extraction Turn may
+convert only those signals into zero or more Candidates. The second Turn may
+use inherited development context to confirm or reject a signal, but it cannot
+invent an un-inventoried rule or treat the inventory itself as confirmation.
+
+The default path does not paginate and reconstruct the raw transcript. A
+compacted summary explicitly attributed to a user confirmation or direction
+may be retained confirmation. An unattributed assistant proposal, inference,
+or ordinary summary is not confirmation.
+
 ### 4.2 Review and publish
 
 Candidates are private and editable. The user may accept, narrow, edit, reject,
@@ -235,6 +255,10 @@ Coordinator above these services.
 | Object | Owner and location | Mutability and lifetime |
 |---|---|---|
 | Source Checkpoint | Capture / Private Store | Immutable reference to one completed source Turn. |
+| Template Snapshot | Capture / Private Store | Immutable selected template identity, source and rendered-prompt digests, and exact frozen prompts for one Capture operation. |
+| Inventory Result | Capture / Private Store | Private, validated Stage 1 typed signals and known gaps; retained only for its Capture operation and never formal project memory. |
+| Capture Stage Turn IDs | Capture / Private Store | Native Turn identities for the successful inventory (Stage 1) and extraction (Stage 2) Turns in one fresh Capture fork. |
+| Capture Output Digests | Capture / Private Store | Digests of successful Stage 1 and Stage 2 outputs, retained for reconciliation without storing invalid payloads verbatim. |
 | Candidate | Capture / Private Store | Private and editable during review; never formal project memory. |
 | Candidate Review | Review / Private Store | Append-only record of the user's accept, edit, reject, or skip action. |
 | Decision Identity | Decision Registry | Stable for the life of the Decision. |
@@ -310,6 +334,19 @@ Private state lives in user-local application data outside this repository.
   retire or supersede a formal Decision.
 - Git writes are restricted to `decision-registry/` and never include unrelated
   workspace changes.
+- Capture validates the complete Stage 1 Inventory Result before starting Stage
+  2. More than 100 signals or an encoded inventory above 256 KiB fails visibly
+  and does not start Stage 2.
+- More than 20 otherwise valid Stage 2 Candidates is the explicit
+  `candidate_limit_exceeded` failure; it writes no preferred subset and no
+  Candidates.
+- Retry and reconciliation use the recorded fresh-fork identity, stage Turn
+  IDs, successful Stage 1/2 output digests, and exact frozen prompt for the
+  recorded stage. They never add repair wording, create a replacement fork, or
+  silently rerun a completed operation.
+- V1 legacy Capture records from the prior one-stage protocol are read-only:
+  they remain readable under their old identity, but cannot be replayed as a
+  two-stage template Capture, silently migrated, or re-extracted.
 
 V1 uses stable operation identity at the three user-visible write boundaries:
 Capture, publication, and new-task creation. Retrying the same completed
