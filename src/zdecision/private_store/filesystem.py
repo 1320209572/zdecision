@@ -6,7 +6,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from zdecision.capture.inventory import InventoryResult, validate_inventory
@@ -22,6 +22,10 @@ from zdecision.jsonio import (
     atomic_create_json,
     atomic_write_json,
     canonical_json_bytes,
+)
+from zdecision.registry.publication import (
+    CandidatePublicationReceipt,
+    PublicationRecord,
 )
 
 
@@ -282,6 +286,181 @@ class FilePrivateStore:
                 raise PrivateStateCorrupt("review_batches", "approval")
             matched = batch
         return matched
+
+    def create_publication(self, record: PublicationRecord) -> PublicationRecord:
+        if not isinstance(record, PublicationRecord):
+            raise TypeError("Only validated Publication records may be written")
+        PublicationRecord.from_dict(record.to_dict())
+        path = self._object_path("publications", record.preview_id)
+        if atomic_create_json(path, record.to_dict()):
+            return record
+        if path.read_bytes() == canonical_json_bytes(record.to_dict()):
+            existing = self.get_publication(record.preview_id)
+            if existing is not None:
+                return existing
+        raise PrivateStateConflict(
+            f"Private publication {record.preview_id!r} already has different content"
+        )
+
+    def get_publication(self, preview_id: str) -> PublicationRecord | None:
+        path = self._object_path("publications", preview_id)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Publication private state must be an object")
+            record = PublicationRecord.from_dict(value)
+            if record.preview_id != preview_id:
+                raise ValueError("Publication object identity mismatch")
+            if path.read_bytes() != canonical_json_bytes(record.to_dict()):
+                raise ValueError("Publication private state is not canonical")
+            return record
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt("publications", preview_id) from None
+
+    def replace_publication(
+        self,
+        expected: PublicationRecord,
+        replacement: PublicationRecord,
+    ) -> PublicationRecord:
+        if not isinstance(expected, PublicationRecord) or not isinstance(
+            replacement, PublicationRecord
+        ):
+            raise TypeError("Publication replacement requires validated records")
+        if expected.preview_id != replacement.preview_id:
+            raise PrivateStateConflict("Publication identity cannot be replaced")
+        self._require_same_publication_payload(expected, replacement)
+        allowed = {
+            "previewed": "confirmed",
+            "confirmed": "committed_pending_push",
+            "committed_pending_push": "completed",
+        }
+        if replacement != expected and allowed.get(expected.state) != replacement.state:
+            raise PrivateStateConflict("Publication state transition is invalid")
+
+        path = self._object_path("publications", expected.preview_id)
+        if not path.exists():
+            raise PrivateStateConflict("Publication private state does not exist")
+        current_bytes = path.read_bytes()
+        replacement_bytes = canonical_json_bytes(replacement.to_dict())
+        if current_bytes == replacement_bytes:
+            return replacement
+        if current_bytes != canonical_json_bytes(expected.to_dict()):
+            raise PrivateStateConflict("Publication private state changed")
+        atomic_write_json(path, replacement.to_dict())
+        return replacement
+
+    def publication_ids_for_candidates(
+        self,
+        candidate_ids: Collection[str],
+    ) -> tuple[str, ...]:
+        if isinstance(candidate_ids, (str, bytes)) or not isinstance(
+            candidate_ids, Collection
+        ):
+            raise ValueError("Candidate ids must be a collection")
+        selected = set(candidate_ids)
+        for candidate_id in selected:
+            self._object_path("candidate_publication_receipts", candidate_id)
+            if re.fullmatch(
+                r"cand_[0-9a-f]{32}_(?:0[1-9]|1[0-9]|20)", candidate_id
+            ) is None:
+                raise ValueError("Candidate id is invalid")
+        if not selected:
+            return ()
+        return tuple(
+            preview_id
+            for preview_id in self._publication_ids()
+            if selected.intersection(
+                self._required_publication(preview_id).candidate_ids
+            )
+        )
+
+    def put_candidate_receipt(
+        self,
+        receipt: CandidatePublicationReceipt,
+    ) -> None:
+        if not isinstance(receipt, CandidatePublicationReceipt):
+            raise TypeError("Only validated Candidate publication receipts may be written")
+        CandidatePublicationReceipt.from_dict(receipt.to_dict())
+        path = self._object_path(
+            "candidate_publication_receipts", receipt.candidate_id
+        )
+        if atomic_create_json(path, receipt.to_dict()):
+            return
+        existing = self.get_candidate_receipt(receipt.candidate_id)
+        if existing is not None and path.read_bytes() == canonical_json_bytes(
+            receipt.to_dict()
+        ):
+            return
+        raise PrivateStateConflict(
+            f"Candidate {receipt.candidate_id!r} already has a publication receipt"
+        )
+
+    def get_candidate_receipt(
+        self,
+        candidate_id: str,
+    ) -> CandidatePublicationReceipt | None:
+        path = self._object_path(
+            "candidate_publication_receipts", candidate_id
+        )
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Candidate publication receipt must be an object")
+            receipt = CandidatePublicationReceipt.from_dict(value)
+            if receipt.candidate_id != candidate_id:
+                raise ValueError("Candidate publication receipt identity mismatch")
+            if path.read_bytes() != canonical_json_bytes(receipt.to_dict()):
+                raise ValueError("Candidate publication receipt is not canonical")
+            return receipt
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt(
+                "candidate_publication_receipts", candidate_id
+            ) from None
+
+    @staticmethod
+    def _require_same_publication_payload(
+        expected: PublicationRecord,
+        replacement: PublicationRecord,
+    ) -> None:
+        mutable_fields = frozenset(
+            ("state", "publication_approval", "commit_sha")
+        )
+        expected_value = {
+            key: value
+            for key, value in expected.to_dict().items()
+            if key not in mutable_fields
+        }
+        replacement_value = {
+            key: value
+            for key, value in replacement.to_dict().items()
+            if key not in mutable_fields
+        }
+        if expected_value != replacement_value:
+            raise PrivateStateConflict("Publication preview bytes are immutable")
+
+    def _publication_ids(self) -> tuple[str, ...]:
+        directory = self.root / "publications"
+        if not directory.exists():
+            return ()
+        return tuple(
+            sorted(
+                path.stem
+                for path in directory.iterdir()
+                if path.is_file()
+                and path.suffix == ".json"
+                and re.fullmatch(r"pub_[0-9a-f]{32}", path.stem) is not None
+            )
+        )
+
+    def _required_publication(self, preview_id: str) -> PublicationRecord:
+        record = self.get_publication(preview_id)
+        if record is None:
+            raise PrivateStateCorrupt("publications", preview_id)
+        return record
 
     def _review_batch_ids(self) -> tuple[str, ...]:
         directory = self.root / "review_batches"
