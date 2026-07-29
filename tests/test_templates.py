@@ -15,7 +15,6 @@ from zdecision.capture.templates import (
     TemplateValidationError,
 )
 from zdecision.capture.prompts import (
-    build_extraction_prompt,
     candidate_schema_json,
     inventory_schema_json,
 )
@@ -65,6 +64,8 @@ class TemplateCatalogTests(unittest.TestCase):
         self.assertIn("ZDECISION_CAPTURE_ARTIFACT_V2:inventory", snapshot.inventory_prompt)
         self.assertIn("ZDECISION_CAPTURE_ARTIFACT_V2:extract", snapshot.extraction_prompt)
         self.assertIn('目标产品："安恒"', snapshot.inventory_prompt)
+        self.assertIn("invalid_inventory", snapshot.inventory_prompt)
+        self.assertNotIn("inventory_invalid", snapshot.inventory_prompt)
         self.assertIn(
             '<decision_policy template_id="business" revision="1">',
             snapshot.extraction_prompt,
@@ -453,39 +454,3 @@ class PromptContractTests(unittest.TestCase):
             },
             json.loads(candidate_schema_json(product)),
         )
-
-    def test_legacy_extraction_prompt_remains_byte_for_byte_compatible(self) -> None:
-        product = "安恒"
-        schema = json.dumps(
-            {
-                "candidates": [
-                    {
-                        "product": product,
-                        "claim": "A concise confirmed decision",
-                        "future_action": "What future work must do",
-                        "scope": {
-                            "summary": "Where the decision applies",
-                            "repositories": ["optional canonical remote"],
-                            "paths": ["optional/path"],
-                        },
-                        "invalidation_conditions": ["Condition that requires review"],
-                    }
-                ]
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        expected = (
-            "Extract only decisions that were explicitly confirmed in the completed "
-            "source-task boundary.\n"
-            "Set every candidate product exactly to '安恒'; express narrower "
-            "applicability in scope.\n"
-            "Zero Candidates is a valid result when no confirmed durable decision "
-            "exists.\n"
-            "Do not include raw quotations, evidence excerpts, source messages, or a "
-            "conversation summary.\n"
-            "Return JSON only, with exactly this shape and no additional fields:\n"
-            f"{schema}"
-        )
-
-        self.assertEqual(expected, build_extraction_prompt(product))

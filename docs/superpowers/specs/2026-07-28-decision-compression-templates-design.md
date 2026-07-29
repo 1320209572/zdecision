@@ -309,7 +309,7 @@ coverage.known_gaps 只记录从保留上下文中能够具体指出、并可能
 
 所有字段都必须存在。没有具体缺口时 known_gaps 使用 []；枚举字段必须选择一个单独值，不得输出带“|”的组合值或示例占位文本。
 
-系统本阶段最多接受 100 个 signal 和 256 KiB 的编码后 JSON。不得静默丢弃线索；一旦确认存在第 101 个 signal，按上下文顺序返回前 101 个，让系统明确报告 inventory_signal_limit_exceeded。如果输出超过字节限制或被截断，系统必须报告 inventory_output_too_large 或 inventory_invalid，且不得启动第二阶段。
+系统本阶段最多接受 100 个 signal 和 256 KiB 的编码后 JSON。不得静默丢弃线索；一旦确认存在第 101 个 signal，按上下文顺序返回前 101 个，让系统明确报告 inventory_signal_limit_exceeded。如果输出超过字节限制或被截断，系统必须报告 inventory_output_too_large 或 invalid_inventory，且不得启动第二阶段。
 
 返回 JSON，且只能返回 JSON；字段必须与下面结构完全一致，不得增加字段：
 {{inventory_schema_json}}

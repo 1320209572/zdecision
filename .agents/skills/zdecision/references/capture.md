@@ -2,10 +2,10 @@
 
 Use this workflow when the user asks to compress an existing task into private
 Candidate decisions. Native tools provide the conversation plane:
-`thread/read` selects a stable boundary, `thread/fork` isolates extraction, and
-`turn/start` runs extraction in that fork. The `zdecision capture ...`
-commands below are internal machine operations; execute them for the user and
-show only useful outcomes.
+`thread/read` selects a stable boundary, `thread/fork` isolates the work, and
+`turn/start` runs each model stage in that fork. The commands below are an
+internal machine boundary. Execute them for the user and show only safe review
+context.
 
 ## Bootstrap the internal command
 
@@ -25,121 +25,182 @@ internal CLI.
 ## Inputs
 
 Obtain the source task ID and one product identifier. If the product identifier
-is unclear, ask the user before preparing Capture. Once confirmed, pass that
-string verbatim on every retry—do not translate, normalize, change case, or
-substitute an alias because it participates in stable operation identity.
+is unclear, ask before preparing Capture. Pass it verbatim on every retry
+because it participates in stable operation identity.
 
-## Exact sequence
+Select a stable template ID from the user's natural-language request,
+defaulting to `business` when none is named. Pass an explicit ID verbatim. A
+template title is display metadata, not an alias.
+
+## Exact initial sequence
 
 1. Call `read_thread` with
    `{"threadId": "SOURCE_TASK_ID", "turnLimit": 10}`. Follow its older-page
-   `cursor` with another `read_thread` call until the latest completed Turn is
-   unambiguous. Use that completed Turn ID as the checkpoint. An active
-   unfinished Turn is intentionally outside the fork and must never be used as
-   the checkpoint. If the source is missing, there is no completed Turn, or the
-   requested boundary cannot be established, stop; do not infer or reconstruct
-   it.
+   `cursor` until the latest completed Turn is unambiguous. Use that completed
+   Turn ID as the checkpoint. An active unfinished Turn is outside the fork and
+   must not be used. If the source, completed boundary, or requested checkpoint
+   cannot be established, stop instead of inferring it.
 
 2. Run:
 
    ```text
-   .venv/bin/python -m zdecision capture prepare --thread-id SOURCE_TASK_ID --turn-id COMPLETED_TURN_ID --product PRODUCT
+   .venv/bin/python -m zdecision capture prepare --thread-id SOURCE_TASK_ID --turn-id COMPLETED_TURN_ID --product PRODUCT --template-id TEMPLATE_ID
    ```
 
-   Read the one-object JSON response.
-
-   - New `prepared` result: retain `operation_id` and `extraction_prompt`, then
-     continue to step 3.
-   - `replayed: true` with `completed`: run `zdecision capture show
-     --operation-id OPERATION_ID`, show the stored Candidate list (including an
-     explicit zero Candidates result), and stop without forking.
-   - `replayed: true` with `fork_attached`: reuse its `fork_thread_id` and
-     `extraction_prompt`; skip steps 3 and 4, then reconcile the extraction Turn
-     at step 5 before sending anything.
-   - Exit 5 with `capture_fork_ambiguous`: retain
-     `error.details.operation_id`; a native fork may already exist. Reconcile it
-     through the native task UI/tools. If exactly one fork is proven, attach its
-     ID to that operation. If it is proven that no fork was created, create
-     exactly one and attach it to that same operation. If neither conclusion is
-     provable, stop. Never delete private state, change an input, or create an
-     unverified replacement.
+   Read the single JSON response. Retain its `operation_id`, selected
+   checkpoint, and frozen template snapshot. For a new `prepared` operation,
+   continue. For a replay or ambiguous result, use the state table below.
 
 3. Call `fork_thread` with
    `{"threadId": "SOURCE_TASK_ID", "environment": {"type": "same-directory"}}`.
-   This native same-directory fork copies completed history only; it excludes
-   the active unfinished Turn. If the call returns a definite child task ID,
-   continue immediately. If its result is unknown, do not fork again—stop for
-   reconciliation.
+   This same-directory fork copies completed history only. If it returns a
+   definite child task ID, continue. If the result is unknown, do not fork
+   again; leave the operation ready for reconciliation.
 
-4. Before starting extraction, persist the returned child ID:
+4. Persist the definite child ID before starting either model Turn:
 
    ```text
    .venv/bin/python -m zdecision capture attach --operation-id OPERATION_ID --fork-thread-id FORK_TASK_ID
    ```
 
-   The same fork ID is an idempotent retry. Exit 5 with
-   `capture_fork_conflict` means a different fork is already attached; stop
-   rather than choosing one silently.
+   The same ID is an idempotent retry. A different attached ID is a conflict;
+   stop instead of choosing one silently.
 
-5. Verify the fork boundary and reconcile before starting a Turn:
+5. Reconcile and run Stage 1 in the attached fork.
 
-   - Call `read_thread` with
-     `{"threadId": "FORK_TASK_ID", "turnLimit": 10}` and page older history as
-     needed. Establish the inherited source boundary: before the first exact
-     `extraction_prompt` Turn when replaying, or the latest completed inherited
-     Turn on a fresh fork. Its Turn ID must equal the selected checkpoint. This
-     closes the race where the source completes another Turn between
-     `read_thread` and `fork_thread`. If it differs or cannot be proven, do not
-     start extraction; stop and report the boundary mismatch.
-   - Match the exact `extraction_prompt`. If its extraction Turn is completed,
-     reuse that final response and do not send again. If it is active, continue
-     to step 6. If the task state cannot prove whether that prompt was already
-     sent, stop for reconciliation.
-   - Only when the attached fork has no Turn for the exact prompt, call
-     `send_message_to_thread` with
-     `{"threadId": "FORK_TASK_ID", "prompt": "EXTRACTION_PROMPT"}`, substituting
-     the returned `extraction_prompt` verbatim. This is the native `turn/start`
-     boundary. Do not add source text from the controlling task.
+   - Call `read_thread` on `FORK_TASK_ID` with `{"turnLimit": 10}`. On a fresh
+     fork, its latest inherited completed Turn must equal the selected checkpoint.
+     On a retry, establish that same inherited boundary before the
+     matching model Turn. If the boundary differs or is uncertain, stop.
+   - Match the exact frozen `inventory_prompt`. If the matching Turn exists,
+     reuse it. Only if no matching Turn exists, call `send_message_to_thread`
+     with that prompt verbatim. Do not add source text, explanations, repair
+     wording, or any other instruction.
+   - Immediately read the resulting Turn ID from the fork. Persist it before
+     waiting:
 
-6. Use `wait_threads` with
-   `{"targets": [{"threadId": "FORK_TASK_ID"}]}` until that extraction Turn
-   completes. On later waits, pass the returned cursor as the target's
-   `afterCursor`. If the final response is truncated, use `read_thread` with
-   `includeOutputs: true` on the fork to retrieve the complete final response.
-   Accept only its final JSON object; do not combine commentary, intermediate
-   tool output, or other messages with it.
+     ```text
+     .venv/bin/python -m zdecision capture attach-turn --operation-id OPERATION_ID --stage inventory --turn-id INVENTORY_TURN_ID
+     ```
 
-7. Feed that exact JSON object over stdin, without shell interpolation or a
-   checkout file:
+   - Use `wait_threads` for that exact matching Turn. Reuse its cursor on later
+     waits. Both model Turns must not call tools and must not paginate; each must
+     produce exactly one final JSON object. If Stage 1 used a tool or emitted
+     non-final processing output, call `fail-stage` with
+     `model_contract_violation` and stop. If the final response is invalid JSON,
+     submit it once and stop after validation; there is no repair prompt.
+
+6. Feed only Stage 1's exact final JSON object over stdin:
 
    ```text
-   .venv/bin/python -m zdecision capture complete --operation-id OPERATION_ID --input -
+   .venv/bin/python -m zdecision capture complete-inventory --operation-id OPERATION_ID --input -
    ```
 
-   A valid empty `candidates` array completes Capture successfully. A validation
-   error is not permission to invent, repair, or broaden a Candidate in the
-   controlling task.
+   Validation must succeed before Stage 2. The private inventory is stored with
+   its digest; do not copy its contents into the controlling conversation.
 
-8. Run:
+7. Reconcile and run Stage 2 as the immediately next Turn in the same attached fork.
+
+   - Use the exact frozen `extraction_prompt` returned by the operation. If a
+     matching Turn already exists, reuse it. Only if none exists, call
+     `send_message_to_thread` with the prompt verbatim. Do not add inventory,
+     source text, repair wording, or pagination instructions.
+   - Read the resulting Turn ID and persist it before waiting:
+
+     ```text
+     .venv/bin/python -m zdecision capture attach-turn --operation-id OPERATION_ID --stage extraction --turn-id EXTRACTION_TURN_ID
+     ```
+
+   - Use `wait_threads` for that exact matching Turn. If it called a tool or
+     emitted non-final processing output, record `model_contract_violation` and
+     stop. Invalid JSON is submitted once; never start a repair Turn.
+
+8. Feed only Stage 2's exact final JSON object over stdin:
+
+   ```text
+   .venv/bin/python -m zdecision capture complete-extraction --operation-id OPERATION_ID --input -
+   ```
+
+   A valid empty `candidates` array is a successful result with zero Candidates.
+
+9. Run:
 
    ```text
    .venv/bin/python -m zdecision capture show --operation-id OPERATION_ID
    ```
 
-   Show each Candidate's claim, future action, scope, and invalidation
-   conditions for later review. Call them Candidates, not Decisions. For zero
-   Candidates, state clearly that the completed checkpoint contained no
-   confirmed durable decision. Do not publish anything.
+   Present the private Candidates and safe review context: template title,
+   template ID, revision, content digest, and `known_gaps`. Show each Candidate's
+   claim, future action, scope, and invalidation conditions. Do not publish.
 
-## Retry and privacy rules
+## Continuation and reconciliation
 
-- Re-read the source task only to confirm the same completed checkpoint; keep
-  the product string verbatim.
-- A completed operation replays its stored Candidate IDs and never starts
-  another fork or Candidate set.
-- A `fork_attached` operation continues in that exact fork and reconciles the
-  extraction Turn before sending, so retry does not start a duplicate Turn.
-- A `prepared` retry is intentionally ambiguous and requires reconciliation.
-- Pass checkpoint IDs, the attached fork ID, and the structured final JSON
-  only. Raw source content remains in native task history and never enters
-  private JSON or Git.
+Every continuation after initial prepare begins with
+`capture resume --operation-id ID`. Resume returns the frozen template snapshot
+and prompts; it must not replace them with a live template edit. Continue from
+the exact returned status:
+
+| Status | Continuation |
+| --- | --- |
+| `prepared` | Reconcile native history. Attach one proven existing fork, or create exactly one only when it is proven that no fork exists. |
+| `fork_attached` | Verify the inherited boundary, then reconcile or start the Stage 1 Turn in that fork. |
+| `inventory_running` | Reconcile the stored inventory Turn ID and matching Turn; wait or submit its final response without sending again. |
+| `inventory_completed` | Resume verifies the private artifact and digest; then reconcile or start Stage 2 in the same fork. |
+| `extraction_running` | Reconcile the stored extraction Turn ID and matching Turn; wait or submit its final response without sending again. |
+| `completed` | Show the stored result. Never fork, send, or create duplicate Candidates. |
+| `failed` | Show the sanitized terminal failure and stop; failed operations never re-fork. |
+
+A legacy completed record is display-only: show its stored Candidates and do
+not resume, fork, or migrate it implicitly.
+
+For `inventory_completed`, missing, corrupt, or digest-mismatched inventory is a
+hard stop at `capture resume`; do not send `extraction_prompt`. Never reconstruct
+private inventory from task history.
+
+Turn matching is exact. Once a stage Turn ID is attached, the matching Turn is
+the exact stored Turn ID with the exact frozen stage prompt in the attached fork.
+A same-prompt Turn with a different ID or in another fork never matches.
+Before attachment after an uncertain `turn/start` result, reconcile only a single unique Turn.
+It must be in the attached fork with that exact prompt and the correct immediate boundary and order.
+Zero or multiple plausible matches is ambiguous and must stop without sending another Turn.
+
+Before completing either stage, reconcile the stored Turn ID against the
+matching Turn and accept only that Turn's final response. A `wait_threads`
+timeout or uncertain native result is not a definite model failure: keep
+reconciling the same Turn, leave the operation running for reconciliation, and
+must not call `fail-stage` with `model_timeout`. Never create a replacement
+fork or Turn merely because a wait expired.
+
+The only allowed `fail-stage` codes are:
+
+- `model_refusal` when the attached model Turn definitely refuses;
+- `model_timeout` only for a definite terminal native Turn timeout, never a controller wait timeout;
+- `native_unavailable` when the stored native Turn's terminal reason explicitly
+  reports unavailable; and
+- `model_contract_violation` when the Turn uses tools or produces non-final
+  processing output instead of its one final JSON object.
+
+A failure is definite only when `read_thread` or `wait_threads` identifies the
+stored stage Turn as terminal and the allowed code is directly evidenced. Its native terminal reason explicitly reports timeout or unavailable for those
+codes, or its final response is an explicit model refusal. A terminal
+`model_contract_violation` requires recorded tool use or non-final processing
+output. A controller wait timeout, missing snapshot, commentary, or uncertain result never qualifies; leave the operation running for reconciliation.
+
+Record a definite terminal failure once and stop. Arbitrary failure codes and messages are forbidden.
+Use the internal command's fixed sanitized message. Do not repair, retry with
+extra wording, paginate, or fork again.
+
+## Privacy and output rules
+
+- Showing validated Candidate fields to the requesting user in the controlling
+  Codex conversation is the required private Review presentation and is allowed.
+- Here, private forbids exposure to Git or the Registry and forbids showing a
+  raw model payload, full inventory, frozen prompts, or raw source excerpts. It
+  does not hide validated Candidate content from its owner.
+- Do not copy raw source excerpts to stdin, private state, Candidate fields, or
+  Git. Raw source remains in native task history.
+- Feed only a model Turn's structured final JSON to its matching completion
+  command. Do not combine commentary or intermediate output with it.
+- Never expose private paths or model-authored payloads in error text.
+- Call extracted items Candidates, not Decisions. Zero Candidates is explicit,
+  successful completion, not an error and not permission to invent a result.

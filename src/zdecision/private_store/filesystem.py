@@ -9,8 +9,14 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from zdecision.capture.models import Candidate, CaptureRecord
-from zdecision.jsonio import atomic_write_json
+from zdecision.capture.inventory import InventoryResult, validate_inventory
+from zdecision.capture.models import (
+    LEGACY_CAPTURE_FIELDS,
+    Candidate,
+    CaptureRecord,
+    LegacyCaptureRecord,
+)
+from zdecision.jsonio import atomic_write_json, canonical_json_bytes
 
 
 _SAFE_OBJECT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -18,6 +24,19 @@ _SAFE_OBJECT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 class InvalidPrivateObjectId(ValueError):
     """Raised when an object id could escape its owned directory."""
+
+
+class PrivateStateCorrupt(Exception):
+    """Sanitized boundary for malformed or internally inconsistent state."""
+
+    def __init__(self, collection: str, object_id: str) -> None:
+        self.collection = collection
+        self.object_id = object_id
+        super().__init__(f"Private {collection} object {object_id!r} is invalid")
+
+
+class PrivateStateConflict(Exception):
+    """Raised when immutable private state would be replaced."""
 
 
 def private_state_root(environ: Mapping[str, str]) -> Path:
@@ -48,19 +67,35 @@ class FilePrivateStore:
         self.root = Path(root)
 
     def put_capture(self, capture: CaptureRecord) -> None:
+        if not isinstance(capture, CaptureRecord):
+            raise TypeError("Only extractor-v2 Capture records may be written")
+        CaptureRecord.from_dict(capture.to_dict())
         atomic_write_json(
             self._object_path("captures", capture.operation_id),
             capture.to_dict(),
         )
 
-    def get_capture(self, operation_id: str) -> CaptureRecord | None:
+    def get_capture(
+        self, operation_id: str
+    ) -> CaptureRecord | LegacyCaptureRecord | None:
         path = self._object_path("captures", operation_id)
         if not path.exists():
             return None
-        value = json.loads(path.read_text("utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("Capture private state must be a JSON object")
-        return CaptureRecord.from_dict(value)
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Capture private state must be a JSON object")
+            if frozenset(value) == LEGACY_CAPTURE_FIELDS:
+                record: CaptureRecord | LegacyCaptureRecord = (
+                    LegacyCaptureRecord.from_dict(value)
+                )
+            else:
+                record = CaptureRecord.from_dict(value)
+            if record.operation_id != operation_id:
+                raise ValueError("Capture object identity mismatch")
+            return record
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt("captures", operation_id) from None
 
     def put_candidate(self, candidate: Candidate) -> None:
         atomic_write_json(
@@ -72,10 +107,46 @@ class FilePrivateStore:
         path = self._object_path("candidates", candidate_id)
         if not path.exists():
             return None
-        value = json.loads(path.read_text("utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("Candidate private state must be a JSON object")
-        return Candidate.from_dict(value)
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("Candidate private state must be a JSON object")
+            candidate = Candidate.from_dict(value)
+            if candidate.candidate_id != candidate_id:
+                raise ValueError("Candidate object identity mismatch")
+            return candidate
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt("candidates", candidate_id) from None
+
+    def put_inventory(
+        self,
+        operation_id: str,
+        inventory: InventoryResult,
+    ) -> None:
+        if not isinstance(inventory, InventoryResult):
+            raise TypeError("Only validated InventoryResult values may be written")
+        path = self._object_path("inventories", operation_id)
+        if path.exists():
+            existing = self.get_inventory(operation_id)
+            assert existing is not None
+            if canonical_json_bytes(existing.to_dict()) == canonical_json_bytes(
+                inventory.to_dict()
+            ):
+                return
+            raise PrivateStateConflict(
+                f"Private inventory {operation_id!r} already has different content"
+            )
+        atomic_write_json(path, inventory.to_dict())
+
+    def get_inventory(self, operation_id: str) -> InventoryResult | None:
+        path = self._object_path("inventories", operation_id)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text("utf-8"))
+            return validate_inventory(value)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise PrivateStateCorrupt("inventories", operation_id) from None
 
     def _object_path(self, collection: str, object_id: str) -> Path:
         if not object_id or not _SAFE_OBJECT_ID.fullmatch(object_id):

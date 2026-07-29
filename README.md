@@ -7,9 +7,17 @@ task without copying the original conversation.
 V1 is conversation-first: clone this repository, open it in Codex App, and
 describe what you want in natural language—for example:
 
-- “压缩任务 `<task-id>` 中已经确认的决策。”
+- “压缩任务 `<task-id>` 的决策。” uses the default 业务决策压缩模板.
+- “用模板 ID `architecture` 处理任务 `<task-id>`。” selects that hypothetical
+  `architecture` template only after you copy or install it locally.
 - “审核刚才提取的候选决策。”
 - “带上安恒项目现有决策，开始一个新的开发任务。”
+
+V1 selects templates by stable ID. A template's title is display metadata, not
+an alias. To add one, copy a template directory, assign its stable ID, title,
+and revision, then edit its two policy files. The repository currently bundles
+the `business` template; `architecture` above is only an example of a template
+the user might install.
 
 The authoritative V1 design is [docs/architecture.md](docs/architecture.md).
 Repository instructions for Codex are in [AGENTS.md](AGENTS.md).
@@ -20,5 +28,6 @@ Source code and formal decisions share this repository and its `main` branch.
 Formal decisions are isolated under `decision-registry/`. Raw conversations,
 candidate decisions, and private review state never enter that subtree.
 
-The implementation is being rebuilt from a clean skeleton under
-`src/zdecision/`; no legacy architecture or compatibility layer is retained.
+The implementation lives under `src/zdecision/`. Legacy execution paths are
+not retained; extractor-v1 completed records remain display-only so existing
+private Candidates can still be reviewed.

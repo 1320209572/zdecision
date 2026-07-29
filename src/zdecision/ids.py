@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 import hashlib
+from typing import TYPE_CHECKING
+
+from zdecision.jsonio import canonical_json_bytes
+
+if TYPE_CHECKING:
+    from zdecision.capture.templates import TemplateSnapshot
 
 
-CAPTURE_EXTRACTOR_VERSION = "extractor-v1"
+CAPTURE_EXTRACTOR_VERSION = "extractor-v2"
 
 
 def capture_operation_id(
     source_thread_id: str,
     source_turn_id: str,
     product: str,
+    template: TemplateSnapshot,
 ) -> str:
     """Return the stable identity for one Capture boundary."""
 
-    payload = "\n".join(
-        (
-            source_thread_id,
-            source_turn_id,
-            product,
-            CAPTURE_EXTRACTOR_VERSION,
-        )
-    ).encode("utf-8")
+    payload = canonical_json_bytes(
+        {
+            "extractor_version": CAPTURE_EXTRACTOR_VERSION,
+            "product": product,
+            "prompt_bundle_sha256": template.prompt_bundle_sha256,
+            "source_thread_id": source_thread_id,
+            "source_turn_id": source_turn_id,
+            "template_id": template.template_id,
+            "template_revision": template.revision,
+            "template_source_sha256": template.template_source_sha256,
+        }
+    )
     return f"cap_{hashlib.sha256(payload).hexdigest()[:32]}"

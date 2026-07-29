@@ -15,6 +15,9 @@ internal command boundary.
 - For “compress this task,” “extract its decisions,” or equivalent Capture
   intent, read [references/capture.md](references/capture.md) completely and
   follow it.
+- Route a named Capture template by its stable template ID. If the user does
+  not name one, use the default `business` template. Treat the template title
+  as display metadata, never as an alias.
 - For the same ongoing development goal, continue or steer the existing Codex
   task. Do not Capture merely because the task is long.
 - Review/Publish and Preflight/New Task are product intents, but their commands
@@ -28,7 +31,7 @@ internal command boundary.
 - Treat every extracted item as a private Candidate. It is not a formal
   Decision until a later review and exact publication confirmation.
 - Keep source task content in the source/Capture tasks. Pass only typed IDs and
-  structured extraction results to the internal boundary.
+  structured stage results to the internal boundary.
 - Keep Candidates and operation state in the user-local private store. Only
   reviewed formal Decisions may eventually enter `decision-registry/`.
 - Report unavailable, ambiguous, and zero-result states explicitly. Do not

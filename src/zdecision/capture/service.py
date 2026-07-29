@@ -1,23 +1,37 @@
-"""Deterministic Capture state transitions and extraction validation."""
+"""Deterministic two-stage Capture state transitions and validation."""
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
+from typing import Literal
 
+from zdecision.capture.inventory import (
+    InventoryResult,
+    InventoryValidationError,
+    validate_inventory,
+)
 from zdecision.capture.models import (
     Candidate,
     CandidateContent,
     CandidateSet,
     CapturePlan,
     CaptureRecord,
+    LegacyCaptureRecord,
     SourceCheckpoint,
+    StageFailure,
+    StageName,
 )
-from zdecision.capture.prompts import build_extraction_prompt
+from zdecision.capture.templates import TemplateCatalog
 from zdecision.ids import capture_operation_id
 from zdecision.jsonio import canonical_json_bytes
-from zdecision.private_store.filesystem import FilePrivateStore
+from zdecision.private_store.filesystem import (
+    FilePrivateStore,
+    PrivateStateConflict,
+)
 
 
 _MAX_CANDIDATES = 20
@@ -27,6 +41,13 @@ _CANDIDATE_FIELDS = frozenset(
     ("product", "claim", "future_action", "scope", "invalidation_conditions")
 )
 _SCOPE_FIELDS = frozenset(("summary", "repositories", "paths"))
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_FAILURE_MESSAGES = {
+    "model_refusal": "Stage model refused the request",
+    "model_timeout": "Stage model did not complete before the timeout",
+    "native_unavailable": "Required native task capability was unavailable",
+    "model_contract_violation": "Stage model violated the output contract",
+}
 
 
 class CaptureError(Exception):
@@ -56,82 +77,102 @@ class CaptureForkConflict(CaptureError):
     """Raised when a different fork is attached to an operation."""
 
 
+class CaptureTurnConflict(CaptureError):
+    """Raised when a different native Turn is attached to a stage."""
+
+
 class ExtractionValidationError(CaptureError):
-    """Raised when extractor output does not match the strict contract."""
+    """Raised when Stage 2 output does not match the strict contract."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _require_nonempty_string(value: object, field: str) -> str:
+def _invalid_extraction() -> ExtractionValidationError:
+    return ExtractionValidationError(
+        "invalid_extraction",
+        "Extraction output does not match the required schema",
+    )
+
+
+def _require_nonempty_string(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ExtractionValidationError(f"{field} must be a non-empty string")
+        raise _invalid_extraction()
     return value
 
 
-def _string_list(value: object, field: str) -> tuple[str, ...]:
+def _string_list(value: object) -> tuple[str, ...]:
     if not isinstance(value, list) or any(
         not isinstance(item, str) for item in value
     ):
-        raise ExtractionValidationError(f"{field} must be a list of strings")
+        raise _invalid_extraction()
     return tuple(value)
 
 
 def _require_exact_fields(
-    value: Mapping[str, object],
-    expected: frozenset[str],
-    name: str,
+    value: Mapping[str, object], expected: frozenset[str]
 ) -> None:
-    actual = frozenset(value)
-    if actual != expected:
-        unknown = sorted(repr(field) for field in actual - expected)
-        missing = sorted(expected - actual)
-        raise ExtractionValidationError(
-            f"Invalid {name} fields: unknown={unknown}, missing={missing}"
-        )
+    if frozenset(value) != expected:
+        raise _invalid_extraction()
+
+
+def _output_digest(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
 class CaptureService:
-    """Own the private prepare, fork attachment, and completion boundary."""
+    """Own the private prepare, native attachment, and completion boundary."""
 
-    def __init__(self, store: FilePrivateStore) -> None:
+    def __init__(self, store: FilePrivateStore, catalog: TemplateCatalog) -> None:
         self.store = store
+        self.catalog = catalog
 
     def prepare(
         self,
         source_thread_id: str,
         source_turn_id: str,
         product: str,
+        template_id: str = "business",
     ) -> CapturePlan:
+        snapshot = self.catalog.render(template_id, product)
         operation_id = capture_operation_id(
             source_thread_id,
             source_turn_id,
             product,
+            snapshot,
         )
         existing = self.store.get_capture(operation_id)
         if existing is None:
             record = CaptureRecord.started(
-                operation_id=operation_id,
-                source=SourceCheckpoint(source_thread_id, source_turn_id),
-                product=product,
+                operation_id,
+                SourceCheckpoint(source_thread_id, source_turn_id),
+                product,
+                snapshot,
             )
             self.store.put_capture(record)
             return CapturePlan(
-                record=record,
-                extraction_prompt=build_extraction_prompt(product),
-                replayed=False,
+                record,
+                snapshot.inventory_prompt,
+                snapshot.extraction_prompt,
+                False,
             )
-        if existing.status == "prepared":
-            raise CaptureForkAmbiguous(operation_id)
-        if existing.status in ("fork_attached", "completed"):
-            return CapturePlan(
-                record=existing,
-                extraction_prompt=build_extraction_prompt(existing.product),
-                replayed=True,
-            )
-        raise CaptureStateError(
-            f"Capture {operation_id} cannot be prepared from state {existing.status!r}"
+        return self._replayed_plan(existing)
+
+    def resume(self, operation_id: str) -> CapturePlan:
+        record = self._required_v2_capture(operation_id)
+        if record.inventory_sha256 is not None:
+            self._verified_inventory(record)
+        return CapturePlan(
+            record,
+            record.template.inventory_prompt,
+            record.template.extraction_prompt,
+            True,
         )
 
     def attach_fork(
@@ -139,44 +180,233 @@ class CaptureService:
         operation_id: str,
         fork_thread_id: str,
     ) -> CaptureRecord:
-        record = self._required_capture(operation_id)
-        if record.status == "prepared":
-            attached = replace(
-                record,
-                status="fork_attached",
-                fork_thread_id=fork_thread_id,
-                updated_at=_now(),
-            )
-            self.store.put_capture(attached)
-            return attached
-        if record.status in ("fork_attached", "completed"):
+        record = self._required_v2_capture(operation_id)
+        if record.fork_thread_id is not None:
             if record.fork_thread_id == fork_thread_id:
                 return record
             raise CaptureForkConflict(
                 f"Capture {operation_id} is already attached to a different fork"
             )
-        raise CaptureStateError(
-            f"Capture {operation_id} cannot attach a fork from state {record.status!r}"
+        if record.status != "prepared":
+            raise CaptureStateError(
+                f"Capture {operation_id} cannot attach a fork from state "
+                f"{record.status!r}"
+            )
+        attached = replace(
+            record,
+            status="fork_attached",
+            fork_thread_id=fork_thread_id,
+            updated_at=_now(),
         )
+        self.store.put_capture(attached)
+        return attached
 
-    def complete(
+    def attach_stage_turn(
         self,
         operation_id: str,
-        extraction: Mapping[str, object],
+        stage: StageName,
+        turn_id: str,
+    ) -> CaptureRecord:
+        record = self._required_v2_capture(operation_id)
+        if stage not in ("inventory", "extraction"):
+            raise CaptureStateError("Capture stage is invalid")
+        return self._attach_stage_turn(record, stage, turn_id)
+
+    def complete_inventory(self, operation_id: str, output: object) -> CaptureRecord:
+        return self._complete_inventory(
+            self._required_v2_capture(operation_id), output
+        )
+
+    def complete_extraction(self, operation_id: str, output: object) -> CandidateSet:
+        return self._complete_extraction(
+            self._required_v2_capture(operation_id), output
+        )
+
+    def record_invalid_json(
+        self,
+        operation_id: str,
+        stage: StageName,
+        output_sha256: str,
+    ) -> CaptureRecord:
+        return self._fail(
+            operation_id,
+            stage,
+            "invalid_json",
+            "Stage output was not valid JSON",
+            output_sha256,
+        )
+
+    def record_stage_failure(
+        self,
+        operation_id: str,
+        stage: StageName,
+        code: Literal[
+            "model_refusal",
+            "model_timeout",
+            "native_unavailable",
+            "model_contract_violation",
+        ],
+        output_sha256: str | None = None,
+    ) -> CaptureRecord:
+        if code not in _FAILURE_MESSAGES:
+            raise CaptureStateError("Capture failure code is invalid")
+        return self._fail(
+            operation_id,
+            stage,
+            code,
+            _FAILURE_MESSAGES[code],
+            output_sha256,
+        )
+
+    def get(self, operation_id: str) -> CaptureRecord | LegacyCaptureRecord:
+        return self._required_capture(operation_id)
+
+    def get_inventory(self, operation_id: str) -> InventoryResult | None:
+        record = self._required_v2_capture(operation_id)
+        return self._verified_inventory(record)
+
+    def _replayed_plan(
+        self, record: CaptureRecord | LegacyCaptureRecord
+    ) -> CapturePlan:
+        if isinstance(record, LegacyCaptureRecord):
+            raise CaptureStateError("Legacy Capture records are read-only")
+        if record.status == "prepared":
+            raise CaptureForkAmbiguous(record.operation_id)
+        if record.inventory_sha256 is not None:
+            self._verified_inventory(record)
+        return CapturePlan(
+            record,
+            record.template.inventory_prompt,
+            record.template.extraction_prompt,
+            True,
+        )
+
+    def _attach_stage_turn(
+        self,
+        record: CaptureRecord,
+        stage: StageName,
+        turn_id: str,
+    ) -> CaptureRecord:
+        existing_turn_id = (
+            record.inventory_turn_id
+            if stage == "inventory"
+            else record.extraction_turn_id
+        )
+        if existing_turn_id is not None:
+            if existing_turn_id == turn_id:
+                return record
+            raise CaptureTurnConflict(
+                f"Capture {record.operation_id} stage {stage} is already attached "
+                "to a different Turn"
+            )
+
+        required_status = (
+            "fork_attached" if stage == "inventory" else "inventory_completed"
+        )
+        if record.status != required_status:
+            raise CaptureStateError(
+                f"Capture {record.operation_id} cannot attach a {stage} Turn from "
+                f"state {record.status!r}"
+            )
+        if stage == "extraction":
+            self._verified_inventory(record)
+            updated = replace(
+                record,
+                status="extraction_running",
+                extraction_turn_id=turn_id,
+                updated_at=_now(),
+            )
+        else:
+            updated = replace(
+                record,
+                status="inventory_running",
+                inventory_turn_id=turn_id,
+                updated_at=_now(),
+            )
+        self.store.put_capture(updated)
+        return updated
+
+    def _complete_inventory(
+        self,
+        record: CaptureRecord,
+        output: object,
+    ) -> CaptureRecord:
+        if record.inventory_sha256 is not None:
+            self._verified_inventory(record)
+            return record
+        if record.status != "inventory_running":
+            raise CaptureStateError(
+                f"Capture {record.operation_id} requires a running inventory Turn"
+            )
+
+        try:
+            output_sha256 = _output_digest(output)
+        except (TypeError, ValueError):
+            output_sha256 = None
+        try:
+            inventory = validate_inventory(output)
+        except InventoryValidationError as exc:
+            self._fail_record(
+                record,
+                "inventory",
+                exc.code,
+                exc.message,
+                output_sha256,
+            )
+            raise
+
+        try:
+            self.store.put_inventory(record.operation_id, inventory)
+        except PrivateStateConflict as exc:
+            raise CaptureStateError(
+                f"Capture {record.operation_id} has conflicting inventory state"
+            ) from exc
+        completed = replace(
+            record,
+            status="inventory_completed",
+            inventory_sha256=output_sha256,
+            updated_at=_now(),
+        )
+        self.store.put_capture(completed)
+        return completed
+
+    def _complete_extraction(
+        self,
+        record: CaptureRecord,
+        output: object,
     ) -> CandidateSet:
-        record = self._required_capture(operation_id)
+        if record.inventory_sha256 is not None:
+            self._verified_inventory(record)
         if record.status == "completed":
+            assert record.extraction_sha256 is not None
             return CandidateSet(
                 operation_id=record.operation_id,
                 status="completed",
                 candidate_ids=record.candidate_ids,
+                extraction_sha256=record.extraction_sha256,
             )
-        if record.status != "fork_attached":
+        if record.status != "extraction_running":
             raise CaptureStateError(
-                f"Capture {operation_id} requires an attached fork before completion"
+                f"Capture {record.operation_id} requires a running extraction Turn"
             )
 
-        candidates = self._validated_candidates(record, extraction)
+        try:
+            output_sha256 = _output_digest(output)
+        except (TypeError, ValueError):
+            output_sha256 = None
+        try:
+            candidates = self._validated_candidates(record, output)
+        except ExtractionValidationError as exc:
+            self._fail_record(
+                record,
+                "extraction",
+                exc.code,
+                exc.message,
+                output_sha256,
+            )
+            raise
+
+        assert output_sha256 is not None
         for candidate in candidates:
             self.store.put_candidate(candidate)
 
@@ -184,90 +414,150 @@ class CaptureService:
         completed = replace(
             record,
             status="completed",
+            extraction_sha256=output_sha256,
             candidate_ids=candidate_ids,
             updated_at=_now(),
         )
         self.store.put_capture(completed)
         return CandidateSet(
-            operation_id=operation_id,
+            operation_id=record.operation_id,
             status="completed",
             candidate_ids=candidate_ids,
+            extraction_sha256=output_sha256,
         )
 
-    def get(self, operation_id: str) -> CaptureRecord:
-        return self._required_capture(operation_id)
+    def _fail(
+        self,
+        operation_id: str,
+        stage: StageName,
+        code: str,
+        message: str,
+        output_sha256: str | None,
+    ) -> CaptureRecord:
+        if stage not in ("inventory", "extraction"):
+            raise CaptureStateError("Capture stage is invalid")
+        if output_sha256 is not None and _SHA256.fullmatch(output_sha256) is None:
+            raise CaptureStateError("Capture output digest is invalid")
+        record = self._required_v2_capture(operation_id)
+        requested_failure = StageFailure(stage, code, message, output_sha256)
+        if record.status == "failed":
+            if record.failure == requested_failure:
+                return record
+            raise CaptureStateError(
+                f"Capture {operation_id} already has a different terminal failure"
+            )
 
-    def _required_capture(self, operation_id: str) -> CaptureRecord:
+        if stage == "inventory":
+            eligible = record.status in ("fork_attached", "inventory_running")
+            running = (
+                record.status == "inventory_running"
+                and record.inventory_turn_id is not None
+            )
+        else:
+            eligible = record.status in (
+                "inventory_completed",
+                "extraction_running",
+            )
+            running = (
+                record.status == "extraction_running"
+                and record.extraction_turn_id is not None
+            )
+        if not eligible or (code != "native_unavailable" and not running):
+            raise CaptureStateError(
+                f"Capture {operation_id} cannot fail stage {stage} from state "
+                f"{record.status!r}"
+            )
+        return self._fail_record(
+            record,
+            stage,
+            code,
+            message,
+            output_sha256,
+        )
+
+    def _fail_record(
+        self,
+        record: CaptureRecord,
+        stage: StageName,
+        code: str,
+        message: str,
+        output_sha256: str | None,
+    ) -> CaptureRecord:
+        failed = replace(
+            record,
+            status="failed",
+            failure=StageFailure(stage, code, message, output_sha256),
+            updated_at=_now(),
+        )
+        self.store.put_capture(failed)
+        return failed
+
+    def _required_capture(
+        self, operation_id: str
+    ) -> CaptureRecord | LegacyCaptureRecord:
         record = self.store.get_capture(operation_id)
         if record is None:
             raise CaptureNotFound(f"Capture {operation_id!r} does not exist")
         return record
 
+    def _required_v2_capture(self, operation_id: str) -> CaptureRecord:
+        record = self._required_capture(operation_id)
+        if isinstance(record, LegacyCaptureRecord):
+            raise CaptureStateError("Legacy Capture records are read-only")
+        return record
+
+    def _verified_inventory(self, record: CaptureRecord) -> InventoryResult | None:
+        if record.inventory_sha256 is None:
+            return None
+        inventory = self.store.get_inventory(record.operation_id)
+        if inventory is None:
+            raise CaptureStateError(
+                f"Capture {record.operation_id} inventory is missing from private state"
+            )
+        digest = _output_digest(inventory.to_dict())
+        if digest != record.inventory_sha256:
+            raise CaptureStateError(
+                f"Capture {record.operation_id} inventory digest does not match"
+            )
+        return inventory
+
     def _validated_candidates(
         self,
         record: CaptureRecord,
-        extraction: Mapping[str, object],
+        extraction: object,
     ) -> tuple[Candidate, ...]:
         if not isinstance(extraction, Mapping):
-            raise ExtractionValidationError("Extraction result must be an object")
-        _require_exact_fields(extraction, _RESULT_FIELDS, "extraction result")
+            raise _invalid_extraction()
+        _require_exact_fields(extraction, _RESULT_FIELDS)
         raw_candidates = extraction["candidates"]
         if not isinstance(raw_candidates, list):
-            raise ExtractionValidationError("candidates must be a list")
+            raise _invalid_extraction()
         if len(raw_candidates) > _MAX_CANDIDATES:
             raise ExtractionValidationError(
-                f"candidates must contain at most {_MAX_CANDIDATES} items"
+                "candidate_limit_exceeded",
+                "Extraction contains more than 20 Candidates",
             )
 
         validated: list[Candidate] = []
         for ordinal, raw_candidate in enumerate(raw_candidates, start=1):
             if not isinstance(raw_candidate, Mapping):
-                raise ExtractionValidationError(
-                    f"candidate {ordinal} must be an object"
-                )
-            _require_exact_fields(
-                raw_candidate,
-                _CANDIDATE_FIELDS,
-                f"candidate {ordinal}",
-            )
+                raise _invalid_extraction()
+            _require_exact_fields(raw_candidate, _CANDIDATE_FIELDS)
             scope = raw_candidate["scope"]
             if not isinstance(scope, Mapping):
-                raise ExtractionValidationError(
-                    f"candidate {ordinal}.scope must be an object"
-                )
-            _require_exact_fields(scope, _SCOPE_FIELDS, f"candidate {ordinal}.scope")
+                raise _invalid_extraction()
+            _require_exact_fields(scope, _SCOPE_FIELDS)
 
-            product = _require_nonempty_string(
-                raw_candidate["product"],
-                f"candidate {ordinal}.product",
-            )
+            product = _require_nonempty_string(raw_candidate["product"])
             if product != record.product:
-                raise ExtractionValidationError(
-                    f"candidate {ordinal}.product must match the Capture product"
-                )
-            claim = _require_nonempty_string(
-                raw_candidate["claim"],
-                f"candidate {ordinal}.claim",
-            )
-            future_action = _require_nonempty_string(
-                raw_candidate["future_action"],
-                f"candidate {ordinal}.future_action",
-            )
-            scope_summary = _require_nonempty_string(
-                scope["summary"],
-                f"candidate {ordinal}.scope.summary",
-            )
-            repositories = _string_list(
-                scope["repositories"],
-                f"candidate {ordinal}.scope.repositories",
-            )
-            paths = _string_list(
-                scope["paths"],
-                f"candidate {ordinal}.scope.paths",
-            )
+                raise _invalid_extraction()
+            claim = _require_nonempty_string(raw_candidate["claim"])
+            future_action = _require_nonempty_string(raw_candidate["future_action"])
+            scope_summary = _require_nonempty_string(scope["summary"])
+            repositories = _string_list(scope["repositories"])
+            paths = _string_list(scope["paths"])
             invalidation_conditions = _string_list(
-                raw_candidate["invalidation_conditions"],
-                f"candidate {ordinal}.invalidation_conditions",
+                raw_candidate["invalidation_conditions"]
             )
             encoded_candidate = {
                 "product": product,
@@ -280,15 +570,15 @@ class CaptureService:
                 },
                 "invalidation_conditions": list(invalidation_conditions),
             }
-            if (
-                len(canonical_json_bytes(encoded_candidate))
-                > _MAX_CANDIDATE_BYTES
-            ):
+            if len(canonical_json_bytes(encoded_candidate)) > _MAX_CANDIDATE_BYTES:
                 raise ExtractionValidationError(
-                    f"candidate {ordinal} exceeds {_MAX_CANDIDATE_BYTES} encoded bytes"
+                    "candidate_item_too_large",
+                    "A Candidate exceeds 16 KiB",
                 )
 
-            candidate_id = f"cand_{operation_id_suffix(record.operation_id)}_{ordinal:02d}"
+            candidate_id = (
+                f"cand_{operation_id_suffix(record.operation_id)}_{ordinal:02d}"
+            )
             validated.append(
                 Candidate(
                     candidate_id=candidate_id,
