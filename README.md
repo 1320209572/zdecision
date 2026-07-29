@@ -16,8 +16,13 @@ describe what you want in natural language—for example:
 V1 selects templates by stable ID. A template's title is display metadata, not
 an alias. To add one, copy a template directory, assign its stable ID, title,
 and revision, then edit its two policy files. The repository currently bundles
-the `business` template; `architecture` above is only an example of a template
-the user might install.
+the high-precision `business` revision 2 template; `architecture` above is only
+an example of a template the user might install. The bundled template keeps
+durable product choices and business boundaries, not rediscoverable API details
+or ordinary implementation correctness. Separate technical-contract templates
+can be added later for those facts. When several signals express one underlying
+product principle, `business` keeps one complete representative instead of
+publishing each implementation fragment.
 
 The authoritative V1 design is [docs/architecture.md](docs/architecture.md).
 Repository instructions for Codex are in [AGENTS.md](AGENTS.md).

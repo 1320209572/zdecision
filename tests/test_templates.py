@@ -59,7 +59,7 @@ class TemplateCatalogTests(unittest.TestCase):
         snapshot = self.catalog().render("business", "安恒")
 
         self.assertEqual("business", snapshot.template_id)
-        self.assertEqual(1, snapshot.revision)
+        self.assertEqual(2, snapshot.revision)
         self.assertEqual("业务决策压缩模板", snapshot.title)
         self.assertIn("ZDECISION_CAPTURE_ARTIFACT_V2:inventory", snapshot.inventory_prompt)
         self.assertIn("ZDECISION_CAPTURE_ARTIFACT_V2:extract", snapshot.extraction_prompt)
@@ -67,11 +67,30 @@ class TemplateCatalogTests(unittest.TestCase):
         self.assertIn("invalid_inventory", snapshot.inventory_prompt)
         self.assertNotIn("inventory_invalid", snapshot.inventory_prompt)
         self.assertIn(
-            '<decision_policy template_id="business" revision="1">',
+            '<decision_policy template_id="business" revision="2">',
             snapshot.extraction_prompt,
         )
         self.assertIn('"future_effect"', snapshot.inventory_prompt)
         self.assertIn('"candidates"', snapshot.extraction_prompt)
+
+    def test_business_extraction_policy_is_high_precision(self) -> None:
+        prompt = self.catalog().render("business", "安恒").extraction_prompt
+
+        required_rules = (
+            "经过明确取舍",
+            "不是从产品文档、接口定义或代码中可直接重新查得的普通事实",
+            "接口路径、HTTP 方法、请求头、鉴权传递方式、字段名、数据格式、枚举值、默认值、取值范围",
+            "除非它本身承载了明确确认的业务语义或兼容性取舍",
+            "把用户最终选择的值正确提交",
+            "Bug 已修复或实现已通过验证，不等于用户确认了长期决策",
+            "同一个底层产品原则",
+            "只保留其中信息最完整、边界最清楚的一条代表 signal",
+            "不得合并多个 signal 的内容或确认依据",
+            "技术契约决策模板",
+        )
+        for rule in required_rules:
+            with self.subTest(rule=rule):
+                self.assertIn(rule, prompt)
 
     def test_policy_change_changes_source_and_prompt_bundle_digests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -380,7 +399,7 @@ class TemplateCatalogTests(unittest.TestCase):
             snapshot.inventory_prompt,
         )
         self.assertNotIn(
-            '<decision_policy template_id="business" revision="1">',
+            '<decision_policy template_id="business" revision="2">',
             snapshot.inventory_prompt,
         )
 

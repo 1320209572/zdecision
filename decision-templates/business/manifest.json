@@ -1,6 +1,6 @@
 {
   "template_id": "business",
-  "revision": 1,
+  "revision": 2,
   "title": "业务决策压缩模板",
   "inventory_template": "inventory.md",
   "extraction_template": "extract.md"

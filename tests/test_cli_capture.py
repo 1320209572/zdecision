@@ -214,7 +214,7 @@ class CaptureCliTests(unittest.TestCase):
         self.assertEqual("capture.prepared", payload["kind"])
         data = payload["data"]
         self.assertEqual("business", data["template"]["template_id"])
-        self.assertEqual(1, data["template"]["revision"])
+        self.assertEqual(2, data["template"]["revision"])
         self.assertEqual("业务决策压缩模板", data["template"]["title"])
         self.assertRegex(data["template"]["content_digest"], r"^[0-9a-f]{12}$")
         self.assertIn("ZDECISION_CAPTURE_ARTIFACT_V2:inventory", data["inventory_prompt"])

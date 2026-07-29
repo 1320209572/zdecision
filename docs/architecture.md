@@ -103,10 +103,21 @@ Zero Candidates is a valid result.
 #### Decision compression templates
 
 Capture selects one versioned Decision Compression Template before creating
-native task work. The default is `business` revision 1, titled
+native task work. The default is `business` revision 2, titled
 “业务决策压缩模板.” A template contributes two editable decision-policy bodies;
 renderer-owned envelopes retain the source, privacy, product, output-contract,
 and Review boundaries.
+
+The bundled `business` extraction policy is intentionally high precision.
+Long-livedness alone does not make a fact a business decision: a retained item
+must express a confirmed, non-obvious product choice about capability boundaries,
+business ownership or flow, permissions, compatibility policy, or user-visible
+semantics. Rediscoverable API details and ordinary implementation correctness
+are excluded unless they themselves encode an explicitly confirmed business or
+compatibility choice; a future technical-contract template may retain those
+facts. If several inventory signals unfold the same underlying product principle,
+extraction keeps the single most complete representative without merging signal
+content or confirmation evidence.
 
 Capture runs exactly two Turns in one fresh Capture fork. The inventory Turn
 scans retained fork context from earliest to latest and returns typed signals
