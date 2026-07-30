@@ -144,9 +144,12 @@ logic.
 - `UserPromptSubmit` resolves the current repository, reads the local Decision
   cache, evaluates applicability locally, and returns bounded
   `additionalContext`.
-- `SessionStart` wakes the Worker and requests the asynchronous cache refresh
-  defined in section 13. It does not wait for the network; onboarding readiness,
-  not Session-start timing, is the first-prompt guarantee boundary.
+- `SessionStart` always wakes the Worker and requests the asynchronous cache
+  refresh defined in section 13. A `startup` or `resume` source performs no
+  Decision injection. A `compact` or `clear` source also opens a new local
+  context epoch and may return the bounded re-injection defined in section
+  13.5 through `additionalContext`. It never waits for the network; onboarding
+  readiness, not Session-start timing, is the first-prompt guarantee boundary.
 
 Plugin Hooks follow Codex's normal review-and-trust flow. An enterprise-managed
 deployment may later mark them trusted through managed policy.
@@ -723,26 +726,50 @@ Hook critical path.
 ### 13.5 Task Usage and injection receipts
 
 Task Usage is local-only and keyed by the Hook's stable `session_id`. It stores
-the active repository and product, mapping version, Decision version, and each
-injected `(decision_id, revision, canonical_content_digest)`. It stores no
-Prompt and never synchronizes centrally.
+the active repository and product, mapping version, Decision version, a
+monotonic `context_epoch`, a separate route epoch, and each injected
+`(context_epoch, route_epoch, decision_id, revision,
+canonical_content_digest)`. `context_epoch` starts at zero and advances only
+for `SessionStart(source=compact|clear)`; a repository or product change
+advances the route epoch. Task Usage also stores the bounded Decision-key set
+selected by the latest Prompt for the active route as `last_relevant_set`. It
+stores no Prompt and never synchronizes centrally.
 
 For each Hook Turn, a Prompt Injection Receipt stores Session and Turn IDs,
-repository and product, mapping and Decision versions, injected revision keys,
-and the final `additionalContext` digest. Task Usage and its Receipt commit in
-one SQLite transaction before Hook output. Re-delivery of the same Session and
-Turn returns the same Receipt and output.
+context and route epochs, repository and product, mapping and Decision
+versions, injected revision keys, and the final `additionalContext` digest.
+Task Usage, `last_relevant_set`, and its Receipt commit in one SQLite
+transaction before Hook output. Re-delivery of the same Session and Turn
+returns the same Receipt and output.
 
-The ranker first selects its bounded result, then removes revisions already
-injected for the current repository/product route. The same revision is never
-injected twice in one Session. A new Decision may inject once. Task Usage keeps
-the revision field for compatibility, but this experiment accepts only the
-existing V1 `revision: 1` formal schema and does not manufacture a revision-2
-fixture. A cache-version change with unchanged heads does not re-inject. A
-product or repository change starts a new route epoch. A cold Prompt writes no
-injected keys, so the next Prompt after readiness can inject. Corrupt Task
-Usage fails closed for injection, wakes repair, and lets the ordinary Prompt
-continue.
+On `UserPromptSubmit`, the ranker first selects its bounded result and persists
+those Decision keys as `last_relevant_set`, then removes revisions already
+injected in the current context and route epochs. The same revision is never
+injected twice within one such epoch pair. A new Decision may inject once.
+Task Usage keeps the revision field for compatibility, but this experiment
+accepts only the existing V1 `revision: 1` formal schema and does not
+manufacture a revision-2 fixture. A cache-version change with unchanged heads
+does not re-inject. A product or repository change starts a new route epoch.
+
+On `SessionStart(source=compact|clear)`, the Hook atomically advances
+`context_epoch`, resolves the preceding epoch's `last_relevant_set` against the
+active signed generation, and returns every still-active matching Decision
+that fits the same eight-Decision and 10,000-byte limits through
+`SessionStart.additionalContext`. It marks that set injected in the new epoch
+and stores a Context Injection Receipt containing the source, preceding and
+new epochs, cache versions, injected revision keys, and output digest before
+returning Hook output. The immediate continuation and the next Prompt
+therefore do not receive those revisions again. This path makes no model or
+network call and does not add newly published or otherwise unrelated
+Decisions; the next Prompt ranks those normally. `startup` and `resume` do not
+advance the context epoch or re-inject.
+
+The existing cache-state policy applies equally to both Hook paths: `stale`
+may inject with stale status, while `cold`, `warming`, `expired`, `invalid`,
+and `unauthorized` inject nothing. A cold Prompt writes neither injected keys
+nor `last_relevant_set`, so the next Prompt after readiness can inject.
+Corrupt Task Usage fails closed for injection, wakes repair, and lets ordinary
+Codex work continue.
 
 ## 14. Failure behavior
 
@@ -883,14 +910,21 @@ synchronize a Decision cache. It must cover:
 8. a warming Prompt returns within 200 ms, injects nothing, does not record
    `no_applicable`, and can inject on the next Prompt after readiness;
 9. fixed English and Chinese Prompts rank the expected downloaded Decision;
-10. the second Prompt in one Session does not re-inject the same revision;
-11. a newly published Decision ID injects once, while a cache-version-only
+10. the second Prompt in the same Session and context epoch does not re-inject
+    the same revision;
+11. after item 10, `SessionStart(source=compact)` advances exactly one context
+    epoch and re-injects the preceding relevant set once through
+    `additionalContext`; neither the immediate continuation nor the next
+    Prompt repeats it;
+12. `SessionStart(source=clear)` follows the same new-epoch rule, while
+    `startup` and `resume` neither advance the context epoch nor re-inject;
+13. a newly published Decision ID injects once, while a cache-version-only
     change with unchanged Decision heads does not;
-12. a repository/product change starts a new route epoch and injects that
+14. a repository/product change starts a new route epoch and injects that
     product once;
-13. re-delivery of one Hook Turn returns the same Prompt Injection Receipt;
-14. a new Session can receive the same relevant Decision again; and
-15. central request logs prove that synchronization never contains the user's
+15. re-delivery of one Hook Turn returns the same Prompt Injection Receipt;
+16. a new Session can receive the same relevant Decision again; and
+17. central request logs prove that synchronization never contains the user's
     Prompt.
 
 Pass also requires steady-state injection p95 of at most 200 ms, complete
@@ -899,7 +933,27 @@ Decision IDs/revisions in context, and no filler context for a genuine
 
 ### Gate 9: Real end-to-end acceptance
 
-Use one centrally registered test repository and three Sessions:
+First pass a required zero-touch completion scenario in one fresh Session:
+
+1. The user asks for an ordinary development change in a registered repository
+   without mentioning ZDecision, decision compression, Capture, or manual
+   submission.
+2. Codex completes that feature and its required validation successfully in
+   the same Session.
+3. Without another user instruction, the installed Skill causes Codex to call
+   `report_work_state(milestone_complete)` with the successful validation fact;
+   the test harness observes but does not inject or simulate that call.
+4. The resulting eligible Capture produces a validated, reconciled Candidate
+   that reaches the central Review Inbox automatically.
+
+Failure to observe a stable automatic `report_work_state` call fails this Gate;
+the scenario may not be rescued by a manual submit or a test-only signal. Only
+after that measured failure may the design add one deterministic readiness
+fallback derived from the observed failure mode. This feasibility
+specification does not prebuild such a fallback.
+
+Then use one centrally registered test repository and three Sessions for the
+broader loop:
 
 1. Plugin authorization and onboarding reach a naturally downloaded `fresh`
    cache with no test seed.
