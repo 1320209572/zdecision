@@ -1,6 +1,6 @@
 # ZDecision On-Demand Candidate Refresh Design
 
-**Status:** Awaiting final written-spec review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Pre-Demo technical loop for the installable Codex Plugin.
 
