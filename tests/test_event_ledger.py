@@ -98,6 +98,7 @@ class EventLedgerTests(unittest.TestCase):
             database=self.database,
             clock=lambda: FIXED_TIME,
             repository_resolver=self.repository_resolver,
+            worker_waker=lambda _: None,
         )
 
     def test_all_five_hook_kinds_record_only_allowlisted_facts(self) -> None:
@@ -164,6 +165,7 @@ class EventLedgerTests(unittest.TestCase):
             database=self.database,
             clock=lambda: datetime(2026, 7, 30, 10, 30, tzinfo=UTC),
             repository_resolver=self.repository_resolver,
+            worker_waker=lambda _: None,
         )
 
         self.assertEqual(first.event_id, second.event_id)

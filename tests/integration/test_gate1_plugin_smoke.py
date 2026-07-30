@@ -28,6 +28,7 @@ class Gate1PluginSmokeTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("test-repository", result.stdout)
+        self.assertIn("worker", result.stdout)
 
 
 if __name__ == "__main__":

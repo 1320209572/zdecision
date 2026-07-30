@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from zdecision.agent.events import (
@@ -20,6 +22,16 @@ from zdecision.jsonio import canonical_json_bytes
 
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
+_FAILURE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True)
+class SessionLease:
+    session_id: str
+    cwd: str
+    renewed_at: datetime
+    expires_at: datetime
+    ended_at: datetime | None
 
 
 class AgentEventConflict(Exception):
@@ -62,7 +74,10 @@ class AgentDatabase:
                         state IN ('recorded','processing','consumed','deferred',
                                   'failed_retryable','failed_terminal')
                     ),
-                    failure_code TEXT
+                    failure_code TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    processing_expires_at TEXT,
+                    retry_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS feasibility_repository_mappings (
@@ -76,7 +91,58 @@ class AgentDatabase:
                     ON events(session_id);
                 CREATE INDEX IF NOT EXISTS events_cwd
                     ON events(cwd);
-                PRAGMA user_version = 1;
+                """
+            )
+            event_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "attempt_count" not in event_columns:
+                connection.execute(
+                    "ALTER TABLE events ADD COLUMN "
+                    "attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "processing_expires_at" not in event_columns:
+                connection.execute(
+                    "ALTER TABLE events ADD COLUMN processing_expires_at TEXT"
+                )
+            if "retry_at" not in event_columns:
+                connection.execute("ALTER TABLE events ADD COLUMN retry_at TEXT")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS session_leases (
+                    session_id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    renewed_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    ended_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_state (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    owner_pid INTEGER,
+                    lease_expires_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS sync_probe (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    cursor INTEGER NOT NULL,
+                    updated_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS events_work_queue
+                    ON events(state, retry_at, processing_expires_at);
+
+                INSERT INTO worker_state (
+                    singleton_id, owner_pid, lease_expires_at
+                ) VALUES (1, NULL, NULL)
+                ON CONFLICT(singleton_id) DO NOTHING;
+
+                INSERT INTO sync_probe (singleton_id, cursor, updated_at)
+                VALUES (1, 0, NULL)
+                ON CONFLICT(singleton_id) DO NOTHING;
+
+                PRAGMA user_version = 2;
                 """
             )
         return cls(database_path, connection)
@@ -214,6 +280,302 @@ class AgentDatabase:
             ).fetchone()
         return int(row["count"])
 
+    def renew_session(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        renewed_at: datetime,
+        expires_at: datetime,
+        create: bool,
+    ) -> bool:
+        renewed = _format_datetime(renewed_at)
+        expires = _format_datetime(expires_at)
+        if expires_at <= renewed_at:
+            raise ValueError("Session lease expiry must follow renewal")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is invalid")
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise ValueError("cwd is invalid")
+        if not isinstance(create, bool):
+            raise TypeError("create must be a boolean")
+        with self._connection:
+            if create:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO session_leases (
+                        session_id, cwd, renewed_at, expires_at, ended_at
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        cwd = excluded.cwd,
+                        renewed_at = excluded.renewed_at,
+                        expires_at = excluded.expires_at,
+                        ended_at = NULL
+                    """,
+                    (session_id, cwd, renewed, expires),
+                )
+            else:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE session_leases
+                    SET cwd = ?, renewed_at = ?, expires_at = ?
+                    WHERE session_id = ? AND ended_at IS NULL
+                    """,
+                    (cwd, renewed, expires, session_id),
+                )
+        return cursor.rowcount > 0
+
+    def end_session(self, session_id: str, *, ended_at: datetime) -> bool:
+        ended = _format_datetime(ended_at)
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE session_leases
+                SET ended_at = ?, expires_at = ?
+                WHERE session_id = ? AND ended_at IS NULL
+                """,
+                (ended, ended, session_id),
+            )
+        return cursor.rowcount > 0
+
+    def active_session_leases(self, now: datetime) -> tuple[SessionLease, ...]:
+        current = _format_datetime(now)
+        rows = self._connection.execute(
+            """
+            SELECT session_id, cwd, renewed_at, expires_at, ended_at
+            FROM session_leases
+            WHERE ended_at IS NULL AND expires_at > ?
+            ORDER BY session_id
+            """,
+            (current,),
+        ).fetchall()
+        return tuple(
+            SessionLease(
+                session_id=row["session_id"],
+                cwd=row["cwd"],
+                renewed_at=_parse_datetime(row["renewed_at"]),
+                expires_at=_parse_datetime(row["expires_at"]),
+                ended_at=(
+                    None
+                    if row["ended_at"] is None
+                    else _parse_datetime(row["ended_at"])
+                ),
+            )
+            for row in rows
+        )
+
+    def claim_events(
+        self,
+        now: datetime,
+        *,
+        limit: int,
+        processing_lease_seconds: float,
+    ) -> tuple[AgentEvent, ...]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("claim limit must be positive")
+        if processing_lease_seconds <= 0:
+            raise ValueError("processing lease must be positive")
+        current = _format_datetime(now)
+        expires = _format_datetime(
+            now + timedelta(seconds=processing_lease_seconds)
+        )
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            rows = cursor.execute(
+                """
+                SELECT event_id
+                FROM events
+                WHERE state = 'recorded'
+                   OR (
+                       state = 'failed_retryable'
+                       AND retry_at IS NOT NULL
+                       AND retry_at <= ?
+                   )
+                ORDER BY rowid
+                LIMIT ?
+                """,
+                (current, limit),
+            ).fetchall()
+            event_ids = tuple(row["event_id"] for row in rows)
+            if event_ids:
+                placeholders = ",".join("?" for _ in event_ids)
+                cursor.execute(
+                    f"""
+                    UPDATE events
+                    SET state = 'processing',
+                        failure_code = NULL,
+                        attempt_count = attempt_count + 1,
+                        processing_expires_at = ?,
+                        retry_at = NULL
+                    WHERE event_id IN ({placeholders})
+                    """,
+                    (expires, *event_ids),
+                )
+                claimed_rows = cursor.execute(
+                    f"""
+                    SELECT * FROM events
+                    WHERE event_id IN ({placeholders})
+                    ORDER BY rowid
+                    """,
+                    event_ids,
+                ).fetchall()
+            else:
+                claimed_rows = []
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        finally:
+            cursor.close()
+        return tuple(self._event_from_row(row) for row in claimed_rows)
+
+    def consume_event(self, event_id: str) -> bool:
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE events
+                SET state = 'consumed',
+                    failure_code = NULL,
+                    processing_expires_at = NULL,
+                    retry_at = NULL
+                WHERE event_id = ? AND state = 'processing'
+                """,
+                (event_id,),
+            )
+        return cursor.rowcount == 1
+
+    def fail_event(
+        self,
+        event_id: str,
+        *,
+        failure_code: str,
+        retry_at: datetime | None,
+        terminal: bool = False,
+    ) -> bool:
+        if _FAILURE_CODE.fullmatch(failure_code) is None:
+            raise ValueError("failure_code is invalid")
+        if not isinstance(terminal, bool):
+            raise TypeError("terminal must be a boolean")
+        if not terminal and retry_at is None:
+            raise ValueError("retryable failures require retry_at")
+        retry = None if retry_at is None else _format_datetime(retry_at)
+        state = "failed_terminal" if terminal else "failed_retryable"
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE events
+                SET state = ?, failure_code = ?,
+                    processing_expires_at = NULL, retry_at = ?
+                WHERE event_id = ? AND state = 'processing'
+                """,
+                (state, failure_code, retry, event_id),
+            )
+        return cursor.rowcount == 1
+
+    def requeue_expired_claims(self, now: datetime) -> int:
+        current = _format_datetime(now)
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE events
+                SET state = 'failed_retryable',
+                    failure_code = 'processing_lease_expired',
+                    processing_expires_at = NULL,
+                    retry_at = ?
+                WHERE state = 'processing'
+                  AND processing_expires_at IS NOT NULL
+                  AND processing_expires_at <= ?
+                """,
+                (current, current),
+            )
+        return cursor.rowcount
+
+    def pending_event_count(self) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM events
+            WHERE state IN ('recorded', 'processing', 'failed_retryable')
+            """
+        ).fetchone()
+        return int(row["count"])
+
+    def next_event_due_at(self, now: datetime) -> datetime | None:
+        if self._connection.execute(
+            "SELECT 1 FROM events WHERE state = 'recorded' LIMIT 1"
+        ).fetchone() is not None:
+            return now
+        row = self._connection.execute(
+            """
+            SELECT MIN(due_at) AS due_at
+            FROM (
+                SELECT processing_expires_at AS due_at
+                FROM events WHERE state = 'processing'
+                UNION ALL
+                SELECT retry_at AS due_at
+                FROM events WHERE state = 'failed_retryable'
+            )
+            WHERE due_at IS NOT NULL
+            """
+        ).fetchone()
+        return None if row["due_at"] is None else _parse_datetime(row["due_at"])
+
+    def sync_probe(self) -> tuple[int, datetime | None]:
+        row = self._connection.execute(
+            "SELECT cursor, updated_at FROM sync_probe WHERE singleton_id = 1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Sync probe row is missing")
+        return (
+            int(row["cursor"]),
+            None if row["updated_at"] is None else _parse_datetime(row["updated_at"]),
+        )
+
+    def update_sync_probe(
+        self,
+        *,
+        expected_cursor: int,
+        new_cursor: int,
+        updated_at: datetime,
+    ) -> int:
+        if not isinstance(new_cursor, int) or isinstance(new_cursor, bool):
+            raise ValueError("Sync cursor must be an integer")
+        if new_cursor < expected_cursor:
+            raise ValueError("Sync cursor cannot move backwards")
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE sync_probe SET cursor = ?, updated_at = ?
+                WHERE singleton_id = 1 AND cursor = ?
+                """,
+                (new_cursor, _format_datetime(updated_at), expected_cursor),
+            )
+        if cursor.rowcount == 0:
+            return self.sync_probe()[0]
+        return new_cursor
+
+    def set_worker_owner(self, owner_pid: int, *, lease_expires_at: datetime) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE worker_state
+                SET owner_pid = ?, lease_expires_at = ?
+                WHERE singleton_id = 1
+                """,
+                (owner_pid, _format_datetime(lease_expires_at)),
+            )
+
+    def clear_worker_owner(self, owner_pid: int) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE worker_state
+                SET owner_pid = NULL, lease_expires_at = NULL
+                WHERE singleton_id = 1 AND owner_pid = ?
+                """,
+                (owner_pid,),
+            )
+
     def close(self) -> None:
         self._connection.close()
 
@@ -268,7 +630,7 @@ class AgentDatabase:
         cls, row: sqlite3.Row, incoming: tuple[object, ...]
     ) -> bool:
         stored = cls._row_canonical_values(row)
-        return stored[:2] == incoming[:2] and stored[3:] == incoming[3:]
+        return stored[:2] == incoming[:2] and stored[3:12] == incoming[3:12]
 
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> AgentEvent:
@@ -302,3 +664,25 @@ class AgentDatabase:
             state=state,
             failure_code=row["failure_code"],
         )
+
+
+def _format_datetime(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware")
+    return (
+        value.astimezone(UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_datetime(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("Stored datetime is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("Stored datetime is invalid") from None
+    if parsed.tzinfo is None:
+        raise ValueError("Stored datetime is invalid")
+    return parsed.astimezone(UTC)

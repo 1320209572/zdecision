@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("hook", help="record one Codex Hook JSON object from stdin")
     subparsers.add_parser("mcp", help="serve the local ZDecision MCP tools over stdio")
+    subparsers.add_parser("worker", help="run the singleton local Agent worker")
     subparsers.add_parser("status", help="show bounded local Agent status")
 
     repository = subparsers.add_parser(
@@ -51,6 +52,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     database = AgentDatabase.open(state_path)
     try:
+        if arguments.command == "worker":
+            from zdecision.agent.worker import (
+                LocalEventProcessor,
+                ProbeSyncPoller,
+                Worker,
+            )
+
+            Worker(
+                database=database,
+                processor=LocalEventProcessor(),
+                sync_poller=ProbeSyncPoller(),
+                lock_path=state_path.parent / "worker.lock",
+            ).run_until_idle()
+            return 0
         if arguments.command == "hook":
             raw = sys.stdin.buffer.read()
             response = handle_hook(
