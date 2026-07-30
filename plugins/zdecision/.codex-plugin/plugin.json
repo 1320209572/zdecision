@@ -1,0 +1,21 @@
+{
+  "name": "zdecision",
+  "version": "0.1.0",
+  "description": "Automatically capture, review, and recall formal decisions",
+  "author": {
+    "name": "ZDecision"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ZDecision",
+    "shortDescription": "Capture and recall reviewed decisions",
+    "longDescription": "Automatically captures decision candidates locally and recalls only reviewed formal decisions.",
+    "developerName": "ZDecision",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "defaultPrompt": [
+      "Show the ZDecision status for this repository."
+    ]
+  }
+}

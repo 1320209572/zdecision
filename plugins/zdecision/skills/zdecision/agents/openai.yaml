@@ -1,0 +1,6 @@
+interface:
+  display_name: "ZDecision"
+  short_description: "Capture and recall reviewed decisions"
+  default_prompt: "Show the ZDecision status for this repository."
+policy:
+  allow_implicit_invocation: true

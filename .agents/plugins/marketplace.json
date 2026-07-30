@@ -1,0 +1,20 @@
+{
+  "name": "zdecision-local",
+  "interface": {
+    "displayName": "ZDecision Local"
+  },
+  "plugins": [
+    {
+      "name": "zdecision",
+      "source": {
+        "source": "local",
+        "path": "./plugins/zdecision"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

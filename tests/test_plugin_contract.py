@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import json
+import tomllib
+import unittest
+from pathlib import Path
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision"
+MARKETPLACE_PATH = REPOSITORY_ROOT / ".agents" / "plugins" / "marketplace.json"
+EXPECTED_HOOKS = {
+    "SessionStart",
+    "UserPromptSubmit",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+}
+
+
+def load_json(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise AssertionError(f"missing required plugin file: {path}")
+    with path.open("rb") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise AssertionError(f"{path} must contain a JSON object")
+    return value
+
+
+class PluginContractTests(unittest.TestCase):
+    def test_repository_marketplace_exposes_one_available_plugin(self) -> None:
+        marketplace = load_json(MARKETPLACE_PATH)
+
+        self.assertEqual("zdecision-local", marketplace["name"])
+        self.assertEqual(
+            {"displayName": "ZDecision Local"}, marketplace["interface"]
+        )
+        self.assertEqual(1, len(marketplace["plugins"]))
+        plugin = marketplace["plugins"][0]
+        self.assertEqual("zdecision", plugin["name"])
+        self.assertEqual(
+            {"source": "local", "path": "./plugins/zdecision"},
+            plugin["source"],
+        )
+        self.assertEqual(
+            {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+            plugin["policy"],
+        )
+        self.assertEqual("Productivity", plugin["category"])
+
+    def test_manifest_points_only_to_bundled_components(self) -> None:
+        manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
+
+        self.assertEqual("zdecision", manifest["name"])
+        self.assertEqual("0.1.0", manifest["version"])
+        self.assertEqual("./skills/", manifest["skills"])
+        self.assertEqual("./.mcp.json", manifest["mcpServers"])
+        self.assertNotIn("hooks", manifest)
+        self.assertTrue((PLUGIN_ROOT / "hooks" / "hooks.json").is_file())
+        self.assertFalse((PLUGIN_ROOT / "AGENTS.md").exists())
+
+    def test_bundled_mcp_invokes_the_lazy_local_agent_entrypoint(self) -> None:
+        document = load_json(PLUGIN_ROOT / ".mcp.json")
+
+        self.assertEqual({"mcpServers"}, set(document))
+        servers = document["mcpServers"]
+        self.assertEqual({"zdecision-local"}, set(servers))
+        self.assertEqual("zdecision-agent", servers["zdecision-local"]["command"])
+        self.assertEqual(["mcp"], servers["zdecision-local"]["args"])
+
+    def test_plugin_registers_exactly_the_five_lifecycle_hooks(self) -> None:
+        document = load_json(PLUGIN_ROOT / "hooks" / "hooks.json")
+        hooks = document["hooks"]
+
+        self.assertEqual(EXPECTED_HOOKS, set(hooks))
+        for event_name, matcher_groups in hooks.items():
+            with self.subTest(event_name=event_name):
+                self.assertEqual(1, len(matcher_groups))
+                handlers = matcher_groups[0]["hooks"]
+                self.assertEqual(1, len(handlers))
+                handler = handlers[0]
+                self.assertEqual("command", handler["type"])
+                self.assertEqual("zdecision-agent hook", handler["command"])
+                if event_name in {"SessionStart", "UserPromptSubmit"}:
+                    self.assertEqual(4000, handler["additionalContextLimit"])
+                else:
+                    self.assertNotIn("additionalContextLimit", handler)
+        self.assertLessEqual(
+            hooks["SessionEnd"][0]["hooks"][0]["timeout"], 3
+        )
+
+    def test_plugin_skill_describes_automatic_status_and_manual_fallback(self) -> None:
+        skill_path = PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
+        self.assertTrue(skill_path.is_file(), f"missing plugin skill: {skill_path}")
+        text = skill_path.read_text("utf-8")
+
+        self.assertTrue(text.startswith("---\nname: zdecision\n"))
+        self.assertIn("report_work_state", text)
+        self.assertIn("zdecision_status", text)
+        self.assertIn("submit_current_boundary", text)
+        self.assertIn("automatic", text.lower())
+        self.assertNotIn("AGENTS.md", text)
+
+    def test_project_installs_agent_entrypoint_and_bounded_mcp_sdk(self) -> None:
+        with (REPOSITORY_ROOT / "pyproject.toml").open("rb") as stream:
+            project = tomllib.load(stream)["project"]
+
+        self.assertIn("mcp>=1.28,<2", project["dependencies"])
+        self.assertEqual(
+            "zdecision.agent.cli:main", project["scripts"]["zdecision-agent"]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

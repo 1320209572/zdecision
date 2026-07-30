@@ -3,10 +3,11 @@ name = "zdecision"
 version = "0.1.0"
 description = "Codex-native reviewed decision memory"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["mcp>=1.28,<2"]
 
 [project.scripts]
 zdecision = "zdecision.cli:main"
+zdecision-agent = "zdecision.agent.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

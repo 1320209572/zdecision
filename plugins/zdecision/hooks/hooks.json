@@ -1,0 +1,64 @@
+{
+  "description": "Record bounded ZDecision lifecycle facts for enabled repositories.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3,
+            "additionalContextLimit": 4000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3,
+            "additionalContextLimit": 4000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
