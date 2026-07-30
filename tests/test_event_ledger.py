@@ -229,6 +229,50 @@ class EventLedgerTests(unittest.TestCase):
             self.database.latest_open_boundary(str(self.repository)),
         )
 
+    def test_resumed_session_reopens_local_mcp_turn_binding(self) -> None:
+        self._handle(
+            self._raw(
+                "UserPromptSubmit",
+                turn_id="turn_before_end",
+                session_id="thr_resumed",
+            )
+        )
+        self._handle(
+            self._raw("SessionEnd", session_id="thr_resumed", reason="other")
+        )
+        self.assertIsNone(self.database.latest_open_boundary(str(self.repository)))
+
+        self._handle(
+            self._raw("SessionStart", session_id="thr_resumed", source="resume")
+        )
+        self._handle(
+            self._raw(
+                "UserPromptSubmit",
+                turn_id="turn_after_resume",
+                session_id="thr_resumed",
+            )
+        )
+        tools = LocalMcpTools(
+            database=self.database,
+            cwd=str(self.repository),
+            clock=lambda: FIXED_TIME,
+        )
+
+        report = tools.report_work_state(
+            status="milestone_complete",
+            validation="passed",
+            unresolved_blockers=[],
+        )
+
+        self.assertEqual(
+            {
+                "ok": True,
+                "session_id": "thr_resumed",
+                "turn_id": "turn_after_resume",
+            },
+            report,
+        )
+
     def test_local_mcp_tools_bind_one_turn_without_storing_blocker_text(self) -> None:
         self._handle(self._raw("SessionStart", session_id="thr_tools", source="startup"))
         self._handle(

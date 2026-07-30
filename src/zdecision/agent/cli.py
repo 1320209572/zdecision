@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("mcp", help="serve the local ZDecision MCP tools over stdio")
     subparsers.add_parser("worker", help="run the singleton local Agent worker")
     subparsers.add_parser("status", help="show bounded local Agent status")
+    gate3 = subparsers.add_parser(
+        "gate3", help="run the diagnostic app-server Capture acceptance"
+    )
+    gate3.add_argument("--session-id", required=True)
+    gate3.add_argument("--turn-id", required=True)
 
     repository = subparsers.add_parser(
         "test-repository",
@@ -83,6 +88,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             sys.stdout.buffer.write(canonical_json_bytes(tools.zdecision_status()))
             return 0
+        if arguments.command == "gate3":
+            return _run_gate3(arguments, database, state_path)
         return _configure_test_repository(arguments, database)
     finally:
         database.close()
@@ -131,6 +138,100 @@ def _configure_test_repository(
 
 def _write_error(code: str) -> None:
     sys.stderr.buffer.write(canonical_json_bytes({"error": code}))
+
+
+def _run_gate3(
+    arguments: argparse.Namespace,
+    database: AgentDatabase,
+    state_path: Path,
+) -> int:
+    from zdecision.app_server.capture_runner import (
+        AutomatedCaptureError,
+        AutomatedCaptureRunner,
+    )
+    from zdecision.app_server.gateway import AppServerGateway, AppServerGatewayError
+    from zdecision.app_server.jsonl import AppServerError
+    from zdecision.capture.service import CaptureService
+    from zdecision.capture.templates import TemplateCatalog
+    from zdecision.private_store.filesystem import FilePrivateStore
+
+    package_root = Path(__file__).resolve().parents[1]
+    repository_root = package_root.parents[1]
+    store = FilePrivateStore(state_path.parents[1])
+    catalog = TemplateCatalog(
+        repository_root / "decision-templates",
+        package_root / "capture" / "prompt_contracts",
+    )
+    gateway: AppServerGateway | None = None
+    route = "replay"
+    try:
+        existing_id = database.automated_capture_id_for_boundary(
+            arguments.session_id, arguments.turn_id
+        )
+        if existing_id is None:
+            gateway = AppServerGateway.connect(database=database)
+            route = gateway.route
+        result = AutomatedCaptureRunner(
+            gateway=gateway,
+            database=database,
+            capture_service=CaptureService(store, catalog),
+            clock=lambda: datetime.now(UTC),
+        ).run(arguments.session_id, arguments.turn_id)
+    except (
+        AppServerError,
+        AutomatedCaptureError,
+        AppServerGatewayError,
+        OSError,
+        ValueError,
+    ):
+        _write_error("gate3_failed")
+        return 1
+    finally:
+        if gateway is not None:
+            gateway.close()
+    run = database.get_automated_capture_run(result.automated_capture_id)
+    profile = database.get_feasibility_model_profile()
+    assessment_record = database.get_boundary_assessment(
+        result.automated_capture_id
+    )
+    if run is None or profile is None or assessment_record is None:
+        _write_error("gate3_receipt_missing")
+        return 1
+    sys.stdout.buffer.write(
+        canonical_json_bytes(
+            {
+                "assessment": {
+                    "blocker_count": len(result.assessment.unresolved_blockers),
+                    "durable_decision_signal": (
+                        result.assessment.has_durable_decision_signal
+                    ),
+                    "phase": result.assessment.phase,
+                    "validation": result.assessment.validation,
+                },
+                "assessment_thread_id": run.assessment_thread_id,
+                "assessment_turn_id": result.assessment_turn_id,
+                "automated_capture_id": result.automated_capture_id,
+                "candidate_count": len(result.candidate_ids),
+                "capture_operation_id": result.capture_operation_id,
+                "capture_thread_id": result.capture_thread_id,
+                "eligibility_input_digest": assessment_record.input_fact_digest,
+                "eligibility_prompt_digest": assessment_record.prompt_digest,
+                "extraction_turn_id": result.extraction_turn_id,
+                "inventory_turn_id": result.inventory_turn_id,
+                "model": {
+                    "discovery_digest": profile.discovery_digest,
+                    "model_id": profile.model_id,
+                    "profile_id": profile.profile_id,
+                    "reasoning_effort": profile.reasoning_effort,
+                },
+                "route": route,
+                "source_thread_id": result.source_thread_id,
+                "source_turn_id": result.source_turn_id,
+                "state": run.state,
+            }
+        )
+    )
+    return 0
 
 
 if __name__ == "__main__":
