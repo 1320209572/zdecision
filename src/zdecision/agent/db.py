@@ -23,6 +23,8 @@ from zdecision.jsonio import canonical_json_bytes
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _FAILURE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_MODEL_PROFILE_ID = re.compile(r"^fmp_[0-9a-f]{32}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -34,8 +36,28 @@ class SessionLease:
     ended_at: datetime | None
 
 
+@dataclass(frozen=True)
+class StoredFeasibilityModelProfile:
+    profile_id: str
+    model_id: str
+    reasoning_effort: str
+    discovery_digest: str
+    discovered_at: str
+
+
+@dataclass(frozen=True)
+class AppServerRouteRecord:
+    route: str
+    failure_code: str | None
+    recorded_at: datetime
+
+
 class AgentEventConflict(Exception):
     """Raised when one event identity is replayed with different content."""
+
+
+class FeasibilityModelProfileConflict(Exception):
+    """Raised when model discovery changes after the feasibility profile freezes."""
 
 
 class AgentDatabase:
@@ -130,6 +152,22 @@ class AgentDatabase:
                     updated_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS feasibility_model_profile (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    profile_id TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL,
+                    discovery_digest TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS app_server_route_events (
+                    route_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    route TEXT NOT NULL,
+                    failure_code TEXT,
+                    recorded_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS events_work_queue
                     ON events(state, retry_at, processing_expires_at);
 
@@ -142,7 +180,7 @@ class AgentDatabase:
                 VALUES (1, 0, NULL)
                 ON CONFLICT(singleton_id) DO NOTHING;
 
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
                 """
             )
         return cls(database_path, connection)
@@ -553,6 +591,107 @@ class AgentDatabase:
         if cursor.rowcount == 0:
             return self.sync_probe()[0]
         return new_cursor
+
+    def get_feasibility_model_profile(
+        self,
+    ) -> StoredFeasibilityModelProfile | None:
+        row = self._connection.execute(
+            """
+            SELECT profile_id, model_id, reasoning_effort,
+                   discovery_digest, discovered_at
+            FROM feasibility_model_profile WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return StoredFeasibilityModelProfile(
+            profile_id=row["profile_id"],
+            model_id=row["model_id"],
+            reasoning_effort=row["reasoning_effort"],
+            discovery_digest=row["discovery_digest"],
+            discovered_at=row["discovered_at"],
+        )
+
+    def freeze_feasibility_model_profile(
+        self,
+        *,
+        profile_id: str,
+        model_id: str,
+        reasoning_effort: str,
+        discovery_digest: str,
+        discovered_at: str,
+    ) -> StoredFeasibilityModelProfile:
+        if _MODEL_PROFILE_ID.fullmatch(profile_id) is None:
+            raise ValueError("profile_id is invalid")
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError("model_id is invalid")
+        if not isinstance(reasoning_effort, str) or not reasoning_effort:
+            raise ValueError("reasoning_effort is invalid")
+        if _DIGEST.fullmatch(discovery_digest) is None:
+            raise ValueError("discovery_digest is invalid")
+        _parse_datetime(discovered_at)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO feasibility_model_profile (
+                    singleton_id, profile_id, model_id, reasoning_effort,
+                    discovery_digest, discovered_at
+                ) VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO NOTHING
+                """,
+                (
+                    profile_id,
+                    model_id,
+                    reasoning_effort,
+                    discovery_digest,
+                    discovered_at,
+                ),
+            )
+        stored = self.get_feasibility_model_profile()
+        if stored is None:
+            raise RuntimeError("Frozen model profile could not be read back")
+        if stored.discovery_digest != discovery_digest:
+            raise FeasibilityModelProfileConflict(
+                "Model discovery changed after the feasibility profile froze"
+            )
+        return stored
+
+    def record_app_server_route(
+        self,
+        *,
+        route: str,
+        failure_code: str | None,
+        recorded_at: datetime,
+    ) -> None:
+        if route not in {"host", "controlled_process"}:
+            raise ValueError("app-server route is invalid")
+        if failure_code is not None and _FAILURE_CODE.fullmatch(failure_code) is None:
+            raise ValueError("failure_code is invalid")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO app_server_route_events (
+                    route, failure_code, recorded_at
+                ) VALUES (?, ?, ?)
+                """,
+                (route, failure_code, _format_datetime(recorded_at)),
+            )
+
+    def list_app_server_route_events(self) -> tuple[AppServerRouteRecord, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT route, failure_code, recorded_at
+            FROM app_server_route_events ORDER BY route_event_id
+            """
+        ).fetchall()
+        return tuple(
+            AppServerRouteRecord(
+                route=row["route"],
+                failure_code=row["failure_code"],
+                recorded_at=_parse_datetime(row["recorded_at"]),
+            )
+            for row in rows
+        )
 
     def set_worker_owner(self, owner_pid: int, *, lease_expires_at: datetime) -> None:
         with self._connection:
