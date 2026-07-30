@@ -1,5 +1,9 @@
 # ZDecision Plugin Runtime and App-Server Implementation Plan
 
+> **Superseded:** Do not continue this plan. Its automatic eligibility and
+> `report_work_state` path has been replaced by the page-triggered design in
+> `../specs/2026-07-30-on-demand-candidate-refresh-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use

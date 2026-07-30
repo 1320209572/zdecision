@@ -1,5 +1,10 @@
 # ZDecision Plugin Feasibility Implementation Roadmap
 
+> **Superseded:** Do not continue this roadmap. The accepted page-triggered
+> architecture is specified in
+> `../specs/2026-07-30-on-demand-candidate-refresh-design.md`. A new plan will
+> be written only after that specification receives final written review.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement each detailed plan task-by-task.

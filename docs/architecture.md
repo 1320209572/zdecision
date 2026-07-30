@@ -1,4 +1,14 @@
-# ZDecision V1 architecture
+# ZDecision architecture
+
+This document is the product architecture authority. Sections 1 through 11
+define the proven manual V1 domain and its safety contracts. The current
+Plugin product direction is the on-demand extension in section 12, with the
+detailed approved-for-review contract in
+`docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md`.
+
+Where the historical manual interaction and the Plugin interaction differ,
+section 12 governs new product implementation. Existing Capture, Review,
+publication, Registry, and Decision-use invariants remain in force.
 
 ## 1. Goal
 
@@ -485,3 +495,56 @@ generic behavior is needed later—canonical JSON, safe Git argument handling, o
 app-server pagination—it is reimplemented and tested under the new component
 that owns it. No legacy module, test fixture, Skill, or schema is retained merely
 as reference.
+
+This legacy rule does not prohibit licensed third-party reuse. A current
+third-party implementation may be copied or adapted only when it fits the
+owning component, has a bounded dependency closure, retains required
+attribution, and passes ZDecision's stricter privacy and durability tests.
+
+## 12. Plugin on-demand Candidate refresh
+
+The first Plugin loop replaces manual Session selection with one page action:
+
+```text
+Plugin observes enabled repositories locally
+  -> user clicks 更新候选决策 for a repository
+  -> central service creates a durable Capture Request
+  -> persistent local Agent claims it
+  -> app-server Capture runs for changed Sessions
+  -> structured Candidate revisions reach the Review page
+  -> explicit Review and publication create formal Decisions
+  -> later Codex work receives applicable Decisions automatically
+```
+
+The page click, not a guessed feature-completion signal, starts Candidate
+generation. Hooks record bounded local facts and Session checkpoints but never
+run a model. `Stop`, `SessionEnd`, silence, tests, commits, pushes, and a model's
+work-state report do not independently start Capture.
+
+The user does not provide Session IDs, open a compression conversation, run a
+CLI command, or merge Session results. The local Agent selects every changed
+eligible Session for the repository, freezes durable upper checkpoints, runs
+the existing two-stage Capture contract, and reconciles `same`, `refine`,
+`replace`, and unrelated Candidate families. Zero Candidates is a successful
+request result.
+
+Because the page is central and source conversations remain local, the
+installed Agent owns an authenticated persistent request channel. A queued
+request survives page closure, Agent outage, and central restart. The Agent
+advances a Session's handled checkpoint only after the complete structured
+result receives an idempotent central acknowledgement.
+
+Only Candidate and operational request metadata cross the device boundary.
+Raw Sessions, Prompts, model context, tool output, code, and diffs remain local.
+The central service derives identity and product; browser and Agent payloads
+cannot select organization, actor, or an unregistered product.
+
+Candidate refresh is user-triggered, but Decision recall remains automatic.
+The local signed Decision cache ranks Prompts locally, suppresses repeat
+injection through `active_injected_set`, and restores that set once after a
+Codex context compact or clear event.
+
+The detailed component contracts, DeepTutor reuse boundary, migration impact,
+and acceptance Gates are defined in the on-demand Candidate refresh design.
+The superseded automatic feasibility specification and its implementation
+plans are historical evidence and must not drive new work.

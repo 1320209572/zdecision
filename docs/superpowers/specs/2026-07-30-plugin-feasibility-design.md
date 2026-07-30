@@ -1,6 +1,12 @@
 # ZDecision Plugin Pre-Demo Technical Feasibility Design
 
-**Status:** Approved for implementation planning.
+**Status:** Superseded for future implementation.
+
+> The user-triggered **Update Candidates** architecture in
+> `2026-07-30-on-demand-candidate-refresh-design.md` replaces this document's
+> automatic eligibility, `report_work_state`, and zero-touch Candidate
+> generation contracts. This file remains historical design evidence only and
+> must not be used to continue implementation.
 
 **Authority:** `docs/architecture.md` remains the authority for the existing
 manual V1. This document defines a bounded experiment for the installable,
