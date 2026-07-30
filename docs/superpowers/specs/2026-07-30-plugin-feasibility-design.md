@@ -1,6 +1,6 @@
 # ZDecision Plugin Pre-Demo Technical Feasibility Design
 
-**Status:** Draft under review.
+**Status:** Approved for implementation planning.
 
 **Authority:** `docs/architecture.md` remains the authority for the existing
 manual V1. This document defines a bounded experiment for the installable,
@@ -727,49 +727,59 @@ Hook critical path.
 
 Task Usage is local-only and keyed by the Hook's stable `session_id`. It stores
 the active repository and product, mapping version, Decision version, a
-monotonic `context_epoch`, a separate route epoch, and each injected
-`(context_epoch, route_epoch, decision_id, revision,
-canonical_content_digest)`. `context_epoch` starts at zero and advances only
-for `SessionStart(source=compact|clear)`; a repository or product change
-advances the route epoch. Task Usage also stores the bounded Decision-key set
-selected by the latest Prompt for the active route as `last_relevant_set`. It
-stores no Prompt and never synchronizes centrally.
+monotonic `context_epoch`, a separate route epoch, and an
+`active_injected_set`. That set contains exactly the bounded
+`(decision_id, revision, canonical_content_digest)` entries that were actually
+emitted into the current Codex context and remain valid for the active route.
+`context_epoch` starts at zero and advances only for
+`SessionStart(source=compact|clear)`; a repository or product change advances
+the route epoch. Task Usage stores no Prompt and never synchronizes centrally.
 
 For each Hook Turn, a Prompt Injection Receipt stores Session and Turn IDs,
 context and route epochs, repository and product, mapping and Decision
 versions, injected revision keys, and the final `additionalContext` digest.
-Task Usage, `last_relevant_set`, and its Receipt commit in one SQLite
+Task Usage, `active_injected_set`, and its Receipt commit in one SQLite
 transaction before Hook output. Re-delivery of the same Session and Turn
 returns the same Receipt and output.
 
-On `UserPromptSubmit`, the ranker first selects its bounded result and persists
-those Decision keys as `last_relevant_set`, then removes revisions already
-injected in the current context and route epochs. The same revision is never
-injected twice within one such epoch pair. A new Decision may inject once.
-Task Usage keeps the revision field for compatibility, but this experiment
-accepts only the existing V1 `revision: 1` formal schema and does not
-manufacture a revision-2 fixture. A cache-version change with unchanged heads
-does not re-inject. A product or repository change starts a new route epoch.
+On `UserPromptSubmit`, the ranker first selects its bounded result, then removes
+revisions already present in `active_injected_set`. Only revisions actually
+emitted through `additionalContext` are added to that set. An empty ranking or
+a Prompt such as "continue" that yields no new match leaves the set unchanged.
+The active set itself remains within the existing eight-Decision and
+10,000-byte limits, so it can be restored completely in one Hook output; a new
+match that would exceed that cumulative budget remains excluded in local
+diagnostics and is not recorded as injected. The same revision is never
+injected twice within one context and route epoch pair. A new Decision may
+inject once. Task Usage keeps the revision field for compatibility, but this
+experiment accepts only the existing V1 `revision: 1` formal schema and does
+not manufacture a revision-2 fixture. A cache-version change with unchanged
+heads does not re-inject.
+
+When a Decision ceases to be active or valid, synchronization removes it from
+`active_injected_set`. A repository or product change clears the set before
+starting a new route epoch, and `SessionEnd` clears it when the Session's
+injection state is closed. These are state invalidations; an ordinary empty
+Prompt is not.
 
 On `SessionStart(source=compact|clear)`, the Hook atomically advances
-`context_epoch`, resolves the preceding epoch's `last_relevant_set` against the
-active signed generation, and returns every still-active matching Decision
-that fits the same eight-Decision and 10,000-byte limits through
-`SessionStart.additionalContext`. It marks that set injected in the new epoch
-and stores a Context Injection Receipt containing the source, preceding and
-new epochs, cache versions, injected revision keys, and output digest before
-returning Hook output. The immediate continuation and the next Prompt
-therefore do not receive those revisions again. This path makes no model or
-network call and does not add newly published or otherwise unrelated
+`context_epoch`, resolves `active_injected_set` against the active signed
+generation, removes any entry that is no longer valid, and returns the complete
+remaining set through `SessionStart.additionalContext`. It rebinds that same
+set to the new epoch and stores a Context Injection Receipt containing the
+source, preceding and new epochs, cache versions, injected revision keys, and
+output digest before returning Hook output. The immediate continuation and the
+next Prompt therefore do not receive those revisions again. This path makes no
+model or network call and does not add newly published or otherwise unrelated
 Decisions; the next Prompt ranks those normally. `startup` and `resume` do not
 advance the context epoch or re-inject.
 
 The existing cache-state policy applies equally to both Hook paths: `stale`
 may inject with stale status, while `cold`, `warming`, `expired`, `invalid`,
-and `unauthorized` inject nothing. A cold Prompt writes neither injected keys
-nor `last_relevant_set`, so the next Prompt after readiness can inject.
-Corrupt Task Usage fails closed for injection, wakes repair, and lets ordinary
-Codex work continue.
+and `unauthorized` inject nothing and retain no active entries that could be
+restored later. A cold Prompt writes no injected keys, so the next Prompt after
+readiness can inject. Corrupt Task Usage fails closed for injection, wakes
+repair, and lets ordinary Codex work continue.
 
 ## 14. Failure behavior
 
@@ -910,10 +920,11 @@ synchronize a Decision cache. It must cover:
 8. a warming Prompt returns within 200 ms, injects nothing, does not record
    `no_applicable`, and can inject on the next Prompt after readiness;
 9. fixed English and Chinese Prompts rank the expected downloaded Decision;
-10. the second Prompt in the same Session and context epoch does not re-inject
-    the same revision;
+10. after a relevant first Prompt, an empty-matching continuation such as
+    "continue" neither re-injects the same revision nor changes
+    `active_injected_set`;
 11. after item 10, `SessionStart(source=compact)` advances exactly one context
-    epoch and re-injects the preceding relevant set once through
+    epoch and re-injects the preceding active set once through
     `additionalContext`; neither the immediate continuation nor the next
     Prompt repeats it;
 12. `SessionStart(source=clear)` follows the same new-epoch rule, while
