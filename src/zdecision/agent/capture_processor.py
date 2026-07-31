@@ -7,6 +7,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from zdecision.agent.central_client import CentralClientError
+from zdecision.agent.capture_operation_store import (
+    CaptureOperationStoreError,
+)
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.request_state import (
     BatchConflict,
@@ -21,8 +24,10 @@ from zdecision.app_server.reconciliation_runner import (
     ReconciliationRunnerError,
 )
 from zdecision.app_server.requested_capture import (
+    CaptureAttemptRetryable,
     RequestedCaptureFailed,
     SessionCaptureResult,
+    SourceBoundaryUnavailable,
     SourceNotInteractive,
 )
 from zdecision.capture.reconciliation import (
@@ -108,6 +113,18 @@ class OnDemandCaptureProcessor:
             raise TerminalCaptureRequestError(
                 "local_delivery_conflict"
             ) from error
+        except CaptureAttemptRetryable as error:
+            raise RetryableCaptureRequestError(
+                "capture_attempt_retryable"
+            ) from error
+        except SourceBoundaryUnavailable as error:
+            raise TerminalCaptureRequestError(
+                "source_boundary_unavailable"
+            ) from error
+        except CaptureOperationStoreError as error:
+            raise TerminalCaptureRequestError(
+                "local_capture_state_invalid"
+            ) from error
         except RequestedCaptureFailed as error:
             raise TerminalCaptureRequestError(
                 "capture_result_failed"
@@ -126,6 +143,7 @@ class OnDemandCaptureProcessor:
         request: ClaimedCaptureRequest,
         client,
     ) -> None:
+        self.capture_runner.sweep_archives()
         client.start(request.request_id, request.lease_token)
         sources = self.session_index.freeze_sources(
             request.request_id,

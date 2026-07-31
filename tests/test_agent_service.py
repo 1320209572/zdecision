@@ -241,6 +241,7 @@ class AgentServiceTest(unittest.TestCase):
             connect.assert_called_once_with(database=database)
             processor.session_index.close()
             processor.request_state.close()
+            processor.capture_runner.operation_store.close()
 
 
 if __name__ == "__main__":

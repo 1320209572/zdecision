@@ -625,6 +625,44 @@ class CaptureOperationStore:
             )
         return result
 
+    def committed_capture(
+        self, operation_id: str
+    ) -> CaptureCommit | None:
+        """Return the durable winner without starting or committing work."""
+
+        operation_row = self._required_operation_row(operation_id)
+        operation = self._operation(operation_row)
+        if operation.status != "committed":
+            return None
+        if operation.winner_generation is None:
+            raise CaptureOperationCorrupt(
+                "Committed Capture operation has no winner"
+            )
+        attempt_row = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_execution_attempts
+            WHERE operation_id = ? AND generation = ?
+            """,
+            (operation_id, operation.winner_generation),
+        ).fetchone()
+        if attempt_row is None:
+            raise CaptureOperationCorrupt(
+                "Committed Capture winner is missing"
+            )
+        attempt = self._attempt(attempt_row)
+        result = self._committed_result(operation_row)
+        if (
+            attempt.state != "accepted"
+            or attempt.validated_result_digest
+            != operation.committed_result_digest
+            or result is None
+        ):
+            raise CaptureOperationCorrupt(
+                "Committed Capture winner is inconsistent"
+            )
+        return CaptureCommit(operation, attempt, result)
+
     def pending_archives(self) -> tuple[ExecutionAttempt, ...]:
         rows = self._connection.execute(
             """

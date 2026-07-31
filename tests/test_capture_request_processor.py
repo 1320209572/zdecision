@@ -101,6 +101,8 @@ def observation(turn_id: str) -> Candidate:
 class FakeCaptureRunner:
     def __init__(self) -> None:
         self.call_count = 0
+        self.sweep_count = 0
+        self.error: Exception | None = None
         self.after_freeze = None
         self.profile = FeasibilityModelProfile.create(
             model_id="model-default",
@@ -118,6 +120,8 @@ class FakeCaptureRunner:
         heartbeat=None,
     ) -> SessionCaptureResult:
         self.call_count += 1
+        if self.error is not None:
+            raise self.error
         if self.after_freeze is not None:
             callback = self.after_freeze
             self.after_freeze = None
@@ -132,6 +136,9 @@ class FakeCaptureRunner:
             evidence_digest="b" * 64,
             model_profile=self.profile,
         )
+
+    def sweep_archives(self) -> None:
+        self.sweep_count += 1
 
 
 class FakeReconciliationRunner:
@@ -372,6 +379,55 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         self.assertEqual(
             0, self.reconciliation_runner.call_count
         )
+
+    def test_disposable_attempt_failure_is_explicitly_retryable(self) -> None:
+        from zdecision.agent.service import (
+            RetryableCaptureRequestError,
+        )
+        from zdecision.app_server.requested_capture import (
+            CaptureAttemptRetryable,
+        )
+
+        self.observe_turn_1()
+        self.capture_runner.error = CaptureAttemptRetryable(
+            "retry whole attempt"
+        )
+
+        with self.assertRaises(
+            RetryableCaptureRequestError
+        ) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(
+            "capture_attempt_retryable", raised.exception.code
+        )
+
+    def test_missing_frozen_boundary_is_explicitly_terminal(self) -> None:
+        from zdecision.agent.service import (
+            TerminalCaptureRequestError,
+        )
+        from zdecision.app_server.requested_capture import (
+            SourceBoundaryUnavailable,
+        )
+
+        self.observe_turn_1()
+        self.capture_runner.error = SourceBoundaryUnavailable(
+            "missing"
+        )
+
+        with self.assertRaises(
+            TerminalCaptureRequestError
+        ) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(
+            "source_boundary_unavailable", raised.exception.code
+        )
+
+    def test_archive_sweep_runs_before_request_processing(self) -> None:
+        self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(1, self.capture_runner.sweep_count)
 
     def test_no_changed_source_uploads_canonical_empty_batch(
         self,

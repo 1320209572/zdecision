@@ -219,6 +219,9 @@ def configured_processor(
     from zdecision.agent.capture_processor import (
         OnDemandCaptureProcessor,
     )
+    from zdecision.agent.capture_operation_store import (
+        CaptureOperationStore,
+    )
     from zdecision.agent.request_state import RequestStateStore
     from zdecision.agent.session_index import SessionIndex
     from zdecision.app_server.gateway import AppServerGateway
@@ -228,33 +231,29 @@ def configured_processor(
     from zdecision.app_server.requested_capture import (
         RequestedCaptureRunner,
     )
-    from zdecision.capture.service import CaptureService
     from zdecision.capture.templates import TemplateCatalog
-    from zdecision.private_store.filesystem import FilePrivateStore
 
     local_state_path = Path(state_path)
     package_root = Path(__file__).resolve().parents[1]
     repository_root = package_root.parents[1]
     session_index = SessionIndex.open(local_state_path)
     request_state = RequestStateStore.open(local_state_path)
+    operation_store = CaptureOperationStore.open(local_state_path)
     database.retire_legacy_automatic_capture()
     gateway = None
     try:
         gateway = AppServerGateway.connect(database=database)
-        capture_service = CaptureService(
-            FilePrivateStore(local_state_path.parents[1]),
-            TemplateCatalog(
-                repository_root / "decision-templates",
-                package_root / "capture" / "prompt_contracts",
-            ),
+        template_catalog = TemplateCatalog(
+            repository_root / "decision-templates",
+            package_root / "capture" / "prompt_contracts",
         )
         return OnDemandCaptureProcessor(
             database=database,
             session_index=session_index,
             capture_runner=RequestedCaptureRunner(
                 gateway=gateway,
-                capture_service=capture_service,
-                request_state=request_state,
+                operation_store=operation_store,
+                template_catalog=template_catalog,
             ),
             reconciliation_runner=ReconciliationRunner(
                 gateway=gateway,
@@ -266,6 +265,7 @@ def configured_processor(
     except Exception:
         session_index.close()
         request_state.close()
+        operation_store.close()
         close_gateway = getattr(gateway, "close", None)
         if callable(close_gateway):
             close_gateway()
