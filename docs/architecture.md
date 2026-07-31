@@ -3,8 +3,10 @@
 This document is the product architecture authority. Sections 1 through 11
 define the proven manual V1 domain and its safety contracts. The current
 Plugin product direction is the on-demand extension in section 12, with the
-detailed approved implementation contract in
-`docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md`.
+detailed base contract in
+`docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md` and
+the approved Codex inline amendment in
+`docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md`.
 
 Where the historical manual interaction and the Plugin interaction differ,
 section 12 governs new product implementation. Existing Capture, Review,
@@ -507,12 +509,13 @@ The Plugin is delivered in three vertical packets. Packet 1 is the current
 executable boundary:
 
 ```text
-Packet 1 (implemented)
+Packet 1 (page path implemented; inline entry approved for implementation)
   Plugin observes enabled repositories locally
-  -> user clicks 更新候选决策 for a repository
+  -> user clicks the page update control or an inline Codex scope control
   -> central service creates a durable Capture Request
   -> persistent local Agent claims it
-  -> app-server Capture runs for changed Sessions
+  -> app-server Capture runs for the trusted current Session
+     or all changed eligible Sessions
   -> structured Candidate revisions reach the Candidate Inbox
 
 Packet 2 (next)
@@ -522,17 +525,20 @@ Packet 3 (after Packet 2)
   signed Decision cache -> local relevance match -> bounded Codex injection
 ```
 
-The page click, not a guessed feature-completion signal, starts Candidate
-generation. Hooks record bounded local facts and Session checkpoints but never
-run a model. `Stop`, `SessionEnd`, silence, tests, commits, pushes, and a model's
-work-state report do not independently start Capture.
+An explicit page or inline-card click, not a guessed feature-completion signal,
+starts Candidate generation. Hooks record bounded local facts and Session
+checkpoints; the narrow inline `PreToolUse` Hook may also bind host-owned task
+identity locally, but neither kind of Hook runs a model or starts Capture.
+`Stop`, `SessionEnd`, silence, tests, commits, pushes, and a model's work-state
+report do not independently start Capture.
 
 The user does not provide Session IDs, open a compression conversation, run a
-CLI command, or merge Session results. The local Agent selects every changed
-eligible Session for the repository, freezes durable upper checkpoints, runs
-the existing two-stage Capture contract, and reconciles `same`, `refine`,
-`replace`, and unrelated Candidate families. Zero Candidates is a successful
-request result.
+CLI command, or merge Session results. The page action selects every changed
+eligible Session for the repository. The inline card selects either the
+host-bound current Session or that same all-valid set. The local Agent freezes
+durable upper checkpoints, runs the existing two-stage Capture contract, and
+reconciles `same`, `refine`, `replace`, and unrelated Candidate families. Zero
+Candidates is a successful request result.
 
 Each frozen source is a durable business operation with disposable native
 execution generations. An unknown `thread/fork` or `turn/start` result abandons
@@ -543,11 +549,11 @@ its result, Candidate-family heads, and immutable outbox batch commit in one
 transaction. `threadSource` and `clientUserMessageId` are not correctness
 mechanisms and are not sent by Packet 1.
 
-Because the page is central and source conversations remain local, the
-installed Agent owns an authenticated persistent request channel. A queued
-request survives page closure, Agent outage, and central restart. The Agent
-advances a Session's handled checkpoint only after the complete structured
-result receives an idempotent central acknowledgement.
+Because source conversations remain local while the page and inline card use
+central request state, the installed Agent owns an authenticated persistent
+request channel. A queued request survives page/card closure, Agent outage, and
+central restart. The Agent advances a Session's handled checkpoint only after
+the complete structured result receives an idempotent central acknowledgement.
 
 Only Candidate and operational request metadata cross the device boundary.
 Raw Sessions, Prompts, model context, tool output, code, and diffs remain local.
@@ -567,6 +573,8 @@ are deployment diagnostics, not end-user Capture UX. No internal command
 accepts a Session ID to authorize Candidate generation.
 
 The detailed component contracts, DeepTutor reuse boundary, migration impact,
-and acceptance Gates are defined in the on-demand Candidate refresh design.
+and base acceptance Gates are defined in the on-demand Candidate refresh
+design. The trusted Codex binding, two inline scopes, card progress, and their
+additional Gates are defined in the approved Codex inline amendment.
 The superseded automatic feasibility specification and its implementation
 plans are historical evidence and must not drive new work.

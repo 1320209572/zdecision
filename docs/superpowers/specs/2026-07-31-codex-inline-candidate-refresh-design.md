@@ -1,6 +1,6 @@
 # ZDecision Codex Inline Candidate Refresh Design
 
-**Status:** Draft under user review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Replace the proven no-side-effect Codex UI probe with the first
 real, user-authorized Candidate refresh control.

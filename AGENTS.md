@@ -1,18 +1,24 @@
 # ZDecision repository instructions
 
 `docs/architecture.md` is the product architecture authority. The active
-Plugin detail is
-`docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md`.
+Plugin detail is the base contract in
+`docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md`
+plus the approved Codex inline amendment in
+`docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md`.
 Do not continue plans or specifications marked Superseded.
 
 ## Product routing
 
-- The Plugin product interface is the ZDecision page plus automatic Codex
-  recall, not a CLI-first workflow.
+- The Plugin product interface is the ZDecision page, the approved inline
+  Codex Candidate-refresh card, and automatic Codex recall; it is not a
+  CLI-first workflow.
 - The Plugin observes enabled repositories locally. Candidate extraction starts
-  only when the user clicks **Update Candidates** for a repository.
-- The user never supplies Session IDs for the Plugin path. The local Agent
-  selects changed eligible Sessions and follows Capture → Review → Publish.
+  only when the user clicks the page update control or one of the inline
+  **当前 Session** / **所有有效 Session** controls.
+- The user never supplies Session IDs for the Plugin path. A trusted local
+  binding resolves current-Session scope; the local Agent resolves all-valid
+  scope from changed eligible Sessions and then follows Capture → Review →
+  Publish.
 - When the user wants a genuinely new goal or a new developer handoff, run
   Preflight, assemble relevant decision context, and start a new Codex task.
 - When the development goal is unchanged, use Codex-native resume/steer
@@ -22,7 +28,7 @@ Do not continue plans or specifications marked Superseded.
   emulate task lifecycle with a new local conversation runtime.
 - Codex app-server remains the conversation authority. The installed local
   Agent may use the approved typed app-server Gateway and must maintain the
-  persistent request channel required for a later page click.
+  persistent request channel required for a later page or inline click.
 
 ## Boundaries
 
