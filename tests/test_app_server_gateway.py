@@ -14,6 +14,7 @@ from zdecision.app_server.gateway import (
     AppServerGateway,
     AppServerUnavailable,
     IncompleteSourceTurn,
+    InvalidAppServerResponse,
     ModelDiscoveryConflict,
     UnknownSourceTurn,
 )
@@ -624,6 +625,255 @@ class AppServerGatewayTests(unittest.TestCase):
             params["sandboxPolicy"],
         )
         self.assertEqual(schema, params["outputSchema"])
+
+    def test_lists_all_interactive_threads_across_active_and_archived_pages(self):
+        archived_thread = "019fb100-0000-7000-8000-000000000010"
+        client = ScriptedClient(
+            [
+                {"data": [{"id": SOURCE_THREAD}], "nextCursor": "active-2"},
+                {"data": [{"id": FORK_THREAD}], "nextCursor": None},
+                {"data": [{"id": archived_thread}], "nextCursor": None},
+            ]
+        )
+
+        result = self._gateway(client).list_interactive_thread_ids(str(self.root))
+
+        self.assertEqual(
+            frozenset((SOURCE_THREAD, FORK_THREAD, archived_thread)),
+            result,
+        )
+        common = {
+            "cwd": [str(self.root.resolve())],
+            "limit": 100,
+            "sourceKinds": ["cli", "vscode", "appServer"],
+        }
+        self.assertEqual(
+            ("thread/list", {**common, "archived": False}),
+            client.requests[0],
+        )
+        self.assertEqual(
+            (
+                "thread/list",
+                {**common, "archived": False, "cursor": "active-2"},
+            ),
+            client.requests[1],
+        )
+        self.assertEqual(
+            ("thread/list", {**common, "archived": True}),
+            client.requests[2],
+        )
+
+    def test_interactive_thread_listing_rejects_duplicate_or_malformed_ids(self):
+        duplicate = self._gateway(
+            ScriptedClient(
+                [
+                    {"data": [{"id": SOURCE_THREAD}], "nextCursor": None},
+                    {"data": [{"id": SOURCE_THREAD}], "nextCursor": None},
+                ]
+            )
+        )
+        with self.assertRaises(InvalidAppServerResponse):
+            duplicate.list_interactive_thread_ids(str(self.root))
+
+        malformed = self._gateway(
+            ScriptedClient(
+                [
+                    {"data": [{"id": ""}], "nextCursor": None},
+                    {"data": [], "nextCursor": None},
+                ]
+            )
+        )
+        with self.assertRaises(InvalidAppServerResponse):
+            malformed.list_interactive_thread_ids(str(self.root))
+
+    def test_starts_a_tagged_read_only_ephemeral_thread(self):
+        profile = FeasibilityModelProfile.create(
+            model_id="model-default",
+            reasoning_effort="medium",
+            discovery_digest="a" * 64,
+            discovered_at="2026-07-30T12:00:00.000000Z",
+        )
+        tag = "zdecision/reconciliation/crq_1"
+        client = ScriptedClient(
+            [
+                {
+                    "thread": {
+                        "id": FORK_THREAD,
+                        "cwd": str(self.root.resolve()),
+                        "ephemeral": True,
+                        "threadSource": tag,
+                    },
+                    "cwd": str(self.root.resolve()),
+                    "model": "model-default",
+                }
+            ]
+        )
+
+        thread_id = self._gateway(client).start_ephemeral_thread(
+            str(self.root), profile, tag
+        )
+
+        self.assertEqual(FORK_THREAD, thread_id)
+        self.assertEqual(
+            (
+                "thread/start",
+                {
+                    "cwd": str(self.root.resolve()),
+                    "ephemeral": True,
+                    "model": "model-default",
+                    "sandbox": "read-only",
+                    "threadSource": tag,
+                },
+            ),
+            client.requests[0],
+        )
+
+    def test_tagged_fork_and_source_lookup_use_exact_thread_source(self):
+        tag = "zdecision/capture/cap_1"
+        client = ScriptedClient(
+            [
+                {
+                    "thread": {
+                        "id": FORK_THREAD,
+                        "ephemeral": True,
+                        "forkedFromId": SOURCE_THREAD,
+                        "threadSource": tag,
+                    }
+                },
+                {
+                    "data": [
+                        {
+                            "id": SOURCE_THREAD,
+                            "threadSource": "other",
+                        },
+                        {"id": FORK_THREAD, "threadSource": tag},
+                    ],
+                    "nextCursor": None,
+                },
+                {"data": [], "nextCursor": None},
+            ]
+        )
+        gateway = self._gateway(client)
+
+        created = gateway.fork_ephemeral(
+            SOURCE_THREAD, SOURCE_TURN, thread_source=tag
+        )
+        recovered = gateway.find_thread_by_source(tag, cwd=str(self.root))
+
+        self.assertEqual(FORK_THREAD, created)
+        self.assertEqual(FORK_THREAD, recovered)
+        self.assertEqual(tag, client.requests[0][1]["threadSource"])
+        common = {
+            "cwd": [str(self.root.resolve())],
+            "limit": 100,
+            "sourceKinds": ["appServer"],
+        }
+        self.assertEqual(
+            ("thread/list", {**common, "archived": False}),
+            client.requests[1],
+        )
+        self.assertEqual(
+            ("thread/list", {**common, "archived": True}),
+            client.requests[2],
+        )
+
+    def test_source_lookup_rejects_multiple_exact_matches(self):
+        tag = "zdecision/capture/cap_1"
+        gateway = self._gateway(
+            ScriptedClient(
+                [
+                    {
+                        "data": [
+                            {"id": FORK_THREAD, "threadSource": tag},
+                            {"id": "another-thread", "threadSource": tag},
+                        ],
+                        "nextCursor": None,
+                    },
+                    {"data": [], "nextCursor": None},
+                ]
+            )
+        )
+
+        with self.assertRaises(InvalidAppServerResponse):
+            gateway.find_thread_by_source(tag, cwd=str(self.root))
+
+    def test_structured_turn_client_id_is_written_and_can_be_read_back(self):
+        profile = FeasibilityModelProfile.create(
+            model_id="model-default",
+            reasoning_effort="medium",
+            discovery_digest="a" * 64,
+            discovered_at="2026-07-30T12:00:00.000000Z",
+        )
+        client_id = "zdecision/cap_1/inventory"
+        output = {"signals": [], "coverage": {"known_gaps": []}}
+        completed_turn = {
+            "id": GENERATED_TURN,
+            "status": "completed",
+            "items": [
+                {
+                    "id": "user-1",
+                    "type": "userMessage",
+                    "clientId": client_id,
+                    "content": [],
+                },
+                {
+                    "id": "agent-1",
+                    "type": "agentMessage",
+                    "text": (
+                        '{"signals":[],"coverage":{"known_gaps":[]}}'
+                    ),
+                },
+            ],
+        }
+        client = ScriptedClient(
+            [
+                {
+                    "turn": {
+                        "id": GENERATED_TURN,
+                        "status": "inProgress",
+                        "items": [],
+                    }
+                },
+                {
+                    "thread": {
+                        "id": FORK_THREAD,
+                        "cwd": str(self.root),
+                        "turns": [completed_turn],
+                    }
+                },
+            ],
+            [
+                (
+                    "turn/completed",
+                    {"threadId": FORK_THREAD, "turn": completed_turn},
+                )
+            ],
+        )
+        gateway = self._gateway(client)
+        schema = {"type": "object"}
+
+        started = gateway.run_structured_turn(
+            thread_id=FORK_THREAD,
+            prompt="Inventory.",
+            output_schema=schema,
+            profile=profile,
+            cwd=str(self.root),
+            client_user_message_id=client_id,
+        )
+        recovered = gateway.read_structured_turn_by_client_id(
+            FORK_THREAD, client_id, profile
+        )
+
+        self.assertEqual(started, recovered)
+        self.assertEqual(output, recovered.structured_output)
+        self.assertEqual(client_id, client.requests[0][1]["clientUserMessageId"])
+        self.assertEqual(
+            (
+                "thread/read",
+                {"threadId": FORK_THREAD, "includeTurns": True},
+            ),
+            client.requests[1],
+        )
 
 
 if __name__ == "__main__":

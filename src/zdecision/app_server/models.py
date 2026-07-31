@@ -133,3 +133,135 @@ class AppServerTurnReceipt:
             ).hexdigest(),
             model_profile_id=model_profile_id,
         )
+
+
+def inventory_output_schema() -> dict[str, object]:
+    """Return the strict Stage 1 structured-output schema."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "signals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {"type": "string"},
+                        "rule": {"type": "string"},
+                        "future_effect": {"type": "string"},
+                        "scope": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "current_confirmed",
+                                "unresolved",
+                                "superseded",
+                            ],
+                        },
+                        "confirmation_basis": {
+                            "type": "string",
+                            "enum": [
+                                "explicit_user_confirmation",
+                                "explicit_user_direction",
+                                "adopted_decision_contract",
+                                "uncertain",
+                            ],
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                        },
+                    },
+                    "required": [
+                        "topic",
+                        "rule",
+                        "future_effect",
+                        "scope",
+                        "status",
+                        "confirmation_basis",
+                        "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "coverage": {
+                "type": "object",
+                "properties": {
+                    "reviewed_retained_context": {
+                        "type": "string",
+                        "enum": ["earliest_to_latest"],
+                    },
+                    "known_gaps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "reviewed_retained_context",
+                    "known_gaps",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["signals", "coverage"],
+        "additionalProperties": False,
+    }
+
+
+def extraction_output_schema(product: str) -> dict[str, object]:
+    """Return the strict Stage 2 schema pinned to one product name."""
+
+    product_name = _nonempty(product, "product")
+    return {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "product": {
+                            "type": "string",
+                            "enum": [product_name],
+                        },
+                        "claim": {"type": "string"},
+                        "future_action": {"type": "string"},
+                        "scope": {
+                            "type": "object",
+                            "properties": {
+                                "summary": {"type": "string"},
+                                "repositories": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "paths": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": [
+                                "summary",
+                                "repositories",
+                                "paths",
+                            ],
+                            "additionalProperties": False,
+                        },
+                        "invalidation_conditions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "product",
+                        "claim",
+                        "future_action",
+                        "scope",
+                        "invalidation_conditions",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["candidates"],
+        "additionalProperties": False,
+    }

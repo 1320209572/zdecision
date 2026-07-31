@@ -244,18 +244,117 @@ class AppServerGateway:
             discovered_at=stored.discovered_at,
         )
 
-    def fork_ephemeral(self, thread_id: str, last_turn_id: str) -> str:
-        source_thread_id = _nonempty(thread_id, "thread_id")
-        source_turn_id = _nonempty(last_turn_id, "last_turn_id")
+    def list_interactive_thread_ids(self, cwd: str) -> frozenset[str]:
+        resolved_cwd = _resolved_cwd(cwd)
+        seen_ids: set[str] = set()
+        page_count = 0
+        for archived in (False, True):
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                page_count += 1
+                if page_count > 100:
+                    raise InvalidAppServerResponse(
+                        "thread/list exceeded the page limit"
+                    )
+                params: dict[str, object] = {
+                    "cwd": [resolved_cwd],
+                    "limit": 100,
+                    "sourceKinds": ["cli", "vscode", "appServer"],
+                    "archived": archived,
+                }
+                if cursor is not None:
+                    params["cursor"] = cursor
+                result = _mapping(
+                    self.client.request("thread/list", params),
+                    "thread/list result",
+                )
+                data = result.get("data")
+                if not isinstance(data, list):
+                    raise InvalidAppServerResponse(
+                        "thread/list data is invalid"
+                    )
+                for value in data:
+                    thread = _mapping(value, "thread/list entry")
+                    thread_id = _nonempty_response(
+                        thread.get("id"), "Thread id"
+                    )
+                    if thread_id in seen_ids:
+                        raise InvalidAppServerResponse(
+                            "thread/list repeated a Thread id"
+                        )
+                    seen_ids.add(thread_id)
+                cursor = _next_cursor(result, seen_cursors)
+                if cursor is None:
+                    break
+        return frozenset(seen_ids)
+
+    def start_ephemeral_thread(
+        self,
+        cwd: str,
+        profile: FeasibilityModelProfile,
+        thread_source: str,
+    ) -> str:
+        resolved_cwd = _resolved_cwd(cwd)
+        if not isinstance(profile, FeasibilityModelProfile):
+            raise TypeError("profile must be a FeasibilityModelProfile")
+        source = _nonempty(thread_source, "thread_source")
         result = _mapping(
             self.client.request(
-                "thread/fork",
+                "thread/start",
                 {
-                    "threadId": source_thread_id,
-                    "lastTurnId": source_turn_id,
+                    "cwd": resolved_cwd,
                     "ephemeral": True,
+                    "model": profile.model_id,
+                    "sandbox": "read-only",
+                    "threadSource": source,
                 },
             ),
+            "thread/start result",
+        )
+        thread = _mapping(result.get("thread"), "thread/start thread")
+        thread_id = _nonempty_response(
+            thread.get("id"), "started Thread id"
+        )
+        if thread.get("cwd") != resolved_cwd or result.get("cwd") != resolved_cwd:
+            raise InvalidAppServerResponse(
+                "thread/start returned the wrong cwd"
+            )
+        if thread.get("ephemeral") is not True:
+            raise InvalidAppServerResponse(
+                "thread/start did not create an ephemeral Thread"
+            )
+        if result.get("model") != profile.model_id:
+            raise InvalidAppServerResponse(
+                "thread/start returned the wrong model"
+            )
+        returned_source = thread.get("threadSource")
+        if returned_source is not None and returned_source != source:
+            raise InvalidAppServerResponse(
+                "thread/start returned the wrong Thread source"
+            )
+        return thread_id
+
+    def fork_ephemeral(
+        self,
+        thread_id: str,
+        last_turn_id: str,
+        *,
+        thread_source: str | None = None,
+    ) -> str:
+        source_thread_id = _nonempty(thread_id, "thread_id")
+        source_turn_id = _nonempty(last_turn_id, "last_turn_id")
+        params: dict[str, object] = {
+            "threadId": source_thread_id,
+            "lastTurnId": source_turn_id,
+            "ephemeral": True,
+        }
+        if thread_source is not None:
+            params["threadSource"] = _nonempty(
+                thread_source, "thread_source"
+            )
+        result = _mapping(
+            self.client.request("thread/fork", params),
             "thread/fork result",
         )
         thread = _mapping(result.get("thread"), "thread/fork thread")
@@ -267,7 +366,82 @@ class AppServerGateway:
         forked_from = thread.get("forkedFromId")
         if forked_from is not None and forked_from != source_thread_id:
             raise InvalidAppServerResponse("thread/fork returned the wrong source Thread")
+        returned_source = thread.get("threadSource")
+        if (
+            thread_source is not None
+            and returned_source is not None
+            and returned_source != thread_source
+        ):
+            raise InvalidAppServerResponse(
+                "thread/fork returned the wrong Thread source"
+            )
         return fork_id
+
+    def find_thread_by_source(
+        self,
+        thread_source: str,
+        *,
+        cwd: str | None = None,
+    ) -> str | None:
+        source = _nonempty(thread_source, "thread_source")
+        resolved_cwd = None if cwd is None else _resolved_cwd(cwd)
+        seen_ids: set[str] = set()
+        matches: list[str] = []
+        page_count = 0
+        for archived in (False, True):
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                page_count += 1
+                if page_count > 100:
+                    raise InvalidAppServerResponse(
+                        "thread/list exceeded the page limit"
+                    )
+                params: dict[str, object] = {
+                    "limit": 100,
+                    "sourceKinds": ["appServer"],
+                    "archived": archived,
+                }
+                if resolved_cwd is not None:
+                    params["cwd"] = [resolved_cwd]
+                if cursor is not None:
+                    params["cursor"] = cursor
+                result = _mapping(
+                    self.client.request("thread/list", params),
+                    "thread/list result",
+                )
+                data = result.get("data")
+                if not isinstance(data, list):
+                    raise InvalidAppServerResponse(
+                        "thread/list data is invalid"
+                    )
+                for value in data:
+                    thread = _mapping(value, "thread/list entry")
+                    thread_id = _nonempty_response(
+                        thread.get("id"), "Thread id"
+                    )
+                    if thread_id in seen_ids:
+                        raise InvalidAppServerResponse(
+                            "thread/list repeated a Thread id"
+                        )
+                    seen_ids.add(thread_id)
+                    returned_source = thread.get("threadSource")
+                    if returned_source is not None and not isinstance(
+                        returned_source, str
+                    ):
+                        raise InvalidAppServerResponse(
+                            "thread/list Thread source is invalid"
+                        )
+                    if returned_source == source:
+                        matches.append(thread_id)
+                cursor = _next_cursor(result, seen_cursors)
+                if cursor is None:
+                    break
+        if len(matches) > 1:
+            raise InvalidAppServerResponse(
+                "thread/list returned multiple exact Thread source matches"
+            )
+        return None if not matches else matches[0]
 
     def run_structured_turn(
         self,
@@ -276,6 +450,8 @@ class AppServerGateway:
         output_schema: Mapping[str, object],
         profile: FeasibilityModelProfile,
         cwd: str,
+        *,
+        client_user_message_id: str | None = None,
     ) -> AppServerTurnReceipt:
         target_thread_id = _nonempty(thread_id, "thread_id")
         prompt_text = _nonempty(prompt, "prompt")
@@ -287,23 +463,25 @@ class AppServerGateway:
             raise TypeError("profile must be a FeasibilityModelProfile")
         if not isinstance(cwd, str) or not Path(cwd).is_absolute():
             raise ValueError("cwd must be an absolute path")
+        params: dict[str, object] = {
+            "threadId": target_thread_id,
+            "input": [{"type": "text", "text": prompt_text}],
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandboxPolicy": {
+                "type": "readOnly",
+                "access": {"type": "fullAccess"},
+            },
+            "model": profile.model_id,
+            "effort": profile.reasoning_effort,
+            "outputSchema": dict(output_schema),
+        }
+        if client_user_message_id is not None:
+            params["clientUserMessageId"] = _nonempty(
+                client_user_message_id, "client_user_message_id"
+            )
         result = _mapping(
-            self.client.request(
-                "turn/start",
-                {
-                    "threadId": target_thread_id,
-                    "input": [{"type": "text", "text": prompt_text}],
-                    "cwd": cwd,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {
-                        "type": "readOnly",
-                        "access": {"type": "fullAccess"},
-                    },
-                    "model": profile.model_id,
-                    "effort": profile.reasoning_effort,
-                    "outputSchema": dict(output_schema),
-                },
-            ),
+            self.client.request("turn/start", params),
             "turn/start result",
         )
         started_turn = _mapping(result.get("turn"), "turn/start Turn")
@@ -328,11 +506,84 @@ class AppServerGateway:
             raise InvalidAppServerResponse("turn/completed returned the wrong Turn")
         if completed_turn.get("status") != "completed":
             raise StructuredTurnFailed("The structured Turn did not complete")
+        if client_user_message_id is not None:
+            _require_one_client_message(
+                completed_turn, client_user_message_id
+            )
         structured_output = _structured_output(completed_turn)
         return AppServerTurnReceipt.create(
             thread_id=target_thread_id,
             turn_id=generated_turn_id,
             structured_output=structured_output,
+            model_profile_id=profile.profile_id,
+        )
+
+    def read_structured_turn_by_client_id(
+        self,
+        thread_id: str,
+        client_user_message_id: str,
+        profile: FeasibilityModelProfile,
+    ) -> AppServerTurnReceipt | None:
+        target_thread_id = _nonempty(thread_id, "thread_id")
+        client_id = _nonempty(
+            client_user_message_id, "client_user_message_id"
+        )
+        if not isinstance(profile, FeasibilityModelProfile):
+            raise TypeError("profile must be a FeasibilityModelProfile")
+        result = _mapping(
+            self.client.request(
+                "thread/read",
+                {"threadId": target_thread_id, "includeTurns": True},
+            ),
+            "thread/read result",
+        )
+        thread = _mapping(result.get("thread"), "thread/read thread")
+        if thread.get("id") != target_thread_id:
+            raise InvalidAppServerResponse(
+                "thread/read returned the wrong Thread"
+            )
+        turns = thread.get("turns")
+        if not isinstance(turns, list):
+            raise InvalidAppServerResponse(
+                "thread/read did not include Turns"
+            )
+        matches: list[Mapping[str, object]] = []
+        for value in turns:
+            turn = _mapping(value, "thread/read Turn")
+            items = turn.get("items")
+            if not isinstance(items, list):
+                raise InvalidAppServerResponse(
+                    "thread/read Turn items are invalid"
+                )
+            count = sum(
+                1
+                for item in items
+                if isinstance(item, Mapping)
+                and item.get("type") == "userMessage"
+                and item.get("clientId") == client_id
+            )
+            if count > 1:
+                raise InvalidAppServerResponse(
+                    "thread/read repeated a client user message id"
+                )
+            if count == 1:
+                matches.append(turn)
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise InvalidAppServerResponse(
+                "thread/read repeated a client user message id"
+            )
+        matched = matches[0]
+        if matched.get("status") != "completed":
+            return None
+        turn_id = _nonempty_response(
+            matched.get("id"), "generated Turn id"
+        )
+        return AppServerTurnReceipt.create(
+            thread_id=target_thread_id,
+            turn_id=turn_id,
+            structured_output=_structured_output(matched),
             model_profile_id=profile.profile_id,
         )
 
@@ -412,6 +663,25 @@ def _optional_string(value: object, field_name: str) -> str | None:
     if not isinstance(value, str) or not value:
         raise InvalidAppServerResponse(f"{field_name} is invalid")
     return value
+
+
+def _resolved_cwd(value: object) -> str:
+    cwd = _nonempty(value, "cwd")
+    return str(Path(cwd).resolve())
+
+
+def _next_cursor(
+    result: Mapping[str, object], seen_cursors: set[str]
+) -> str | None:
+    next_cursor = result.get("nextCursor")
+    if next_cursor is None:
+        return None
+    if not isinstance(next_cursor, str) or not next_cursor:
+        raise InvalidAppServerResponse("thread/list cursor is invalid")
+    if next_cursor in seen_cursors:
+        raise InvalidAppServerResponse("thread/list repeated a cursor")
+    seen_cursors.add(next_cursor)
+    return next_cursor
 
 
 def _validate_model(model: Mapping[str, object]) -> None:
@@ -495,6 +765,27 @@ def _structured_output(turn: Mapping[str, object]) -> Mapping[str, object]:
             "The structured Turn output must be a JSON object"
         )
     return dict(parsed)
+
+
+def _require_one_client_message(
+    turn: Mapping[str, object], client_user_message_id: str
+) -> None:
+    items = turn.get("items")
+    if not isinstance(items, list):
+        raise InvalidAppServerResponse(
+            "completed Turn items are invalid"
+        )
+    matches = [
+        value
+        for value in items
+        if isinstance(value, Mapping)
+        and value.get("type") == "userMessage"
+        and value.get("clientId") == client_user_message_id
+    ]
+    if len(matches) != 1:
+        raise InvalidAppServerResponse(
+            "completed Turn did not preserve one client user message id"
+        )
 
 
 def _format_datetime(value: datetime) -> str:
