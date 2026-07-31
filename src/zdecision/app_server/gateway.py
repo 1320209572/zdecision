@@ -289,25 +289,21 @@ class AppServerGateway:
                     break
         return frozenset(seen_ids)
 
-    def start_ephemeral_thread(
+    def start_disposable_thread(
         self,
         cwd: str,
         profile: FeasibilityModelProfile,
-        thread_source: str,
     ) -> str:
         resolved_cwd = _resolved_cwd(cwd)
         if not isinstance(profile, FeasibilityModelProfile):
             raise TypeError("profile must be a FeasibilityModelProfile")
-        source = _nonempty(thread_source, "thread_source")
         result = _mapping(
             self.client.request(
                 "thread/start",
                 {
                     "cwd": resolved_cwd,
-                    "ephemeral": True,
                     "model": profile.model_id,
                     "sandbox": "read-only",
-                    "threadSource": source,
                 },
             ),
             "thread/start result",
@@ -316,24 +312,82 @@ class AppServerGateway:
         thread_id = _nonempty_response(
             thread.get("id"), "started Thread id"
         )
-        if thread.get("cwd") != resolved_cwd or result.get("cwd") != resolved_cwd:
+        if thread.get("ephemeral") is True or result.get("ephemeral") is True:
+            raise InvalidAppServerResponse(
+                "thread/start returned an ephemeral Thread"
+            )
+        if (
+            "cwd" in thread
+            and thread.get("cwd") != resolved_cwd
+        ) or (
+            "cwd" in result
+            and result.get("cwd") != resolved_cwd
+        ):
             raise InvalidAppServerResponse(
                 "thread/start returned the wrong cwd"
             )
-        if thread.get("ephemeral") is not True:
-            raise InvalidAppServerResponse(
-                "thread/start did not create an ephemeral Thread"
-            )
-        if result.get("model") != profile.model_id:
+        if (
+            "model" in thread
+            and thread.get("model") != profile.model_id
+        ) or (
+            "model" in result
+            and result.get("model") != profile.model_id
+        ):
             raise InvalidAppServerResponse(
                 "thread/start returned the wrong model"
             )
-        returned_source = thread.get("threadSource")
-        if returned_source is not None and returned_source != source:
-            raise InvalidAppServerResponse(
-                "thread/start returned the wrong Thread source"
-            )
         return thread_id
+
+    def fork_disposable_thread(
+        self,
+        thread_id: str,
+        last_turn_id: str,
+    ) -> str:
+        source_thread_id = _nonempty(thread_id, "thread_id")
+        source_turn_id = _nonempty(last_turn_id, "last_turn_id")
+        result = _mapping(
+            self.client.request(
+                "thread/fork",
+                {
+                    "threadId": source_thread_id,
+                    "lastTurnId": source_turn_id,
+                },
+            ),
+            "thread/fork result",
+        )
+        thread = _mapping(result.get("thread"), "thread/fork thread")
+        fork_id = _nonempty_response(thread.get("id"), "fork Thread id")
+        if fork_id == source_thread_id:
+            raise InvalidAppServerResponse("thread/fork reused the source Thread id")
+        if thread.get("ephemeral") is True or result.get("ephemeral") is True:
+            raise InvalidAppServerResponse(
+                "thread/fork returned an ephemeral Thread"
+            )
+        forked_from = thread.get("forkedFromId")
+        if forked_from is not None and forked_from != source_thread_id:
+            raise InvalidAppServerResponse("thread/fork returned the wrong source Thread")
+        return fork_id
+
+    def archive_thread(self, thread_id: str) -> None:
+        target_thread_id = _nonempty(thread_id, "thread_id")
+        _mapping(
+            self.client.request(
+                "thread/archive",
+                {"threadId": target_thread_id},
+            ),
+            "thread/archive result",
+        )
+
+    def start_ephemeral_thread(
+        self,
+        cwd: str,
+        profile: FeasibilityModelProfile,
+        thread_source: str,
+    ) -> str:
+        """Compatibility shim until the reconciliation caller migrates."""
+
+        _nonempty(thread_source, "thread_source")
+        return self.start_disposable_thread(cwd, profile)
 
     def fork_ephemeral(
         self,
@@ -342,40 +396,11 @@ class AppServerGateway:
         *,
         thread_source: str | None = None,
     ) -> str:
-        source_thread_id = _nonempty(thread_id, "thread_id")
-        source_turn_id = _nonempty(last_turn_id, "last_turn_id")
-        params: dict[str, object] = {
-            "threadId": source_thread_id,
-            "lastTurnId": source_turn_id,
-            "ephemeral": True,
-        }
+        """Compatibility shim until the Capture caller migrates."""
+
         if thread_source is not None:
-            params["threadSource"] = _nonempty(
-                thread_source, "thread_source"
-            )
-        result = _mapping(
-            self.client.request("thread/fork", params),
-            "thread/fork result",
-        )
-        thread = _mapping(result.get("thread"), "thread/fork thread")
-        fork_id = _nonempty_response(thread.get("id"), "fork Thread id")
-        if fork_id == source_thread_id:
-            raise InvalidAppServerResponse("thread/fork reused the source Thread id")
-        if thread.get("ephemeral") is not True:
-            raise InvalidAppServerResponse("thread/fork did not create an ephemeral Thread")
-        forked_from = thread.get("forkedFromId")
-        if forked_from is not None and forked_from != source_thread_id:
-            raise InvalidAppServerResponse("thread/fork returned the wrong source Thread")
-        returned_source = thread.get("threadSource")
-        if (
-            thread_source is not None
-            and returned_source is not None
-            and returned_source != thread_source
-        ):
-            raise InvalidAppServerResponse(
-                "thread/fork returned the wrong Thread source"
-            )
-        return fork_id
+            _nonempty(thread_source, "thread_source")
+        return self.fork_disposable_thread(thread_id, last_turn_id)
 
     def find_thread_by_source(
         self,
@@ -476,10 +501,10 @@ class AppServerGateway:
             "effort": profile.reasoning_effort,
             "outputSchema": dict(output_schema),
         }
+        # Kept temporarily in the Python signature for caller migration only.
+        # It is deliberately neither sent nor used for result validation.
         if client_user_message_id is not None:
-            params["clientUserMessageId"] = _nonempty(
-                client_user_message_id, "client_user_message_id"
-            )
+            _nonempty(client_user_message_id, "client_user_message_id")
         result = _mapping(
             self.client.request("turn/start", params),
             "turn/start result",
@@ -506,10 +531,6 @@ class AppServerGateway:
             raise InvalidAppServerResponse("turn/completed returned the wrong Turn")
         if completed_turn.get("status") != "completed":
             raise StructuredTurnFailed("The structured Turn did not complete")
-        if client_user_message_id is not None:
-            _require_one_client_message(
-                completed_turn, client_user_message_id
-            )
         structured_output = _structured_output(completed_turn)
         return AppServerTurnReceipt.create(
             thread_id=target_thread_id,
@@ -765,27 +786,6 @@ def _structured_output(turn: Mapping[str, object]) -> Mapping[str, object]:
             "The structured Turn output must be a JSON object"
         )
     return dict(parsed)
-
-
-def _require_one_client_message(
-    turn: Mapping[str, object], client_user_message_id: str
-) -> None:
-    items = turn.get("items")
-    if not isinstance(items, list):
-        raise InvalidAppServerResponse(
-            "completed Turn items are invalid"
-        )
-    matches = [
-        value
-        for value in items
-        if isinstance(value, Mapping)
-        and value.get("type") == "userMessage"
-        and value.get("clientId") == client_user_message_id
-    ]
-    if len(matches) != 1:
-        raise InvalidAppServerResponse(
-            "completed Turn did not preserve one client user message id"
-        )
 
 
 def _format_datetime(value: datetime) -> str:
