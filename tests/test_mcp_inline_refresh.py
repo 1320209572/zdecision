@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -542,6 +544,204 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             ).glob("*.html")
         }
         self.assertEqual({"update-candidates-v1.html"}, static_files)
+
+    async def test_widget_ignores_app_tool_result_notifications_after_render(
+        self,
+    ) -> None:
+        html = mcp_server.UPDATE_CANDIDATES_PATH.read_text("utf-8")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        harness = f"""
+const vm = require("node:vm");
+const shippedScript = {json.dumps(script)};
+const outbound = [];
+const timers = [];
+let messageHandler = null;
+
+class Element {{
+  constructor() {{
+    this.disabled = false;
+    this.hidden = false;
+    this.textContent = "";
+    this.listeners = new Map();
+  }}
+
+  addEventListener(name, listener) {{
+    const listeners = this.listeners.get(name) || [];
+    listeners.push(listener);
+    this.listeners.set(name, listeners);
+  }}
+
+  dispatch(name) {{
+    return Promise.all((this.listeners.get(name) || []).map((listener) => listener()));
+  }}
+}}
+
+const elementIds = ["current", "all", "open-page", "status"];
+const elements = Object.fromEntries(elementIds.map((id) => [id, new Element()]));
+const host = {{
+  postMessage(message) {{ outbound.push(message); }},
+}};
+global.document = {{ getElementById: (id) => elements[id] }};
+global.window = {{
+  parent: host,
+  addEventListener(name, listener) {{
+    if (name === "message") messageHandler = listener;
+  }},
+}};
+global.setTimeout = (callback, delay) => {{
+  timers.push({{ callback, delay }});
+  return timers.length;
+}};
+
+function check(condition, message) {{
+  if (!condition) throw new Error(message);
+}}
+
+function deliver(message) {{
+  messageHandler({{ source: host, data: message }});
+}}
+
+function latestToolCall(name) {{
+  return [...outbound].reverse().find(
+    (message) => message.method === "tools/call" && message.params?.name === name,
+  );
+}}
+
+vm.runInThisContext(shippedScript);
+
+(async () => {{
+  const initialize = outbound.find((message) => message.method === "ui/initialize");
+  check(initialize, "widget did not initialize the bridge");
+  deliver({{
+    jsonrpc: "2.0",
+    id: initialize.id,
+    result: {{ hostCapabilities: {{ serverTools: {{}} }} }},
+  }});
+  await Promise.resolve();
+
+  const trustedControl = "ctl_11111111111111111111111111111111";
+  deliver({{
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: {{
+      content: [{{ type: "text", text: "ready" }}],
+      structuredContent: {{ actions_enabled: true, safe_state: "ready" }},
+      _meta: {{ "zdecision/control_id": trustedControl }},
+    }},
+  }});
+  check(!elements.current.disabled && !elements.all.disabled, "render result did not enable actions");
+
+  const click = elements.current.dispatch("click");
+  const start = latestToolCall("start_zdecision_candidate_refresh");
+  check(start, "current Session click did not call start");
+  check(start.params.arguments.control_id === trustedControl, "start lost trusted control");
+  check(elements.current.disabled && elements.all.disabled, "first click did not lock both actions");
+
+  deliver({{
+    jsonrpc: "2.0",
+    id: start.id,
+    result: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "queued",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+      }},
+    }},
+  }});
+  await click;
+  check(elements.status.textContent === "等待本地设备", "direct start response was not rendered");
+  check(timers.length === 1 && timers[0].delay === 1500, "active start did not schedule one poll");
+
+  deliver({{
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "queued",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+      }},
+    }},
+  }});
+  check(elements.status.textContent === "等待本地设备", "start notification reset active state");
+
+  const firstTimer = timers.shift();
+  const firstPoll = firstTimer.callback();
+  const statusCall = latestToolCall("get_zdecision_candidate_refresh");
+  check(statusCall, "start notification stopped the next poll");
+  check(statusCall.params.arguments.control_id === trustedControl, "poll lost trusted control");
+
+  deliver({{
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "capturing",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+      }},
+    }},
+  }});
+  check(elements.status.textContent === "等待本地设备", "status notification reset active state");
+
+  deliver({{
+    jsonrpc: "2.0",
+    id: statusCall.id,
+    result: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "capturing",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+      }},
+    }},
+  }});
+  await firstPoll;
+  check(elements.status.textContent === "正在整理候选决策", "direct status response was not rendered");
+  check(timers.length === 1 && timers[0].delay === 1500, "active status did not continue polling");
+
+  const secondPoll = timers.shift().callback();
+  const secondStatusCall = latestToolCall("get_zdecision_candidate_refresh");
+  check(secondStatusCall.id !== statusCall.id, "next status poll was not sent");
+  check(secondStatusCall.params.arguments.control_id === trustedControl, "next poll lost trusted control");
+  deliver({{
+    jsonrpc: "2.0",
+    id: secondStatusCall.id,
+    result: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "failed",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+      }},
+    }},
+  }});
+  await secondPoll;
+  check(timers.length === 0, "terminal state scheduled another poll");
+  process.stdout.write("bridge-regression-ok");
+}})().catch((error) => {{
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+}});
+"""
+
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(
+            0,
+            completed.returncode,
+            completed.stderr or completed.stdout,
+        )
+        self.assertEqual("bridge-regression-ok", completed.stdout)
 
     async def test_run_mcp_starts_with_disabled_card_when_locator_unavailable(
         self,

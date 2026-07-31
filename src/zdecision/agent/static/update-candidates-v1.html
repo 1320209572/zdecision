@@ -195,6 +195,7 @@
 
       let nextRequestId = 1;
       let initialized = false;
+      let initialResultAccepted = false;
       let selected = false;
       let controlId = null;
       let safeState = "disabled";
@@ -271,8 +272,16 @@
       }
 
       function acceptInitialResult(result) {
+        const initial = result?.structuredContent;
+        const enabled = initial?.actions_enabled;
+        const expectedState = enabled === true ? "ready" : "disabled";
+        const isRenderResult =
+          typeof enabled === "boolean" && initial?.safe_state === expectedState;
+        if (initialResultAccepted || selected || !isRenderResult) return;
+
         const metaControl = result?._meta?.["zdecision/control_id"];
-        const enabled = result?.structuredContent?.actions_enabled === true;
+        if (enabled && typeof metaControl !== "string") return;
+        initialResultAccepted = true;
         controlId = enabled && typeof metaControl === "string" ? metaControl : null;
         safeState = controlId ? "ready" : "disabled";
         status.textContent = "";
