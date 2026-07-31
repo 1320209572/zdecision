@@ -369,11 +369,14 @@ class CentralRequestServiceTest(unittest.TestCase):
         connection.commit()
         connection.close()
 
-        self.store = CentralStore.open(legacy_path)
-        record = self.store.get_request_record(request_id)
+        legacy_store = CentralStore.open(legacy_path)
+        try:
+            record = legacy_store.get_request_record(request_id)
 
-        self.assertEqual("all_valid_sessions", record.capture_scope)
-        self.assertEqual(old_action, record.client_action_id)
+            self.assertEqual("all_valid_sessions", record.capture_scope)
+            self.assertEqual(old_action, record.client_action_id)
+        finally:
+            legacy_store.close()
 
     def test_expired_claim_requeues_and_survives_restart(self) -> None:
         created = self.create()
