@@ -69,7 +69,7 @@ class SyncContractsTest(unittest.TestCase):
     def test_browser_request_rejects_identity_and_source_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "CaptureRequestCreate fields"):
             CaptureRequestCreate.from_dict({
-                "repository_id": "repo_" + "1" * 64,
+                "repository_id": "repo_" + "1" * 32,
                 "template_id": "business",
                 "client_action_id": "web_action_001",
                 "organization_id": "org_forbidden",
@@ -83,11 +83,11 @@ class SyncContractsTest(unittest.TestCase):
             CandidateBatchUpload.from_dict(payload)
 
     def test_request_and_revision_ids_are_replay_stable(self) -> None:
-        first = capture_request_id("org_demo", "repo_" + "1" * 64,
+        first = capture_request_id("org_demo", "repo_" + "1" * 32,
                                    "business", "web_action_001")
         self.assertEqual(first, capture_request_id(
-            "org_demo", "repo_" + "1" * 64, "business", "web_action_001"))
-        family = candidate_family_id("repo_" + "1" * 64, "cand_" + "2" * 32 + "_01")
+            "org_demo", "repo_" + "1" * 32, "business", "web_action_001"))
+        family = candidate_family_id("repo_" + "1" * 32, "cand_" + "2" * 32 + "_01")
         self.assertEqual(candidate_revision_id(family, 1, "3" * 64),
                          candidate_revision_id(family, 1, "3" * 64))
 ```

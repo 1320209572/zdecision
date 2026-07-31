@@ -25,6 +25,8 @@ _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _REVIEW_BATCH_ID = re.compile(r"^rvb_[0-9a-f]{32}$")
 _DECISION_ID = re.compile(r"^dec_[0-9a-f]{32}$")
 _REVIEW_ID = re.compile(r"^rvi_[0-9a-f]{32}$")
+_REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
+_CANDIDATE_FAMILY_ID = re.compile(r"^cfm_[0-9a-f]{32}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CONTENT_FIELDS = frozenset(
@@ -96,6 +98,88 @@ def product_id(canonical_name: str) -> str:
     return _stable_id(
         "prod",
         {"product_name": canonical_product_name(canonical_name)},
+    )
+
+
+def capture_request_id(
+    organization_id: str,
+    repository_id: str,
+    template_id: str,
+    client_action_id: str,
+) -> str:
+    """Return the replay-stable identity for one browser action."""
+
+    organization = _nonempty_string(organization_id, "organization_id")
+    if (
+        not isinstance(repository_id, str)
+        or _REPOSITORY_ID.fullmatch(repository_id) is None
+    ):
+        raise ValueError("repository_id is invalid")
+    template = _nonempty_string(template_id, "template_id")
+    action = _nonempty_string(client_action_id, "client_action_id")
+    return _stable_id(
+        "crq",
+        {
+            "client_action_id": action,
+            "organization_id": organization,
+            "repository_id": repository_id,
+            "template_id": template,
+        },
+    )
+
+
+def candidate_family_id(
+    repository_id: str,
+    first_observation_id: str,
+) -> str:
+    """Return the stable family seeded by its first Candidate observation."""
+
+    if (
+        not isinstance(repository_id, str)
+        or _REPOSITORY_ID.fullmatch(repository_id) is None
+    ):
+        raise ValueError("repository_id is invalid")
+    if (
+        not isinstance(first_observation_id, str)
+        or _CANDIDATE_ID.fullmatch(first_observation_id) is None
+    ):
+        raise ValueError("first_observation_id is invalid")
+    return _stable_id(
+        "cfm",
+        {
+            "first_observation_id": first_observation_id,
+            "repository_id": repository_id,
+        },
+    )
+
+
+def candidate_revision_id(
+    family_id: str,
+    revision: int,
+    content_digest: str,
+) -> str:
+    """Return the immutable identity for one family revision."""
+
+    if (
+        not isinstance(family_id, str)
+        or _CANDIDATE_FAMILY_ID.fullmatch(family_id) is None
+    ):
+        raise ValueError("family_id is invalid")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise ValueError("revision must be a positive integer")
+    if not isinstance(content_digest, str) or _DIGEST.fullmatch(content_digest) is None:
+        raise ValueError("content_digest is invalid")
+    return _stable_id(
+        "crv",
+        {
+            "content_digest": content_digest,
+            "family_id": family_id,
+            "revision": revision,
+        },
     )
 
 
