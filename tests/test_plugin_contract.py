@@ -138,11 +138,18 @@ class PluginContractTests(unittest.TestCase):
 
     def test_project_installs_agent_entrypoint_and_bounded_mcp_sdk(self) -> None:
         with (REPOSITORY_ROOT / "pyproject.toml").open("rb") as stream:
-            project = tomllib.load(stream)["project"]
+            document = tomllib.load(stream)
+        project = document["project"]
 
         self.assertIn("mcp>=1.28,<2", project["dependencies"])
         self.assertEqual(
             "zdecision.agent.cli:main", project["scripts"]["zdecision-agent"]
+        )
+        self.assertEqual(
+            ["static/*.html"],
+            document["tool"]["setuptools"]["package-data"].get(
+                "zdecision.agent"
+            ),
         )
 
 
