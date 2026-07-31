@@ -4,17 +4,22 @@ ZDecision turns decisions from normal Codex development into small, reviewed
 project memory, then recalls the relevant formal Decisions in later work
 without copying the source conversation.
 
-The implemented pre-Demo **Packet 1** is page-triggered:
+The implemented pre-Demo **Packet 1** is user-triggered:
 
 1. The installed Plugin observes Codex activity only in company-enabled Git
    repositories.
-2. The user clicks **更新候选决策** for that repository on the ZDecision page.
-3. The local Agent selects changed Sessions, runs two-stage decision
+2. After a completed and verified code-development boundary, Codex renders an
+   inline card once. The same-task phrase **更新候选决策** renders it
+   immediately as a fallback.
+3. The user clicks **当前 Session** or **所有有效 Session** on that card, or
+   clicks **更新候选决策** for the repository on the central page.
+4. The local Agent selects the authorized changed Sessions, runs two-stage decision
    extraction, and uploads only structured Candidate decisions.
-4. Current Candidate revisions appear in the product-isolated Candidate Inbox.
+5. Current Candidate revisions appear in the product-isolated Candidate Inbox.
 
 No Session ID, separate compression conversation, or CLI command is part of
-the Plugin product flow. Packet 1 ends at the Candidate Inbox. Web
+the Plugin product flow. Rendering the card does not authorize Capture; only a
+scope button or the central page action does. Packet 1 ends at the Candidate Inbox. Web
 Review/publication is Packet 2, and automatic Decision recall is Packet 3; they
 are deliberately not simulated by the Packet 1 page.
 
@@ -37,8 +42,8 @@ zdecision-agent service run \
 ```
 
 The generated config files are private onboarding artifacts. The browser opens
-`http://127.0.0.1:8765`; clicking **更新候选决策** is the only action that
-authorizes model-based Candidate generation.
+`http://127.0.0.1:8765`; a central-page update click or an inline card scope
+click authorizes model-based Candidate generation.
 
 V1 selects templates by stable ID. A template's title is display metadata, not
 an alias. To add one, copy a template directory, assign its stable ID, title,
@@ -54,7 +59,9 @@ implementation fragment.
 
 The product authority is [docs/architecture.md](docs/architecture.md). The
 active Plugin contract is the
-[on-demand Candidate refresh design](docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md).
+[on-demand Candidate refresh design](docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md),
+as amended by the
+[Codex inline Candidate refresh design](docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md).
 Repository instructions for Codex are in [AGENTS.md](AGENTS.md).
 
 ## V1 storage

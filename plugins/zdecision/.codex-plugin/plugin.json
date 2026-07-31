@@ -15,7 +15,7 @@
     "category": "Productivity",
     "capabilities": ["Read"],
     "defaultPrompt": [
-      "Show the ZDecision status for this repository."
+      "更新候选决策"
     ]
   }
 }

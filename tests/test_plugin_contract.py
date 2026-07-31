@@ -133,6 +133,48 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("capture CLI", text)
         self.assertNotIn("AGENTS.md", text)
 
+    def test_plugin_skill_presents_the_inline_control_at_approved_boundaries(
+        self,
+    ) -> None:
+        text = (
+            PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
+        ).read_text("utf-8")
+
+        for required in (
+            "completed and verified code-development boundary",
+            "enabled repository",
+            "render `show_zdecision_update` once",
+            "更新候选决策",
+            "render `show_zdecision_update` immediately",
+            "Rendering the card is not Capture authorization",
+            "Session start",
+            "intermediate Turns",
+            "incomplete or failed validation",
+            "non-code work",
+            "Duplicate renders have no domain side effect",
+            "central page",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, text)
+
+    def test_plugin_defaults_to_the_explicit_inline_refresh_phrase(self) -> None:
+        agent_config = (
+            PLUGIN_ROOT
+            / "skills"
+            / "zdecision"
+            / "agents"
+            / "openai.yaml"
+        ).read_text("utf-8")
+        manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
+
+        self.assertIn('default_prompt: "更新候选决策"', agent_config)
+        self.assertEqual(
+            ["更新候选决策"], manifest["interface"]["defaultPrompt"]
+        )
+        self.assertIn(
+            "allow_implicit_invocation: true", agent_config
+        )
+
     def test_plugin_exposes_no_model_based_automatic_capture_tools(
         self,
     ) -> None:

@@ -18,6 +18,7 @@ from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.agent.capture_processor import OnDemandCaptureProcessor
 from zdecision.agent.central_client import CentralClient
+from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import handle_hook
@@ -366,6 +367,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.session_index: SessionIndex | None = None
         self.operation_store: CaptureOperationStore | None = None
         self.request_state: RequestStateStore | None = None
+        self.control_store: ControlBindingStore | None = None
         self.capture_runner: RequestedCaptureRunner | None = None
         self.reconciliation_runner: ReconciliationRunner | None = None
         self.central_client: CentralClient | None = None
@@ -651,7 +653,10 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self._drain_hooks()
         request_id = self._click("web_action_frozen_boundary")
         frozen = self.session_index.freeze_sources(
-            request_id, self.repository_id, self.clock()
+            request_id,
+            self.repository_id,
+            self.clock(),
+            capture_scope="all_valid_sessions",
         )[0]
         self.clock.advance(1)
         self.gateway.boundaries[SESSION_A] = TURN_A2
@@ -693,7 +698,10 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self._drain_hooks()
         request_id = self._click("web_action_missing_boundary")
         frozen = self.session_index.freeze_sources(
-            request_id, self.repository_id, self.clock()
+            request_id,
+            self.repository_id,
+            self.clock(),
+            capture_scope="all_valid_sessions",
         )[0]
         del self.gateway.boundaries[SESSION_A]
         self.gateway.available_boundaries.discard((SESSION_A, TURN_A1))
@@ -750,7 +758,10 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             "failed_retryable", self._request(request_id)["state"]
         )
         frozen = self.session_index.freeze_sources(
-            request_id, self.repository_id, self.clock()
+            request_id,
+            self.repository_id,
+            self.clock(),
+            capture_scope="all_valid_sessions",
         )[0]
         self.assertIsNone(
             self.session_index.handled_turn(frozen.source_key)
@@ -831,6 +842,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.session_index = SessionIndex.open(self.agent_path)
         self.operation_store = CaptureOperationStore.open(self.agent_path)
         self.request_state = RequestStateStore.open(self.agent_path)
+        self.control_store = ControlBindingStore.open(self.agent_path)
         self.agent_database.retire_legacy_automatic_capture()
         catalog = TemplateCatalog(
             REPOSITORY_ROOT / "decision-templates",
@@ -851,6 +863,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             capture_runner=self.capture_runner,
             reconciliation_runner=self.reconciliation_runner,
             request_state=self.request_state,
+            control_store=self.control_store,
             clock=self.clock,
         )
         self.central_client = CentralClient(
@@ -871,6 +884,9 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         if self.request_state is not None:
             self.request_state.close()
             self.request_state = None
+        if self.control_store is not None:
+            self.control_store.close()
+            self.control_store = None
         if self.operation_store is not None:
             self.operation_store.close()
             self.operation_store = None
