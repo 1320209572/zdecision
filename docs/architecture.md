@@ -3,7 +3,7 @@
 This document is the product architecture authority. Sections 1 through 11
 define the proven manual V1 domain and its safety contracts. The current
 Plugin product direction is the on-demand extension in section 12, with the
-detailed approved-for-review contract in
+detailed approved implementation contract in
 `docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md`.
 
 Where the historical manual interaction and the Plugin interaction differ,
@@ -503,17 +503,23 @@ attribution, and passes ZDecision's stricter privacy and durability tests.
 
 ## 12. Plugin on-demand Candidate refresh
 
-The first Plugin loop replaces manual Session selection with one page action:
+The Plugin is delivered in three vertical packets. Packet 1 is the current
+executable boundary:
 
 ```text
-Plugin observes enabled repositories locally
+Packet 1 (implemented)
+  Plugin observes enabled repositories locally
   -> user clicks 更新候选决策 for a repository
   -> central service creates a durable Capture Request
   -> persistent local Agent claims it
   -> app-server Capture runs for changed Sessions
-  -> structured Candidate revisions reach the Review page
-  -> explicit Review and publication create formal Decisions
-  -> later Codex work receives applicable Decisions automatically
+  -> structured Candidate revisions reach the Candidate Inbox
+
+Packet 2 (next)
+  Candidate Inbox -> explicit Review -> explicit publication -> Registry
+
+Packet 3 (after Packet 2)
+  signed Decision cache -> local relevance match -> bounded Codex injection
 ```
 
 The page click, not a guessed feature-completion signal, starts Candidate
@@ -539,10 +545,17 @@ Raw Sessions, Prompts, model context, tool output, code, and diffs remain local.
 The central service derives identity and product; browser and Agent payloads
 cannot select organization, actor, or an unregistered product.
 
-Candidate refresh is user-triggered, but Decision recall remains automatic.
-The local signed Decision cache ranks Prompts locally, suppresses repeat
+Packet 1 stops at the product-isolated Candidate Inbox. Its page intentionally
+has no accept, reject, or publish control. Packet 2 connects the proven Review,
+preview, publication, and Registry contracts. Packet 3 adds automatic Decision
+recall: the local signed cache ranks Prompts locally, suppresses repeat
 injection through `active_injected_set`, and restores that set once after a
 Codex context compact or clear event.
+
+The technical-loop operator may start the central service and persistent Agent
+with `zdecision-central run` and `zdecision-agent service run`; those commands
+are deployment diagnostics, not end-user Capture UX. No internal command
+accepts a Session ID to authorize Candidate generation.
 
 The detailed component contracts, DeepTutor reuse boundary, migration impact,
 and acceptance Gates are defined in the on-demand Candidate refresh design.

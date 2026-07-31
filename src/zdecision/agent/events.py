@@ -43,17 +43,6 @@ EVENT_STATES = frozenset(
         "failed_terminal",
     )
 )
-WORK_STATES = frozenset(
-    (
-        "exploring",
-        "implementing",
-        "awaiting_user",
-        "validation_failed",
-        "milestone_complete",
-    )
-)
-VALIDATION_STATES = frozenset(("passed", "failed", "not_applicable", "unknown"))
-
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,255}$")
 _VALIDATION_COMMAND = re.compile(
@@ -180,66 +169,6 @@ def event_id_for(invocation: HookInvocation) -> str:
     """Return the replay-stable identity for one normalized observation."""
 
     return f"evt_{invocation.input_digest[:32]}"
-
-
-def local_fact_invocation(
-    *,
-    session_id: str,
-    turn_id: str,
-    cwd: str,
-    occurred_at: str,
-    repository: RepositorySnapshot | None,
-    fact_kind: Literal["work_state", "manual_submit"],
-    status: str | None = None,
-    validation: str | None = None,
-    unresolved_blocker_count: int = 0,
-) -> HookInvocation:
-    """Build a bounded local-tool fact without retaining arbitrary tool text."""
-
-    normalized_session = _safe_identifier(session_id, "session_id")
-    normalized_turn = _safe_identifier(turn_id, "turn_id")
-    normalized_cwd = _safe_cwd(cwd)
-    if fact_kind == "work_state":
-        if status not in WORK_STATES or validation not in VALIDATION_STATES:
-            raise InvalidHookInvocation("Work state report is invalid")
-        if not isinstance(unresolved_blocker_count, int) or isinstance(
-            unresolved_blocker_count, bool
-        ):
-            raise InvalidHookInvocation("Blocker count is invalid")
-        if not 0 <= unresolved_blocker_count <= 100:
-            raise InvalidHookInvocation("Blocker count is invalid")
-        safe_fact: dict[str, object] = {
-            "report_kind": "work_state",
-            "status": status,
-            "validation": validation,
-            "unresolved_blocker_count": unresolved_blocker_count,
-        }
-        tool_name = "zdecision.report_work_state"
-    else:
-        safe_fact = {"report_kind": "manual_submit"}
-        tool_name = "zdecision.submit_current_boundary"
-    discriminator = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "fact_kind": fact_kind,
-                "safe_fact": safe_fact,
-                "session_id": normalized_session,
-                "turn_id": normalized_turn,
-            }
-        )
-    ).hexdigest()
-    return _build_invocation(
-        event_name="PostToolUse",
-        session_id=normalized_session,
-        turn_id=normalized_turn,
-        cwd=normalized_cwd,
-        occurred_at=_safe_occurrence_time(occurred_at),
-        repository=repository,
-        source=None,
-        tool_name=tool_name,
-        safe_fact=safe_fact,
-        hidden_discriminator=discriminator,
-    )
 
 
 def _build_invocation(

@@ -317,6 +317,14 @@ class ZDecisionSkillContractTests(unittest.TestCase):
 
         self.assertIn("更新候选决策", text)
         self.assertIn("No Session ID", text)
+        self.assertIn("Packet 1 ends at the Candidate Inbox", text)
+        self.assertRegex(
+            text,
+            re.compile(r"Web\s+Review/publication is Packet 2"),
+        )
+        self.assertIn("automatic Decision recall is Packet 3", text)
+        self.assertIn("zdecision-central run", text)
+        self.assertIn("zdecision-agent service run", text)
         self.assertIn("业务决策压缩模板", text)
         self.assertIn("architecture", text)
         self.assertRegex(

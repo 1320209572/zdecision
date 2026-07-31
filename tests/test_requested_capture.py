@@ -3,7 +3,6 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.session_index import FrozenSessionSource
@@ -190,15 +189,11 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
     def test_request_runs_inventory_then_extraction_without_assessment(
         self,
     ) -> None:
-        with patch(
-            "zdecision.capture.eligibility.capture_eligible",
-            side_effect=AssertionError("eligibility must not run"),
-        ):
-            result = self.runner.run(
-                self.source,
-                product_name="ZDecision",
-                template_id="business",
-            )
+        result = self.runner.run(
+            self.source,
+            product_name="ZDecision",
+            template_id="business",
+        )
 
         self.assertEqual(("inventory", "extraction"), tuple(self.gateway.stage_names))
         self.assertNotIn("eligibility", self.gateway.stage_names)

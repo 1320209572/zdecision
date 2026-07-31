@@ -90,17 +90,51 @@ class PluginContractTests(unittest.TestCase):
             hooks["SessionEnd"][0]["hooks"][0]["timeout"], 3
         )
 
-    def test_plugin_skill_describes_automatic_status_and_manual_fallback(self) -> None:
+    def test_plugin_skill_describes_the_page_authorized_workflow(self) -> None:
         skill_path = PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
         self.assertTrue(skill_path.is_file(), f"missing plugin skill: {skill_path}")
         text = skill_path.read_text("utf-8")
 
         self.assertTrue(text.startswith("---\nname: zdecision\n"))
-        self.assertIn("report_work_state", text)
         self.assertIn("zdecision_status", text)
-        self.assertIn("submit_current_boundary", text)
-        self.assertIn("automatic", text.lower())
+        self.assertIn("更新候选决策", text)
+        self.assertIn("enabled repositories", text)
+        self.assertIn("persistent local Agent", text)
+        self.assertIn("structured Candidate revisions", text)
+        self.assertIn("Review and publication", text)
+        self.assertIn("Do not ask", text)
+        self.assertIn("Session ID", text)
+        self.assertIn("capture CLI", text)
         self.assertNotIn("AGENTS.md", text)
+
+    def test_plugin_exposes_no_model_based_automatic_capture_tools(
+        self,
+    ) -> None:
+        text = (
+            PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
+        ).read_text("utf-8")
+
+        for forbidden in (
+            "report_work_state",
+            "submit_current_boundary",
+            "milestone_complete",
+            "静默 60",
+            "automatic eligibility",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, text)
+
+    def test_update_candidates_is_the_only_capture_authority(
+        self,
+    ) -> None:
+        source = REPOSITORY_ROOT / "src" / "zdecision"
+
+        self.assertFalse(
+            (source / "capture" / "eligibility.py").exists()
+        )
+        self.assertFalse(
+            (source / "app_server" / "capture_runner.py").exists()
+        )
 
     def test_project_installs_agent_entrypoint_and_bounded_mcp_sdk(self) -> None:
         with (REPOSITORY_ROOT / "pyproject.toml").open("rb") as stream:

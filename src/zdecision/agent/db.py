@@ -11,8 +11,6 @@ from pathlib import Path
 
 from zdecision.agent.events import (
     EVENT_STATES,
-    VALIDATION_STATES,
-    WORK_STATES,
     AgentEvent,
     EventState,
     HookInvocation,
@@ -27,41 +25,6 @@ _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _FAILURE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MODEL_PROFILE_ID = re.compile(r"^fmp_[0-9a-f]{32}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_AUTOMATED_CAPTURE_ID = re.compile(r"^acp_[0-9a-f]{32}$")
-_CAPTURE_OPERATION_ID = re.compile(r"^cap_[0-9a-f]{32}$")
-_AUTOMATED_CAPTURE_STATES = frozenset(
-    (
-        "prepared",
-        "assessment_fork_pending",
-        "assessment_fork_attached",
-        "assessment_completed",
-        "completed_ineligible",
-        "capture_fork_pending",
-        "capture_fork_attached",
-        "inventory_completed",
-        "completed",
-        "ambiguous",
-        "failed",
-    )
-)
-_TERMINAL_AUTOMATED_CAPTURE_STATES = frozenset(
-    ("completed_ineligible", "completed", "ambiguous", "failed")
-)
-_AUTOMATED_CAPTURE_TRANSITIONS = {
-    "prepared": frozenset(("assessment_fork_pending", "failed")),
-    "assessment_fork_pending": frozenset(
-        ("assessment_fork_attached", "ambiguous", "failed")
-    ),
-    "assessment_fork_attached": frozenset(("assessment_completed", "failed")),
-    "assessment_completed": frozenset(
-        ("completed_ineligible", "capture_fork_pending", "failed")
-    ),
-    "capture_fork_pending": frozenset(
-        ("capture_fork_attached", "ambiguous", "failed")
-    ),
-    "capture_fork_attached": frozenset(("inventory_completed", "failed")),
-    "inventory_completed": frozenset(("completed", "failed")),
-}
 
 
 @dataclass(frozen=True)
@@ -89,59 +52,12 @@ class AppServerRouteRecord:
     recorded_at: datetime
 
 
-@dataclass(frozen=True)
-class AutomatedCaptureRunRecord:
-    automated_capture_id: str
-    session_id: str
-    source_turn_id: str
-    repository_id: str
-    product_id: str
-    product_name: str
-    template_id: str
-    template_snapshot_digest: str
-    eligibility_prompt_digest: str
-    model_profile_id: str
-    state: str
-    assessment_thread_id: str | None
-    assessment_turn_id: str | None
-    capture_operation_id: str | None
-    capture_thread_id: str | None
-    inventory_turn_id: str | None
-    extraction_turn_id: str | None
-    candidate_ids: tuple[str, ...]
-    failure_code: str | None
-    created_at: str
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class BoundaryAssessmentRecord:
-    automated_capture_id: str
-    source_thread_id: str
-    source_turn_id: str
-    prompt_version: str
-    prompt_digest: str
-    input_fact_digest: str
-    assessment_thread_id: str
-    assessment_turn_id: str
-    model_profile_id: str
-    phase: str
-    has_durable_decision_signal: bool
-    validation: str
-    unresolved_blockers: tuple[str, ...]
-    recorded_at: str
-
-
 class AgentEventConflict(Exception):
     """Raised when one event identity is replayed with different content."""
 
 
 class FeasibilityModelProfileConflict(Exception):
     """Raised when model discovery changes after the feasibility profile freezes."""
-
-
-class AutomatedCaptureConflict(Exception):
-    """Raised when a private automated-Capture CAS or immutable write conflicts."""
 
 
 class AgentDatabase:
@@ -252,61 +168,6 @@ class AgentDatabase:
                     recorded_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS automated_capture_runs (
-                    automated_capture_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    source_turn_id TEXT NOT NULL,
-                    repository_id TEXT NOT NULL,
-                    product_id TEXT NOT NULL,
-                    product_name TEXT NOT NULL,
-                    template_id TEXT NOT NULL,
-                    template_snapshot_digest TEXT NOT NULL,
-                    eligibility_prompt_digest TEXT NOT NULL,
-                    model_profile_id TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (
-                        state IN (
-                            'prepared','assessment_fork_pending',
-                            'assessment_fork_attached','assessment_completed',
-                            'completed_ineligible','capture_fork_pending',
-                            'capture_fork_attached','inventory_completed',
-                            'completed','ambiguous','failed'
-                        )
-                    ),
-                    assessment_thread_id TEXT,
-                    assessment_turn_id TEXT,
-                    capture_operation_id TEXT,
-                    capture_thread_id TEXT,
-                    inventory_turn_id TEXT,
-                    extraction_turn_id TEXT,
-                    candidate_ids_json BLOB NOT NULL,
-                    failure_code TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS automated_capture_boundary
-                    ON automated_capture_runs(session_id, source_turn_id);
-
-                CREATE TABLE IF NOT EXISTS boundary_assessments (
-                    automated_capture_id TEXT PRIMARY KEY,
-                    source_thread_id TEXT NOT NULL,
-                    source_turn_id TEXT NOT NULL,
-                    prompt_version TEXT NOT NULL,
-                    prompt_digest TEXT NOT NULL,
-                    input_fact_digest TEXT NOT NULL,
-                    assessment_thread_id TEXT NOT NULL,
-                    assessment_turn_id TEXT NOT NULL,
-                    model_profile_id TEXT NOT NULL,
-                    phase TEXT NOT NULL,
-                    has_durable_decision_signal INTEGER NOT NULL
-                        CHECK (has_durable_decision_signal IN (0, 1)),
-                    validation TEXT NOT NULL,
-                    unresolved_blockers_json BLOB NOT NULL,
-                    recorded_at TEXT NOT NULL,
-                    FOREIGN KEY(automated_capture_id)
-                        REFERENCES automated_capture_runs(automated_capture_id)
-                );
-
                 CREATE INDEX IF NOT EXISTS events_work_queue
                     ON events(state, retry_at, processing_expires_at);
 
@@ -319,10 +180,17 @@ class AgentDatabase:
                 VALUES (1, 0, NULL)
                 ON CONFLICT(singleton_id) DO NOTHING;
 
-                PRAGMA user_version = 4;
+                PRAGMA user_version = 5;
                 """
             )
+            _retire_legacy_automatic_capture(connection)
         return cls(database_path, connection)
+
+    def retire_legacy_automatic_capture(self) -> bool:
+        """Drop the obsolete journal after the on-demand stores exist."""
+
+        with self._connection:
+            return _retire_legacy_automatic_capture(self._connection)
 
     def record_hook(self, invocation: HookInvocation) -> AgentEvent:
         if not isinstance(invocation, HookInvocation):
@@ -833,229 +701,6 @@ class AgentDatabase:
             for row in rows
         )
 
-    def create_automated_capture_run(
-        self, record: AutomatedCaptureRunRecord
-    ) -> AutomatedCaptureRunRecord:
-        _validate_automated_capture_run(record)
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO automated_capture_runs (
-                    automated_capture_id, session_id, source_turn_id,
-                    repository_id, product_id, product_name, template_id,
-                    template_snapshot_digest, eligibility_prompt_digest,
-                    model_profile_id, state, assessment_thread_id,
-                    assessment_turn_id, capture_operation_id,
-                    capture_thread_id, inventory_turn_id, extraction_turn_id,
-                    candidate_ids_json, failure_code, created_at, updated_at
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                ON CONFLICT(automated_capture_id) DO NOTHING
-                """,
-                _automated_capture_values(record),
-            )
-        stored = self.get_automated_capture_run(record.automated_capture_id)
-        if stored != record:
-            raise AutomatedCaptureConflict(
-                "Automated Capture identity already has different state"
-            )
-        return stored
-
-    def get_automated_capture_run(
-        self, automated_capture_id: str
-    ) -> AutomatedCaptureRunRecord | None:
-        if _AUTOMATED_CAPTURE_ID.fullmatch(automated_capture_id) is None:
-            raise ValueError("automated_capture_id is invalid")
-        row = self._connection.execute(
-            """
-            SELECT * FROM automated_capture_runs
-            WHERE automated_capture_id = ?
-            """,
-            (automated_capture_id,),
-        ).fetchone()
-        return None if row is None else _automated_capture_from_row(row)
-
-    def replace_automated_capture_run(
-        self,
-        expected: AutomatedCaptureRunRecord,
-        replacement: AutomatedCaptureRunRecord,
-    ) -> AutomatedCaptureRunRecord:
-        _validate_automated_capture_run(expected)
-        _validate_automated_capture_run(replacement)
-        immutable_fields = (
-            "automated_capture_id",
-            "session_id",
-            "source_turn_id",
-            "repository_id",
-            "product_id",
-            "product_name",
-            "template_id",
-            "template_snapshot_digest",
-            "eligibility_prompt_digest",
-            "model_profile_id",
-            "created_at",
-        )
-        if any(
-            getattr(expected, field_name) != getattr(replacement, field_name)
-            for field_name in immutable_fields
-        ):
-            raise AutomatedCaptureConflict(
-                "Automated Capture identity fields cannot change"
-            )
-        if replacement != expected and replacement.state not in (
-            _AUTOMATED_CAPTURE_TRANSITIONS.get(expected.state, frozenset())
-        ):
-            raise AutomatedCaptureConflict(
-                "Automated Capture state transition is invalid"
-            )
-        current = self.get_automated_capture_run(expected.automated_capture_id)
-        if current is None:
-            raise AutomatedCaptureConflict("Automated Capture run does not exist")
-        if current == replacement:
-            return current
-        if current != expected:
-            raise AutomatedCaptureConflict("Automated Capture run changed")
-        with self._connection:
-            cursor = self._connection.execute(
-                """
-                UPDATE automated_capture_runs SET
-                    state = ?, assessment_thread_id = ?, assessment_turn_id = ?,
-                    capture_operation_id = ?, capture_thread_id = ?,
-                    inventory_turn_id = ?, extraction_turn_id = ?,
-                    candidate_ids_json = ?, failure_code = ?, updated_at = ?
-                WHERE automated_capture_id = ? AND state = ? AND updated_at = ?
-                """,
-                (
-                    replacement.state,
-                    replacement.assessment_thread_id,
-                    replacement.assessment_turn_id,
-                    replacement.capture_operation_id,
-                    replacement.capture_thread_id,
-                    replacement.inventory_turn_id,
-                    replacement.extraction_turn_id,
-                    canonical_json_bytes(list(replacement.candidate_ids)),
-                    replacement.failure_code,
-                    replacement.updated_at,
-                    expected.automated_capture_id,
-                    expected.state,
-                    expected.updated_at,
-                ),
-            )
-        if cursor.rowcount != 1:
-            raise AutomatedCaptureConflict("Automated Capture CAS failed")
-        stored = self.get_automated_capture_run(replacement.automated_capture_id)
-        if stored != replacement:
-            raise AutomatedCaptureConflict(
-                "Automated Capture replacement did not persist exactly"
-            )
-        return stored
-
-    def automated_capture_id_for_boundary(
-        self, session_id: str, source_turn_id: str
-    ) -> str | None:
-        rows = self._connection.execute(
-            """
-            SELECT automated_capture_id FROM automated_capture_runs
-            WHERE session_id = ? AND source_turn_id = ?
-            ORDER BY rowid
-            """,
-            (session_id, source_turn_id),
-        ).fetchall()
-        return None if not rows else rows[-1]["automated_capture_id"]
-
-    def boundary_has_assessment(self, session_id: str, source_turn_id: str) -> bool:
-        row = self._connection.execute(
-            """
-            SELECT 1 FROM boundary_assessments
-            WHERE source_thread_id = ? AND source_turn_id = ? LIMIT 1
-            """,
-            (session_id, source_turn_id),
-        ).fetchone()
-        return row is not None
-
-    def automated_capture_active(
-        self,
-        session_id: str,
-        source_turn_id: str,
-        *,
-        excluding_id: str | None = None,
-    ) -> bool:
-        placeholders = ",".join("?" for _ in _TERMINAL_AUTOMATED_CAPTURE_STATES)
-        parameters: list[object] = [
-            session_id,
-            source_turn_id,
-            *_TERMINAL_AUTOMATED_CAPTURE_STATES,
-        ]
-        exclusion = ""
-        if excluding_id is not None:
-            exclusion = " AND automated_capture_id != ?"
-            parameters.append(excluding_id)
-        row = self._connection.execute(
-            f"""
-            SELECT 1 FROM automated_capture_runs
-            WHERE session_id = ? AND source_turn_id = ?
-              AND state NOT IN ({placeholders}){exclusion}
-            LIMIT 1
-            """,
-            tuple(parameters),
-        ).fetchone()
-        return row is not None
-
-    def put_boundary_assessment(
-        self, record: BoundaryAssessmentRecord
-    ) -> BoundaryAssessmentRecord:
-        _validate_boundary_assessment_record(record)
-        with self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO boundary_assessments (
-                    automated_capture_id, source_thread_id, source_turn_id,
-                    prompt_version, prompt_digest, input_fact_digest,
-                    assessment_thread_id, assessment_turn_id,
-                    model_profile_id, phase, has_durable_decision_signal,
-                    validation, unresolved_blockers_json, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(automated_capture_id) DO NOTHING
-                """,
-                (
-                    record.automated_capture_id,
-                    record.source_thread_id,
-                    record.source_turn_id,
-                    record.prompt_version,
-                    record.prompt_digest,
-                    record.input_fact_digest,
-                    record.assessment_thread_id,
-                    record.assessment_turn_id,
-                    record.model_profile_id,
-                    record.phase,
-                    int(record.has_durable_decision_signal),
-                    record.validation,
-                    canonical_json_bytes(list(record.unresolved_blockers)),
-                    record.recorded_at,
-                ),
-            )
-        stored = self.get_boundary_assessment(record.automated_capture_id)
-        if stored != record:
-            raise AutomatedCaptureConflict(
-                "Boundary assessment already has different content"
-            )
-        return stored
-
-    def get_boundary_assessment(
-        self, automated_capture_id: str
-    ) -> BoundaryAssessmentRecord | None:
-        if _AUTOMATED_CAPTURE_ID.fullmatch(automated_capture_id) is None:
-            raise ValueError("automated_capture_id is invalid")
-        row = self._connection.execute(
-            """
-            SELECT * FROM boundary_assessments
-            WHERE automated_capture_id = ?
-            """,
-            (automated_capture_id,),
-        ).fetchone()
-        return None if row is None else _boundary_assessment_from_row(row)
-
     def set_worker_owner(self, owner_pid: int, *, lease_expires_at: datetime) -> None:
         with self._connection:
             self._connection.execute(
@@ -1168,190 +813,30 @@ class AgentDatabase:
         )
 
 
-def _validate_automated_capture_run(record: AutomatedCaptureRunRecord) -> None:
-    if not isinstance(record, AutomatedCaptureRunRecord):
-        raise TypeError("record must be an AutomatedCaptureRunRecord")
-    if _AUTOMATED_CAPTURE_ID.fullmatch(record.automated_capture_id) is None:
-        raise ValueError("automated_capture_id is invalid")
-    for field_name in (
-        "session_id",
-        "source_turn_id",
-        "product_name",
-        "template_id",
-    ):
-        value = getattr(record, field_name)
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"{field_name} is invalid")
-    if _REPOSITORY_ID.fullmatch(record.repository_id) is None:
-        raise ValueError("repository_id is invalid")
-    if _PRODUCT_ID.fullmatch(record.product_id) is None:
-        raise ValueError("product_id is invalid")
-    if _DIGEST.fullmatch(record.template_snapshot_digest) is None:
-        raise ValueError("template_snapshot_digest is invalid")
-    if _DIGEST.fullmatch(record.eligibility_prompt_digest) is None:
-        raise ValueError("eligibility_prompt_digest is invalid")
-    if _MODEL_PROFILE_ID.fullmatch(record.model_profile_id) is None:
-        raise ValueError("model_profile_id is invalid")
-    if record.state not in _AUTOMATED_CAPTURE_STATES:
-        raise ValueError("Automated Capture state is invalid")
-    for field_name in (
-        "assessment_thread_id",
-        "assessment_turn_id",
-        "capture_thread_id",
-        "inventory_turn_id",
-        "extraction_turn_id",
-    ):
-        value = getattr(record, field_name)
-        if value is not None and (not isinstance(value, str) or not value):
-            raise ValueError(f"{field_name} is invalid")
-    if record.capture_operation_id is not None and _CAPTURE_OPERATION_ID.fullmatch(
-        record.capture_operation_id
-    ) is None:
-        raise ValueError("capture_operation_id is invalid")
-    if not isinstance(record.candidate_ids, tuple) or any(
-        not isinstance(value, str) or not value for value in record.candidate_ids
-    ):
-        raise ValueError("candidate_ids is invalid")
-    if len(set(record.candidate_ids)) != len(record.candidate_ids):
-        raise ValueError("candidate_ids contains a duplicate")
-    if record.failure_code is not None and _FAILURE_CODE.fullmatch(
-        record.failure_code
-    ) is None:
-        raise ValueError("failure_code is invalid")
-    _parse_datetime(record.created_at)
-    _parse_datetime(record.updated_at)
+def _retire_legacy_automatic_capture(connection: sqlite3.Connection) -> bool:
+    """Remove the superseded journal only after every replacement store exists."""
 
-
-def _automated_capture_values(
-    record: AutomatedCaptureRunRecord,
-) -> tuple[object, ...]:
-    return (
-        record.automated_capture_id,
-        record.session_id,
-        record.source_turn_id,
-        record.repository_id,
-        record.product_id,
-        record.product_name,
-        record.template_id,
-        record.template_snapshot_digest,
-        record.eligibility_prompt_digest,
-        record.model_profile_id,
-        record.state,
-        record.assessment_thread_id,
-        record.assessment_turn_id,
-        record.capture_operation_id,
-        record.capture_thread_id,
-        record.inventory_turn_id,
-        record.extraction_turn_id,
-        canonical_json_bytes(list(record.candidate_ids)),
-        record.failure_code,
-        record.created_at,
-        record.updated_at,
+    table_names = {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    required_replacements = {
+        "session_checkpoints",
+        "native_attempts",
+        "reconciliation_results",
+        "candidate_outbox",
+    }
+    if not required_replacements.issubset(table_names):
+        return False
+    legacy_present = bool(
+        {"automated_capture_runs", "boundary_assessments"} & table_names
     )
-
-
-def _automated_capture_from_row(row: sqlite3.Row) -> AutomatedCaptureRunRecord:
-    record = AutomatedCaptureRunRecord(
-        automated_capture_id=row["automated_capture_id"],
-        session_id=row["session_id"],
-        source_turn_id=row["source_turn_id"],
-        repository_id=row["repository_id"],
-        product_id=row["product_id"],
-        product_name=row["product_name"],
-        template_id=row["template_id"],
-        template_snapshot_digest=row["template_snapshot_digest"],
-        eligibility_prompt_digest=row["eligibility_prompt_digest"],
-        model_profile_id=row["model_profile_id"],
-        state=row["state"],
-        assessment_thread_id=row["assessment_thread_id"],
-        assessment_turn_id=row["assessment_turn_id"],
-        capture_operation_id=row["capture_operation_id"],
-        capture_thread_id=row["capture_thread_id"],
-        inventory_turn_id=row["inventory_turn_id"],
-        extraction_turn_id=row["extraction_turn_id"],
-        candidate_ids=_stored_string_tuple(
-            row["candidate_ids_json"], "candidate_ids"
-        ),
-        failure_code=row["failure_code"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
-    _validate_automated_capture_run(record)
-    return record
-
-
-def _validate_boundary_assessment_record(record: BoundaryAssessmentRecord) -> None:
-    if not isinstance(record, BoundaryAssessmentRecord):
-        raise TypeError("record must be a BoundaryAssessmentRecord")
-    if _AUTOMATED_CAPTURE_ID.fullmatch(record.automated_capture_id) is None:
-        raise ValueError("automated_capture_id is invalid")
-    for field_name in (
-        "source_thread_id",
-        "source_turn_id",
-        "prompt_version",
-        "assessment_thread_id",
-        "assessment_turn_id",
-    ):
-        value = getattr(record, field_name)
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"{field_name} is invalid")
-    for field_name in ("prompt_digest", "input_fact_digest"):
-        if _DIGEST.fullmatch(getattr(record, field_name)) is None:
-            raise ValueError(f"{field_name} is invalid")
-    if _MODEL_PROFILE_ID.fullmatch(record.model_profile_id) is None:
-        raise ValueError("model_profile_id is invalid")
-    if record.phase not in WORK_STATES:
-        raise ValueError("phase is invalid")
-    if not isinstance(record.has_durable_decision_signal, bool):
-        raise ValueError("has_durable_decision_signal is invalid")
-    if record.validation not in VALIDATION_STATES:
-        raise ValueError("validation is invalid")
-    if (
-        not isinstance(record.unresolved_blockers, tuple)
-        or len(record.unresolved_blockers) > 20
-        or any(
-            not isinstance(value, str) or not value or len(value) > 256
-            for value in record.unresolved_blockers
-        )
-        or len(set(record.unresolved_blockers)) != len(record.unresolved_blockers)
-    ):
-        raise ValueError("unresolved_blockers is invalid")
-    _parse_datetime(record.recorded_at)
-
-
-def _boundary_assessment_from_row(row: sqlite3.Row) -> BoundaryAssessmentRecord:
-    record = BoundaryAssessmentRecord(
-        automated_capture_id=row["automated_capture_id"],
-        source_thread_id=row["source_thread_id"],
-        source_turn_id=row["source_turn_id"],
-        prompt_version=row["prompt_version"],
-        prompt_digest=row["prompt_digest"],
-        input_fact_digest=row["input_fact_digest"],
-        assessment_thread_id=row["assessment_thread_id"],
-        assessment_turn_id=row["assessment_turn_id"],
-        model_profile_id=row["model_profile_id"],
-        phase=row["phase"],
-        has_durable_decision_signal=bool(row["has_durable_decision_signal"]),
-        validation=row["validation"],
-        unresolved_blockers=_stored_string_tuple(
-            row["unresolved_blockers_json"], "unresolved_blockers"
-        ),
-        recorded_at=row["recorded_at"],
-    )
-    _validate_boundary_assessment_record(record)
-    return record
-
-
-def _stored_string_tuple(value: object, field_name: str) -> tuple[str, ...]:
-    try:
-        decoded = json.loads(bytes(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        raise ValueError(f"Stored {field_name} is invalid") from None
-    if not isinstance(decoded, list) or any(
-        not isinstance(member, str) for member in decoded
-    ):
-        raise ValueError(f"Stored {field_name} is invalid")
-    return tuple(decoded)
+    connection.execute("DROP TABLE IF EXISTS boundary_assessments")
+    connection.execute("DROP INDEX IF EXISTS automated_capture_boundary")
+    connection.execute("DROP TABLE IF EXISTS automated_capture_runs")
+    return legacy_present
 
 
 def _format_datetime(value: datetime) -> str:

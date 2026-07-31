@@ -237,6 +237,7 @@ def configured_processor(
     repository_root = package_root.parents[1]
     session_index = SessionIndex.open(local_state_path)
     request_state = RequestStateStore.open(local_state_path)
+    database.retire_legacy_automatic_capture()
     gateway = None
     try:
         gateway = AppServerGateway.connect(database=database)

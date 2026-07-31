@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -229,7 +230,7 @@ class EventLedgerTests(unittest.TestCase):
             self.database.latest_open_boundary(str(self.repository)),
         )
 
-    def test_resumed_session_reopens_local_mcp_turn_binding(self) -> None:
+    def test_resumed_session_reopens_status_turn_binding(self) -> None:
         self._handle(
             self._raw(
                 "UserPromptSubmit",
@@ -255,25 +256,13 @@ class EventLedgerTests(unittest.TestCase):
         tools = LocalMcpTools(
             database=self.database,
             cwd=str(self.repository),
-            clock=lambda: FIXED_TIME,
         )
 
-        report = tools.report_work_state(
-            status="milestone_complete",
-            validation="passed",
-            unresolved_blockers=[],
-        )
+        status = tools.zdecision_status()
 
-        self.assertEqual(
-            {
-                "ok": True,
-                "session_id": "thr_resumed",
-                "turn_id": "turn_after_resume",
-            },
-            report,
-        )
+        self.assertTrue(status["active_session_bound"])
 
-    def test_local_mcp_tools_bind_one_turn_without_storing_blocker_text(self) -> None:
+    def test_local_mcp_status_does_not_store_tool_text(self) -> None:
         self._handle(self._raw("SessionStart", session_id="thr_tools", source="startup"))
         self._handle(
             self._raw(
@@ -282,59 +271,97 @@ class EventLedgerTests(unittest.TestCase):
                 turn_id="turn_tools",
                 tool_name="Bash",
                 tool_use_id="tool_validation",
-                tool_input={"command": "python -m unittest"},
+                tool_input={"command": f"python -m unittest {SECRET}"},
                 tool_response={"exit_code": 0},
             )
         )
         tools = LocalMcpTools(
             database=self.database,
             cwd=str(self.repository),
-            clock=lambda: FIXED_TIME,
         )
 
-        report = tools.report_work_state(
-            status="milestone_complete",
-            validation="passed",
-            unresolved_blockers=[SECRET],
-        )
-        manual = tools.submit_current_boundary()
         status = tools.zdecision_status()
 
-        self.assertEqual(
-            {
-                "ok": True,
-                "session_id": "thr_tools",
-                "turn_id": "turn_tools",
-            },
-            report,
-        )
-        self.assertTrue(manual["ok"])
-        self.assertEqual("thr_tools", manual["session_id"])
-        self.assertEqual("turn_tools", manual["turn_id"])
         self.assertEqual(True, status["repository_registered"])
         self.assertEqual(True, status["repository_enabled"])
-        self.assertEqual(4, status["event_count"])
+        self.assertEqual(True, status["active_session_bound"])
+        self.assertEqual(2, status["event_count"])
         for path in self.database_path.parent.iterdir():
             if path.is_file():
                 self.assertNotIn(SECRET.encode(), path.read_bytes())
 
-    def test_local_mcp_report_fails_closed_without_one_active_turn(self) -> None:
+    def test_local_mcp_status_has_no_capture_side_effect(self) -> None:
         tools = LocalMcpTools(
             database=self.database,
             cwd=str(self.repository),
-            clock=lambda: FIXED_TIME,
         )
 
-        result = tools.report_work_state(
-            status="exploring",
-            validation="unknown",
-            unresolved_blockers=[],
-        )
+        result = tools.zdecision_status()
 
-        self.assertEqual(
-            {"ok": False, "error": "session_binding_ambiguous"}, result
-        )
+        self.assertFalse(result["active_session_bound"])
         self.assertEqual(0, self.database.count_events())
+
+    def test_legacy_capture_tables_retire_only_after_new_stores_exist(self) -> None:
+        from zdecision.agent.request_state import RequestStateStore
+        from zdecision.agent.session_index import SessionIndex
+
+        self._handle(
+            self._raw(
+                "Stop",
+                session_id="thr_migration",
+                turn_id="turn_migration",
+            )
+        )
+        self.database.close()
+        connection = sqlite3.connect(self.database_path)
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE automated_capture_runs (
+                    automated_capture_id TEXT PRIMARY KEY
+                );
+                CREATE INDEX automated_capture_boundary
+                    ON automated_capture_runs(automated_capture_id);
+                CREATE TABLE boundary_assessments (
+                    automated_capture_id TEXT PRIMARY KEY
+                );
+                """
+            )
+        connection.close()
+
+        self.database = AgentDatabase.open(self.database_path)
+        self.assertEqual(
+            {"automated_capture_runs", "boundary_assessments"},
+            self._legacy_table_names(),
+        )
+        self.database.close()
+
+        session_index = SessionIndex.open(self.database_path)
+        request_state = RequestStateStore.open(self.database_path)
+        session_index.close()
+        request_state.close()
+
+        self.database = AgentDatabase.open(self.database_path)
+        self.assertEqual(set(), self._legacy_table_names())
+        self.assertEqual(1, self.database.count_events())
+        self.assertEqual(
+            self.mapping,
+            self.database.get_repository_mapping(self.mapping.repository_id),
+        )
+
+    def _legacy_table_names(self) -> set[str]:
+        connection = sqlite3.connect(self.database_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN ('automated_capture_runs', 'boundary_assessments')
+                """
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

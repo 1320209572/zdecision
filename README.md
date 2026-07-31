@@ -4,22 +4,41 @@ ZDecision turns decisions from normal Codex development into small, reviewed
 project memory, then recalls the relevant formal Decisions in later work
 without copying the source conversation.
 
-The current pre-Demo Plugin direction is page-triggered:
+The implemented pre-Demo **Packet 1** is page-triggered:
 
 1. The installed Plugin observes Codex activity only in company-enabled Git
    repositories.
-2. When a body of work is ready, the user clicks **更新候选决策** for that
-   repository on the ZDecision page.
+2. The user clicks **更新候选决策** for that repository on the ZDecision page.
 3. The local Agent selects changed Sessions, runs two-stage decision
    extraction, and uploads only structured Candidate decisions.
-4. The user accepts or rejects Candidates and explicitly publishes the chosen
-   batch.
-5. The Plugin automatically recalls applicable formal Decisions in later Codex
-   tasks.
+4. Current Candidate revisions appear in the product-isolated Candidate Inbox.
 
 No Session ID, separate compression conversation, or CLI command is part of
-the Plugin product flow. The existing conversation and CLI paths remain useful
-as internal diagnostics for the proven Capture domain.
+the Plugin product flow. Packet 1 ends at the Candidate Inbox. Web
+Review/publication is Packet 2, and automatic Decision recall is Packet 3; they
+are deliberately not simulated by the Packet 1 page.
+
+For the local technical-loop operator, the internal startup boundary is:
+
+```bash
+zdecision-central demo-config init \
+  --repository-cwd /absolute/path/to/repository \
+  --product-name PRODUCT \
+  --output-dir /absolute/path/to/new-config-directory
+
+zdecision-central run \
+  --database /absolute/path/to/central.sqlite3 \
+  --config /absolute/path/to/new-config-directory/central.json \
+  --host 127.0.0.1 \
+  --port 8765
+
+zdecision-agent service run \
+  --config /absolute/path/to/new-config-directory/agent.json
+```
+
+The generated config files are private onboarding artifacts. The browser opens
+`http://127.0.0.1:8765`; clicking **更新候选决策** is the only action that
+authorizes model-based Candidate generation.
 
 V1 selects templates by stable ID. A template's title is display metadata, not
 an alias. To add one, copy a template directory, assign its stable ID, title,
@@ -60,11 +79,9 @@ decision-registry/
                 └── r0001.json
 ```
 
-Review is private and batched. Preview is read-only and shows the exact formal
-documents and paths. Review acceptance does not publish. The manual diagnostic
-path requires a later user message whose complete trimmed content is exactly
-`确认发布`; the Plugin page uses a separate explicit publication action bound to
-the same frozen preview.
+The proven Review and publication domain remains private and batched. Preview
+is read-only and shows the exact formal documents and paths; acceptance does
+not publish. Wiring that domain to the Plugin page belongs to Packet 2.
 
 The implementation lives under `src/zdecision/`. Legacy execution paths are
 not retained; extractor-v1 completed records remain display-only so existing
