@@ -3,11 +3,17 @@ name = "zdecision"
 version = "0.1.0"
 description = "Codex-native reviewed decision memory"
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.28,<2"]
+dependencies = [
+  "mcp>=1.28,<2",
+  "fastapi>=0.131,<1",
+  "httpx>=0.28,<1",
+  "uvicorn>=0.34,<1",
+]
 
 [project.scripts]
 zdecision = "zdecision.cli:main"
 zdecision-agent = "zdecision.agent.cli:main"
+zdecision-central = "zdecision.central.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -18,3 +24,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "zdecision.capture" = ["prompt_contracts/*.md"]
+"zdecision.central" = ["static/*.html"]

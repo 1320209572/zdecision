@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZDecision · 候选决策</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #19211d;
+      --muted: #657069;
+      --paper: #f3f1e9;
+      --panel: rgba(255, 255, 252, 0.82);
+      --line: rgba(25, 33, 29, 0.16);
+      --accent: #d94f2b;
+      --accent-dark: #9f3218;
+      --success: #1f7454;
+      --shadow: 0 24px 80px rgba(35, 42, 37, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, transparent 49.8%, rgba(25, 33, 29, 0.035) 50%),
+        radial-gradient(circle at 14% 12%, rgba(217, 79, 43, 0.12), transparent 30rem),
+        var(--paper);
+      font-family: "Noto Serif SC", "Songti SC", "Iowan Old Style", serif;
+    }
+
+    body::before {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      content: "";
+      opacity: 0.24;
+      background-image:
+        repeating-linear-gradient(
+          0deg,
+          transparent 0,
+          transparent 23px,
+          rgba(25, 33, 29, 0.045) 24px
+        );
+    }
+
+    main {
+      position: relative;
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 72px 0 96px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 32px;
+      align-items: end;
+      margin-bottom: 48px;
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--accent-dark);
+      font-family: "SFMono-Regular", "Cascadia Mono", monospace;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 760px;
+      font-size: clamp(42px, 7vw, 82px);
+      font-weight: 500;
+      letter-spacing: -0.055em;
+      line-height: 0.98;
+    }
+
+    .intro {
+      width: min(320px, 100%);
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.8;
+    }
+
+    #repository-list {
+      display: grid;
+      gap: 16px;
+    }
+
+    .repository {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(220px, 0.36fr);
+      gap: 36px;
+      align-items: center;
+      min-height: 190px;
+      padding: 30px 32px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 2px 26px 2px 2px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+      animation: enter 420ms ease both;
+    }
+
+    .repository:nth-child(2) {
+      animation-delay: 60ms;
+    }
+
+    .repository:nth-child(3) {
+      animation-delay: 120ms;
+    }
+
+    .product-name {
+      margin: 0 0 18px;
+      font-size: clamp(27px, 4vw, 44px);
+      font-weight: 500;
+      letter-spacing: -0.035em;
+    }
+
+    .repository-id {
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--muted);
+      font-family: "SFMono-Regular", "Cascadia Mono", monospace;
+      font-size: 11px;
+      letter-spacing: 0.03em;
+    }
+
+    .action {
+      display: grid;
+      gap: 12px;
+    }
+
+    button {
+      width: 100%;
+      min-height: 52px;
+      padding: 13px 18px;
+      border: 1px solid var(--ink);
+      border-radius: 2px;
+      color: #fffdf8;
+      background: var(--ink);
+      font: 700 14px/1.2 "Noto Sans SC", "PingFang SC", sans-serif;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      transition:
+        transform 150ms ease,
+        border-color 150ms ease,
+        background 150ms ease;
+    }
+
+    button:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: var(--accent);
+      transform: translateY(-2px);
+    }
+
+    button:focus-visible {
+      outline: 3px solid rgba(217, 79, 43, 0.3);
+      outline-offset: 3px;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.52;
+    }
+
+    .status {
+      min-height: 22px;
+      margin: 0;
+      color: var(--muted);
+      font: 600 12px/1.5 "Noto Sans SC", "PingFang SC", sans-serif;
+    }
+
+    .status[data-tone="active"] {
+      color: var(--accent-dark);
+    }
+
+    .status[data-tone="success"] {
+      color: var(--success);
+    }
+
+    .empty {
+      padding: 52px 0;
+      color: var(--muted);
+      font-size: 18px;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    @keyframes enter {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 760px) {
+      main {
+        width: min(100% - 28px, 1120px);
+        padding-top: 40px;
+      }
+
+      header,
+      .repository {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        align-items: start;
+      }
+
+      .repository {
+        gap: 28px;
+        padding: 26px 22px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">ZDecision / Candidate Refresh</p>
+        <h1>把已完成的工作，整理成可审核的候选决策。</h1>
+      </div>
+      <p class="intro">
+        从已登记的仓库发起一次更新。本地设备会处理变化，
+        页面刷新后仍会恢复当前进度。
+      </p>
+    </header>
+    <section id="repository-list" aria-live="polite"></section>
+  </main>
+
+  <script>
+    const repositoryList = document.querySelector("#repository-list");
+    const activeStates = new Set(["queued", "claimed", "running", "failed_retryable"]);
+    const stateLabels = {
+      queued: "等待本地设备",
+      claimed: "本地设备已接收",
+      running: "正在整理候选决策",
+      failed_retryable: "暂时中断，等待重试",
+      failed_terminal: "本次更新未完成",
+      succeeded: "候选决策已更新",
+      succeeded_no_candidates: "没有发现新的候选决策",
+      cancelled: "本次更新已取消"
+    };
+
+    function storageKey(repositoryId) {
+      return `zdecision:capture:${repositoryId}`;
+    }
+
+    function readProgress(repositoryId) {
+      const raw = localStorage.getItem(storageKey(repositoryId));
+      if (!raw) return null;
+      try {
+        const value = JSON.parse(raw);
+        if (
+          typeof value.request_id !== "string" ||
+          !Number.isInteger(value.last_sequence) ||
+          value.last_sequence < 0
+        ) {
+          return null;
+        }
+        return {
+          request_id: value.request_id,
+          last_sequence: value.last_sequence
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    function writeProgress(repositoryId, requestId, lastSequence) {
+      localStorage.setItem(
+        storageKey(repositoryId),
+        JSON.stringify({
+          request_id: requestId,
+          last_sequence: lastSequence
+        })
+      );
+    }
+
+    function setStatus(view, state) {
+      view.status.textContent = stateLabels[state] || "状态已更新";
+      view.status.dataset.tone = activeStates.has(state)
+        ? "active"
+        : state.startsWith("succeeded")
+          ? "success"
+          : "neutral";
+      view.button.disabled = activeStates.has(state) || !view.enabled;
+    }
+
+    async function requestJson(url, options) {
+      const response = await fetch(url, options);
+      if (!response.ok) throw new Error("request_failed");
+      return response.status === 204 ? null : response.json();
+    }
+
+    async function follow(repositoryId, view, saved) {
+      let requestId = saved.request_id;
+      let lastSequence = saved.last_sequence;
+      try {
+        const current = await requestJson(`/api/v1/capture-requests/${requestId}`);
+        lastSequence = Math.max(lastSequence, current.last_sequence);
+        writeProgress(repositoryId, requestId, lastSequence);
+        setStatus(view, current.state);
+        if (!activeStates.has(current.state)) return;
+
+        const result = await requestJson(
+          `/api/v1/capture-requests/${requestId}/events?after_sequence=${saved.last_sequence}`
+        );
+        for (const event of result.events) {
+          lastSequence = event.sequence;
+          setStatus(view, event.state);
+        }
+        writeProgress(repositoryId, requestId, lastSequence);
+        const latest = result.events.at(-1);
+        if (!latest || activeStates.has(latest.state)) {
+          window.setTimeout(
+            () => follow(repositoryId, view, {request_id: requestId, last_sequence: lastSequence}),
+            1500
+          );
+        }
+      } catch {
+        view.status.textContent = "暂时无法读取进度";
+        view.status.dataset.tone = "neutral";
+        window.setTimeout(
+          () => follow(repositoryId, view, {request_id: requestId, last_sequence: lastSequence}),
+          3000
+        );
+      }
+    }
+
+    async function startUpdate(repositoryId, view) {
+      view.button.disabled = true;
+      view.status.textContent = "正在创建更新请求";
+      view.status.dataset.tone = "active";
+      const repository_id = repositoryId;
+      const client_action_id = `web_action_${crypto.randomUUID()}`;
+      try {
+        const request = await requestJson("/api/v1/capture-requests", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            repository_id,
+            template_id: "business",
+            client_action_id
+          })
+        });
+        writeProgress(repositoryId, request.request_id, request.last_sequence);
+        setStatus(view, request.state);
+        follow(repositoryId, view, {
+          request_id: request.request_id,
+          last_sequence: request.last_sequence
+        });
+      } catch {
+        view.status.textContent = "创建请求失败，请稍后重试";
+        view.status.dataset.tone = "neutral";
+        view.button.disabled = !view.enabled;
+      }
+    }
+
+    function renderRepository(repository) {
+      const article = document.createElement("article");
+      article.className = "repository";
+
+      const identity = document.createElement("div");
+      const name = document.createElement("h2");
+      name.className = "product-name";
+      name.textContent = repository.product_name;
+      const repositoryId = document.createElement("p");
+      repositoryId.className = "repository-id";
+      repositoryId.textContent = repository.repository_id;
+      identity.append(name, repositoryId);
+
+      const action = document.createElement("div");
+      action.className = "action";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "更新候选决策";
+      const status = document.createElement("p");
+      status.className = "status";
+      status.textContent = repository.enabled ? "尚未发起更新" : "此仓库未启用";
+      action.append(button, status);
+      article.append(identity, action);
+      repositoryList.append(article);
+
+      const view = {
+        button,
+        status,
+        enabled: repository.enabled
+      };
+      button.disabled = !repository.enabled;
+      button.addEventListener("click", () => startUpdate(repository.repository_id, view));
+      const saved = readProgress(repository.repository_id);
+      if (saved) {
+        button.disabled = true;
+        follow(repository.repository_id, view, saved);
+      }
+    }
+
+    async function initialize() {
+      try {
+        const result = await requestJson("/api/v1/repositories");
+        if (!result.repositories.length) {
+          const empty = document.createElement("p");
+          empty.className = "empty";
+          empty.textContent = "尚未登记可更新的仓库。";
+          repositoryList.append(empty);
+          return;
+        }
+        result.repositories.forEach(renderRepository);
+      } catch {
+        const failure = document.createElement("p");
+        failure.className = "empty";
+        failure.textContent = "暂时无法读取仓库列表。";
+        repositoryList.append(failure);
+      }
+    }
+
+    initialize();
+  </script>
+</body>
+</html>
