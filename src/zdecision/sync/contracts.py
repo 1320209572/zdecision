@@ -24,6 +24,7 @@ CaptureRequestState = Literal[
     "failed_terminal",
     "cancelled",
 ]
+CaptureScope = Literal["current_session", "all_valid_sessions"]
 
 _REQUEST_STATES = frozenset(
     (
@@ -37,6 +38,7 @@ _REQUEST_STATES = frozenset(
         "cancelled",
     )
 )
+_CAPTURE_SCOPES = frozenset(("current_session", "all_valid_sessions"))
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
@@ -112,6 +114,26 @@ def _state(value: object) -> CaptureRequestState:
     return cast(CaptureRequestState, value)
 
 
+def _capture_scope(value: object) -> CaptureScope:
+    if value not in _CAPTURE_SCOPES:
+        raise ValueError("capture_scope is invalid")
+    return cast(CaptureScope, value)
+
+
+def _optional_nonnegative_integer(
+    value: object, field_name: str
+) -> int | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        raise ValueError(f"{field_name} is invalid")
+    return value
+
+
 def _content(value: object) -> CandidateContent:
     if isinstance(value, CandidateContent):
         return CandidateContent.from_dict(value.to_dict())
@@ -165,17 +187,20 @@ class RepositoryView:
 class CaptureRequestCreate:
     repository_id: str
     template_id: str
+    capture_scope: CaptureScope
     client_action_id: str
 
     def __post_init__(self) -> None:
         _pattern(self.repository_id, _REPOSITORY_ID, "repository_id")
         _safe_identifier(self.template_id, "template_id")
+        _capture_scope(self.capture_scope)
         _safe_identifier(self.client_action_id, "client_action_id")
 
     def to_dict(self) -> dict[str, object]:
         return {
             "repository_id": self.repository_id,
             "template_id": self.template_id,
+            "capture_scope": self.capture_scope,
             "client_action_id": self.client_action_id,
         }
 
@@ -183,12 +208,18 @@ class CaptureRequestCreate:
     def from_dict(cls, value: object) -> CaptureRequestCreate:
         item = _mapping(
             value,
-            frozenset(("repository_id", "template_id", "client_action_id")),
+            frozenset(
+                (
+                    "repository_id", "template_id", "capture_scope",
+                    "client_action_id",
+                )
+            ),
             "CaptureRequestCreate",
         )
         return cls(
             repository_id=item["repository_id"],
             template_id=item["template_id"],
+            capture_scope=item["capture_scope"],
             client_action_id=item["client_action_id"],
         )
 
@@ -201,6 +232,8 @@ class CaptureRequestView:
     product_name: str
     template_id: str
     state: CaptureRequestState
+    progress_code: str
+    candidate_revision_count: int | None
     last_sequence: int
     created_at: str
     updated_at: str
@@ -212,6 +245,10 @@ class CaptureRequestView:
         _nonempty(self.product_name, "product_name")
         _safe_identifier(self.template_id, "template_id")
         _state(self.state)
+        _safe_identifier(self.progress_code, "progress_code")
+        _optional_nonnegative_integer(
+            self.candidate_revision_count, "candidate_revision_count"
+        )
         _positive_integer(self.last_sequence, "last_sequence")
         _timestamp(self.created_at, "created_at")
         _timestamp(self.updated_at, "updated_at")
@@ -224,6 +261,8 @@ class CaptureRequestView:
             "product_name": self.product_name,
             "template_id": self.template_id,
             "state": self.state,
+            "progress_code": self.progress_code,
+            "candidate_revision_count": self.candidate_revision_count,
             "last_sequence": self.last_sequence,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -241,6 +280,8 @@ class CaptureRequestView:
                     "product_name",
                     "template_id",
                     "state",
+                    "progress_code",
+                    "candidate_revision_count",
                     "last_sequence",
                     "created_at",
                     "updated_at",
@@ -255,6 +296,8 @@ class CaptureRequestView:
             product_name=item["product_name"],
             template_id=item["template_id"],
             state=item["state"],
+            progress_code=item["progress_code"],
+            candidate_revision_count=item["candidate_revision_count"],
             last_sequence=item["last_sequence"],
             created_at=item["created_at"],
             updated_at=item["updated_at"],
@@ -268,6 +311,8 @@ class ClaimedCaptureRequest:
     product_id: str
     product_name: str
     template_id: str
+    capture_scope: CaptureScope
+    client_action_id: str
     lease_token: str
     lease_expires_at: str
 
@@ -277,6 +322,8 @@ class ClaimedCaptureRequest:
         _pattern(self.product_id, _PRODUCT_ID, "product_id")
         _nonempty(self.product_name, "product_name")
         _safe_identifier(self.template_id, "template_id")
+        _capture_scope(self.capture_scope)
+        _safe_identifier(self.client_action_id, "client_action_id")
         _pattern(self.lease_token, _LEASE_TOKEN, "lease_token")
         _timestamp(self.lease_expires_at, "lease_expires_at")
 
@@ -287,6 +334,8 @@ class ClaimedCaptureRequest:
             "product_id": self.product_id,
             "product_name": self.product_name,
             "template_id": self.template_id,
+            "capture_scope": self.capture_scope,
+            "client_action_id": self.client_action_id,
             "lease_token": self.lease_token,
             "lease_expires_at": self.lease_expires_at,
         }
@@ -302,6 +351,8 @@ class ClaimedCaptureRequest:
                     "product_id",
                     "product_name",
                     "template_id",
+                    "capture_scope",
+                    "client_action_id",
                     "lease_token",
                     "lease_expires_at",
                 )
@@ -314,6 +365,8 @@ class ClaimedCaptureRequest:
             product_id=item["product_id"],
             product_name=item["product_name"],
             template_id=item["template_id"],
+            capture_scope=item["capture_scope"],
+            client_action_id=item["client_action_id"],
             lease_token=item["lease_token"],
             lease_expires_at=item["lease_expires_at"],
         )

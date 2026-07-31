@@ -38,6 +38,7 @@ class _StrictBody(BaseModel):
 class _CaptureRequestBody(_StrictBody):
     repository_id: str = Field(min_length=1, max_length=64)
     template_id: str = Field(min_length=1, max_length=128)
+    capture_scope: str = Field(min_length=1, max_length=32)
     client_action_id: str = Field(min_length=1, max_length=128)
 
 

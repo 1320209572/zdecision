@@ -941,6 +941,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             json={
                 "repository_id": self.repository_id,
                 "template_id": "business",
+                "capture_scope": "all_valid_sessions",
                 "client_action_id": action_id,
             },
         )

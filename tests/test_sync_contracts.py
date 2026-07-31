@@ -135,6 +135,7 @@ class SyncContractsTest(unittest.TestCase):
         payload = {
             "repository_id": REPOSITORY_ID,
             "template_id": "business",
+            "capture_scope": "current_session",
             "client_action_id": "web_action_001",
             "organization_id": "org_forbidden",
             "session_id": "session_forbidden",
@@ -159,6 +160,7 @@ class SyncContractsTest(unittest.TestCase):
                 {
                     "repository_id": REPOSITORY_ID,
                     "template_id": "business",
+                    "capture_scope": "current_session",
                     "client_action_id": "web_action_001",
                 }
             ),
@@ -170,6 +172,8 @@ class SyncContractsTest(unittest.TestCase):
                     "product_name": "ZDecision",
                     "template_id": "business",
                     "state": "queued",
+                    "progress_code": "request_queued",
+                    "candidate_revision_count": None,
                     "last_sequence": 1,
                     "created_at": "2026-07-31T00:00:00Z",
                     "updated_at": "2026-07-31T00:00:00Z",
@@ -182,6 +186,8 @@ class SyncContractsTest(unittest.TestCase):
                     "product_id": PRODUCT_ID,
                     "product_name": "ZDecision",
                     "template_id": "business",
+                    "capture_scope": "current_session",
+                    "client_action_id": "web_action_001",
                     "lease_token": "lease_0123456789abcdef",
                     "lease_expires_at": "2026-07-31T00:00:30Z",
                 }
@@ -210,6 +216,29 @@ class SyncContractsTest(unittest.TestCase):
                     value,
                     type(value).from_dict(value.to_dict()),
                 )
+
+    def test_capture_scope_is_closed_and_required(self) -> None:
+        """Catch broad, missing, or silently defaulted source selection."""
+        api = self.sync_api()
+        command = api.CaptureRequestCreate.from_dict(
+            {
+                "repository_id": REPOSITORY_ID,
+                "template_id": "business",
+                "capture_scope": "current_session",
+                "client_action_id": "codex_action_001",
+            }
+        )
+
+        self.assertEqual("current_session", command.capture_scope)
+        with self.assertRaisesRegex(ValueError, "capture_scope is invalid"):
+            api.CaptureRequestCreate.from_dict(
+                {
+                    "repository_id": REPOSITORY_ID,
+                    "template_id": "business",
+                    "capture_scope": "recent_session",
+                    "client_action_id": "codex_action_001",
+                }
+            )
 
     def test_candidate_batch_round_trips_only_validated_content(self) -> None:
         """Catch digest drift or serialization that changes a Candidate revision."""

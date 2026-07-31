@@ -42,6 +42,8 @@ def claimed_request() -> ClaimedCaptureRequest:
         product_id=PRODUCT_ID,
         product_name="ZDecision",
         template_id="business",
+        capture_scope="all_valid_sessions",
+        client_action_id="web_action_001",
         lease_token="lease_0123456789abcdef",
         lease_expires_at="2026-07-31T03:00:30Z",
     )

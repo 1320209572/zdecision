@@ -169,18 +169,15 @@ class CaptureRequestService:
                 ),
             ).fetchone()
             if action_row is not None:
-                return _request_view(action_row)
-
-            mapping = connection.execute(
-                """
-                SELECT repository_id, product_id, product_name, enabled
-                FROM repository_mappings
-                WHERE organization_id = ? AND repository_id = ?
-                """,
-                (principal.organization_id, command.repository_id),
-            ).fetchone()
-            if mapping is None or not bool(mapping["enabled"]):
-                raise RepositoryUnavailable("repository_unavailable")
+                if (
+                    action_row["repository_id"] != command.repository_id
+                    or action_row["template_id"] != command.template_id
+                    or action_row["capture_scope"] != command.capture_scope
+                ):
+                    raise RequestConflict("capture_request_action_conflict")
+                return _request_view(
+                    _request_row(connection, action_row["request_id"])
+                )
 
             active = connection.execute(
                 """
@@ -193,22 +190,18 @@ class CaptureRequestService:
                 (principal.organization_id, command.repository_id),
             ).fetchone()
             if active is not None:
-                connection.execute(
-                    """
-                    INSERT INTO capture_request_actions(
-                        organization_id, actor_id, client_action_id,
-                        request_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        principal.organization_id,
-                        principal.actor_id,
-                        command.client_action_id,
-                        active["request_id"],
-                        timestamp,
-                    ),
-                )
-                return _request_view(active)
+                raise RequestConflict("repository_capture_busy")
+
+            mapping = connection.execute(
+                """
+                SELECT repository_id, product_id, product_name, enabled
+                FROM repository_mappings
+                WHERE organization_id = ? AND repository_id = ?
+                """,
+                (principal.organization_id, command.repository_id),
+            ).fetchone()
+            if mapping is None or not bool(mapping["enabled"]):
+                raise RepositoryUnavailable("repository_unavailable")
 
             request_id = capture_request_id(
                 principal.organization_id,
@@ -221,11 +214,12 @@ class CaptureRequestService:
                     """
                     INSERT INTO capture_requests(
                         request_id, organization_id, actor_id, repository_id,
-                        product_id, product_name, template_id, state,
+                        product_id, product_name, template_id, capture_scope,
+                        client_action_id, state,
                         attempt_count, claimed_device_id, lease_token_digest,
                         lease_expires_at, retry_at, result_batch_digest,
                         terminal_code, last_sequence, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, NULL, NULL,
                               NULL, NULL, NULL, NULL, 1, ?, ?)
                     """,
                     (
@@ -236,6 +230,8 @@ class CaptureRequestService:
                         mapping["product_id"],
                         mapping["product_name"],
                         command.template_id,
+                        command.capture_scope,
+                        command.client_action_id,
                         timestamp,
                         timestamp,
                     ),
@@ -654,12 +650,16 @@ class CaptureRequestService:
                 SET state = ?,
                     lease_expires_at = NULL,
                     result_batch_digest = ?,
+                    result_candidate_count = ?,
                     terminal_code = ?,
                     last_sequence = ?,
                     updated_at = ?
                 WHERE request_id = ?
                 """,
-                (state, digest, code, sequence, timestamp, request_id),
+                (
+                    state, digest, stored_batch["item_count"], code, sequence,
+                    timestamp, request_id,
+                ),
             )
             _insert_event(
                 connection,
@@ -881,7 +881,14 @@ def _request_row(
 ) -> sqlite3.Row:
     _require_request_id(request_id)
     row = connection.execute(
-        "SELECT * FROM capture_requests WHERE request_id = ?",
+        """
+        SELECT request.*, event.code AS progress_code
+        FROM capture_requests AS request
+        JOIN capture_request_events AS event
+          ON event.request_id = request.request_id
+         AND event.sequence = request.last_sequence
+        WHERE request.request_id = ?
+        """,
         (request_id,),
     ).fetchone()
     if row is None:
@@ -897,6 +904,12 @@ def _request_view(row: sqlite3.Row) -> CaptureRequestView:
         product_name=row["product_name"],
         template_id=row["template_id"],
         state=row["state"],
+        progress_code=row["progress_code"],
+        candidate_revision_count=(
+            row["result_candidate_count"]
+            if row["state"] in _SUCCESS_STATES
+            else None
+        ),
         last_sequence=row["last_sequence"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -912,6 +925,8 @@ def _claimed_view(
         product_id=row["product_id"],
         product_name=row["product_name"],
         template_id=row["template_id"],
+        capture_scope=row["capture_scope"],
+        client_action_id=row["client_action_id"],
         lease_token=lease_token,
         lease_expires_at=row["lease_expires_at"],
     )

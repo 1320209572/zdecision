@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -8,9 +9,13 @@ from pathlib import Path
 
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
+    CandidateContent,
+    CandidateRevisionUpload,
     CaptureRequestCreate,
     RepositoryView,
 )
+from zdecision.ids import candidate_family_id, candidate_revision_id
+from zdecision.jsonio import canonical_json_bytes
 
 try:
     from zdecision.central.auth import (
@@ -23,6 +28,7 @@ try:
         CaptureRequestService,
         InvalidLease,
         InvalidTransition,
+        RequestConflict,
         RepositoryUnavailable,
     )
     from zdecision.central.store import CentralStore
@@ -63,6 +69,40 @@ def empty_batch(request_id: str) -> CandidateBatchUpload:
     )
 
 
+def one_item_batch(request_id: str) -> CandidateBatchUpload:
+    content = CandidateContent(
+        product="ZDecision",
+        claim="Candidate results are counted after acknowledgement.",
+        future_action="Show the completed count in the request view.",
+        scope_summary="Capture request result count",
+        repositories=(REPOSITORY_ID,),
+        paths=(),
+        invalidation_conditions=("The central result contract changes.",),
+    )
+    content_digest = hashlib.sha256(
+        canonical_json_bytes(content.to_dict())
+    ).hexdigest()
+    family_id = candidate_family_id(
+        REPOSITORY_ID, "cand_" + "5" * 32 + "_01"
+    )
+    item = CandidateRevisionUpload(
+        family_id=family_id,
+        revision_id=candidate_revision_id(family_id, 1, content_digest),
+        revision=1,
+        content=content,
+        content_digest=content_digest,
+        evidence_digest="e" * 64,
+    )
+    return CandidateBatchUpload(
+        request_id=request_id,
+        repository_id=REPOSITORY_ID,
+        items=(item,),
+        batch_digest=hashlib.sha256(
+            canonical_json_bytes({"items": [item.to_dict()]})
+        ).hexdigest(),
+    )
+
+
 class CentralRequestServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNone(
@@ -93,13 +133,17 @@ class CentralRequestServiceTest(unittest.TestCase):
         self,
         action_id: str = "web_action_001",
         *,
+        repository_id: str = REPOSITORY_ID,
+        template_id: str = "business",
+        capture_scope: str = "all_valid_sessions",
         now: datetime = NOW,
     ):
         return self.service.create_request(
             USER,
             CaptureRequestCreate(
-                repository_id=REPOSITORY_ID,
-                template_id="business",
+                repository_id=repository_id,
+                template_id=template_id,
+                capture_scope=capture_scope,
                 client_action_id=action_id,
             ),
             now,
@@ -165,18 +209,48 @@ class CentralRequestServiceTest(unittest.TestCase):
                 CaptureRequestCreate(
                     repository_id=REPOSITORY_ID,
                     template_id="business",
+                    capture_scope="all_valid_sessions",
                     client_action_id="web_action_other_org",
                 ),
                 NOW,
             )
 
-    def test_retry_and_second_active_click_return_one_request(self) -> None:
-        first = self.create("web_action_001")
-        same_action = self.create("web_action_001")
-        second_action = self.create("web_action_002")
+    def test_active_request_is_busy_even_if_mapping_is_disabled(self) -> None:
+        self.create("web_action_001")
+        self.store.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                repository_id=REPOSITORY_ID,
+                product_id=PRODUCT_ID,
+                product_name="ZDecision",
+                enabled=False,
+            ),
+        )
 
-        self.assertEqual(first.request_id, same_action.request_id)
-        self.assertEqual(first.request_id, second_action.request_id)
+        with self.assertRaisesRegex(RequestConflict, "repository_capture_busy"):
+            self.create("web_action_002")
+
+    def test_replay_is_exact_and_repository_is_busy_until_terminal(self) -> None:
+        first = self.create("web_action_001")
+        replay = self.create("web_action_001")
+
+        self.assertEqual(first.request_id, replay.request_id)
+        with self.assertRaisesRegex(RequestConflict, "repository_capture_busy"):
+            self.create("web_action_002")
+        action_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM capture_request_actions"
+        ).fetchone()[0]
+        self.assertEqual(1, action_count)
+        for changed in (
+            {"repository_id": "repo_" + "2" * 32},
+            {"template_id": "technical"},
+            {"capture_scope": "current_session"},
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(
+                    RequestConflict, "capture_request_action_conflict"
+                ):
+                    self.create("web_action_001", **changed)
 
         claimed = self.claim()
         self.service.start(DEVICE, first.request_id, claimed.lease_token, NOW)
@@ -193,10 +267,113 @@ class CentralRequestServiceTest(unittest.TestCase):
             EMPTY_BATCH_DIGEST,
             NOW,
         )
-        self.assertEqual(
+        self.assertNotEqual(
             first.request_id,
             self.create("web_action_002", now=NOW + timedelta(seconds=1)).request_id,
         )
+
+    def test_claim_keeps_original_scope_and_action(self) -> None:
+        self.create("codex_action_001", capture_scope="current_session")
+
+        claimed = self.claim()
+
+        self.assertEqual("current_session", claimed.capture_scope)
+        self.assertEqual("codex_action_001", claimed.client_action_id)
+
+    def test_request_view_tracks_progress_and_completed_batch_count(self) -> None:
+        created = self.create()
+        self.assertEqual("request_queued", created.progress_code)
+        self.assertIsNone(created.candidate_revision_count)
+        claimed = self.claim()
+        self.service.start(DEVICE, created.request_id, claimed.lease_token, NOW)
+        active = self.service.get_request(USER, created.request_id)
+        self.assertEqual("capture_started", active.progress_code)
+        self.assertIsNone(active.candidate_revision_count)
+        self.service.accept_candidate_batch(
+            DEVICE, claimed.lease_token, empty_batch(created.request_id), NOW
+        )
+        completed = self.service.complete(
+            DEVICE, created.request_id, claimed.lease_token,
+            EMPTY_BATCH_DIGEST, NOW
+        )
+        self.assertEqual(0, completed.candidate_revision_count)
+
+    def test_failed_request_has_no_candidate_revision_count(self) -> None:
+        created = self.create()
+        claimed = self.claim()
+        failed = self.service.fail(
+            DEVICE, created.request_id, claimed.lease_token,
+            "source_not_interactive", False, NOW
+        )
+
+        self.assertIsNone(failed.candidate_revision_count)
+
+    def test_completed_nonempty_batch_exposes_its_item_count(self) -> None:
+        created = self.create()
+        claimed = self.claim()
+        self.service.start(DEVICE, created.request_id, claimed.lease_token, NOW)
+        batch = one_item_batch(created.request_id)
+        self.service.accept_candidate_batch(
+            DEVICE, claimed.lease_token, batch, NOW
+        )
+
+        completed = self.service.complete(
+            DEVICE, created.request_id, claimed.lease_token,
+            batch.batch_digest, NOW
+        )
+
+        self.assertEqual("succeeded", completed.state)
+        self.assertEqual(1, completed.candidate_revision_count)
+
+    def test_migration_recovers_old_request_scope_and_original_action(self) -> None:
+        legacy_path = Path(self.temporary_directory.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        connection.executescript(
+            """
+            CREATE TABLE capture_requests (
+                request_id TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL, repository_id TEXT NOT NULL,
+                product_id TEXT NOT NULL, product_name TEXT NOT NULL,
+                template_id TEXT NOT NULL, state TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL, claimed_device_id TEXT,
+                lease_token_digest TEXT, lease_expires_at TEXT, retry_at TEXT,
+                result_batch_digest TEXT, terminal_code TEXT,
+                last_sequence INTEGER NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE capture_request_actions (
+                organization_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+                client_action_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(organization_id, actor_id, client_action_id)
+            );
+            """
+        )
+        from zdecision.ids import capture_request_id
+        old_action = "web_action_legacy"
+        request_id = capture_request_id(
+            "org_demo", REPOSITORY_ID, "business", old_action
+        )
+        connection.execute(
+            """INSERT INTO capture_requests VALUES
+            (?, 'org_demo', 'user_demo', ?, ?, 'ZDecision', 'business',
+             'queued', 0, NULL, NULL, NULL, NULL, NULL, NULL, 1,
+             '2026-07-31T01:00:00Z', '2026-07-31T01:00:00Z')""",
+            (request_id, REPOSITORY_ID, PRODUCT_ID),
+        )
+        connection.execute(
+            "INSERT INTO capture_request_actions VALUES (?, ?, ?, ?, ?)",
+            ("org_demo", "user_demo", old_action, request_id,
+             "2026-07-31T01:00:00Z"),
+        )
+        connection.commit()
+        connection.close()
+
+        self.store = CentralStore.open(legacy_path)
+        record = self.store.get_request_record(request_id)
+
+        self.assertEqual("all_valid_sessions", record.capture_scope)
+        self.assertEqual(old_action, record.client_action_id)
 
     def test_expired_claim_requeues_and_survives_restart(self) -> None:
         created = self.create()

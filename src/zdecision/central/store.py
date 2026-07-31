@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zdecision.central.auth import require_id
+from zdecision.ids import capture_request_id
 from zdecision.sync.contracts import RepositoryView
 
 
@@ -19,6 +20,8 @@ class CaptureRequestRecord:
     product_id: str
     product_name: str
     template_id: str
+    capture_scope: str
+    client_action_id: str
     state: str
     attempt_count: int
     claimed_device_id: str | None
@@ -26,6 +29,7 @@ class CaptureRequestRecord:
     lease_expires_at: str | None
     retry_at: str | None
     result_batch_digest: str | None
+    result_candidate_count: int | None
     terminal_code: str | None
     last_sequence: int
     created_at: str
@@ -70,6 +74,10 @@ class CentralStore:
                     product_id TEXT NOT NULL,
                     product_name TEXT NOT NULL,
                     template_id TEXT NOT NULL,
+                    capture_scope TEXT NOT NULL CHECK(
+                        capture_scope IN ('current_session', 'all_valid_sessions')
+                    ),
+                    client_action_id TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN (
                         'queued','claimed','running','succeeded',
                         'succeeded_no_candidates','failed_retryable',
@@ -81,6 +89,10 @@ class CentralStore:
                     lease_expires_at TEXT,
                     retry_at TEXT,
                     result_batch_digest TEXT,
+                    result_candidate_count INTEGER CHECK(
+                        result_candidate_count IS NULL
+                        OR result_candidate_count >= 0
+                    ),
                     terminal_code TEXT,
                     last_sequence INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
@@ -166,6 +178,7 @@ class CentralStore:
                 );
                 """
             )
+            _migrate_capture_requests(connection)
         return cls(database_path, connection)
 
     def close(self) -> None:
@@ -221,6 +234,8 @@ def request_record_from_row(row: sqlite3.Row) -> CaptureRequestRecord:
         product_id=row["product_id"],
         product_name=row["product_name"],
         template_id=row["template_id"],
+        capture_scope=row["capture_scope"],
+        client_action_id=row["client_action_id"],
         state=row["state"],
         attempt_count=row["attempt_count"],
         claimed_device_id=row["claimed_device_id"],
@@ -228,8 +243,81 @@ def request_record_from_row(row: sqlite3.Row) -> CaptureRequestRecord:
         lease_expires_at=row["lease_expires_at"],
         retry_at=row["retry_at"],
         result_batch_digest=row["result_batch_digest"],
+        result_candidate_count=row["result_candidate_count"],
         terminal_code=row["terminal_code"],
         last_sequence=row["last_sequence"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _migrate_capture_requests(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(capture_requests)"
+        ).fetchall()
+    }
+    if "capture_scope" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE capture_requests ADD COLUMN capture_scope TEXT
+            NOT NULL DEFAULT 'all_valid_sessions' CHECK(
+                capture_scope IN ('current_session', 'all_valid_sessions')
+            )
+            """
+        )
+    if "client_action_id" not in columns:
+        connection.execute(
+            "ALTER TABLE capture_requests ADD COLUMN client_action_id TEXT"
+        )
+    rows = connection.execute(
+        """
+        SELECT request_id, organization_id, repository_id, template_id
+        FROM capture_requests WHERE client_action_id IS NULL
+        """
+    ).fetchall()
+    for row in rows:
+        actions = connection.execute(
+            """
+            SELECT client_action_id FROM capture_request_actions
+            WHERE request_id = ?
+            """,
+            (row["request_id"],),
+        ).fetchall()
+        matching = {
+            action["client_action_id"] for action in actions
+            if capture_request_id(
+                row["organization_id"], row["repository_id"],
+                row["template_id"], action["client_action_id"],
+            ) == row["request_id"]
+        }
+        if len(matching) != 1:
+            raise ValueError("capture_request_original_action_unrecoverable")
+        connection.execute(
+            """
+            UPDATE capture_requests SET client_action_id = ?
+            WHERE request_id = ?
+            """,
+            (matching.pop(), row["request_id"]),
+        )
+    if "result_candidate_count" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE capture_requests ADD COLUMN result_candidate_count
+            INTEGER CHECK(
+                result_candidate_count IS NULL
+                OR result_candidate_count >= 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE capture_requests
+            SET result_candidate_count = (
+                SELECT item_count FROM candidate_batches
+                WHERE candidate_batches.request_id = capture_requests.request_id
+            )
+            WHERE state IN ('succeeded', 'succeeded_no_candidates')
+            """
+        )

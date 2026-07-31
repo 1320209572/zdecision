@@ -140,6 +140,7 @@ class CentralApiTest(unittest.TestCase):
             json={
                 "repository_id": REPOSITORY_ID,
                 "template_id": "business",
+                "capture_scope": "all_valid_sessions",
                 "client_action_id": action_id,
             },
         )
@@ -206,6 +207,7 @@ class CentralApiTest(unittest.TestCase):
             json={
                 "repository_id": REPOSITORY_ID,
                 "template_id": "business",
+                "capture_scope": "all_valid_sessions",
                 "client_action_id": "web_action_001",
                 "organization_id": "forbidden",
                 "session_id": "forbidden",
