@@ -244,6 +244,31 @@ class CentralClientTest(unittest.TestCase):
         finally:
             client.close()
 
+    def test_plugin_create_sanitizes_busy_code_without_conflict_status(
+        self,
+    ) -> None:
+        transport = RecordingTransport(
+            [httpx.Response(422, json={"error": "repository_capture_busy"})]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(transport),
+        )
+        command = CaptureRequestCreate(
+            repository_id=REPOSITORY_ID,
+            template_id="business",
+            capture_scope="current_session",
+            client_action_id="codex_action_001",
+        )
+        try:
+            with self.assertRaisesRegex(
+                CentralClientError, "central_request_rejected"
+            ):
+                client.create_capture_request(command)
+        finally:
+            client.close()
+
     def test_client_never_serializes_local_source_values(self) -> None:
         batch = valid_upload_batch()
         transport = RecordingTransport(

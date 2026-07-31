@@ -238,11 +238,12 @@ class CentralClient:
                     self.sleeper(_retry_delay(attempt))
                     continue
                 if response.status_code not in allowed_statuses:
-                    allowed_error = _allowed_error(
-                        response, allowed_error_codes
-                    )
-                    if allowed_error is not None:
-                        raise CentralClientError(allowed_error)
+                    if response.status_code == 409:
+                        allowed_error = _allowed_error(
+                            response, allowed_error_codes
+                        )
+                        if allowed_error is not None:
+                            raise CentralClientError(allowed_error)
                     raise CentralClientError("central_request_rejected")
                 content = response.content
                 if len(content) > _MAX_RESPONSE_BYTES:
