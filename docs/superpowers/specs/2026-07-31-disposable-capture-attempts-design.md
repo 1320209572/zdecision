@@ -1,6 +1,6 @@
 # ZDecision Disposable Capture Attempts Design
 
-**Status:** Draft for written review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Correct the app-server recovery contract in Packet 1 of the
 page-authorized Candidate refresh loop.
