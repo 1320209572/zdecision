@@ -75,20 +75,13 @@ class WorkerCycle:
     active_sessions: int
 
 
-class ProbeSyncPoller:
-    """Local feasibility poller used until the central sync client exists."""
-
-    def poll(self, current_cursor: int) -> int:
-        return current_cursor + 1
-
-
 class Worker:
     def __init__(
         self,
         *,
         database: AgentDatabase,
         processor: EventProcessor,
-        sync_poller: SyncPoller,
+        sync_poller: SyncPoller | None,
         lock_path: Path,
         config: WorkerConfig | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -140,7 +133,7 @@ class Worker:
         poll_due = last_polled_at is None or now >= last_polled_at + timedelta(
             seconds=self.config.poll_interval_seconds
         )
-        if active_sessions and poll_due:
+        if self.sync_poller is not None and active_sessions and poll_due:
             try:
                 next_cursor = self.sync_poller.poll(sync_cursor)
                 sync_cursor = self.database.update_sync_probe(
@@ -187,7 +180,10 @@ class Worker:
                     if cycle.claimed:
                         idle_since = None
                         continue
-                    if cycle.active_sessions or self.database.pending_event_count():
+                    if (
+                        self.sync_poller is not None
+                        and cycle.active_sessions
+                    ) or self.database.pending_event_count():
                         idle_since = None
                         self.sleeper(self._next_wake_delay(now))
                         continue
@@ -209,7 +205,7 @@ class Worker:
         if next_event is not None:
             candidates.append(max(0.0, (next_event - now).total_seconds()))
         active_leases = self.database.active_session_leases(now)
-        if active_leases:
+        if self.sync_poller is not None and active_leases:
             candidates.append(
                 max(
                     0.0,

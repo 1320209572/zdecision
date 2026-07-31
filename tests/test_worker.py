@@ -401,6 +401,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(0, result)
         processor = worker_class.call_args.kwargs["processor"]
         self.assertIsInstance(processor, SessionIndexEventProcessor)
+        self.assertIsNone(worker_class.call_args.kwargs["sync_poller"])
         worker_class.return_value.run_until_idle.assert_called_once_with()
 
 
