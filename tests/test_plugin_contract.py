@@ -68,6 +68,19 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual({"zdecision-local"}, set(servers))
         self.assertEqual("zdecision-agent", servers["zdecision-local"]["command"])
         self.assertEqual(["mcp"], servers["zdecision-local"]["args"])
+        serialized = json.dumps(document, sort_keys=True)
+        self.assertNotIn("device_token", serialized)
+        self.assertNotIn("central_url", serialized)
+        self.assertNotIn("organization_id", serialized)
+        self.assertNotIn("repository_id", serialized)
+        manifest_serialized = json.dumps(
+            load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json"),
+            sort_keys=True,
+        )
+        self.assertNotIn("device_token", manifest_serialized)
+        self.assertNotIn("central_url", manifest_serialized)
+        self.assertNotIn("organization_id", manifest_serialized)
+        self.assertNotIn("repository_id", manifest_serialized)
 
     def test_plugin_registers_exactly_the_five_lifecycle_hooks(self) -> None:
         document = load_json(PLUGIN_ROOT / "hooks" / "hooks.json")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
 import time
@@ -148,7 +149,15 @@ def load_agent_config(path: Path) -> AgentConfig:
     if not config_path.is_absolute():
         raise AgentServiceConfigError("agent_config_path_not_absolute")
     try:
-        mode = stat.S_IMODE(config_path.stat().st_mode)
+        metadata = config_path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise AgentServiceConfigError(
+                "agent_config_permissions_invalid"
+            )
         if mode & 0o077:
             raise AgentServiceConfigError(
                 "agent_config_permissions_invalid"

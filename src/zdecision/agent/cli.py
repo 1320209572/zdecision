@@ -25,6 +25,10 @@ def database_path(environ: Mapping[str, str]) -> Path:
     return private_state_root(environ) / "agent" / "zdecision.sqlite3"
 
 
+def config_locator_path(environ: Mapping[str, str]) -> Path:
+    return private_state_root(environ) / "agent" / "config-locator.json"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zdecision-agent")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -193,6 +197,11 @@ def _run_service_command(
 
         config_path = Path(arguments.config).expanduser()
         config = load_agent_config(config_path)
+        from zdecision.agent.config_locator import publish_agent_config_locator
+
+        publish_agent_config_locator(
+            state_path.with_name("config-locator.json"), config_path
+        )
         database = AgentDatabase.open(state_path)
         try:
             mirror_repository_mappings(database, config)

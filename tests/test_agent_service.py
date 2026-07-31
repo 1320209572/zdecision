@@ -4,6 +4,8 @@ import json
 import os
 import tempfile
 import unittest
+from argparse import Namespace
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,6 +81,11 @@ class FakeProcessor:
         self.processed.append(request.request_id)
         if self.error is not None:
             raise self.error
+
+
+class _CapturedOutput:
+    def __init__(self) -> None:
+        self.buffer = BytesIO()
 
 
 class AgentServiceTest(unittest.TestCase):
@@ -201,6 +208,144 @@ class AgentServiceTest(unittest.TestCase):
                 AgentServiceConfigError, "agent_config_permissions_invalid"
             ):
                 load_agent_config(path)
+
+    def test_service_install_publishes_locator_only_after_config_validation(
+        self,
+    ) -> None:
+        from zdecision.agent.cli import (
+            _run_service_command,
+            config_locator_path,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root / "agent.json"
+            config_path.write_text("{}", "utf-8")
+            os.chmod(config_path, 0o600)
+            state_path = root / "state" / "agent" / "zdecision.sqlite3"
+            locator = config_locator_path(
+                {"ZDECISION_STATE_DIR": str(root / "state")}
+            )
+            output = _CapturedOutput()
+            error_output = _CapturedOutput()
+            with patch("sys.stdout", output), patch(
+                "sys.stderr", error_output
+            ), patch(
+                "zdecision.agent.launchd.install_launch_agent"
+            ) as install:
+                result = _run_service_command(
+                    Namespace(service_action="install", config=str(config_path)),
+                    state_path,
+                )
+            self.assertEqual(1, result)
+            self.assertFalse(locator.exists())
+            install.assert_not_called()
+            self.assertNotIn(
+                b"RAW_DEVICE_TOKEN_NOT_IN_OUTPUT",
+                output.buffer.getvalue() + error_output.buffer.getvalue(),
+            )
+
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "central_url": "http://127.0.0.1:8765",
+                        "organization_id": "org_demo",
+                        "device_id": "device_demo",
+                        "device_token": "RAW_DEVICE_TOKEN_NOT_IN_OUTPUT",
+                        "repositories": [
+                            {
+                                "repository_id": REPOSITORY_ID,
+                                "product_id": PRODUCT_ID,
+                                "product_name": "ZDecision",
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ),
+                "utf-8",
+            )
+            os.chmod(config_path, 0o600)
+            output = _CapturedOutput()
+            installed_path = root / "LaunchAgents" / "zdecision.plist"
+            with patch("sys.stdout", output), patch(
+                "zdecision.agent.launchd.install_launch_agent",
+                return_value=installed_path,
+            ):
+                result = _run_service_command(
+                    Namespace(service_action="install", config=str(config_path)),
+                    state_path,
+                )
+            self.assertEqual(0, result)
+            self.assertEqual(
+                config_path,
+                Path(json.loads(locator.read_text())["agent_config_path"]),
+            )
+            self.assertNotIn(
+                b"RAW_DEVICE_TOKEN_NOT_IN_OUTPUT", output.buffer.getvalue()
+            )
+
+    def test_service_run_refreshes_locator_before_constructing_central_client(
+        self,
+    ) -> None:
+        from zdecision.agent.cli import (
+            _run_service_command,
+            config_locator_path,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state_path = root / "state" / "agent" / "zdecision.sqlite3"
+            locator = config_locator_path(
+                {"ZDECISION_STATE_DIR": str(root / "state")}
+            )
+            config_path = root / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "central_url": "http://127.0.0.1:8765",
+                        "organization_id": "org_demo",
+                        "device_id": "device_demo",
+                        "device_token": "device-secret-token",
+                        "repositories": [
+                            {
+                                "repository_id": REPOSITORY_ID,
+                                "product_id": PRODUCT_ID,
+                                "product_name": "ZDecision",
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ),
+                "utf-8",
+            )
+            os.chmod(config_path, 0o600)
+
+            class FakeClient:
+                def __init__(self, central_url, token) -> None:
+                    located_path = Path(
+                        json.loads(locator.read_text("utf-8"))["agent_config_path"]
+                    )
+                    if located_path != config_path:
+                        raise AssertionError("locator was not refreshed first")
+
+                def close(self) -> None:
+                    pass
+
+            output = _CapturedOutput()
+            with patch("sys.stdout", output), patch(
+                "zdecision.agent.central_client.CentralClient", FakeClient
+            ), patch(
+                "zdecision.agent.service.configured_processor", return_value=None
+            ), patch.object(AgentService, "run_forever", return_value=None):
+                result = _run_service_command(
+                    Namespace(service_action="run", config=str(config_path)),
+                    state_path,
+                )
+            self.assertEqual(0, result)
+            self.assertEqual(
+                config_path,
+                Path(json.loads(locator.read_text())["agent_config_path"]),
+            )
 
     def test_configured_service_builds_the_on_demand_processor(
         self,
