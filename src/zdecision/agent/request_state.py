@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 from collections.abc import Callable
@@ -12,7 +13,16 @@ from typing import Literal
 
 from zdecision.app_server.jsonl import AppServerRequestError
 from zdecision.app_server.models import AppServerTurnReceipt
+from zdecision.capture.reconciliation import (
+    CandidateFamilyRevision,
+    ReconciliationResult,
+)
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.sync.contracts import (
+    CandidateBatchUpload,
+    CandidateRevisionUpload,
+    UploadReceipt,
+)
 
 
 NativeStage = Literal[
@@ -25,6 +35,7 @@ NativeStage = Literal[
 NativeAttemptState = Literal["prepared", "pending", "attached", "completed"]
 
 _REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
+_REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _STAGES = frozenset(
@@ -54,6 +65,18 @@ class CaptureResultUnknown(RequestStateError):
     """An external mutation may have succeeded but cannot yet be adopted."""
 
 
+class ReconciliationConflict(RequestStateError):
+    """A reconciliation replay disagrees with durable local state."""
+
+
+class BatchConflict(RequestStateError):
+    """A Candidate batch or upload receipt conflicts with durable state."""
+
+
+class RequestStateCorrupt(RequestStateError):
+    """Persisted canonical data failed its digest or typed contract."""
+
+
 @dataclass(frozen=True)
 class NativeAttempt:
     request_id: str
@@ -80,6 +103,7 @@ class RequestStateStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA foreign_keys = ON")
         with connection:
             connection.executescript(
                 """
@@ -103,6 +127,45 @@ class RequestStateStore:
                     native_id TEXT,
                     output_digest TEXT,
                     PRIMARY KEY(request_id, operation_key, stage)
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_family_revisions (
+                    repository_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    revision_id TEXT NOT NULL UNIQUE,
+                    record_json TEXT NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    PRIMARY KEY(repository_id, family_id, revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_family_heads (
+                    repository_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    PRIMARY KEY(repository_id, family_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS reconciliation_results (
+                    request_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    result_digest TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_outbox (
+                    request_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    revisions_json TEXT NOT NULL,
+                    revisions_digest TEXT NOT NULL,
+                    batch_json TEXT NOT NULL,
+                    batch_digest TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'pending',
+                        'uploaded'
+                    )),
+                    receipt_json TEXT,
+                    receipt_digest TEXT
                 );
                 """
             )
@@ -290,6 +353,432 @@ class RequestStateStore:
         except Exception:
             self._connection.rollback()
             raise
+
+    def current_families(
+        self, repository_id: str
+    ) -> tuple[CandidateFamilyRevision, ...]:
+        repository = _repository_id(repository_id)
+        rows = self._connection.execute(
+            """
+            SELECT revisions.record_json, revisions.record_digest
+            FROM candidate_family_heads AS heads
+            JOIN candidate_family_revisions AS revisions
+              ON revisions.repository_id = heads.repository_id
+             AND revisions.family_id = heads.family_id
+             AND revisions.revision_id = heads.revision_id
+            WHERE heads.repository_id = ?
+            ORDER BY heads.family_id
+            """,
+            (repository,),
+        ).fetchall()
+        return tuple(
+            CandidateFamilyRevision.from_dict(
+                _read_canonical(
+                    row["record_json"],
+                    row["record_digest"],
+                    "Candidate family revision",
+                )
+            )
+            for row in rows
+        )
+
+    def get_reconciliation(
+        self, request_id: str
+    ) -> ReconciliationResult | None:
+        request = _request_id(request_id)
+        row = self._connection.execute(
+            """
+            SELECT result_json, result_digest
+            FROM reconciliation_results
+            WHERE request_id = ?
+            """,
+            (request,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ReconciliationResult.from_dict(
+            _read_canonical(
+                row["result_json"],
+                row["result_digest"],
+                "Reconciliation result",
+            )
+        )
+
+    def save_reconciliation(
+        self,
+        request_id: str,
+        result: ReconciliationResult,
+    ) -> None:
+        request = _request_id(request_id)
+        if not isinstance(result, ReconciliationResult):
+            raise TypeError("result must be a ReconciliationResult")
+        result_json, result_digest = _canonical_record(
+            result.to_dict()
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing_result = self._connection.execute(
+                """
+                SELECT repository_id, result_json, result_digest
+                FROM reconciliation_results
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+            if existing_result is not None:
+                if (
+                    existing_result["repository_id"]
+                    != result.repository_id
+                    or existing_result["result_json"] != result_json
+                    or existing_result["result_digest"] != result_digest
+                ):
+                    raise ReconciliationConflict(
+                        "Reconciliation result conflicts"
+                    )
+                self._connection.commit()
+                return
+
+            revisions: dict[str, CandidateFamilyRevision] = {}
+            for revision in (
+                *result.new_revisions,
+                *result.current_revisions,
+            ):
+                prior = revisions.get(revision.revision_id)
+                if prior is not None and prior != revision:
+                    raise ReconciliationConflict(
+                        "Revision identity conflicts"
+                    )
+                revisions[revision.revision_id] = revision
+            for revision in sorted(
+                revisions.values(),
+                key=lambda item: (item.family_id, item.revision),
+            ):
+                self._save_family_revision(
+                    result.repository_id, revision
+                )
+            for revision in result.current_revisions:
+                self._save_family_head(
+                    result.repository_id, revision
+                )
+            self._connection.execute(
+                """
+                INSERT INTO reconciliation_results(
+                    request_id, repository_id, result_json, result_digest
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    request,
+                    result.repository_id,
+                    result_json,
+                    result_digest,
+                ),
+            )
+            self._connection.commit()
+        except sqlite3.IntegrityError as error:
+            self._connection.rollback()
+            raise ReconciliationConflict(
+                "Reconciliation persistence conflicts"
+            ) from error
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def stage_batch(
+        self,
+        request_id: str,
+        revisions: tuple[CandidateFamilyRevision, ...],
+        batch: CandidateBatchUpload,
+    ) -> None:
+        request = _request_id(request_id)
+        if (
+            not isinstance(revisions, tuple)
+            or any(
+                not isinstance(item, CandidateFamilyRevision)
+                for item in revisions
+            )
+        ):
+            raise TypeError(
+                "revisions must be CandidateFamilyRevision values"
+            )
+        if not isinstance(batch, CandidateBatchUpload):
+            raise TypeError("batch must be a CandidateBatchUpload")
+        if batch.request_id != request:
+            raise BatchConflict("Candidate batch request conflicts")
+        expected_items = tuple(
+            CandidateRevisionUpload(
+                family_id=revision.family_id,
+                revision_id=revision.revision_id,
+                revision=revision.revision,
+                content=revision.content,
+                content_digest=revision.content_digest,
+                evidence_digest=revision.evidence_digest,
+            )
+            for revision in revisions
+        )
+        if batch.items != expected_items:
+            raise BatchConflict(
+                "Candidate batch revisions conflict"
+            )
+        revisions_json, revisions_digest = _canonical_record(
+            [item.to_dict() for item in revisions]
+        )
+        batch_json, stored_batch_digest = _canonical_record(
+            batch.to_dict()
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            result_row = self._connection.execute(
+                """
+                SELECT repository_id, result_json, result_digest
+                FROM reconciliation_results
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+            if result_row is None:
+                raise BatchConflict(
+                    "Candidate batch has no reconciliation result"
+                )
+            result = ReconciliationResult.from_dict(
+                _read_canonical(
+                    result_row["result_json"],
+                    result_row["result_digest"],
+                    "Reconciliation result",
+                )
+            )
+            if (
+                batch.repository_id != result.repository_id
+                or result_row["repository_id"] != result.repository_id
+                or revisions != result.uploadable_revisions
+            ):
+                raise BatchConflict(
+                    "Candidate batch does not match reconciliation"
+                )
+            existing = self._connection.execute(
+                """
+                SELECT repository_id, revisions_json, revisions_digest,
+                       batch_json, batch_digest
+                FROM candidate_outbox
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["repository_id"] != batch.repository_id
+                    or existing["revisions_json"] != revisions_json
+                    or existing["revisions_digest"]
+                    != revisions_digest
+                    or existing["batch_json"] != batch_json
+                    or existing["batch_digest"]
+                    != stored_batch_digest
+                ):
+                    raise BatchConflict("Candidate batch conflicts")
+                self._connection.commit()
+                return
+            self._connection.execute(
+                """
+                INSERT INTO candidate_outbox(
+                    request_id, repository_id,
+                    revisions_json, revisions_digest,
+                    batch_json, batch_digest,
+                    state, receipt_json, receipt_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+                """,
+                (
+                    request,
+                    batch.repository_id,
+                    revisions_json,
+                    revisions_digest,
+                    batch_json,
+                    stored_batch_digest,
+                ),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def pending_batch(
+        self, request_id: str
+    ) -> CandidateBatchUpload | None:
+        request = _request_id(request_id)
+        row = self._connection.execute(
+            """
+            SELECT batch_json, batch_digest
+            FROM candidate_outbox
+            WHERE request_id = ? AND state = 'pending'
+            """,
+            (request,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CandidateBatchUpload.from_dict(
+            _read_canonical(
+                row["batch_json"],
+                row["batch_digest"],
+                "Candidate batch",
+            )
+        )
+
+    def mark_uploaded(self, receipt: UploadReceipt) -> None:
+        if not isinstance(receipt, UploadReceipt):
+            raise TypeError("receipt must be an UploadReceipt")
+        request = _request_id(receipt.request_id)
+        receipt_json, receipt_digest = _canonical_record(
+            receipt.to_dict()
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                """
+                SELECT batch_json, batch_digest, state,
+                       receipt_json, receipt_digest
+                FROM candidate_outbox
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+            if row is None:
+                raise BatchConflict(
+                    "Upload receipt has no Candidate batch"
+                )
+            batch = CandidateBatchUpload.from_dict(
+                _read_canonical(
+                    row["batch_json"],
+                    row["batch_digest"],
+                    "Candidate batch",
+                )
+            )
+            if receipt.batch_digest != batch.batch_digest:
+                raise BatchConflict("Upload receipt digest conflicts")
+            if row["state"] == "uploaded":
+                if (
+                    row["receipt_json"] != receipt_json
+                    or row["receipt_digest"] != receipt_digest
+                ):
+                    raise BatchConflict("Upload receipt conflicts")
+                self._connection.commit()
+                return
+            self._connection.execute(
+                """
+                UPDATE candidate_outbox
+                SET state = 'uploaded',
+                    receipt_json = ?,
+                    receipt_digest = ?
+                WHERE request_id = ?
+                """,
+                (receipt_json, receipt_digest, request),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def _save_family_revision(
+        self,
+        repository_id: str,
+        revision: CandidateFamilyRevision,
+    ) -> None:
+        record_json, record_digest = _canonical_record(
+            revision.to_dict()
+        )
+        existing = self._connection.execute(
+            """
+            SELECT repository_id, family_id, revision,
+                   revision_id, record_json, record_digest
+            FROM candidate_family_revisions
+            WHERE (
+                repository_id = ? AND family_id = ? AND revision = ?
+            ) OR revision_id = ?
+            """,
+            (
+                repository_id,
+                revision.family_id,
+                revision.revision,
+                revision.revision_id,
+            ),
+        ).fetchall()
+        for row in existing:
+            if (
+                row["repository_id"] != repository_id
+                or row["family_id"] != revision.family_id
+                or row["revision"] != revision.revision
+                or row["revision_id"] != revision.revision_id
+                or row["record_json"] != record_json
+                or row["record_digest"] != record_digest
+            ):
+                raise ReconciliationConflict(
+                    "Candidate family revision conflicts"
+                )
+        if existing:
+            return
+        self._connection.execute(
+            """
+            INSERT INTO candidate_family_revisions(
+                repository_id, family_id, revision, revision_id,
+                record_json, record_digest
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                repository_id,
+                revision.family_id,
+                revision.revision,
+                revision.revision_id,
+                record_json,
+                record_digest,
+            ),
+        )
+
+    def _save_family_head(
+        self,
+        repository_id: str,
+        revision: CandidateFamilyRevision,
+    ) -> None:
+        row = self._connection.execute(
+            """
+            SELECT heads.revision_id, revisions.revision
+            FROM candidate_family_heads AS heads
+            JOIN candidate_family_revisions AS revisions
+              ON revisions.repository_id = heads.repository_id
+             AND revisions.family_id = heads.family_id
+             AND revisions.revision_id = heads.revision_id
+            WHERE heads.repository_id = ? AND heads.family_id = ?
+            """,
+            (repository_id, revision.family_id),
+        ).fetchone()
+        if row is None:
+            self._connection.execute(
+                """
+                INSERT INTO candidate_family_heads(
+                    repository_id, family_id, revision_id
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    repository_id,
+                    revision.family_id,
+                    revision.revision_id,
+                ),
+            )
+            return
+        if row["revision_id"] == revision.revision_id:
+            return
+        if row["revision"] >= revision.revision:
+            raise ReconciliationConflict(
+                "Candidate family head would move backward"
+            )
+        self._connection.execute(
+            """
+            UPDATE candidate_family_heads
+            SET revision_id = ?
+            WHERE repository_id = ? AND family_id = ?
+            """,
+            (
+                revision.revision_id,
+                repository_id,
+                revision.family_id,
+            ),
+        )
 
     def _transition(
         self,
@@ -528,12 +1017,26 @@ class NativeCallCoordinator:
 def _identity(
     request_id: str, operation_key: str, stage: str
 ) -> tuple[str, str, str]:
-    if not isinstance(request_id, str) or _REQUEST_ID.fullmatch(request_id) is None:
-        raise ValueError("request_id is invalid")
+    request = _request_id(request_id)
     operation = _safe_value(operation_key, "operation_key")
     if not isinstance(stage, str) or stage not in _STAGES:
         raise ValueError("stage is invalid")
-    return request_id, operation, stage
+    return request, operation, stage
+
+
+def _request_id(value: object) -> str:
+    if not isinstance(value, str) or _REQUEST_ID.fullmatch(value) is None:
+        raise ValueError("request_id is invalid")
+    return value
+
+
+def _repository_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or _REPOSITORY_ID.fullmatch(value) is None
+    ):
+        raise ValueError("repository_id is invalid")
+    return value
 
 
 def _safe_value(value: object, field_name: str) -> str:
@@ -558,6 +1061,43 @@ def _thread_digest(native_id: str, stage: str, stable_tag: str) -> str:
             }
         )
     ).hexdigest()
+
+
+def _canonical_record(value: object) -> tuple[str, str]:
+    payload = canonical_json_bytes(value)
+    return payload.decode("utf-8"), hashlib.sha256(payload).hexdigest()
+
+
+def _read_canonical(
+    payload: object,
+    expected_digest: object,
+    record_name: str,
+) -> object:
+    if (
+        not isinstance(payload, str)
+        or not isinstance(expected_digest, str)
+        or _DIGEST.fullmatch(expected_digest) is None
+    ):
+        raise RequestStateCorrupt(
+            f"{record_name} persistence fields are invalid"
+        )
+    encoded = payload.encode("utf-8")
+    actual_digest = hashlib.sha256(encoded).hexdigest()
+    if actual_digest != expected_digest:
+        raise RequestStateCorrupt(
+            f"{record_name} digest does not match stored bytes"
+        )
+    try:
+        value = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RequestStateCorrupt(
+            f"{record_name} is not valid JSON"
+        ) from error
+    if canonical_json_bytes(value) != encoded:
+        raise RequestStateCorrupt(
+            f"{record_name} bytes are not canonical JSON"
+        )
+    return value
 
 
 def _attempt(row: sqlite3.Row) -> NativeAttempt:
