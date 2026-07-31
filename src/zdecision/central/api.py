@@ -137,6 +137,9 @@ def create_app(
     def device(authorization: str | None) -> Principal:
         return identity_provider.authenticate_device(authorization)
 
+    def plugin(authorization: str | None) -> Principal:
+        return identity_provider.authenticate_plugin_action(authorization)
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         path = Path(__file__).with_name("static") / "index.html"
@@ -175,6 +178,23 @@ def create_app(
     @app.get("/api/v1/capture-requests/{request_id}")
     async def get_capture_request(request_id: str) -> dict[str, object]:
         return service.get_request(browser(), request_id).to_dict()
+
+    @app.post("/api/v1/plugin/capture-requests")
+    async def create_plugin_capture_request(
+        body: _CaptureRequestBody,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        command = CaptureRequestCreate.from_dict(body.model_dump())
+        return service.create_request(
+            plugin(authorization), command, current_time()
+        ).to_dict()
+
+    @app.get("/api/v1/plugin/capture-requests/{request_id}")
+    async def get_plugin_capture_request(
+        request_id: str,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        return service.get_request(plugin(authorization), request_id).to_dict()
 
     @app.get("/api/v1/capture-requests/{request_id}/events")
     async def capture_request_events(

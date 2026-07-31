@@ -11,6 +11,7 @@ import httpx
 
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
+    CaptureRequestCreate,
     CaptureRequestView,
     ClaimedCaptureRequest,
     ProgressEvent,
@@ -61,9 +62,10 @@ class CentralClient:
         self.client.close()
 
     def claim_next(self) -> ClaimedCaptureRequest | None:
-        status_code, value = self._post(
+        status_code, value = self._request(
+            "POST",
             "/api/v1/agent/capture-requests/claim",
-            {},
+            payload={},
             allowed_statuses=(200, 204),
         )
         if status_code == 204:
@@ -74,18 +76,20 @@ class CentralClient:
             raise CentralClientError("central_response_invalid") from error
 
     def heartbeat(self, request_id: str, lease_token: str) -> None:
-        status_code, _ = self._post(
+        status_code, _ = self._request(
+            "POST",
             _action_path(request_id, "heartbeat"),
-            {"lease_token": lease_token},
+            payload={"lease_token": lease_token},
             allowed_statuses=(204,),
         )
         if status_code != 204:
             raise CentralClientError("central_response_invalid")
 
     def start(self, request_id: str, lease_token: str) -> None:
-        _, value = self._post(
+        _, value = self._request(
+            "POST",
             _action_path(request_id, "start"),
-            {"lease_token": lease_token},
+            payload={"lease_token": lease_token},
             allowed_statuses=(200,),
         )
         try:
@@ -99,9 +103,10 @@ class CentralClient:
         lease_token: str,
         code: str,
     ) -> None:
-        _, value = self._post(
+        _, value = self._request(
+            "POST",
             _action_path(request_id, "progress"),
-            {"lease_token": lease_token, "code": code},
+            payload={"lease_token": lease_token, "code": code},
             allowed_statuses=(200,),
         )
         try:
@@ -116,9 +121,10 @@ class CentralClient:
     ) -> UploadReceipt:
         if not isinstance(batch, CandidateBatchUpload):
             raise TypeError("batch must be a CandidateBatchUpload")
-        _, value = self._post(
+        _, value = self._request(
+            "POST",
             _action_path(batch.request_id, "candidates"),
-            {
+            payload={
                 "lease_token": lease_token,
                 "batch": batch.to_dict(),
             },
@@ -135,9 +141,10 @@ class CentralClient:
         lease_token: str,
         batch_digest: str,
     ) -> None:
-        _, value = self._post(
+        _, value = self._request(
+            "POST",
             _action_path(request_id, "complete"),
-            {
+            payload={
                 "lease_token": lease_token,
                 "batch_digest": batch_digest,
             },
@@ -155,9 +162,10 @@ class CentralClient:
         code: str,
         retryable: bool,
     ) -> None:
-        _, value = self._post(
+        _, value = self._request(
+            "POST",
             _action_path(request_id, "fail"),
-            {
+            payload={
                 "lease_token": lease_token,
                 "code": code,
                 "retryable": retryable,
@@ -169,16 +177,51 @@ class CentralClient:
         except (TypeError, ValueError) as error:
             raise CentralClientError("central_response_invalid") from error
 
-    def _post(
+    def create_capture_request(
+        self, command: CaptureRequestCreate
+    ) -> CaptureRequestView:
+        if not isinstance(command, CaptureRequestCreate):
+            raise TypeError("command must be a CaptureRequestCreate")
+        _, value = self._request(
+            "POST",
+            "/api/v1/plugin/capture-requests",
+            payload=command.to_dict(),
+            allowed_statuses=(200,),
+            allowed_error_codes=("repository_capture_busy",),
+        )
+        try:
+            return CaptureRequestView.from_dict(value)
+        except (TypeError, ValueError) as error:
+            raise CentralClientError("central_response_invalid") from error
+
+    def get_capture_request(self, request_id: str) -> CaptureRequestView:
+        _, value = self._request(
+            "GET",
+            f"/api/v1/plugin/capture-requests/{_request_id(request_id)}",
+            payload=None,
+            allowed_statuses=(200,),
+        )
+        try:
+            return CaptureRequestView.from_dict(value)
+        except (TypeError, ValueError) as error:
+            raise CentralClientError("central_response_invalid") from error
+
+    def _request(
         self,
+        method: str,
         path: str,
-        payload: Mapping[str, object],
         *,
+        payload: Mapping[str, object] | None,
         allowed_statuses: tuple[int, ...],
+        allowed_error_codes: tuple[str, ...] = (),
     ) -> tuple[int, object | None]:
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                response = self.client.post(path, json=dict(payload))
+                response = self.client.request(
+                    method,
+                    path,
+                    json=dict(payload) if payload is not None else None,
+                )
             except (httpx.ConnectError, httpx.ConnectTimeout) as error:
                 if attempt + 1 == _MAX_ATTEMPTS:
                     raise CentralClientError(
@@ -195,6 +238,11 @@ class CentralClient:
                     self.sleeper(_retry_delay(attempt))
                     continue
                 if response.status_code not in allowed_statuses:
+                    allowed_error = _allowed_error(
+                        response, allowed_error_codes
+                    )
+                    if allowed_error is not None:
+                        raise CentralClientError(allowed_error)
                     raise CentralClientError("central_request_rejected")
                 content = response.content
                 if len(content) > _MAX_RESPONSE_BYTES:
@@ -242,11 +290,7 @@ def _device_token(value: str) -> str:
 
 
 def _action_path(request_id: str, action: str) -> str:
-    if (
-        not isinstance(request_id, str)
-        or _REQUEST_ID.fullmatch(request_id) is None
-    ):
-        raise ValueError("request_id is invalid")
+    request_id = _request_id(request_id)
     if action not in (
         "start",
         "heartbeat",
@@ -257,6 +301,31 @@ def _action_path(request_id: str, action: str) -> str:
     ):
         raise ValueError("action is invalid")
     return f"/api/v1/agent/capture-requests/{request_id}/{action}"
+
+
+def _request_id(value: str) -> str:
+    if not isinstance(value, str) or _REQUEST_ID.fullmatch(value) is None:
+        raise ValueError("request_id is invalid")
+    return value
+
+
+def _allowed_error(
+    response: httpx.Response, allowed_codes: tuple[str, ...]
+) -> str | None:
+    if not allowed_codes or len(response.content) > _MAX_RESPONSE_BYTES:
+        return None
+    try:
+        value = response.json()
+    except ValueError:
+        return None
+    if (
+        isinstance(value, dict)
+        and set(value) == {"error"}
+        and isinstance(value["error"], str)
+        and value["error"] in allowed_codes
+    ):
+        return value["error"]
+    return None
 
 
 def _retryable_status(status_code: int) -> bool:

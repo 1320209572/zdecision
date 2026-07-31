@@ -538,14 +538,27 @@
     async function initialize() {
       try {
         const result = await requestJson("/api/v1/repositories");
-        if (!result.repositories.length) {
+        const requestedRepositoryId = new URLSearchParams(
+          window.location.search
+        ).get("repository_id");
+        const requestedRepository =
+          typeof requestedRepositoryId === "string" &&
+          /^repo_[0-9a-f]{32}$/.test(requestedRepositoryId)
+            ? result.repositories.find(
+                (repository) => repository.repository_id === requestedRepositoryId
+              )
+            : null;
+        const repositories = requestedRepository
+          ? [requestedRepository]
+          : result.repositories;
+        if (!repositories.length) {
           const empty = document.createElement("p");
           empty.className = "empty";
           empty.textContent = "尚未登记可更新的仓库。";
           repositoryList.append(empty);
           return;
         }
-        result.repositories.forEach(renderRepository);
+        repositories.forEach(renderRepository);
       } catch {
         const failure = document.createElement("p");
         failure.className = "empty";

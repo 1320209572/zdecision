@@ -12,6 +12,7 @@ from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
     CandidateRevisionUpload,
+    CaptureRequestCreate,
 )
 
 try:
@@ -43,6 +44,22 @@ def claimed_payload() -> dict[str, object]:
         "client_action_id": "web_action_001",
         "lease_token": "lease_0123456789abcdef",
         "lease_expires_at": "2026-07-31T03:00:30Z",
+    }
+
+
+def capture_request_payload() -> dict[str, object]:
+    return {
+        "request_id": REQUEST_ID,
+        "repository_id": REPOSITORY_ID,
+        "product_id": PRODUCT_ID,
+        "product_name": "ZDecision",
+        "template_id": "business",
+        "state": "queued",
+        "progress_code": "queued",
+        "candidate_revision_count": None,
+        "last_sequence": 1,
+        "created_at": "2026-07-31T03:00:00Z",
+        "updated_at": "2026-07-31T03:00:00Z",
     }
 
 
@@ -129,6 +146,103 @@ class CentralClientTest(unittest.TestCase):
             "/api/v1/agent/capture-requests/claim",
             request.url.path,
         )
+
+    def test_plugin_capture_client_sends_only_command_and_reads_request(self) -> None:
+        transport = RecordingTransport(
+            [
+                httpx.Response(200, json=capture_request_payload()),
+                httpx.Response(200, json=capture_request_payload()),
+            ]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(transport),
+        )
+        command = CaptureRequestCreate(
+            repository_id=REPOSITORY_ID,
+            template_id="business",
+            capture_scope="current_session",
+            client_action_id="codex_action_001",
+        )
+        try:
+            created = client.create_capture_request(command)
+            read = client.get_capture_request(created.request_id)
+        finally:
+            client.close()
+
+        self.assertEqual(REQUEST_ID, read.request_id)
+        self.assertEqual(
+            {
+                "repository_id": REPOSITORY_ID,
+                "template_id": "business",
+                "capture_scope": "current_session",
+                "client_action_id": "codex_action_001",
+            },
+            json.loads(transport.requests[0].content),
+        )
+        self.assertEqual(
+            "/api/v1/plugin/capture-requests", transport.requests[0].url.path
+        )
+        self.assertEqual(
+            f"/api/v1/plugin/capture-requests/{REQUEST_ID}",
+            transport.requests[1].url.path,
+        )
+
+    def test_plugin_create_preserves_only_repository_busy_error(self) -> None:
+        transport = RecordingTransport(
+            [httpx.Response(409, json={"error": "repository_capture_busy"})]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(transport),
+        )
+        command = CaptureRequestCreate(
+            repository_id=REPOSITORY_ID,
+            template_id="business",
+            capture_scope="current_session",
+            client_action_id="codex_action_001",
+        )
+        try:
+            with self.assertRaisesRegex(
+                CentralClientError, "repository_capture_busy"
+            ):
+                client.create_capture_request(command)
+        finally:
+            client.close()
+
+        unexpected = RecordingTransport(
+            [httpx.Response(409, json={"error": "sensitive_internal_code"})]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(unexpected),
+        )
+        try:
+            with self.assertRaisesRegex(
+                CentralClientError, "central_request_rejected"
+            ):
+                client.create_capture_request(command)
+        finally:
+            client.close()
+
+        read = RecordingTransport(
+            [httpx.Response(409, json={"error": "repository_capture_busy"})]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(read),
+        )
+        try:
+            with self.assertRaisesRegex(
+                CentralClientError, "central_request_rejected"
+            ):
+                client.get_capture_request(REQUEST_ID)
+        finally:
+            client.close()
 
     def test_client_never_serializes_local_source_values(self) -> None:
         batch = valid_upload_batch()

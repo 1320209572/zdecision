@@ -82,6 +82,12 @@ class DemoIdentityProvider:
             self.device_id,
         )
 
+    def authenticate_plugin_action(
+        self, authorization: str | None
+    ) -> Principal:
+        self.authenticate_device(authorization)
+        return self.browser_principal()
+
 
 def require_id(value: object, field_name: str) -> str:
     if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
@@ -93,4 +99,3 @@ def require_sha256(value: object, field_name: str) -> str:
     if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
         raise ValueError(f"{field_name} is invalid")
     return value
-

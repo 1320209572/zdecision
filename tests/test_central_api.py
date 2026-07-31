@@ -252,6 +252,101 @@ class CentralApiTest(unittest.TestCase):
         self.assertEqual(401, wrong.status_code)
         self.assertNotIn(DEVICE_TOKEN, wrong.text)
 
+    def test_plugin_create_uses_device_authentication_and_demo_user(self) -> None:
+        response = self.client.post(
+            "/api/v1/plugin/capture-requests",
+            headers=self.authorization,
+            json={
+                "repository_id": REPOSITORY_ID,
+                "template_id": "business",
+                "capture_scope": "current_session",
+                "client_action_id": "codex_action_001",
+            },
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        request_id = response.json()["request_id"]
+        self.assertEqual(
+            "user_demo", self.store.get_request_record(request_id).actor_id
+        )
+
+        for headers in ({}, {"Authorization": "Bearer wrong-token"}):
+            with self.subTest(headers=headers):
+                rejected = self.client.post(
+                    "/api/v1/plugin/capture-requests",
+                    headers=headers,
+                    json={
+                        "repository_id": REPOSITORY_ID,
+                        "template_id": "business",
+                        "capture_scope": "current_session",
+                        "client_action_id": "codex_action_002",
+                    },
+                )
+                self.assertEqual(401, rejected.status_code)
+
+        current = self.client.get(
+            f"/api/v1/plugin/capture-requests/{request_id}",
+            headers=self.authorization,
+        )
+        self.assertEqual(200, current.status_code, current.text)
+        self.assertEqual(request_id, current.json()["request_id"])
+        for headers in ({}, {"Authorization": "Bearer wrong-token"}):
+            with self.subTest(headers=headers):
+                rejected = self.client.get(
+                    f"/api/v1/plugin/capture-requests/{request_id}",
+                    headers=headers,
+                )
+                self.assertEqual(401, rejected.status_code)
+
+    def test_plugin_create_rejects_identity_and_local_source_fields(self) -> None:
+        command = {
+            "repository_id": REPOSITORY_ID,
+            "template_id": "business",
+            "capture_scope": "current_session",
+            "client_action_id": "codex_action_001",
+        }
+        for field in (
+            "organization_id",
+            "actor_id",
+            "product_id",
+            "device_id",
+            "session_id",
+            "turn_id",
+            "cwd",
+            "control_id",
+        ):
+            with self.subTest(field=field):
+                response = self.client.post(
+                    "/api/v1/plugin/capture-requests",
+                    headers=self.authorization,
+                    json={**command, field: "forbidden"},
+                )
+                self.assertEqual(422, response.status_code)
+                self.assertEqual({"error": "invalid_request"}, response.json())
+
+    def test_plugin_create_exposes_the_central_busy_code(self) -> None:
+        command = {
+            "repository_id": REPOSITORY_ID,
+            "template_id": "business",
+            "capture_scope": "current_session",
+            "client_action_id": "codex_action_001",
+        }
+        created = self.client.post(
+            "/api/v1/plugin/capture-requests",
+            headers=self.authorization,
+            json=command,
+        )
+        self.assertEqual(200, created.status_code, created.text)
+
+        response = self.client.post(
+            "/api/v1/plugin/capture-requests",
+            headers=self.authorization,
+            json={**command, "client_action_id": "codex_action_002"},
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual({"error": "repository_capture_busy"}, response.json())
+
     def test_device_routes_expose_only_bounded_lifecycle_values(self) -> None:
         request_id, lease_token = self.start_request()
         start = self.client.get(

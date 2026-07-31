@@ -73,13 +73,15 @@ class UpdateCandidatesPageTest(unittest.TestCase):
         self.assertNotIn("review", lowered)
         self.assertNotIn("publish", lowered)
 
-    def test_page_posts_only_the_three_capture_request_fields(self) -> None:
+    def test_page_posts_only_the_four_capture_request_fields(self) -> None:
         html = self.client.get("/").text
 
         self.assertRegex(
             html,
             r"JSON\.stringify\(\{\s*repository_id,\s*"
-            r"template_id:\s*['\"]business['\"],\s*client_action_id",
+            r"template_id:\s*['\"]business['\"],\s*"
+            r"capture_scope:\s*['\"]all_valid_sessions['\"],\s*"
+            r"client_action_id",
         )
 
     def test_terminal_request_refreshes_safe_candidate_fields(
