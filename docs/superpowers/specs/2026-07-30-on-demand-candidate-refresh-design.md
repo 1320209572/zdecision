@@ -1,6 +1,6 @@
 # ZDecision On-Demand Candidate Refresh Design
 
-**Status:** Approved for implementation planning.
+**Status:** Packet 1 Gates A–C implemented and accepted on 2026-07-31.
 
 **Scope:** Pre-Demo technical loop for the installable Codex Plugin.
 
@@ -258,7 +258,7 @@ For every changed Session operation, the existing app-server Gateway performs:
 
 ```text
 thread/read at durable upper checkpoint
-  -> fresh ephemeral fork
+  -> fresh persisted read-only fork for one disposable attempt
   -> turn/start Inventory with frozen template and model
   -> validate complete Inventory
   -> turn/start Extraction
@@ -268,10 +268,14 @@ thread/read at durable upper checkpoint
 There is no eligibility assessment Turn. The user's page action is the Capture
 boundary. Zero Candidates is a successful result.
 
-Strict existing limits, frozen prompts, output digests, native Turn IDs, and
-ambiguous external-result recovery remain in force. A retry adopts or resumes
-the same operation; it does not create a replacement fork merely because a
-result is unknown.
+Strict existing limits, frozen prompts, output digests, and native Turn IDs
+remain in force. The durable business operation is separate from native model
+execution. If a fork or Turn result is unknown, the whole native attempt is
+abandoned and a higher generation reruns Inventory and Extraction in a fresh
+fork. Only the active generation may win the operation CAS, so model execution
+is at-least-once while Candidate effects remain exactly-once. Reconciliation
+uses the same disposable-attempt and generation-fencing rule, then commits its
+result, family heads, and immutable outbox in one SQLite transaction.
 
 Candidate Observations from all Sessions in the request are reconciled against
 current product Candidate families as exactly one of:
@@ -457,8 +461,11 @@ implementation plan must begin from this design after written-spec approval.
   reversal produce the expected family and revision structure.
 - Zero durable decisions returns `succeeded_no_candidates`.
 - Activity after the frozen upper boundary waits for the next click.
-- A crash or ambiguous app-server result resumes or reconciles the same
-  operation without duplicate Candidates.
+- A crash resumes a durable validated or committed operation result; an
+  unknown app-server result starts a higher disposable generation without
+  duplicate Candidate effects.
+- A late abandoned generation cannot alter the winning Candidate family or
+  outbox batch.
 - Handled checkpoints advance only after central acknowledgement.
 
 ### Gate D: Web Review and publication

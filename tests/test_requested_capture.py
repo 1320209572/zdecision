@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.capture_operation_store import CaptureOperationStore
@@ -340,6 +341,34 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         replay = self._run()
 
         self.assertEqual(first, replay)
+        self.assertEqual(
+            counts,
+            (
+                self.gateway.fork_count,
+                self.gateway.inventory_count,
+                self.gateway.extraction_count,
+            ),
+        )
+
+    def test_restart_commits_active_validated_attempt_without_model_work(
+        self,
+    ) -> None:
+        with patch.object(
+            self.operation_store,
+            "commit_attempt",
+            side_effect=RuntimeError("crash before operation CAS"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self._run()
+        counts = (
+            self.gateway.fork_count,
+            self.gateway.inventory_count,
+            self.gateway.extraction_count,
+        )
+
+        result = self._run()
+
+        self.assertEqual("completed", result.status)
         self.assertEqual(
             counts,
             (

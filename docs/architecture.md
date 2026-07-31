@@ -534,6 +534,15 @@ the existing two-stage Capture contract, and reconciles `same`, `refine`,
 `replace`, and unrelated Candidate families. Zero Candidates is a successful
 request result.
 
+Each frozen source is a durable business operation with disposable native
+execution generations. An unknown `thread/fork` or `turn/start` result abandons
+that generation and reruns both Capture stages in a fresh persisted read-only
+fork. Native execution may therefore duplicate, but only the active generation
+can win the local operation CAS. Reconciliation is fenced the same way, and
+its result, Candidate-family heads, and immutable outbox batch commit in one
+transaction. `threadSource` and `clientUserMessageId` are not correctness
+mechanisms and are not sent by Packet 1.
+
 Because the page is central and source conversations remain local, the
 installed Agent owns an authenticated persistent request channel. A queued
 request survives page closure, Agent outage, and central restart. The Agent

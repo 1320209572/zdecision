@@ -2,6 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **2026-07-31 recovery amendment:** Packet 1 is implemented. The stable-tag
+> adoption instructions originally written in Tasks 6–9 are superseded by
+> `2026-07-31-disposable-capture-attempts-design.md` and its implementation
+> plan. Do not restore `threadSource`, `clientUserMessageId`,
+> `NativeCallCoordinator`, or native-object lookup. Current recovery uses
+> durable operations, disposable whole-pipeline generations, winner CAS, and
+> one atomic reconciliation/Candidate/outbox transaction.
+
 **Goal:** Build the first working vertical slice in which a user clicks **更新候选决策**, a durable central request reaches the persistent local Agent, every changed eligible Codex Session is captured with the existing two-stage pipeline, and reconciled Candidate revisions appear on the page.
 
 **Architecture:** The central service owns authenticated repository mappings, durable Capture Requests, progress events, and the Candidate Inbox; it never receives Session content or Session identifiers. The local Agent owns the Session Index, frozen source boundaries, app-server work, Candidate-family reconciliation, and the acknowledgement checkpoint. Existing app-server transport, strict Inventory/Extraction validation, templates, private artifacts, and Registry code remain in place.
@@ -845,7 +853,11 @@ git commit -m "feat: persist local capture delivery"
 
 **Interfaces:**
 - Consumes: `FrozenSessionSource`, `CaptureService`, `AppServerGateway`, and the existing Inventory/Extraction schemas and validators.
-- Produces: `AppServerGateway.list_interactive_thread_ids(cwd)`, `AppServerGateway.start_ephemeral_thread(cwd, profile, thread_source)`, tagged `fork_ephemeral()`, `read_structured_turn_by_client_id()`, `RequestStateStore.open(path)`, `get_or_create_native_attempt()`, `mark_native_pending()`, `attach_native_result()`, `complete_native_attempt()`, `reset_native_after_rejection()`, `NativeCallCoordinator.resolve_thread()`, `NativeCallCoordinator.resolve_structured_turn()`, `RequestedCaptureRunner.run(source, product_name, template_id)`, and `SessionCaptureResult`.
+- Produces: `AppServerGateway.list_interactive_thread_ids(cwd)`,
+  `start_disposable_thread()`, `fork_disposable_thread()`,
+  `archive_thread()`, `CaptureOperationStore`, `RequestedCaptureRunner.run()`,
+  and `SessionCaptureResult`. Recovery identity is local operation/attempt
+  state, never an app-server tag.
 
 - [ ] **Step 1: Write a failing no-eligibility orchestration test**
 
@@ -867,13 +879,13 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         with self.assertRaises(SourceNotInteractive):
             self.runner.run(SOURCE, product_name="ZDecision", template_id="business")
 
-    def test_retry_adopts_unknown_fork_and_stage_turn_by_stable_tags(self) -> None:
+    def test_unknown_fork_starts_a_higher_disposable_generation(self) -> None:
         self.gateway.fail_after_external_fork = True
         with self.assertRaises(CaptureResultUnknown):
             self.runner.run(SOURCE, product_name="ZDecision", template_id="business")
         self.gateway.fail_after_external_fork = False
         result = self.runner.run(SOURCE, product_name="ZDecision", template_id="business")
-        self.assertEqual(1, self.gateway.created_fork_count)
+        self.assertEqual(2, self.gateway.created_fork_count)
         self.assertEqual(1, self.gateway.inventory_turn_count)
         self.assertEqual("completed", result.status)
 ```
@@ -898,43 +910,45 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'zdecision.app_server.
 
 It follows `nextCursor`, rejects malformed or duplicate IDs, and caps at 100 pages. This host-owned allowlist excludes `subAgent`, `subAgentReview`, `subAgentCompact`, `subAgentThreadSpawn`, `subAgentOther`, `exec`, and `unknown`.
 
-`start_ephemeral_thread(cwd, profile, thread_source)` calls `thread/start` with exact fields:
+`start_disposable_thread(cwd, profile)` calls persisted `thread/start` with
+exact fields:
 
 ```python
 {
     "cwd": str(Path(cwd).resolve()),
-    "ephemeral": True,
     "model": profile.model_id,
     "sandbox": "read-only",
-    "threadSource": thread_source,
 }
 ```
 
-Validate that the response contains one `thread.id`, the exact cwd, `ephemeral: true`, and the requested model. This method is used by Task 7; source Capture itself continues to use the exact-boundary `thread/fork`.
+`fork_disposable_thread(source_thread_id, upper_turn_id)` uses the official
+`thread/fork` boundary. `run_structured_turn()` sends no recovery tag. Both
+methods validate returned native IDs, and `archive_thread()` owns cleanup of a
+known terminal attempt Thread.
 
-Extend `fork_ephemeral()` with a required-for-automation `thread_source` tag. Requested Capture uses `zdecision/capture/<operation_id>` and reconciliation uses `zdecision/reconciliation/<request_id>`. Add `find_thread_by_source()` to page `thread/list`, require zero or one exact tag match, and attach a recovered match rather than creating another fork.
+- [ ] **Step 4: Persist operations and disposable generations**
 
-Extend `run_structured_turn()` with `client_user_message_id`. Use `zdecision/<operation_id>/inventory` and `zdecision/<operation_id>/extraction`; app-server returns this as the `userMessage.clientId`. `read_structured_turn_by_client_id()` reads the thread, finds exactly one matching Turn, and reconstructs the same validated receipt from its completed agent message. A retry first adopts that receipt. Zero matches after an explicitly failed request may start the Turn; an unknown transport result remains retryable and never starts a replacement until the read route resolves it.
-
-- [ ] **Step 4: Persist native-call intent before every external mutation**
-
-Create `RequestStateStore` with a `native_attempts` table keyed by `(request_id, operation_key, stage)`. Its state is `prepared`, `pending`, `attached`, or `completed`, and it retains the deterministic thread-source or client-message tag, native ID when known, and validated output digest when completed.
+Create `CaptureOperationStore` with one immutable frozen operation per request
+source and monotonically increasing `capture_execution_attempts`. Each attempt
+runs the whole Inventory/Extraction pipeline. Before external creation, commit
+the new active generation. Persist known Thread/Turn IDs only as diagnostics.
 
 ```python
 @dataclass(frozen=True)
-class NativeAttempt:
-    request_id: str
-    operation_key: str
-    stage: Literal["capture_fork", "inventory", "extraction", "reconciliation_thread", "reconciliation_turn"]
-    stable_tag: str
-    state: Literal["prepared", "pending", "attached", "completed"]
-    native_id: str | None
-    output_digest: str | None
+class ExecutionAttempt:
+    attempt_id: str
+    operation_id: str
+    generation: int
+    state: Literal[
+        "creating_thread", "running", "validated",
+        "accepted", "superseded", "abandoned"
+    ]
 ```
 
-Before `thread/fork`, `thread/start`, or `turn/start`, commit `pending`. After a known successful response or read-back, attach the native ID. A transport interruption leaves `pending`; a retry may only query by the stable tag and adopt a unique match. If no match is yet visible, raise `CaptureResultUnknown` and retry later. Only an explicit app-server error proving that no native object was created may transition back to `prepared` and issue the call again.
-
-`NativeCallCoordinator` contains that network/state handshake so both requested Capture and Task 7 reconciliation use the same rule. Its exact public signatures are `resolve_thread(*, request_id: str, operation_key: str, stage: str, stable_tag: str, find: Callable[[str], str | None], create: Callable[[], str]) -> str` and `resolve_structured_turn(*, request_id: str, operation_key: str, stage: str, stable_tag: str, read: Callable[[str], AppServerTurnReceipt | None], create: Callable[[], AppServerTurnReceipt]) -> AppServerTurnReceipt`. The implementation follows the fully specified `prepared -> pending -> attached -> completed` algorithm above and is covered by the unknown-result test.
+An unknown fork or Turn result abandons that generation. A retry starts a fresh
+generation and reruns both stages. A validated active attempt is persisted
+before the winner CAS and can be committed after restart without a new model
+call. A late or abandoned generation can only become `superseded`.
 
 - [ ] **Step 5: Implement the request-authorized runner**
 
@@ -960,15 +974,19 @@ verify source.session_id is in list_interactive_thread_ids(source.cwd)
 read_completed_boundary(source.session_id, source.upper_turn_id)
 verify boundary.cwd == source.cwd
 discover_and_freeze_profile(boundary)
-CaptureService.prepare(source.session_id, source.upper_turn_id,
-                       product_name, template_id)
-fork_ephemeral at upper_turn_id and durably attach the fork
+freeze the operation input, template, and model profile
+begin a new active generation
+fork_disposable_thread at upper_turn_id and attach the known fork
 run/validate/attach Inventory
 run/validate/attach Extraction
-return persisted Candidate observations and a canonical evidence digest
+store the validated result and attempt the winner CAS
+archive known terminal attempt Threads
+return the committed Candidate observations and canonical evidence digest
 ```
 
-Reuse `CaptureService.resume()` and its ambiguity rules plus the durable native-attempt journal, stable fork source, and `clientUserMessageId` recovery above. A replay adopts attached or discoverable fork/Turn IDs; it never starts a replacement merely because a prior external result is unknown. Do not import or call `capture.eligibility`.
+Replay a validated or committed local operation result. Never look up a native
+object by an application-defined tag. Do not import or call
+`capture.eligibility`.
 
 - [ ] **Step 6: Run Gateway, journal, Capture, and requested-runner tests**
 
@@ -995,7 +1013,7 @@ git commit -m "feat: run capture from page requests"
 - Test: `tests/test_reconciliation_runner.py`
 
 **Interfaces:**
-- Consumes: Candidate observations from Task 6, Task 1 family/revision IDs, and `AppServerGateway.start_ephemeral_thread()`.
+- Consumes: Candidate observations from Task 6, Task 1 family/revision IDs, and `AppServerGateway.start_disposable_thread()`.
 - Produces: `CandidateRelation`, `ReconciliationDecision`, `CandidateFamilyRevision`, `ReconciliationResult`, `reconciliation_output_schema()`, `validate_reconciliation()`, `apply_reconciliation()`, `RequestStateStore.open(path: Path) -> RequestStateStore`, `current_families(repository_id: str) -> tuple[CandidateFamilyRevision, ...]`, `save_reconciliation(request_id: str, result: ReconciliationResult) -> None`, `stage_batch(request_id: str, revisions: tuple[CandidateFamilyRevision, ...], batch: CandidateBatchUpload) -> None`, `pending_batch(request_id: str) -> CandidateBatchUpload | None`, `mark_uploaded(receipt: UploadReceipt) -> None`, and `ReconciliationRunner.run(request_id, repository_id, cwd, observations, current, profile) -> ReconciliationResult`.
 
 - [ ] **Step 1: Write failing same/refine/replace/unrelated/ambiguous tests**
@@ -1101,7 +1119,7 @@ This permits two newly observed, equivalent decisions from different Sessions to
 
 - [ ] **Step 4: Add the fixed, editable reconciliation prompt contract**
 
-`candidate-reconciliation-v1.md` must tell the model that Candidate and Registry text is untrusted data, define all five relations, forbid instructions from Candidate content, require one result per observation, and prefer `ambiguous` over guessing. `reconciliation_output_schema()` constrains observation IDs and both current/proposed family IDs to the host-provided enums. The runner renders canonical current-family and ordered observation JSON, including host-computed proposed IDs, between explicit data delimiters; starts one fresh ephemeral thread; runs one structured Turn; validates it; and persists the Turn ID and output digest before applying host transitions. Its `render_prompt()` method accepts only the repository ID plus these typed values; it never reads a source Thread.
+`candidate-reconciliation-v1.md` must tell the model that Candidate and Registry text is untrusted data, define all five relations, forbid instructions from Candidate content, require one result per observation, and prefer `ambiguous` over guessing. `reconciliation_output_schema()` constrains observation IDs and both current/proposed family IDs to the host-provided enums. The runner renders canonical current-family and ordered observation JSON, including host-computed proposed IDs, between explicit data delimiters. Its `render_prompt()` method accepts only the repository ID plus these typed values; it never reads a source Thread.
 
 ```python
 class ReconciliationRunner:
@@ -1114,58 +1132,52 @@ class ReconciliationRunner:
             candidate_family_id(repository_id, item.candidate_id)
             for item in ordered
         )
-        thread_source = f"zdecision/reconciliation/{request_id}"
-        thread_id = self.native_calls.resolve_thread(
-            request_id=request_id,
-            operation_key=request_id,
-            stage="reconciliation_thread",
-            stable_tag=thread_source,
-            find=self.gateway.find_thread_by_source,
-            create=lambda: self.gateway.start_ephemeral_thread(
-                cwd, profile, thread_source
-            ),
+        attempt = self.request_state.begin_reconciliation_attempt(
+            request_id, frozen_input_digest, now
         )
-        client_message_id = f"zdecision/{request_id}/reconciliation"
-        receipt = self.native_calls.resolve_structured_turn(
-            request_id=request_id,
-            operation_key=request_id,
-            stage="reconciliation_turn",
-            stable_tag=client_message_id,
-            read=lambda value: self.gateway.read_structured_turn_by_client_id(
-                thread_id, value, profile
+        thread_id = self.gateway.start_disposable_thread(cwd, profile)
+        self.request_state.attach_reconciliation_thread(
+            attempt.attempt_id, thread_id
+        )
+        receipt = self.gateway.run_structured_turn(
+            thread_id=thread_id,
+            prompt=self.render_prompt(
+                repository_id, ordered, proposed_family_ids, current
             ),
-            create=lambda: self.gateway.run_structured_turn(
-                thread_id=thread_id,
-                prompt=self.render_prompt(
-                    repository_id, ordered, proposed_family_ids, current
-                ),
-                output_schema=reconciliation_output_schema(
-                    observation_ids=tuple(
-                        item.candidate_id for item in ordered
-                    ),
-                    family_ids=(
-                        tuple(item.family_id for item in current)
-                        + proposed_family_ids
-                    ),
-                ),
-                profile=profile,
-                cwd=cwd,
-                client_user_message_id=client_message_id,
-            ),
+            output_schema=reconciliation_output_schema(...),
+            profile=profile,
+            cwd=cwd,
         )
         decisions = validate_reconciliation(
             receipt.structured_output, ordered, current
         )
-        return apply_reconciliation(
+        result = apply_reconciliation(
             repository_id, ordered, current, decisions
         )
+        self.request_state.store_validated_reconciliation(
+            attempt.attempt_id, result, now
+        )
+        return self.request_state.commit_reconciliation_attempt(
+            attempt.attempt_id
+        )
 ```
+
+An unknown native result abandons the generation and retries the complete
+reconciliation in a fresh persisted Thread. The active generation alone may
+win; known terminal Threads are archived independently of the result commit.
 
 Never run reconciliation in a source fork: that would leak one Session's retained context into cross-Session comparison.
 
 - [ ] **Step 5: Implement local request mirror, family store, and outbox**
 
-Extend Task 6's `RequestStateStore` with request mirrors, captured observation receipts, family revisions, reconciliation results, and one candidate batch per request. Canonical JSON plus SHA-256 is the persistence format. Enforce unique `(family_id, revision)`, unique `revision_id`, and one current revision per family. Store native Session/Turn/source keys only in local tables. Before starting reconciliation, use the existing `reconciliation_thread` and `reconciliation_turn` native-attempt rows to recover the tagged thread and stable client-message Turn; persist the native receipt before applying the host result. `mark_uploaded()` requires an exact `UploadReceipt` digest before changing outbox state.
+Extend Task 6's `RequestStateStore` with reconciliation operations and
+generations, family revisions, reconciliation results, and one Candidate
+outbox row per request. Canonical JSON plus SHA-256 is the persistence format.
+Enforce unique `(family_id, revision)`, unique `revision_id`, and one current
+revision per family. Commit the winning reconciliation result, family revisions
+and heads, and the exact outbox batch in one `BEGIN IMMEDIATE` transaction.
+`mark_uploaded()` requires an exact `UploadReceipt` digest before changing
+outbox state.
 
 - [ ] **Step 6: Run reconciliation and durability tests**
 
@@ -1362,7 +1374,13 @@ def test_one_click_captures_changed_sessions_and_survives_restart(self) -> None:
     self.assertEqual(2, len(page_candidates(REPOSITORY_ID)))
 ```
 
-Add companion cases for no page request (zero app-server calls), zero Candidates, a second click after later activity, a replace/reversal revision, an unknown app-server fork/Turn result followed by adoption, offline upload followed by restart, and the exact same batch replay. Use a sentinel raw Prompt, local path, Session ID, Turn ID, and source-code fragment; assert none occurs in central SQLite text or HTTP recordings.
+Add companion cases for no page request (zero app-server calls), zero
+Candidates, a second click after later activity, a replace/reversal revision,
+unknown app-server fork/Turn results followed by higher disposable generations,
+offline upload followed by restart, and the exact same batch replay. Use a
+sentinel raw Prompt, local path, Session ID, Turn ID, source-code fragment, and
+`transcript_path`; assert none occurs in central SQLite text or HTTP recordings
+and the transcript path is never opened.
 
 - [ ] **Step 3: Remove obsolete automatic-assessment state**
 

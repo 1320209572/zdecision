@@ -191,6 +191,20 @@ class RequestedCaptureRunner:
         if committed is not None:
             return self._result(source, committed, profile)
 
+        validated_attempt = self.operation_store.active_validated_attempt(
+            operation.operation_id
+        )
+        if validated_attempt is not None:
+            committed = self.operation_store.commit_attempt(
+                validated_attempt.attempt_id
+            )
+            self.sweep_archives()
+            if committed.result is None:
+                raise CaptureAttemptRetryable(
+                    "Validated Capture generation was superseded before commit"
+                )
+            return self._result(source, committed, profile)
+
         attempt = self.operation_store.begin_attempt(
             operation.operation_id, _now()
         )

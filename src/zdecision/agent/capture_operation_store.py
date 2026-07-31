@@ -211,6 +211,27 @@ class CaptureOperationStore:
             )
         return None if not rows else self._operation(rows[0])
 
+    def active_validated_attempt(
+        self, operation_id: str
+    ) -> ExecutionAttempt | None:
+        operation = self._operation(
+            self._required_operation_row(operation_id)
+        )
+        if operation.status != "open" or operation.active_generation == 0:
+            return None
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_execution_attempts
+            WHERE operation_id = ? AND generation = ?
+              AND state = 'validated'
+              AND validated_result_json IS NOT NULL
+              AND validated_result_digest IS NOT NULL
+            """,
+            (operation.operation_id, operation.active_generation),
+        ).fetchone()
+        return None if row is None else self._attempt(row)
+
     def begin_attempt(
         self, operation_id: str, started_at: str
     ) -> ExecutionAttempt:

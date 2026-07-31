@@ -1,6 +1,7 @@
 # ZDecision Disposable Capture Attempts Design
 
-**Status:** Approved for implementation planning.
+**Status:** Implemented in Packet 1; deterministic and live acceptance passed
+on 2026-07-31.
 
 **Scope:** Correct the app-server recovery contract in Packet 1 of the
 page-authorized Candidate refresh loop.
@@ -151,9 +152,9 @@ before the ID is known, ZDecision accepts that the blank fork may be an
 unarchivable orphan; it cannot contain Capture Turns because ZDecision never
 received the ID needed to start one.
 
-`threadSource` and `clientUserMessageId` may remain bounded diagnostics when
-the installed Codex version accepts them. Correctness must be unchanged when
-they are absent, ignored, duplicated, or not returned.
+Packet 1 sends neither `threadSource` nor `clientUserMessageId`. Native IDs are
+bounded attempt diagnostics only; generation fencing and the operation CAS are
+the complete correctness mechanism.
 
 ## 6. Fencing and result commit
 
@@ -286,3 +287,18 @@ Replace only:
 Do not add JSONL import, Web Review/publication, recall, OIDC, multi-device
 coordination, non-code Capture, or a generalized workflow engine in this
 correction.
+
+## 12. Implementation evidence
+
+The deterministic Gate A–C suite covers unknown fork, Inventory, and Extraction
+results; late abandoned output; the Capture and Candidate transaction crash
+points; exact outbox replay; frozen later activity; missing source boundaries;
+zero Candidates; and a `transcript_path` no-read/no-persist sentinel.
+
+The 2026-07-31 live Codex app-server acceptance deliberately discarded the
+first `thread/fork` response. Operation
+`cap_5e9fec31b58f18112d6e3dac9dec96d4` abandoned generation 1
+(`cat_292b4ff33b87a47fcfe06e59a1b41498`) and accepted generation 2
+(`cat_bbd607d050b4f8f8566418264779cc19`). It produced one Candidate result;
+the known winning Thread was archived, the unknown blank first fork remained
+unidentifiable, and replay issued no additional model Turn.
