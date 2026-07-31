@@ -26,6 +26,18 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__zdecision_local__show_zdecision_update",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [

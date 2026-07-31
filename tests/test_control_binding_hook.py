@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import subprocess
+import tempfile
+import unittest
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import patch
+
+from zdecision.agent.control_bindings import ControlBindingStore
+from zdecision.agent.db import AgentDatabase
+from zdecision.agent.events import TestRepositoryMapping
+from zdecision.agent.hooks import handle_control_binding_hook, handle_hook
+from zdecision.agent.repository import RepositoryResolver
+from zdecision.ids import product_id
+
+
+NOW = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
+CONTROL_ID = "ctl_0123456789abcdef0123456789abcdef"
+MODEL_CONTROL_ID = "ctl_ffffffffffffffffffffffffffffffff"
+TOOL_NAME = "mcp__zdecision_local__show_zdecision_update"
+EMPTY_INPUT_OUTPUT = {
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": {},
+    }
+}
+
+
+class FailingControlStore:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def create_binding(self, **_: object) -> None:
+        raise RuntimeError("persistence unavailable")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ControlBindingHookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.repository = self.root / "repository"
+        self.repository.mkdir()
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "tests@example.com")
+        self._git("config", "user.name", "ZDecision Tests")
+        (self.repository / "README.md").write_text("fixture\n", "utf-8")
+        self._git("add", "README.md")
+        self._git("commit", "-m", "fixture")
+        self._git(
+            "remote", "add", "origin", "https://github.com/OpenAI/example.git"
+        )
+        self.database_path = self.root / "state" / "zdecision.sqlite3"
+        self.database = AgentDatabase.open(self.database_path)
+        self.addCleanup(self.database.close)
+        self.control_store = ControlBindingStore.open(self.database_path)
+        self.addCleanup(self.control_store.close)
+        self.repository_resolver = RepositoryResolver(timeout_seconds=0.5)
+        self.snapshot = self.repository_resolver.resolve(self.repository)
+        self.assertIsNotNone(self.snapshot)
+        self.mapping = TestRepositoryMapping(
+            repository_id=self.snapshot.repository_id,
+            product_id=product_id("Example"),
+            product_name="Example",
+            enabled=True,
+        )
+        self.database.put_test_repository_mapping(self.mapping)
+
+    def _git(self, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=self.repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def _raw(self, **overrides: object) -> dict[str, object]:
+        raw: dict[str, object] = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "session_a",
+            "turn_id": "turn_a",
+            "cwd": str(self.repository),
+            "tool_name": TOOL_NAME,
+            "tool_input": {
+                "control_id": MODEL_CONTROL_ID,
+                "discarded": "TOOL-INPUT-SECRET",
+            },
+            "model_payload": "MODEL-SECRET",
+        }
+        raw.update(overrides)
+        return raw
+
+    def _handle(self, raw: object):
+        return handle_hook(
+            raw,
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.repository_resolver,
+            control_store=self.control_store,
+            control_id_factory=lambda: CONTROL_ID,
+            worker_waker=lambda _: self.fail("must not wake worker"),
+        )
+
+    def test_trusted_envelope_replaces_all_model_input_with_local_binding(self) -> None:
+        response = self._handle(self._raw())
+
+        self.assertEqual(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": {"control_id": CONTROL_ID},
+                }
+            },
+            response.output,
+        )
+        self.assertEqual("", response.event_id)
+        self.assertEqual(0, self.database.count_events())
+        binding = self.control_store.get(CONTROL_ID)
+        self.assertIsNotNone(binding)
+        self.assertEqual("session_a", binding.session_id)
+        self.assertEqual("turn_a", binding.render_turn_id)
+        self.assertEqual(str(self.repository), binding.cwd)
+        self.assertEqual(self.snapshot.repository_id, binding.repository_id)
+        self.assertEqual(self.mapping.product_id, binding.product_id)
+        self.assertEqual("2026-07-31T03:00:00.000000Z", binding.created_at)
+        self.assertEqual("2026-07-31T03:15:00.000000Z", binding.expires_at)
+        database_bytes = b"".join(
+            path.read_bytes()
+            for path in self.database_path.parent.iterdir()
+            if path.is_file()
+        )
+        self.assertNotIn(MODEL_CONTROL_ID.encode(), database_bytes)
+        self.assertNotIn(b"TOOL-INPUT-SECRET", database_bytes)
+        self.assertNotIn(b"MODEL-SECRET", database_bytes)
+
+    def test_untrusted_or_unavailable_envelopes_allow_with_empty_input(self) -> None:
+        unregistered = self.root / "unregistered"
+        unregistered.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main"], cwd=unregistered, check=True,
+            capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "tests@example.com"],
+            cwd=unregistered, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "ZDecision Tests"],
+            cwd=unregistered, check=True, capture_output=True, text=True,
+        )
+        (unregistered / "README.md").write_text("fixture\n", "utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"], cwd=unregistered, check=True,
+            capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "fixture"], cwd=unregistered, check=True,
+            capture_output=True, text=True,
+        )
+        subprocess.run(
+            [
+                "git", "remote", "add", "origin",
+                "https://github.com/OpenAI/unregistered.git",
+            ],
+            cwd=unregistered, check=True, capture_output=True, text=True,
+        )
+        cases = (
+            ("unresolved", self._raw(cwd=str(self.root / "missing"))),
+            ("unregistered", self._raw(cwd=str(unregistered))),
+            ("subagent", self._raw(agent_id="agent_child")),
+            ("missing session", self._raw(session_id=None)),
+            ("unsafe session", self._raw(session_id="session with spaces")),
+            ("missing turn", self._raw(turn_id=None)),
+            ("relative cwd", self._raw(cwd="relative/path")),
+            ("wrong tool", self._raw(tool_name="mcp__other__render")),
+        )
+
+        for name, raw in cases:
+            with self.subTest(name=name):
+                self.assertEqual(EMPTY_INPUT_OUTPUT, self._handle(raw).output)
+
+        self.database.put_test_repository_mapping(replace(self.mapping, enabled=False))
+        self.assertEqual(EMPTY_INPUT_OUTPUT, self._handle(self._raw()).output)
+        self.assertEqual(0, self.database.count_events())
+
+    def test_persistence_failure_is_silent_and_injected_store_stays_open(self) -> None:
+        store = FailingControlStore()
+
+        response = handle_control_binding_hook(
+            self._raw(),
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.repository_resolver,
+            control_store=store,
+            control_id_factory=lambda: CONTROL_ID,
+        )
+
+        self.assertEqual(EMPTY_INPUT_OUTPUT, response.output)
+        self.assertFalse(store.closed)
+        self.assertEqual(0, self.database.count_events())
+
+    def test_handle_hook_closes_its_temporary_store_on_success_and_failure(self) -> None:
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                store = FailingControlStore()
+                if not fails:
+                    store.create_binding = lambda **_: None
+                with patch(
+                    "zdecision.agent.hooks.ControlBindingStore.open",
+                    return_value=store,
+                ):
+                    response = handle_hook(
+                        self._raw(),
+                        database=self.database,
+                        clock=lambda: NOW,
+                        repository_resolver=self.repository_resolver,
+                        control_id_factory=lambda: CONTROL_ID,
+                        worker_waker=lambda _: self.fail("must not wake worker"),
+                    )
+
+                expected = (
+                    EMPTY_INPUT_OUTPUT
+                    if fails
+                    else {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "updatedInput": {"control_id": CONTROL_ID},
+                        }
+                    }
+                )
+                self.assertEqual(expected, response.output)
+                self.assertTrue(store.closed)
+
+
+if __name__ == "__main__":
+    unittest.main()

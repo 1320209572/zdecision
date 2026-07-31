@@ -9,7 +9,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision"
 MARKETPLACE_PATH = REPOSITORY_ROOT / ".agents" / "plugins" / "marketplace.json"
-EXPECTED_HOOKS = {
+EXPECTED_LIFECYCLE_HOOKS = {
     "SessionStart",
     "UserPromptSubmit",
     "PostToolUse",
@@ -82,12 +82,13 @@ class PluginContractTests(unittest.TestCase):
         self.assertNotIn("organization_id", manifest_serialized)
         self.assertNotIn("repository_id", manifest_serialized)
 
-    def test_plugin_registers_exactly_the_five_lifecycle_hooks(self) -> None:
+    def test_plugin_registers_five_lifecycle_hooks_and_one_render_matcher(self) -> None:
         document = load_json(PLUGIN_ROOT / "hooks" / "hooks.json")
         hooks = document["hooks"]
 
-        self.assertEqual(EXPECTED_HOOKS, set(hooks))
-        for event_name, matcher_groups in hooks.items():
+        self.assertEqual(EXPECTED_LIFECYCLE_HOOKS | {"PreToolUse"}, set(hooks))
+        for event_name in EXPECTED_LIFECYCLE_HOOKS:
+            matcher_groups = hooks[event_name]
             with self.subTest(event_name=event_name):
                 self.assertEqual(1, len(matcher_groups))
                 handlers = matcher_groups[0]["hooks"]
@@ -102,6 +103,18 @@ class PluginContractTests(unittest.TestCase):
         self.assertLessEqual(
             hooks["SessionEnd"][0]["hooks"][0]["timeout"], 3
         )
+        pre_tool_groups = hooks["PreToolUse"]
+        self.assertEqual(1, len(pre_tool_groups))
+        self.assertEqual(
+            "mcp__zdecision_local__show_zdecision_update",
+            pre_tool_groups[0]["matcher"],
+        )
+        self.assertEqual(1, len(pre_tool_groups[0]["hooks"]))
+        handler = pre_tool_groups[0]["hooks"][0]
+        self.assertEqual("command", handler["type"])
+        self.assertEqual("zdecision-agent hook", handler["command"])
+        self.assertLessEqual(handler["timeout"], 3)
+        self.assertNotIn("additionalContextLimit", handler)
 
     def test_plugin_skill_describes_the_page_authorized_workflow(self) -> None:
         skill_path = PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
