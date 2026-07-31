@@ -13,6 +13,7 @@ from zdecision.agent.capture_operation_store import (
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.request_state import (
     BatchConflict,
+    RequestStateError,
     RequestStateStore,
 )
 from zdecision.agent.service import (
@@ -21,6 +22,7 @@ from zdecision.agent.service import (
 )
 from zdecision.agent.session_index import SessionIndex
 from zdecision.app_server.reconciliation_runner import (
+    ReconciliationAttemptRetryable,
     ReconciliationRunnerError,
 )
 from zdecision.app_server.requested_capture import (
@@ -125,6 +127,10 @@ class OnDemandCaptureProcessor:
             raise TerminalCaptureRequestError(
                 "local_capture_state_invalid"
             ) from error
+        except ReconciliationAttemptRetryable as error:
+            raise RetryableCaptureRequestError(
+                "reconciliation_attempt_retryable"
+            ) from error
         except RequestedCaptureFailed as error:
             raise TerminalCaptureRequestError(
                 "capture_result_failed"
@@ -132,6 +138,10 @@ class OnDemandCaptureProcessor:
         except ReconciliationRunnerError as error:
             raise TerminalCaptureRequestError(
                 "reconciliation_result_failed"
+            ) from error
+        except RequestStateError as error:
+            raise TerminalCaptureRequestError(
+                "local_request_state_invalid"
             ) from error
         except OSError as error:
             raise RetryableCaptureRequestError(
@@ -144,6 +154,7 @@ class OnDemandCaptureProcessor:
         client,
     ) -> None:
         self.capture_runner.sweep_archives()
+        self.reconciliation_runner.sweep_archives()
         client.start(request.request_id, request.lease_token)
         sources = self.session_index.freeze_sources(
             request.request_id,
@@ -211,9 +222,6 @@ class OnDemandCaptureProcessor:
                 result = ReconciliationResult.empty(
                     request.repository_id
                 )
-                self.request_state.save_reconciliation(
-                    request.request_id, result
-                )
         if result.repository_id != request.repository_id:
             raise TerminalCaptureRequestError(
                 "reconciliation_repository_mismatch"
@@ -223,10 +231,8 @@ class OnDemandCaptureProcessor:
             request.repository_id,
             result.uploadable_revisions,
         )
-        self.request_state.stage_batch(
-            request.request_id,
-            result.uploadable_revisions,
-            batch,
+        batch = self.request_state.commit_candidate_result(
+            request.request_id, result, batch
         )
         client.progress(
             request.request_id,

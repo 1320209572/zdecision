@@ -302,6 +302,9 @@ class EventLedgerTests(unittest.TestCase):
         self.assertEqual(0, self.database.count_events())
 
     def test_legacy_capture_tables_retire_only_after_new_stores_exist(self) -> None:
+        from zdecision.agent.capture_operation_store import (
+            CaptureOperationStore,
+        )
         from zdecision.agent.request_state import RequestStateStore
         from zdecision.agent.session_index import SessionIndex
 
@@ -337,8 +340,10 @@ class EventLedgerTests(unittest.TestCase):
         self.database.close()
 
         session_index = SessionIndex.open(self.database_path)
+        operation_store = CaptureOperationStore.open(self.database_path)
         request_state = RequestStateStore.open(self.database_path)
         session_index.close()
+        operation_store.close()
         request_state.close()
 
         self.database = AgentDatabase.open(self.database_path)

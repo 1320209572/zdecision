@@ -378,96 +378,6 @@ class AppServerGateway:
             "thread/archive result",
         )
 
-    def start_ephemeral_thread(
-        self,
-        cwd: str,
-        profile: FeasibilityModelProfile,
-        thread_source: str,
-    ) -> str:
-        """Compatibility shim until the reconciliation caller migrates."""
-
-        _nonempty(thread_source, "thread_source")
-        return self.start_disposable_thread(cwd, profile)
-
-    def fork_ephemeral(
-        self,
-        thread_id: str,
-        last_turn_id: str,
-        *,
-        thread_source: str | None = None,
-    ) -> str:
-        """Compatibility shim until the Capture caller migrates."""
-
-        if thread_source is not None:
-            _nonempty(thread_source, "thread_source")
-        return self.fork_disposable_thread(thread_id, last_turn_id)
-
-    def find_thread_by_source(
-        self,
-        thread_source: str,
-        *,
-        cwd: str | None = None,
-    ) -> str | None:
-        source = _nonempty(thread_source, "thread_source")
-        resolved_cwd = None if cwd is None else _resolved_cwd(cwd)
-        seen_ids: set[str] = set()
-        matches: list[str] = []
-        page_count = 0
-        for archived in (False, True):
-            cursor: str | None = None
-            seen_cursors: set[str] = set()
-            while True:
-                page_count += 1
-                if page_count > 100:
-                    raise InvalidAppServerResponse(
-                        "thread/list exceeded the page limit"
-                    )
-                params: dict[str, object] = {
-                    "limit": 100,
-                    "sourceKinds": ["appServer"],
-                    "archived": archived,
-                }
-                if resolved_cwd is not None:
-                    params["cwd"] = [resolved_cwd]
-                if cursor is not None:
-                    params["cursor"] = cursor
-                result = _mapping(
-                    self.client.request("thread/list", params),
-                    "thread/list result",
-                )
-                data = result.get("data")
-                if not isinstance(data, list):
-                    raise InvalidAppServerResponse(
-                        "thread/list data is invalid"
-                    )
-                for value in data:
-                    thread = _mapping(value, "thread/list entry")
-                    thread_id = _nonempty_response(
-                        thread.get("id"), "Thread id"
-                    )
-                    if thread_id in seen_ids:
-                        raise InvalidAppServerResponse(
-                            "thread/list repeated a Thread id"
-                        )
-                    seen_ids.add(thread_id)
-                    returned_source = thread.get("threadSource")
-                    if returned_source is not None and not isinstance(
-                        returned_source, str
-                    ):
-                        raise InvalidAppServerResponse(
-                            "thread/list Thread source is invalid"
-                        )
-                    if returned_source == source:
-                        matches.append(thread_id)
-                cursor = _next_cursor(result, seen_cursors)
-                if cursor is None:
-                    break
-        if len(matches) > 1:
-            raise InvalidAppServerResponse(
-                "thread/list returned multiple exact Thread source matches"
-            )
-        return None if not matches else matches[0]
-
     def run_structured_turn(
         self,
         thread_id: str,
@@ -475,8 +385,6 @@ class AppServerGateway:
         output_schema: Mapping[str, object],
         profile: FeasibilityModelProfile,
         cwd: str,
-        *,
-        client_user_message_id: str | None = None,
     ) -> AppServerTurnReceipt:
         target_thread_id = _nonempty(thread_id, "thread_id")
         prompt_text = _nonempty(prompt, "prompt")
@@ -501,10 +409,6 @@ class AppServerGateway:
             "effort": profile.reasoning_effort,
             "outputSchema": dict(output_schema),
         }
-        # Kept temporarily in the Python signature for caller migration only.
-        # It is deliberately neither sent nor used for result validation.
-        if client_user_message_id is not None:
-            _nonempty(client_user_message_id, "client_user_message_id")
         result = _mapping(
             self.client.request("turn/start", params),
             "turn/start result",
@@ -536,75 +440,6 @@ class AppServerGateway:
             thread_id=target_thread_id,
             turn_id=generated_turn_id,
             structured_output=structured_output,
-            model_profile_id=profile.profile_id,
-        )
-
-    def read_structured_turn_by_client_id(
-        self,
-        thread_id: str,
-        client_user_message_id: str,
-        profile: FeasibilityModelProfile,
-    ) -> AppServerTurnReceipt | None:
-        target_thread_id = _nonempty(thread_id, "thread_id")
-        client_id = _nonempty(
-            client_user_message_id, "client_user_message_id"
-        )
-        if not isinstance(profile, FeasibilityModelProfile):
-            raise TypeError("profile must be a FeasibilityModelProfile")
-        result = _mapping(
-            self.client.request(
-                "thread/read",
-                {"threadId": target_thread_id, "includeTurns": True},
-            ),
-            "thread/read result",
-        )
-        thread = _mapping(result.get("thread"), "thread/read thread")
-        if thread.get("id") != target_thread_id:
-            raise InvalidAppServerResponse(
-                "thread/read returned the wrong Thread"
-            )
-        turns = thread.get("turns")
-        if not isinstance(turns, list):
-            raise InvalidAppServerResponse(
-                "thread/read did not include Turns"
-            )
-        matches: list[Mapping[str, object]] = []
-        for value in turns:
-            turn = _mapping(value, "thread/read Turn")
-            items = turn.get("items")
-            if not isinstance(items, list):
-                raise InvalidAppServerResponse(
-                    "thread/read Turn items are invalid"
-                )
-            count = sum(
-                1
-                for item in items
-                if isinstance(item, Mapping)
-                and item.get("type") == "userMessage"
-                and item.get("clientId") == client_id
-            )
-            if count > 1:
-                raise InvalidAppServerResponse(
-                    "thread/read repeated a client user message id"
-                )
-            if count == 1:
-                matches.append(turn)
-        if not matches:
-            return None
-        if len(matches) != 1:
-            raise InvalidAppServerResponse(
-                "thread/read repeated a client user message id"
-            )
-        matched = matches[0]
-        if matched.get("status") != "completed":
-            return None
-        turn_id = _nonempty_response(
-            matched.get("id"), "generated Turn id"
-        )
-        return AppServerTurnReceipt.create(
-            thread_id=target_thread_id,
-            turn_id=turn_id,
-            structured_output=_structured_output(matched),
             model_profile_id=profile.profile_id,
         )
 

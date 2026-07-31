@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import (
@@ -145,6 +146,8 @@ class FakeReconciliationRunner:
     def __init__(self, request_state) -> None:
         self.request_state = request_state
         self.call_count = 0
+        self.sweep_count = 0
+        self.error: Exception | None = None
 
     def run(
         self,
@@ -158,6 +161,8 @@ class FakeReconciliationRunner:
         heartbeat=None,
     ):
         self.call_count += 1
+        if self.error is not None:
+            raise self.error
         ordered = tuple(sorted(
             observations, key=lambda item: item.candidate_id
         ))
@@ -175,10 +180,10 @@ class FakeReconciliationRunner:
         result = apply_reconciliation(
             repository_id, ordered, current, decisions
         )
-        self.request_state.save_reconciliation(
-            request_id, result
-        )
         return result
+
+    def sweep_archives(self) -> None:
+        self.sweep_count += 1
 
 
 class FakeCentralClient:
@@ -424,10 +429,47 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             "source_boundary_unavailable", raised.exception.code
         )
 
+    def test_reconciliation_generation_failure_is_retryable(self) -> None:
+        from zdecision.agent.service import (
+            RetryableCaptureRequestError,
+        )
+        from zdecision.app_server.reconciliation_runner import (
+            ReconciliationAttemptRetryable,
+        )
+
+        self.observe_turn_1()
+        self.reconciliation_runner.error = (
+            ReconciliationAttemptRetryable("retry")
+        )
+
+        with self.assertRaises(
+            RetryableCaptureRequestError
+        ) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(
+            "reconciliation_attempt_retryable",
+            raised.exception.code,
+        )
+
     def test_archive_sweep_runs_before_request_processing(self) -> None:
         self.processor.process(claimed_request(), self.client)
 
         self.assertEqual(1, self.capture_runner.sweep_count)
+        self.assertEqual(1, self.reconciliation_runner.sweep_count)
+
+    def test_candidate_result_and_outbox_use_one_commit_entrypoint(
+        self,
+    ) -> None:
+        self.observe_turn_1()
+        with patch.object(
+            self.request_state,
+            "commit_candidate_result",
+            wraps=self.request_state.commit_candidate_result,
+        ) as commit:
+            self.processor.process(claimed_request(), self.client)
+
+        commit.assert_called_once()
 
     def test_no_changed_source_uploads_canonical_empty_batch(
         self,

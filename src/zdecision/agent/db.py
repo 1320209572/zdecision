@@ -824,8 +824,10 @@ def _retire_legacy_automatic_capture(connection: sqlite3.Connection) -> bool:
     }
     required_replacements = {
         "session_checkpoints",
-        "native_attempts",
-        "reconciliation_results",
+        "capture_operations",
+        "capture_execution_attempts",
+        "reconciliation_operations",
+        "reconciliation_attempts",
         "candidate_outbox",
     }
     if not required_replacements.issubset(table_names):

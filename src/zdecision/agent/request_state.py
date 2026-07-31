@@ -1,4 +1,4 @@
-"""Durable intent journal for native app-server mutations."""
+"""Durable reconciliation generations and atomic Candidate delivery state."""
 
 from __future__ import annotations
 
@@ -6,13 +6,10 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from zdecision.app_server.jsonl import AppServerRequestError
-from zdecision.app_server.models import AppServerTurnReceipt
 from zdecision.capture.reconciliation import (
     CandidateFamilyRevision,
     ReconciliationResult,
@@ -25,48 +22,44 @@ from zdecision.sync.contracts import (
 )
 
 
-NativeStage = Literal[
-    "capture_fork",
-    "inventory",
-    "extraction",
-    "reconciliation_thread",
-    "reconciliation_turn",
+ReconciliationAttemptState = Literal[
+    "creating_thread",
+    "running",
+    "validated",
+    "accepted",
+    "superseded",
+    "abandoned",
 ]
-NativeAttemptState = Literal["prepared", "pending", "attached", "completed"]
+ArchiveState = Literal["not_applicable", "pending", "archived"]
 
 _REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
-_SAFE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_STAGES = frozenset(
+_FAILURE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ATTEMPT_STATES = frozenset(
     (
-        "capture_fork",
-        "inventory",
-        "extraction",
-        "reconciliation_thread",
-        "reconciliation_turn",
+        "creating_thread",
+        "running",
+        "validated",
+        "accepted",
+        "superseded",
+        "abandoned",
     )
+)
+_TERMINAL_ATTEMPT_STATES = frozenset(
+    ("accepted", "superseded", "abandoned")
+)
+_ARCHIVE_STATES = frozenset(
+    ("not_applicable", "pending", "archived")
 )
 
 
 class RequestStateError(Exception):
-    """Base class for native-attempt state failures."""
-
-
-class NativeAttemptNotFound(RequestStateError):
-    """A requested native attempt has not been prepared."""
-
-
-class NativeAttemptConflict(RequestStateError):
-    """A replay disagrees with the durably recorded native attempt."""
-
-
-class CaptureResultUnknown(RequestStateError):
-    """An external mutation may have succeeded but cannot yet be adopted."""
+    """Base class for private reconciliation and delivery failures."""
 
 
 class ReconciliationConflict(RequestStateError):
-    """A reconciliation replay disagrees with durable local state."""
+    """A reconciliation replay conflicts with durable local state."""
 
 
 class BatchConflict(RequestStateError):
@@ -78,18 +71,57 @@ class RequestStateCorrupt(RequestStateError):
 
 
 @dataclass(frozen=True)
-class NativeAttempt:
+class ReconciliationAttempt:
+    attempt_id: str
     request_id: str
-    operation_key: str
-    stage: NativeStage
-    stable_tag: str
-    state: NativeAttemptState
-    native_id: str | None
-    output_digest: str | None
+    generation: int
+    state: ReconciliationAttemptState
+    thread_id: str | None
+    turn_id: str | None
+    failure_code: str | None
+    validated_result_digest: str | None
+    archive_state: ArchiveState
+    started_at: str
+    finished_at: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attempt_id, str) or not self.attempt_id:
+            raise ValueError("attempt_id is invalid")
+        _request_id(self.request_id)
+        if (
+            not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 1
+        ):
+            raise ValueError("generation is invalid")
+        if self.state not in _ATTEMPT_STATES:
+            raise ValueError("state is invalid")
+        if self.archive_state not in _ARCHIVE_STATES:
+            raise ValueError("archive_state is invalid")
+        _nonempty(self.started_at, "started_at")
+        for field_name in (
+            "thread_id",
+            "turn_id",
+            "failure_code",
+            "finished_at",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _nonempty(value, field_name)
+        if self.validated_result_digest is not None:
+            _digest(self.validated_result_digest)
+        if self.thread_id is None and self.archive_state != "not_applicable":
+            raise ValueError(
+                "Unknown reconciliation Thread cannot require archive"
+            )
+        if self.thread_id is not None and self.archive_state == "not_applicable":
+            raise ValueError(
+                "Known reconciliation Thread must track archive state"
+            )
 
 
 class RequestStateStore:
-    """Persist app-server intent before any non-idempotent native call."""
+    """Own reconciliation fencing, family heads, and the Candidate outbox."""
 
     def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
         self.path = path
@@ -107,26 +139,40 @@ class RequestStateStore:
         with connection:
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS native_attempts (
+                CREATE TABLE IF NOT EXISTS reconciliation_operations (
+                    request_id TEXT PRIMARY KEY,
+                    input_digest TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'open', 'committed'
+                    )),
+                    active_generation INTEGER NOT NULL
+                        CHECK(active_generation >= 0),
+                    winner_generation INTEGER,
+                    committed_result_json TEXT,
+                    committed_result_digest TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS reconciliation_attempts (
+                    attempt_id TEXT PRIMARY KEY,
                     request_id TEXT NOT NULL,
-                    operation_key TEXT NOT NULL,
-                    stage TEXT NOT NULL CHECK(stage IN (
-                        'capture_fork',
-                        'inventory',
-                        'extraction',
-                        'reconciliation_thread',
-                        'reconciliation_turn'
-                    )),
-                    stable_tag TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK(generation > 0),
                     state TEXT NOT NULL CHECK(state IN (
-                        'prepared',
-                        'pending',
-                        'attached',
-                        'completed'
+                        'creating_thread', 'running', 'validated',
+                        'accepted', 'superseded', 'abandoned'
                     )),
-                    native_id TEXT,
-                    output_digest TEXT,
-                    PRIMARY KEY(request_id, operation_key, stage)
+                    thread_id TEXT,
+                    turn_id TEXT,
+                    failure_code TEXT,
+                    validated_result_json TEXT,
+                    validated_result_digest TEXT,
+                    archive_state TEXT NOT NULL CHECK(archive_state IN (
+                        'not_applicable', 'pending', 'archived'
+                    )),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    UNIQUE(request_id, generation),
+                    FOREIGN KEY(request_id)
+                        REFERENCES reconciliation_operations(request_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS candidate_family_revisions (
@@ -161,195 +207,414 @@ class RequestStateStore:
                     batch_json TEXT NOT NULL,
                     batch_digest TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN (
-                        'pending',
-                        'uploaded'
+                        'pending', 'uploaded'
                     )),
                     receipt_json TEXT,
                     receipt_digest TEXT
                 );
+
+                CREATE INDEX IF NOT EXISTS reconciliation_archive_queue
+                    ON reconciliation_attempts(archive_state, state);
                 """
             )
+            _retire_native_attempts(connection)
         return cls(database_path, connection)
 
     def close(self) -> None:
         self._connection.close()
 
-    def get_native_attempt(
+    def begin_reconciliation_attempt(
         self,
         request_id: str,
-        operation_key: str,
-        stage: str,
-    ) -> NativeAttempt | None:
-        identity = _identity(request_id, operation_key, stage)
-        row = self._connection.execute(
-            """
-            SELECT request_id, operation_key, stage, stable_tag, state,
-                   native_id, output_digest
-            FROM native_attempts
-            WHERE request_id = ? AND operation_key = ? AND stage = ?
-            """,
-            identity,
-        ).fetchone()
-        return None if row is None else _attempt(row)
-
-    def get_or_create_native_attempt(
-        self,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-        stable_tag: str,
-    ) -> NativeAttempt:
-        identity = _identity(request_id, operation_key, stage)
-        tag = _safe_value(stable_tag, "stable_tag")
+        input_digest: str,
+        started_at: str,
+    ) -> ReconciliationAttempt:
+        request = _request_id(request_id)
+        digest = _digest(input_digest)
+        started = _nonempty(started_at, "started_at")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            existing = self._row(identity)
-            if existing is not None:
-                attempt = _attempt(existing)
-                if attempt.stable_tag != tag:
-                    raise NativeAttemptConflict(
-                        "Native attempt stable tag conflicts"
-                    )
+            operation = self._reconciliation_operation(request)
+            if operation is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO reconciliation_operations(
+                        request_id, input_digest, status,
+                        active_generation, winner_generation,
+                        committed_result_json, committed_result_digest
+                    ) VALUES (?, ?, 'open', 0, NULL, NULL, NULL)
+                    """,
+                    (request, digest),
+                )
+                operation = self._required_reconciliation_operation(
+                    request
+                )
+            elif operation["input_digest"] != digest:
+                raise ReconciliationConflict(
+                    "Reconciliation input digest conflicts"
+                )
+
+            if operation["status"] == "committed":
+                winner = self._winner_attempt(operation)
                 self._connection.commit()
-                return attempt
+                return winner
+
+            active_generation = operation["active_generation"]
+            if active_generation:
+                active_row = self._attempt_for_generation(
+                    request, active_generation
+                )
+                if active_row is None:
+                    raise RequestStateCorrupt(
+                        "Active reconciliation attempt is missing"
+                    )
+                active = self._attempt(active_row)
+                if active.state == "validated":
+                    self._connection.commit()
+                    return active
+                if active.state in ("creating_thread", "running"):
+                    self._connection.execute(
+                        """
+                        UPDATE reconciliation_attempts
+                        SET state = 'abandoned',
+                            failure_code = 'restart_result_unknown',
+                            finished_at = ?
+                        WHERE attempt_id = ?
+                        """,
+                        (started, active.attempt_id),
+                    )
+                elif active.state == "accepted":
+                    raise RequestStateCorrupt(
+                        "Open reconciliation has an accepted attempt"
+                    )
+
+            generation = active_generation + 1
+            attempt_id = _attempt_id(request, generation)
+            updated = self._connection.execute(
+                """
+                UPDATE reconciliation_operations
+                SET active_generation = ?
+                WHERE request_id = ? AND status = 'open'
+                  AND active_generation = ?
+                """,
+                (generation, request, active_generation),
+            )
+            if updated.rowcount != 1:
+                raise ReconciliationConflict(
+                    "Reconciliation generation changed concurrently"
+                )
             self._connection.execute(
                 """
-                INSERT INTO native_attempts(
-                    request_id, operation_key, stage, stable_tag, state,
-                    native_id, output_digest
-                ) VALUES (?, ?, ?, ?, 'prepared', NULL, NULL)
+                INSERT INTO reconciliation_attempts(
+                    attempt_id, request_id, generation, state,
+                    thread_id, turn_id, failure_code,
+                    validated_result_json, validated_result_digest,
+                    archive_state, started_at, finished_at
+                ) VALUES (
+                    ?, ?, ?, 'creating_thread',
+                    NULL, NULL, NULL, NULL, NULL,
+                    'not_applicable', ?, NULL
+                )
                 """,
-                (*identity, tag),
+                (attempt_id, request, generation, started),
             )
-            attempt = _attempt(self._required_row(identity))
+            attempt = self._attempt(
+                self._required_attempt(attempt_id)
+            )
             self._connection.commit()
             return attempt
         except Exception:
             self._connection.rollback()
             raise
 
-    def mark_native_pending(
-        self,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-    ) -> NativeAttempt:
-        identity = _identity(request_id, operation_key, stage)
-        return self._transition(
-            identity,
-            allowed=frozenset(("prepared", "pending")),
-            target="pending",
-        )
-
-    def attach_native_result(
-        self,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-        native_id: str,
-    ) -> NativeAttempt:
-        identity = _identity(request_id, operation_key, stage)
-        result_id = _safe_value(native_id, "native_id")
+    def attach_reconciliation_thread(
+        self, attempt_id: str, thread_id: str
+    ) -> ReconciliationAttempt:
+        thread = _nonempty(thread_id, "thread_id")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            current = _attempt(self._required_row(identity))
-            if current.state == "prepared":
-                raise NativeAttemptConflict(
-                    "Native result cannot attach before pending"
-                )
-            if current.native_id is not None:
-                if current.native_id != result_id:
-                    raise NativeAttemptConflict(
-                        "Native attempt result conflicts"
+            current = self._attempt(self._required_attempt(attempt_id))
+            if current.thread_id is not None:
+                if current.thread_id != thread:
+                    raise ReconciliationConflict(
+                        "Reconciliation Thread conflicts"
                     )
                 self._connection.commit()
                 return current
-            if current.state != "pending":
-                raise NativeAttemptConflict("Native attempt state conflicts")
+            if current.state != "creating_thread":
+                raise ReconciliationConflict(
+                    "Reconciliation cannot attach a Thread"
+                )
             self._connection.execute(
                 """
-                UPDATE native_attempts
-                SET state = 'attached', native_id = ?
-                WHERE request_id = ? AND operation_key = ? AND stage = ?
+                UPDATE reconciliation_attempts
+                SET state = 'running', thread_id = ?,
+                    archive_state = 'pending'
+                WHERE attempt_id = ?
                 """,
-                (result_id, *identity),
+                (thread, attempt_id),
             )
-            attached = _attempt(self._required_row(identity))
+            updated = self._attempt(
+                self._required_attempt(attempt_id)
+            )
             self._connection.commit()
-            return attached
+            return updated
         except Exception:
             self._connection.rollback()
             raise
 
-    def complete_native_attempt(
-        self,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-        output_digest: str,
-    ) -> NativeAttempt:
-        identity = _identity(request_id, operation_key, stage)
-        digest = _digest(output_digest)
+    def attach_reconciliation_turn(
+        self, attempt_id: str, turn_id: str
+    ) -> ReconciliationAttempt:
+        turn = _nonempty(turn_id, "turn_id")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            current = _attempt(self._required_row(identity))
-            if current.native_id is None or current.state not in {
-                "attached",
-                "completed",
-            }:
-                raise NativeAttemptConflict(
-                    "Native attempt cannot complete before attachment"
-                )
-            if current.output_digest is not None:
-                if current.output_digest != digest:
-                    raise NativeAttemptConflict(
-                        "Native attempt output digest conflicts"
+            current = self._attempt(self._required_attempt(attempt_id))
+            if current.turn_id is not None:
+                if current.turn_id != turn:
+                    raise ReconciliationConflict(
+                        "Reconciliation Turn conflicts"
                     )
                 self._connection.commit()
                 return current
+            if current.state != "running" or current.thread_id is None:
+                raise ReconciliationConflict(
+                    "Reconciliation attempt is not running"
+                )
             self._connection.execute(
                 """
-                UPDATE native_attempts
-                SET state = 'completed', output_digest = ?
-                WHERE request_id = ? AND operation_key = ? AND stage = ?
+                UPDATE reconciliation_attempts
+                SET turn_id = ?
+                WHERE attempt_id = ?
                 """,
-                (digest, *identity),
+                (turn, attempt_id),
             )
-            completed = _attempt(self._required_row(identity))
+            updated = self._attempt(
+                self._required_attempt(attempt_id)
+            )
             self._connection.commit()
-            return completed
+            return updated
         except Exception:
             self._connection.rollback()
             raise
 
-    def reset_native_after_rejection(
+    def abandon_reconciliation_attempt(
         self,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-    ) -> NativeAttempt:
-        identity = _identity(request_id, operation_key, stage)
+        attempt_id: str,
+        failure_code: str,
+        finished_at: str,
+    ) -> ReconciliationAttempt:
+        failure = _failure_code(failure_code)
+        finished = _nonempty(finished_at, "finished_at")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            current = _attempt(self._required_row(identity))
-            if current.state == "prepared":
+            current = self._attempt(self._required_attempt(attempt_id))
+            if current.state == "abandoned":
+                if current.failure_code != failure:
+                    raise ReconciliationConflict(
+                        "Reconciliation failure conflicts"
+                    )
                 self._connection.commit()
                 return current
-            if current.state != "pending" or current.native_id is not None:
-                raise NativeAttemptConflict(
-                    "Attached native attempts cannot be reset"
+            if current.state in ("accepted", "superseded"):
+                raise ReconciliationConflict(
+                    "Terminal reconciliation cannot be abandoned"
                 )
             self._connection.execute(
                 """
-                UPDATE native_attempts
-                SET state = 'prepared', native_id = NULL, output_digest = NULL
-                WHERE request_id = ? AND operation_key = ? AND stage = ?
+                UPDATE reconciliation_attempts
+                SET state = 'abandoned', failure_code = ?,
+                    finished_at = ?
+                WHERE attempt_id = ?
                 """,
-                identity,
+                (failure, finished, attempt_id),
             )
-            reset = _attempt(self._required_row(identity))
+            updated = self._attempt(
+                self._required_attempt(attempt_id)
+            )
             self._connection.commit()
-            return reset
+            return updated
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def store_validated_reconciliation(
+        self,
+        attempt_id: str,
+        result: ReconciliationResult,
+        finished_at: str,
+    ) -> ReconciliationAttempt:
+        if not isinstance(result, ReconciliationResult):
+            raise TypeError("result must be a ReconciliationResult")
+        canonical = ReconciliationResult.from_dict(result.to_dict())
+        if canonical != result:
+            raise ReconciliationConflict(
+                "Reconciliation result is not canonical"
+            )
+        result_json, result_digest = _canonical_record(result.to_dict())
+        finished = _nonempty(finished_at, "finished_at")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._required_attempt(attempt_id)
+            current = self._attempt(row)
+            existing_json = row["validated_result_json"]
+            existing_digest = row["validated_result_digest"]
+            if existing_json is not None or existing_digest is not None:
+                if (
+                    existing_json != result_json
+                    or existing_digest != result_digest
+                ):
+                    raise ReconciliationConflict(
+                        "Validated reconciliation conflicts"
+                    )
+                self._connection.commit()
+                return current
+            next_state = (
+                current.state
+                if current.state in _TERMINAL_ATTEMPT_STATES
+                else "validated"
+            )
+            self._connection.execute(
+                """
+                UPDATE reconciliation_attempts
+                SET state = ?, validated_result_json = ?,
+                    validated_result_digest = ?,
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE attempt_id = ?
+                """,
+                (
+                    next_state,
+                    result_json,
+                    result_digest,
+                    finished,
+                    attempt_id,
+                ),
+            )
+            updated = self._attempt(
+                self._required_attempt(attempt_id)
+            )
+            self._connection.commit()
+            return updated
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def commit_reconciliation_attempt(
+        self, attempt_id: str
+    ) -> ReconciliationResult:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            attempt_row = self._required_attempt(attempt_id)
+            attempt = self._attempt(attempt_row)
+            attempted_result = self._attempt_result(attempt_row)
+            if attempted_result is None:
+                raise ReconciliationConflict(
+                    "Reconciliation attempt has no validated result"
+                )
+            operation = self._required_reconciliation_operation(
+                attempt.request_id
+            )
+            if operation["status"] == "committed":
+                winner_result = self._operation_result(operation)
+                if winner_result is None:
+                    raise RequestStateCorrupt(
+                        "Committed reconciliation has no result"
+                    )
+                if operation["winner_generation"] == attempt.generation:
+                    if winner_result != attempted_result:
+                        raise RequestStateCorrupt(
+                            "Winning reconciliation result conflicts"
+                        )
+                    target_state = "accepted"
+                else:
+                    target_state = "superseded"
+                self._set_attempt_state(attempt_id, target_state)
+                self._connection.commit()
+                return winner_result
+
+            can_win = (
+                operation["active_generation"] == attempt.generation
+                and attempt.state == "validated"
+            )
+            if not can_win:
+                raise ReconciliationConflict(
+                    "Stale reconciliation has no committed winner"
+                )
+            result_json, result_digest = _canonical_record(
+                attempted_result.to_dict()
+            )
+            updated = self._connection.execute(
+                """
+                UPDATE reconciliation_operations
+                SET status = 'committed', winner_generation = ?,
+                    committed_result_json = ?,
+                    committed_result_digest = ?
+                WHERE request_id = ? AND status = 'open'
+                  AND active_generation = ?
+                """,
+                (
+                    attempt.generation,
+                    result_json,
+                    result_digest,
+                    attempt.request_id,
+                    attempt.generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ReconciliationConflict(
+                    "Reconciliation winner CAS lost"
+                )
+            self._set_attempt_state(attempt_id, "accepted")
+            self._connection.commit()
+            return attempted_result
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def pending_reconciliation_archives(
+        self,
+    ) -> tuple[ReconciliationAttempt, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM reconciliation_attempts
+            WHERE archive_state = 'pending'
+              AND state IN ('accepted', 'superseded', 'abandoned')
+            ORDER BY request_id, generation
+            """
+        ).fetchall()
+        return tuple(self._attempt(row) for row in rows)
+
+    def mark_reconciliation_archived(
+        self, attempt_id: str
+    ) -> ReconciliationAttempt:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._attempt(self._required_attempt(attempt_id))
+            if current.archive_state == "archived":
+                self._connection.commit()
+                return current
+            if (
+                current.thread_id is None
+                or current.archive_state != "pending"
+                or current.state not in _TERMINAL_ATTEMPT_STATES
+            ):
+                raise ReconciliationConflict(
+                    "Reconciliation is not ready to archive"
+                )
+            self._connection.execute(
+                """
+                UPDATE reconciliation_attempts
+                SET archive_state = 'archived'
+                WHERE attempt_id = ?
+                """,
+                (attempt_id,),
+            )
+            updated = self._attempt(
+                self._required_attempt(attempt_id)
+            )
+            self._connection.commit()
+            return updated
         except Exception:
             self._connection.rollback()
             raise
@@ -396,27 +661,71 @@ class RequestStateStore:
         ).fetchone()
         if row is None:
             return None
-        return ReconciliationResult.from_dict(
-            _read_canonical(
-                row["result_json"],
-                row["result_digest"],
-                "Reconciliation result",
+        try:
+            return ReconciliationResult.from_dict(
+                _read_canonical(
+                    row["result_json"],
+                    row["result_digest"],
+                    "Reconciliation result",
+                )
             )
-        )
+        except ValueError as error:
+            raise RequestStateCorrupt(
+                "Reconciliation result is invalid"
+            ) from error
 
-    def save_reconciliation(
+    def commit_candidate_result(
         self,
         request_id: str,
         result: ReconciliationResult,
-    ) -> None:
+        batch: CandidateBatchUpload,
+    ) -> CandidateBatchUpload:
         request = _request_id(request_id)
         if not isinstance(result, ReconciliationResult):
             raise TypeError("result must be a ReconciliationResult")
-        result_json, result_digest = _canonical_record(
-            result.to_dict()
+        if not isinstance(batch, CandidateBatchUpload):
+            raise TypeError("batch must be a CandidateBatchUpload")
+        if batch.request_id != request:
+            raise BatchConflict("Candidate batch request conflicts")
+        if batch.repository_id != result.repository_id:
+            raise BatchConflict("Candidate batch repository conflicts")
+        expected_items = tuple(
+            CandidateRevisionUpload(
+                family_id=revision.family_id,
+                revision_id=revision.revision_id,
+                revision=revision.revision,
+                content=revision.content,
+                content_digest=revision.content_digest,
+                evidence_digest=revision.evidence_digest,
+            )
+            for revision in result.uploadable_revisions
         )
+        if batch.items != expected_items:
+            raise BatchConflict(
+                "Candidate batch revisions conflict"
+            )
+        result_json, result_digest = _canonical_record(result.to_dict())
+        revisions_json, revisions_digest = _canonical_record(
+            [item.to_dict() for item in result.uploadable_revisions]
+        )
+        batch_json, stored_batch_digest = _canonical_record(
+            batch.to_dict()
+        )
+
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            operation = self._reconciliation_operation(request)
+            if operation is not None:
+                if operation["status"] != "committed":
+                    raise BatchConflict(
+                        "Candidate commit has no reconciliation winner"
+                    )
+                winner = self._operation_result(operation)
+                if winner != result:
+                    raise BatchConflict(
+                        "Candidate result conflicts with winner"
+                    )
+
             existing_result = self._connection.execute(
                 """
                 SELECT repository_id, result_json, result_digest
@@ -425,18 +734,39 @@ class RequestStateStore:
                 """,
                 (request,),
             ).fetchone()
-            if existing_result is not None:
-                if (
-                    existing_result["repository_id"]
-                    != result.repository_id
-                    or existing_result["result_json"] != result_json
-                    or existing_result["result_digest"] != result_digest
+            if existing_result is not None and (
+                existing_result["repository_id"] != result.repository_id
+                or existing_result["result_json"] != result_json
+                or existing_result["result_digest"] != result_digest
+            ):
+                raise BatchConflict(
+                    "Candidate reconciliation result conflicts"
+                )
+            existing_outbox = self._connection.execute(
+                """
+                SELECT repository_id, revisions_json, revisions_digest,
+                       batch_json, batch_digest
+                FROM candidate_outbox
+                WHERE request_id = ?
+                """,
+                (request,),
+            ).fetchone()
+            if existing_outbox is not None:
+                if existing_result is None or (
+                    existing_outbox["repository_id"]
+                    != batch.repository_id
+                    or existing_outbox["revisions_json"]
+                    != revisions_json
+                    or existing_outbox["revisions_digest"]
+                    != revisions_digest
+                    or existing_outbox["batch_json"] != batch_json
+                    or existing_outbox["batch_digest"]
+                    != stored_batch_digest
                 ):
-                    raise ReconciliationConflict(
-                        "Reconciliation result conflicts"
-                    )
+                    raise BatchConflict("Candidate batch conflicts")
+                stored = self._batch_from_row(existing_outbox)
                 self._connection.commit()
-                return
+                return stored
 
             revisions: dict[str, CandidateFamilyRevision] = {}
             for revision in (
@@ -445,7 +775,7 @@ class RequestStateStore:
             ):
                 prior = revisions.get(revision.revision_id)
                 if prior is not None and prior != revision:
-                    raise ReconciliationConflict(
+                    raise BatchConflict(
                         "Revision identity conflicts"
                     )
                 revisions[revision.revision_id] = revision
@@ -460,141 +790,41 @@ class RequestStateStore:
                 self._save_family_head(
                     result.repository_id, revision
                 )
-            self._connection.execute(
-                """
-                INSERT INTO reconciliation_results(
-                    request_id, repository_id, result_json, result_digest
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    request,
-                    result.repository_id,
-                    result_json,
-                    result_digest,
-                ),
+            if existing_result is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO reconciliation_results(
+                        request_id, repository_id,
+                        result_json, result_digest
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        request,
+                        result.repository_id,
+                        result_json,
+                        result_digest,
+                    ),
+                )
+            self._insert_candidate_outbox(
+                request=request,
+                repository_id=batch.repository_id,
+                revisions_json=revisions_json,
+                revisions_digest=revisions_digest,
+                batch_json=batch_json,
+                batch_digest=stored_batch_digest,
             )
             self._connection.commit()
+            return batch
         except sqlite3.IntegrityError as error:
             self._connection.rollback()
-            raise ReconciliationConflict(
-                "Reconciliation persistence conflicts"
-            ) from error
-        except Exception:
-            self._connection.rollback()
-            raise
-
-    def stage_batch(
-        self,
-        request_id: str,
-        revisions: tuple[CandidateFamilyRevision, ...],
-        batch: CandidateBatchUpload,
-    ) -> None:
-        request = _request_id(request_id)
-        if (
-            not isinstance(revisions, tuple)
-            or any(
-                not isinstance(item, CandidateFamilyRevision)
-                for item in revisions
-            )
-        ):
-            raise TypeError(
-                "revisions must be CandidateFamilyRevision values"
-            )
-        if not isinstance(batch, CandidateBatchUpload):
-            raise TypeError("batch must be a CandidateBatchUpload")
-        if batch.request_id != request:
-            raise BatchConflict("Candidate batch request conflicts")
-        expected_items = tuple(
-            CandidateRevisionUpload(
-                family_id=revision.family_id,
-                revision_id=revision.revision_id,
-                revision=revision.revision,
-                content=revision.content,
-                content_digest=revision.content_digest,
-                evidence_digest=revision.evidence_digest,
-            )
-            for revision in revisions
-        )
-        if batch.items != expected_items:
             raise BatchConflict(
-                "Candidate batch revisions conflict"
-            )
-        revisions_json, revisions_digest = _canonical_record(
-            [item.to_dict() for item in revisions]
-        )
-        batch_json, stored_batch_digest = _canonical_record(
-            batch.to_dict()
-        )
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            result_row = self._connection.execute(
-                """
-                SELECT repository_id, result_json, result_digest
-                FROM reconciliation_results
-                WHERE request_id = ?
-                """,
-                (request,),
-            ).fetchone()
-            if result_row is None:
-                raise BatchConflict(
-                    "Candidate batch has no reconciliation result"
-                )
-            result = ReconciliationResult.from_dict(
-                _read_canonical(
-                    result_row["result_json"],
-                    result_row["result_digest"],
-                    "Reconciliation result",
-                )
-            )
-            if (
-                batch.repository_id != result.repository_id
-                or result_row["repository_id"] != result.repository_id
-                or revisions != result.uploadable_revisions
-            ):
-                raise BatchConflict(
-                    "Candidate batch does not match reconciliation"
-                )
-            existing = self._connection.execute(
-                """
-                SELECT repository_id, revisions_json, revisions_digest,
-                       batch_json, batch_digest
-                FROM candidate_outbox
-                WHERE request_id = ?
-                """,
-                (request,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    existing["repository_id"] != batch.repository_id
-                    or existing["revisions_json"] != revisions_json
-                    or existing["revisions_digest"]
-                    != revisions_digest
-                    or existing["batch_json"] != batch_json
-                    or existing["batch_digest"]
-                    != stored_batch_digest
-                ):
-                    raise BatchConflict("Candidate batch conflicts")
-                self._connection.commit()
-                return
-            self._connection.execute(
-                """
-                INSERT INTO candidate_outbox(
-                    request_id, repository_id,
-                    revisions_json, revisions_digest,
-                    batch_json, batch_digest,
-                    state, receipt_json, receipt_digest
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
-                """,
-                (
-                    request,
-                    batch.repository_id,
-                    revisions_json,
-                    revisions_digest,
-                    batch_json,
-                    stored_batch_digest,
-                ),
-            )
-            self._connection.commit()
+                "Candidate persistence conflicts"
+            ) from error
+        except ReconciliationConflict as error:
+            self._connection.rollback()
+            raise BatchConflict(
+                "Candidate family state conflicts"
+            ) from error
         except Exception:
             self._connection.rollback()
             raise
@@ -605,21 +835,13 @@ class RequestStateStore:
         request = _request_id(request_id)
         row = self._connection.execute(
             """
-            SELECT batch_json, batch_digest
+            SELECT *
             FROM candidate_outbox
             WHERE request_id = ? AND state = 'pending'
             """,
             (request,),
         ).fetchone()
-        if row is None:
-            return None
-        return CandidateBatchUpload.from_dict(
-            _read_canonical(
-                row["batch_json"],
-                row["batch_digest"],
-                "Candidate batch",
-            )
-        )
+        return None if row is None else self._batch_from_row(row)
 
     def staged_batch(
         self, request_id: str
@@ -627,21 +849,13 @@ class RequestStateStore:
         request = _request_id(request_id)
         row = self._connection.execute(
             """
-            SELECT batch_json, batch_digest
+            SELECT *
             FROM candidate_outbox
             WHERE request_id = ?
             """,
             (request,),
         ).fetchone()
-        if row is None:
-            return None
-        return CandidateBatchUpload.from_dict(
-            _read_canonical(
-                row["batch_json"],
-                row["batch_digest"],
-                "Candidate batch",
-            )
-        )
+        return None if row is None else self._batch_from_row(row)
 
     def upload_receipt(
         self, request_id: str
@@ -657,13 +871,18 @@ class RequestStateStore:
         ).fetchone()
         if row is None:
             return None
-        return UploadReceipt.from_dict(
-            _read_canonical(
-                row["receipt_json"],
-                row["receipt_digest"],
-                "Upload receipt",
+        try:
+            return UploadReceipt.from_dict(
+                _read_canonical(
+                    row["receipt_json"],
+                    row["receipt_digest"],
+                    "Upload receipt",
+                )
             )
-        )
+        except ValueError as error:
+            raise RequestStateCorrupt(
+                "Upload receipt is invalid"
+            ) from error
 
     def mark_uploaded(self, receipt: UploadReceipt) -> None:
         if not isinstance(receipt, UploadReceipt):
@@ -676,8 +895,7 @@ class RequestStateStore:
         try:
             row = self._connection.execute(
                 """
-                SELECT batch_json, batch_digest, state,
-                       receipt_json, receipt_digest
+                SELECT *, state AS outbox_state
                 FROM candidate_outbox
                 WHERE request_id = ?
                 """,
@@ -687,16 +905,10 @@ class RequestStateStore:
                 raise BatchConflict(
                     "Upload receipt has no Candidate batch"
                 )
-            batch = CandidateBatchUpload.from_dict(
-                _read_canonical(
-                    row["batch_json"],
-                    row["batch_digest"],
-                    "Candidate batch",
-                )
-            )
+            batch = self._batch_from_row(row)
             if receipt.batch_digest != batch.batch_digest:
                 raise BatchConflict("Upload receipt digest conflicts")
-            if row["state"] == "uploaded":
+            if row["outbox_state"] == "uploaded":
                 if (
                     row["receipt_json"] != receipt_json
                     or row["receipt_digest"] != receipt_digest
@@ -718,6 +930,35 @@ class RequestStateStore:
         except Exception:
             self._connection.rollback()
             raise
+
+    def _insert_candidate_outbox(
+        self,
+        *,
+        request: str,
+        repository_id: str,
+        revisions_json: str,
+        revisions_digest: str,
+        batch_json: str,
+        batch_digest: str,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO candidate_outbox(
+                request_id, repository_id,
+                revisions_json, revisions_digest,
+                batch_json, batch_digest,
+                state, receipt_json, receipt_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+            """,
+            (
+                request,
+                repository_id,
+                revisions_json,
+                revisions_digest,
+                batch_json,
+                batch_digest,
+            ),
+        )
 
     def _save_family_revision(
         self,
@@ -824,248 +1065,198 @@ class RequestStateStore:
             ),
         )
 
-    def _transition(
-        self,
-        identity: tuple[str, str, str],
-        *,
-        allowed: frozenset[str],
-        target: NativeAttemptState,
-    ) -> NativeAttempt:
-        self._connection.execute("BEGIN IMMEDIATE")
+    def _batch_from_row(
+        self, row: sqlite3.Row
+    ) -> CandidateBatchUpload:
         try:
-            current = _attempt(self._required_row(identity))
-            if current.state not in allowed:
-                raise NativeAttemptConflict("Native attempt state conflicts")
-            if current.state != target:
-                self._connection.execute(
-                    """
-                    UPDATE native_attempts
-                    SET state = ?
-                    WHERE request_id = ? AND operation_key = ? AND stage = ?
-                    """,
-                    (target, *identity),
+            return CandidateBatchUpload.from_dict(
+                _read_canonical(
+                    row["batch_json"],
+                    row["batch_digest"],
+                    "Candidate batch",
                 )
-            transitioned = _attempt(self._required_row(identity))
-            self._connection.commit()
-            return transitioned
-        except Exception:
-            self._connection.rollback()
-            raise
+            )
+        except ValueError as error:
+            raise RequestStateCorrupt(
+                "Candidate batch is invalid"
+            ) from error
 
-    def _row(
-        self, identity: tuple[str, str, str]
+    def _reconciliation_operation(
+        self, request_id: str
     ) -> sqlite3.Row | None:
         return self._connection.execute(
             """
-            SELECT request_id, operation_key, stage, stable_tag, state,
-                   native_id, output_digest
-            FROM native_attempts
-            WHERE request_id = ? AND operation_key = ? AND stage = ?
+            SELECT *
+            FROM reconciliation_operations
+            WHERE request_id = ?
             """,
-            identity,
+            (request_id,),
         ).fetchone()
 
-    def _required_row(
-        self, identity: tuple[str, str, str]
+    def _required_reconciliation_operation(
+        self, request_id: str
     ) -> sqlite3.Row:
-        row = self._row(identity)
+        row = self._reconciliation_operation(request_id)
         if row is None:
-            raise NativeAttemptNotFound("Native attempt does not exist")
+            raise ReconciliationConflict(
+                "Reconciliation operation does not exist"
+            )
         return row
 
+    def _attempt_for_generation(
+        self, request_id: str, generation: int
+    ) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT *
+            FROM reconciliation_attempts
+            WHERE request_id = ? AND generation = ?
+            """,
+            (request_id, generation),
+        ).fetchone()
 
-class NativeCallCoordinator:
-    """Combine durable intent with unique native-object recovery."""
-
-    def __init__(self, store: RequestStateStore) -> None:
-        if not isinstance(store, RequestStateStore):
-            raise TypeError("store must be a RequestStateStore")
-        self.store = store
-
-    def resolve_thread(
-        self,
-        *,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-        stable_tag: str,
-        find: Callable[[str], str | None],
-        create: Callable[[], str],
-    ) -> str:
-        attempt = self.store.get_or_create_native_attempt(
-            request_id, operation_key, stage, stable_tag
-        )
-        if attempt.state == "completed":
-            assert attempt.native_id is not None
-            return attempt.native_id
-        if attempt.state == "attached":
-            assert attempt.native_id is not None
-            self.store.complete_native_attempt(
-                request_id,
-                operation_key,
-                stage,
-                _thread_digest(attempt.native_id, stage, stable_tag),
+    def _required_attempt(self, attempt_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM reconciliation_attempts
+            WHERE attempt_id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationConflict(
+                "Reconciliation attempt does not exist"
             )
-            return attempt.native_id
-        if attempt.state == "pending":
-            native_id = self._find_thread(find, stable_tag)
-            if native_id is None:
-                raise CaptureResultUnknown(
-                    "Native Thread result is not yet observable"
-                )
-            attached = self.store.attach_native_result(
-                request_id, operation_key, stage, native_id
-            )
-            self.store.complete_native_attempt(
-                request_id,
-                operation_key,
-                stage,
-                _thread_digest(native_id, stage, stable_tag),
-            )
-            assert attached.native_id is not None
-            return attached.native_id
+        return row
 
-        self.store.mark_native_pending(request_id, operation_key, stage)
-        try:
-            native_id = create()
-            _safe_value(native_id, "native_id")
-        except AppServerRequestError:
-            self.store.reset_native_after_rejection(
-                request_id, operation_key, stage
+    def _winner_attempt(
+        self, operation: sqlite3.Row
+    ) -> ReconciliationAttempt:
+        generation = operation["winner_generation"]
+        if not isinstance(generation, int):
+            raise RequestStateCorrupt(
+                "Committed reconciliation winner is invalid"
             )
-            raise
-        except Exception:
-            raise CaptureResultUnknown(
-                "Native Thread result is unknown"
-            ) from None
-        self.store.attach_native_result(
-            request_id, operation_key, stage, native_id
+        row = self._attempt_for_generation(
+            operation["request_id"], generation
         )
-        self.store.complete_native_attempt(
-            request_id,
-            operation_key,
-            stage,
-            _thread_digest(native_id, stage, stable_tag),
-        )
-        return native_id
-
-    def resolve_structured_turn(
-        self,
-        *,
-        request_id: str,
-        operation_key: str,
-        stage: str,
-        stable_tag: str,
-        read: Callable[[str], AppServerTurnReceipt | None],
-        create: Callable[[], AppServerTurnReceipt],
-    ) -> AppServerTurnReceipt:
-        attempt = self.store.get_or_create_native_attempt(
-            request_id, operation_key, stage, stable_tag
-        )
-        if attempt.state in {"pending", "attached", "completed"}:
-            receipt = self._read_turn(read, stable_tag)
-            if receipt is None:
-                raise CaptureResultUnknown(
-                    "Native Turn result is not yet observable"
-                )
-            self._verify_receipt(attempt, receipt)
-            if attempt.native_id is None:
-                self.store.attach_native_result(
-                    request_id,
-                    operation_key,
-                    stage,
-                    receipt.turn_id,
-                )
-            self.store.complete_native_attempt(
-                request_id,
-                operation_key,
-                stage,
-                receipt.output_sha256,
+        if row is None:
+            raise RequestStateCorrupt(
+                "Committed reconciliation winner is missing"
             )
-            return receipt
-
-        self.store.mark_native_pending(request_id, operation_key, stage)
-        try:
-            receipt = create()
-            if not isinstance(receipt, AppServerTurnReceipt):
-                raise TypeError("create did not return an app-server receipt")
-        except AppServerRequestError:
-            self.store.reset_native_after_rejection(
-                request_id, operation_key, stage
+        attempt = self._attempt(row)
+        if attempt.state != "accepted":
+            raise RequestStateCorrupt(
+                "Committed reconciliation winner is not accepted"
             )
-            raise
-        except Exception:
-            raise CaptureResultUnknown(
-                "Native Turn result is unknown"
-            ) from None
-        self.store.attach_native_result(
-            request_id, operation_key, stage, receipt.turn_id
-        )
-        self.store.complete_native_attempt(
-            request_id,
-            operation_key,
-            stage,
-            receipt.output_sha256,
-        )
-        return receipt
+        return attempt
 
-    @staticmethod
-    def _find_thread(
-        find: Callable[[str], str | None], stable_tag: str
-    ) -> str | None:
-        try:
-            native_id = find(stable_tag)
-            if native_id is not None:
-                return _safe_value(native_id, "native_id")
+    def _operation_result(
+        self, operation: sqlite3.Row
+    ) -> ReconciliationResult | None:
+        raw = operation["committed_result_json"]
+        digest = operation["committed_result_digest"]
+        if raw is None and digest is None:
             return None
-        except Exception:
-            raise CaptureResultUnknown(
-                "Native Thread recovery is unavailable"
-            ) from None
-
-    @staticmethod
-    def _read_turn(
-        read: Callable[[str], AppServerTurnReceipt | None],
-        stable_tag: str,
-    ) -> AppServerTurnReceipt | None:
-        try:
-            receipt = read(stable_tag)
-            if receipt is not None and not isinstance(
-                receipt, AppServerTurnReceipt
-            ):
-                raise TypeError("read did not return an app-server receipt")
-            return receipt
-        except Exception:
-            raise CaptureResultUnknown(
-                "Native Turn recovery is unavailable"
-            ) from None
-
-    @staticmethod
-    def _verify_receipt(
-        attempt: NativeAttempt, receipt: AppServerTurnReceipt
-    ) -> None:
-        if (
-            attempt.native_id is not None
-            and attempt.native_id != receipt.turn_id
-        ):
-            raise NativeAttemptConflict("Recovered native Turn id conflicts")
-        if (
-            attempt.output_digest is not None
-            and attempt.output_digest != receipt.output_sha256
-        ):
-            raise NativeAttemptConflict(
-                "Recovered native Turn output conflicts"
+        if raw is None or digest is None:
+            raise RequestStateCorrupt(
+                "Committed reconciliation result is incomplete"
             )
+        try:
+            return ReconciliationResult.from_dict(
+                _read_canonical(
+                    raw, digest, "Committed reconciliation result"
+                )
+            )
+        except ValueError as error:
+            raise RequestStateCorrupt(
+                "Committed reconciliation result is invalid"
+            ) from error
+
+    def _attempt_result(
+        self, attempt: sqlite3.Row
+    ) -> ReconciliationResult | None:
+        raw = attempt["validated_result_json"]
+        digest = attempt["validated_result_digest"]
+        if raw is None and digest is None:
+            return None
+        if raw is None or digest is None:
+            raise RequestStateCorrupt(
+                "Validated reconciliation result is incomplete"
+            )
+        try:
+            return ReconciliationResult.from_dict(
+                _read_canonical(
+                    raw, digest, "Validated reconciliation result"
+                )
+            )
+        except ValueError as error:
+            raise RequestStateCorrupt(
+                "Validated reconciliation result is invalid"
+            ) from error
+
+    def _attempt(self, row: sqlite3.Row) -> ReconciliationAttempt:
+        try:
+            return ReconciliationAttempt(
+                attempt_id=row["attempt_id"],
+                request_id=row["request_id"],
+                generation=row["generation"],
+                state=row["state"],
+                thread_id=row["thread_id"],
+                turn_id=row["turn_id"],
+                failure_code=row["failure_code"],
+                validated_result_digest=row[
+                    "validated_result_digest"
+                ],
+                archive_state=row["archive_state"],
+                started_at=row["started_at"],
+                finished_at=row["finished_at"],
+            )
+        except (TypeError, ValueError, KeyError):
+            raise RequestStateCorrupt(
+                "Reconciliation attempt is invalid"
+            ) from None
+
+    def _set_attempt_state(self, attempt_id: str, state: str) -> None:
+        self._connection.execute(
+            """
+            UPDATE reconciliation_attempts
+            SET state = ?
+            WHERE attempt_id = ?
+            """,
+            (state, attempt_id),
+        )
 
 
-def _identity(
-    request_id: str, operation_key: str, stage: str
-) -> tuple[str, str, str]:
-    request = _request_id(request_id)
-    operation = _safe_value(operation_key, "operation_key")
-    if not isinstance(stage, str) or stage not in _STAGES:
-        raise ValueError("stage is invalid")
-    return request, operation, stage
+def _retire_native_attempts(connection: sqlite3.Connection) -> bool:
+    tables = {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    required = {
+        "capture_operations",
+        "capture_execution_attempts",
+        "reconciliation_operations",
+        "reconciliation_attempts",
+        "candidate_outbox",
+    }
+    if not required.issubset(tables):
+        return False
+    existed = "native_attempts" in tables
+    connection.execute("DROP TABLE IF EXISTS native_attempts")
+    return existed
+
+
+def _attempt_id(request_id: str, generation: int) -> str:
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {"generation": generation, "request_id": request_id}
+        )
+    ).hexdigest()[:32]
+    return f"rat_{digest}"
 
 
 def _request_id(value: object) -> str:
@@ -1083,28 +1274,25 @@ def _repository_id(value: object) -> str:
     return value
 
 
-def _safe_value(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or _SAFE_KEY.fullmatch(value) is None:
-        raise ValueError(f"{field_name} is invalid")
-    return value
-
-
 def _digest(value: object) -> str:
     if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
-        raise ValueError("output_digest is invalid")
+        raise ValueError("digest is invalid")
     return value
 
 
-def _thread_digest(native_id: str, stage: str, stable_tag: str) -> str:
-    return hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "native_id": native_id,
-                "stable_tag": stable_tag,
-                "stage": stage,
-            }
-        )
-    ).hexdigest()
+def _failure_code(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or _FAILURE_CODE.fullmatch(value) is None
+    ):
+        raise ValueError("failure_code is invalid")
+    return value
+
+
+def _nonempty(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} is invalid")
+    return value
 
 
 def _canonical_record(value: object) -> tuple[str, str]:
@@ -1126,8 +1314,7 @@ def _read_canonical(
             f"{record_name} persistence fields are invalid"
         )
     encoded = payload.encode("utf-8")
-    actual_digest = hashlib.sha256(encoded).hexdigest()
-    if actual_digest != expected_digest:
+    if hashlib.sha256(encoded).hexdigest() != expected_digest:
         raise RequestStateCorrupt(
             f"{record_name} digest does not match stored bytes"
         )
@@ -1142,15 +1329,3 @@ def _read_canonical(
             f"{record_name} bytes are not canonical JSON"
         )
     return value
-
-
-def _attempt(row: sqlite3.Row) -> NativeAttempt:
-    return NativeAttempt(
-        request_id=row["request_id"],
-        operation_key=row["operation_key"],
-        stage=row["stage"],
-        stable_tag=row["stable_tag"],
-        state=row["state"],
-        native_id=row["native_id"],
-        output_digest=row["output_digest"],
-    )

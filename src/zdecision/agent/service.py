@@ -237,8 +237,8 @@ def configured_processor(
     package_root = Path(__file__).resolve().parents[1]
     repository_root = package_root.parents[1]
     session_index = SessionIndex.open(local_state_path)
-    request_state = RequestStateStore.open(local_state_path)
     operation_store = CaptureOperationStore.open(local_state_path)
+    request_state = RequestStateStore.open(local_state_path)
     database.retire_legacy_automatic_capture()
     gateway = None
     try:

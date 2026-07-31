@@ -19,8 +19,6 @@ from zdecision.ids import candidate_family_id
 
 REQUEST_ID = "crq_11111111111111111111111111111111"
 REPOSITORY_ID = "repo_22222222222222222222222222222222"
-RECONCILIATION_THREAD = "reconciliation-thread"
-RECONCILIATION_TURN = "reconciliation-turn"
 SOURCE_THREAD = "source-thread-must-not-leak"
 SOURCE_TURN = "source-turn-must-not-leak"
 
@@ -55,7 +53,6 @@ def _observation() -> Candidate:
 class FakeGateway:
     def __init__(self, cwd: str, observation: Candidate) -> None:
         self.cwd = cwd
-        self.observation = observation
         self.profile = FeasibilityModelProfile.create(
             model_id="model-default",
             reasoning_effort="medium",
@@ -76,34 +73,24 @@ class FakeGateway:
         }
         self.started_threads = 0
         self.started_turns = 0
-        self.fail_after_external_turn = False
-        self.thread_sources: dict[str, str] = {}
-        self.turns: dict[str, AppServerTurnReceipt] = {}
+        self.drop_first_thread_response = False
+        self.drop_first_turn_response = False
+        self.archive_failures_remaining = 0
+        self.archived_threads: list[str] = []
         self.last_prompt: str | None = None
         self.last_schema: dict[str, object] | None = None
 
-    def find_thread_by_source(
-        self, source: str, *, cwd: str | None = None
-    ) -> str | None:
-        if cwd != self.cwd:
-            return None
-        return self.thread_sources.get(source)
-
-    def start_ephemeral_thread(
+    def start_disposable_thread(
         self,
         cwd: str,
         profile: FeasibilityModelProfile,
-        thread_source: str,
     ) -> str:
         self.assert_call_context(cwd, profile)
         self.started_threads += 1
-        self.thread_sources[thread_source] = RECONCILIATION_THREAD
-        return RECONCILIATION_THREAD
-
-    def fork_ephemeral(self, *args, **kwargs) -> str:
-        raise AssertionError(
-            "Reconciliation must not fork a source Session"
-        )
+        thread_id = f"reconciliation-thread-{self.started_threads}"
+        if self.drop_first_thread_response and self.started_threads == 1:
+            raise AppServerTimeout("thread result unknown")
+        return thread_id
 
     def run_structured_turn(
         self,
@@ -112,39 +99,26 @@ class FakeGateway:
         output_schema: dict[str, object],
         profile: FeasibilityModelProfile,
         cwd: str,
-        *,
-        client_user_message_id: str | None = None,
     ) -> AppServerTurnReceipt:
         self.assert_call_context(cwd, profile)
-        if thread_id != RECONCILIATION_THREAD:
-            raise AssertionError("wrong reconciliation Thread")
-        if client_user_message_id is None:
-            raise AssertionError("missing stable client message id")
         self.started_turns += 1
         self.last_prompt = prompt
         self.last_schema = output_schema
         receipt = AppServerTurnReceipt.create(
             thread_id=thread_id,
-            turn_id=RECONCILIATION_TURN,
+            turn_id=f"reconciliation-turn-{self.started_turns}",
             structured_output=self.output,
             model_profile_id=profile.profile_id,
         )
-        self.turns[client_user_message_id] = receipt
-        if self.fail_after_external_turn:
-            raise AppServerTimeout("transport result unknown")
+        if self.drop_first_turn_response and self.started_turns == 1:
+            raise AppServerTimeout("turn result unknown")
         return receipt
 
-    def read_structured_turn_by_client_id(
-        self,
-        thread_id: str,
-        client_user_message_id: str,
-        profile: FeasibilityModelProfile,
-    ) -> AppServerTurnReceipt | None:
-        if thread_id != RECONCILIATION_THREAD:
-            raise AssertionError("wrong reconciliation Thread")
-        if profile != self.profile:
-            raise AssertionError("wrong model profile")
-        return self.turns.get(client_user_message_id)
+    def archive_thread(self, thread_id: str) -> None:
+        if self.archive_failures_remaining:
+            self.archive_failures_remaining -= 1
+            raise AppServerTimeout("archive unavailable")
+        self.archived_threads.append(thread_id)
 
     def assert_call_context(
         self, cwd: str, profile: FeasibilityModelProfile
@@ -198,7 +172,6 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertEqual(1, self.gateway.started_threads)
         self.assertEqual(1, self.gateway.started_turns)
         self.assertEqual(1, len(result.uploadable_revisions))
-        self.assertIsNotNone(self.gateway.last_prompt)
         prompt = self.gateway.last_prompt or ""
         self.assertIn("untrusted data", prompt.lower())
         self.assertIn(
@@ -208,7 +181,6 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertNotIn(SOURCE_THREAD, prompt)
         self.assertNotIn(SOURCE_TURN, prompt)
         schema = self.gateway.last_schema
-        self.assertIsNotNone(schema)
         family_options = schema["properties"]["results"]["items"][
             "properties"
         ]["family_id"]["anyOf"]
@@ -221,7 +193,7 @@ class ReconciliationRunnerTest(unittest.TestCase):
             family_options[0]["enum"],
         )
 
-    def test_persisted_result_replay_starts_no_native_work(self) -> None:
+    def test_persisted_winner_replay_starts_no_native_work(self) -> None:
         first = self._run()
         second = self._run()
 
@@ -244,41 +216,90 @@ class ReconciliationRunnerTest(unittest.TestCase):
 
         self.assertEqual(["renewed", "renewed"], heartbeats)
 
-    def test_unknown_turn_result_is_adopted_without_duplicate(self) -> None:
-        from zdecision.agent.request_state import CaptureResultUnknown
+    def test_unknown_thread_starts_a_new_generation(self) -> None:
+        from zdecision.app_server.reconciliation_runner import (
+            ReconciliationAttemptRetryable,
+        )
 
-        self.gateway.fail_after_external_turn = True
-        with self.assertRaises(CaptureResultUnknown):
+        self.gateway.drop_first_thread_response = True
+        with self.assertRaises(ReconciliationAttemptRetryable):
             self._run()
-        self.gateway.fail_after_external_turn = False
 
         result = self._run()
 
         self.assertEqual(1, len(result.current_revisions))
-        self.assertEqual(1, self.gateway.started_threads)
+        self.assertEqual(2, self.gateway.started_threads)
         self.assertEqual(1, self.gateway.started_turns)
 
-    def test_invented_family_is_rejected_and_not_persisted(self) -> None:
+    def test_unknown_turn_reruns_a_fresh_thread_and_turn(self) -> None:
+        from zdecision.app_server.reconciliation_runner import (
+            ReconciliationAttemptRetryable,
+        )
+
+        self.gateway.drop_first_turn_response = True
+        with self.assertRaises(ReconciliationAttemptRetryable):
+            self._run()
+
+        result = self._run()
+
+        self.assertEqual(1, len(result.current_revisions))
+        self.assertEqual(2, self.gateway.started_threads)
+        self.assertEqual(2, self.gateway.started_turns)
+        self.assertIn(
+            "reconciliation-thread-1",
+            self.gateway.archived_threads,
+        )
+
+    def test_invented_family_is_rejected_and_not_committed(self) -> None:
+        from zdecision.app_server.reconciliation_runner import (
+            ReconciliationAttemptRetryable,
+        )
+
         self.gateway.output["results"][0]["family_id"] = (
             "cfm_" + "f" * 32
         )
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ReconciliationAttemptRetryable):
             self._run()
 
         self.assertIsNone(
             self.request_state.get_reconciliation(REQUEST_ID)
         )
 
-    def test_empty_observation_set_needs_no_native_thread(self) -> None:
+    def test_empty_observation_set_needs_no_native_attempt(self) -> None:
         result = self._run(())
 
         self.assertEqual((), result.current_revisions)
         self.assertEqual(0, self.gateway.started_threads)
         self.assertEqual(0, self.gateway.started_turns)
+        names = {
+            row[0]
+            for row in self.request_state._connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                """
+            ).fetchall()
+        }
+        count = self.request_state._connection.execute(
+            "SELECT COUNT(*) FROM reconciliation_attempts"
+        ).fetchone()[0]
+        self.assertIn("reconciliation_attempts", names)
+        self.assertEqual(0, count)
+
+    def test_archive_failure_does_not_reopen_winner(self) -> None:
+        self.gateway.archive_failures_remaining = 1
+        first = self._run()
+        self.assertEqual([], self.gateway.archived_threads)
+
+        self.runner.sweep_archives()
+        replay = self._run()
+
+        self.assertEqual(first, replay)
+        self.assertEqual(1, self.gateway.started_threads)
         self.assertEqual(
-            result,
-            self.request_state.get_reconciliation(REQUEST_ID),
+            ["reconciliation-thread-1"],
+            self.gateway.archived_threads,
         )
 
 
