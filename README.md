@@ -24,13 +24,14 @@ as internal diagnostics for the proven Capture domain.
 V1 selects templates by stable ID. A template's title is display metadata, not
 an alias. To add one, copy a template directory, assign its stable ID, title,
 and revision, then edit its two policy files. The repository currently bundles
-the high-precision `business` revision 2 template; `architecture` above is only
-an example of a template the user might install. The bundled template keeps
-durable product choices and business boundaries, not rediscoverable API details
-or ordinary implementation correctness. Separate technical-contract templates
-can be added later for those facts. When several signals express one underlying
-product principle, `business` keeps one complete representative instead of
-publishing each implementation fragment.
+the high-precision `business` revision 2 template, titled
+**业务决策压缩模板**; `architecture` above is only an example of a template the
+user might install. The bundled template keeps durable product choices and
+business boundaries, not rediscoverable API details or ordinary implementation
+correctness. Separate technical-contract templates can be added later for those
+facts. When several signals express one underlying product principle,
+`business` keeps one complete representative instead of publishing each
+implementation fragment.
 
 The product authority is [docs/architecture.md](docs/architecture.md). The
 active Plugin contract is the

@@ -312,13 +312,17 @@ class ZDecisionSkillContractTests(unittest.TestCase):
                 self.assertIn(phrase, text)
         self.assertNotIn('"turnLimit": 20', text)
 
-    def test_readme_documents_default_and_hypothetical_installed_template(self) -> None:
+    def test_readme_documents_page_trigger_and_installed_templates(self) -> None:
         text = (REPOSITORY_ROOT / "README.md").read_text("utf-8")
 
-        self.assertIn("压缩任务 `<task-id>` 的决策", text)
+        self.assertIn("更新候选决策", text)
+        self.assertIn("No Session ID", text)
         self.assertIn("业务决策压缩模板", text)
         self.assertIn("architecture", text)
-        self.assertRegex(text, re.compile(r"architecture.{0,100}(install|安装|cop)", re.I))
+        self.assertRegex(
+            text,
+            re.compile(r"architecture.{0,100}(install|安装|cop)", re.I | re.S),
+        )
         self.assertIn("stable ID", text)
         self.assertIn("title", text)
         self.assertIn("revision", text)
