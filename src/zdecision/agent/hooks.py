@@ -21,6 +21,7 @@ UNAVAILABLE_HOOK_OUTPUT = {
     "systemMessage": "ZDecision could not record this lifecycle event."
 }
 CONTROL_BINDING_TOOL = "mcp__zdecision_local__show_zdecision_update"
+_CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 
@@ -124,13 +125,15 @@ def handle_control_binding_hook(
         if mapping is None or not mapping.enabled:
             raise ValueError("repository is not enabled")
         created_at = _parse_time(_format_time(clock()))
+        control_id = (
+            control_id_factory or (lambda: f"ctl_{secrets.token_hex(16)}")
+        )()
+        if not isinstance(control_id, str) or _CONTROL_ID.fullmatch(control_id) is None:
+            raise ValueError("generated control ID is invalid")
         store = control_store
         if store is None:
             owned_store = ControlBindingStore.open(database.path)
             store = owned_store
-        control_id = (
-            control_id_factory or (lambda: f"ctl_{secrets.token_hex(16)}")
-        )()
         store.create_binding(
             session_id=session_id,
             render_turn_id=turn_id,

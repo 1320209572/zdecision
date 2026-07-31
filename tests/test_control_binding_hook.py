@@ -40,6 +40,14 @@ class FailingControlStore:
         self.closed = True
 
 
+class RecordingControlStore:
+    def __init__(self) -> None:
+        self.control_ids: list[object] = []
+
+    def create_binding(self, **values: object) -> None:
+        self.control_ids.append(values["control_id"])
+
+
 class ControlBindingHookTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -207,6 +215,28 @@ class ControlBindingHookTests(unittest.TestCase):
         self.assertEqual(EMPTY_INPUT_OUTPUT, response.output)
         self.assertFalse(store.closed)
         self.assertEqual(0, self.database.count_events())
+
+    def test_invalid_generated_control_ids_are_rejected_before_persistence(self) -> None:
+        invalid_ids: tuple[object, ...] = (
+            "ctl_not-canonical",
+            "ctl_0123456789ABCDEF0123456789ABCDEF",
+            123,
+        )
+
+        for invalid_id in invalid_ids:
+            with self.subTest(invalid_id=invalid_id):
+                store = RecordingControlStore()
+                response = handle_control_binding_hook(
+                    self._raw(),
+                    database=self.database,
+                    clock=lambda: NOW,
+                    repository_resolver=self.repository_resolver,
+                    control_store=store,
+                    control_id_factory=lambda: invalid_id,  # type: ignore[return-value]
+                )
+
+                self.assertEqual(EMPTY_INPUT_OUTPUT, response.output)
+                self.assertEqual([], store.control_ids)
 
     def test_handle_hook_closes_its_temporary_store_on_success_and_failure(self) -> None:
         for fails in (False, True):
