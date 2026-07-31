@@ -144,6 +144,9 @@ class FakeAppServerGateway:
             discovered_at="2026-07-31T06:00:00Z",
         )
         self.capture_source_by_fork: dict[str, tuple[str, str]] = {}
+        self.source_context_by_boundary: dict[tuple[str, str], str] = {}
+        self.source_context_by_fork: dict[str, str] = {}
+        self.source_context_reads: list[str] = []
         self.source_reads: list[str] = []
         self.fork_creates = 0
         self.reconciliation_thread_creates = 0
@@ -213,6 +216,11 @@ class FakeAppServerGateway:
         self.fork_creates += 1
         fork_id = f"capture-thread-{self.fork_creates}"
         self.capture_source_by_fork[fork_id] = (thread_id, last_turn_id)
+        source_context = self.source_context_by_boundary.get(
+            (thread_id, last_turn_id)
+        )
+        if source_context is not None:
+            self.source_context_by_fork[fork_id] = source_context
         if self.drop_next_fork_result:
             self.drop_next_fork_result = False
             raise AppServerTimeout("external fork result unknown")
@@ -267,6 +275,9 @@ class FakeAppServerGateway:
     def _extraction_output(self, thread_id: str) -> dict[str, object]:
         if self.zero_candidates:
             return {"candidates": []}
+        source_context = self.source_context_by_fork.get(thread_id)
+        if source_context is not None:
+            self.source_context_reads.append(source_context)
         source, turn = self.capture_source_by_fork[thread_id]
         version = (
             self.extraction_claims.pop(0)

@@ -38,6 +38,12 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
         try:
             harness.setUp()
             started = True
+            harness.gateway.source_context_by_boundary.update(
+                {
+                    (SESSION_A, TURN_A1): RAW_SOURCE,
+                    (SESSION_B, TURN_B1): RAW_SOURCE,
+                }
+            )
             harness._observe(
                 SESSION_A,
                 TURN_A1,
@@ -168,6 +174,10 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 {"inventory": 2, "extraction": 2, "reconciliation": 2},
                 harness.gateway.structured_turn_creates,
             )
+            self.assertEqual(
+                [RAW_SOURCE, RAW_SOURCE],
+                harness.gateway.source_context_reads,
+            )
 
             for request_id, status in (
                 (request_a, status_a),
@@ -194,7 +204,13 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
             for candidate in candidates:
                 self.assertIn(candidate["revision_id"], candidate_text)
                 self.assertNotIn(candidate["revision_id"], mcp_text)
-                self.assertNotIn(candidate["content"]["claim"], mcp_text)
+                content_tokens = self._candidate_content_tokens(
+                    candidate["content"]
+                )
+                self.assertGreater(len(content_tokens), 10)
+                for token in content_tokens:
+                    with self.subTest(candidate_content_token=token):
+                        self.assertNotIn(token, mcp_text)
 
             event_payloads = []
             for request_id in (request_a, request_b):
@@ -307,6 +323,24 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
         return connection.execute(
             f"SELECT COUNT(*) FROM {table}"
         ).fetchone()[0]
+
+    @staticmethod
+    def _candidate_content_tokens(value: object) -> tuple[str, ...]:
+        tokens: list[str] = []
+
+        def visit(item: object) -> None:
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    tokens.append(key)
+                    visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+            elif item is not None:
+                tokens.append(str(item))
+
+        visit(value)
+        return tuple(dict.fromkeys(token for token in tokens if token))
 
     @staticmethod
     def _all_database_cells(connection) -> bytes:
