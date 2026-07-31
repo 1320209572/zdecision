@@ -162,6 +162,88 @@ def _persisted_extraction_candidate(candidate: Candidate) -> dict[str, object]:
     }
 
 
+def validate_extraction_output(
+    operation_id: str,
+    source: SourceCheckpoint,
+    product: str,
+    extraction: object,
+) -> tuple[Candidate, ...]:
+    """Validate one complete Stage 2 result for either V2 or V3 Capture."""
+
+    if not isinstance(extraction, Mapping):
+        raise _invalid_extraction()
+    _require_exact_fields(extraction, _RESULT_FIELDS)
+    raw_candidates = extraction["candidates"]
+    if not isinstance(raw_candidates, list):
+        raise _invalid_extraction()
+    if len(raw_candidates) > _MAX_CANDIDATES:
+        raise ExtractionValidationError(
+            "candidate_limit_exceeded",
+            "Extraction contains more than 20 Candidates",
+        )
+
+    validated: list[Candidate] = []
+    for ordinal, raw_candidate in enumerate(raw_candidates, start=1):
+        if not isinstance(raw_candidate, Mapping):
+            raise _invalid_extraction()
+        _require_exact_fields(raw_candidate, _CANDIDATE_FIELDS)
+        scope = raw_candidate["scope"]
+        if not isinstance(scope, Mapping):
+            raise _invalid_extraction()
+        _require_exact_fields(scope, _SCOPE_FIELDS)
+
+        candidate_product = _require_nonempty_string(raw_candidate["product"])
+        if candidate_product != product:
+            raise _invalid_extraction()
+        claim = _require_nonempty_string(raw_candidate["claim"])
+        future_action = _require_nonempty_string(raw_candidate["future_action"])
+        scope_summary = _require_nonempty_string(scope["summary"])
+        repositories = _string_list(scope["repositories"])
+        paths = _string_list(scope["paths"])
+        invalidation_conditions = _string_list(
+            raw_candidate["invalidation_conditions"]
+        )
+        encoded_candidate = {
+            "product": candidate_product,
+            "claim": claim,
+            "future_action": future_action,
+            "scope": {
+                "summary": scope_summary,
+                "repositories": list(repositories),
+                "paths": list(paths),
+            },
+            "invalidation_conditions": list(invalidation_conditions),
+        }
+        try:
+            encoded_size = len(canonical_json_bytes(encoded_candidate))
+        except (TypeError, ValueError):
+            raise _invalid_extraction() from None
+        if encoded_size > _MAX_CANDIDATE_BYTES:
+            raise ExtractionValidationError(
+                "candidate_item_too_large",
+                "A Candidate exceeds 16 KiB",
+            )
+
+        validated.append(
+            Candidate(
+                candidate_id=capture_candidate_id(operation_id, ordinal),
+                capture_id=operation_id,
+                ordinal=ordinal,
+                content=CandidateContent(
+                    product=candidate_product,
+                    claim=claim,
+                    future_action=future_action,
+                    scope_summary=scope_summary,
+                    repositories=repositories,
+                    paths=paths,
+                    invalidation_conditions=invalidation_conditions,
+                ),
+                source=source,
+            )
+        )
+    return tuple(validated)
+
+
 class CaptureService:
     """Own the private prepare, native attachment, and completion boundary."""
 
@@ -654,76 +736,9 @@ class CaptureService:
         record: CaptureRecord,
         extraction: object,
     ) -> tuple[Candidate, ...]:
-        if not isinstance(extraction, Mapping):
-            raise _invalid_extraction()
-        _require_exact_fields(extraction, _RESULT_FIELDS)
-        raw_candidates = extraction["candidates"]
-        if not isinstance(raw_candidates, list):
-            raise _invalid_extraction()
-        if len(raw_candidates) > _MAX_CANDIDATES:
-            raise ExtractionValidationError(
-                "candidate_limit_exceeded",
-                "Extraction contains more than 20 Candidates",
-            )
-
-        validated: list[Candidate] = []
-        for ordinal, raw_candidate in enumerate(raw_candidates, start=1):
-            if not isinstance(raw_candidate, Mapping):
-                raise _invalid_extraction()
-            _require_exact_fields(raw_candidate, _CANDIDATE_FIELDS)
-            scope = raw_candidate["scope"]
-            if not isinstance(scope, Mapping):
-                raise _invalid_extraction()
-            _require_exact_fields(scope, _SCOPE_FIELDS)
-
-            product = _require_nonempty_string(raw_candidate["product"])
-            if product != record.product:
-                raise _invalid_extraction()
-            claim = _require_nonempty_string(raw_candidate["claim"])
-            future_action = _require_nonempty_string(raw_candidate["future_action"])
-            scope_summary = _require_nonempty_string(scope["summary"])
-            repositories = _string_list(scope["repositories"])
-            paths = _string_list(scope["paths"])
-            invalidation_conditions = _string_list(
-                raw_candidate["invalidation_conditions"]
-            )
-            encoded_candidate = {
-                "product": product,
-                "claim": claim,
-                "future_action": future_action,
-                "scope": {
-                    "summary": scope_summary,
-                    "repositories": list(repositories),
-                    "paths": list(paths),
-                },
-                "invalidation_conditions": list(invalidation_conditions),
-            }
-            try:
-                encoded_size = len(canonical_json_bytes(encoded_candidate))
-            except (TypeError, ValueError):
-                raise _invalid_extraction() from None
-            if encoded_size > _MAX_CANDIDATE_BYTES:
-                raise ExtractionValidationError(
-                    "candidate_item_too_large",
-                    "A Candidate exceeds 16 KiB",
-                )
-
-            candidate_id = capture_candidate_id(record.operation_id, ordinal)
-            validated.append(
-                Candidate(
-                    candidate_id=candidate_id,
-                    capture_id=record.operation_id,
-                    ordinal=ordinal,
-                    content=CandidateContent(
-                        product=product,
-                        claim=claim,
-                        future_action=future_action,
-                        scope_summary=scope_summary,
-                        repositories=repositories,
-                        paths=paths,
-                        invalidation_conditions=invalidation_conditions,
-                    ),
-                    source=record.source,
-                )
-            )
-        return tuple(validated)
+        return validate_extraction_output(
+            record.operation_id,
+            record.source,
+            record.product,
+            extraction,
+        )

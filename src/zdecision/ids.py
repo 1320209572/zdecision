@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 CAPTURE_EXTRACTOR_VERSION = "extractor-v2"
+ON_DEMAND_CAPTURE_PROTOCOL = "extractor-v3"
 PUBLISHER_FORMAT_VERSION = "zdecision-publisher/v1"
 
 _CAPTURE_ID = re.compile(r"^cap_[0-9a-f]{32}$")
@@ -373,6 +374,34 @@ def capture_operation_id(
         }
     )
     return f"cap_{hashlib.sha256(payload).hexdigest()[:32]}"
+
+
+def on_demand_capture_operation_id(frozen_identity: Mapping[str, object]) -> str:
+    """Return the stable identity for one extractor-v3 frozen input."""
+
+    if not isinstance(frozen_identity, Mapping):
+        raise ValueError("frozen_identity must be an object")
+    payload = dict(frozen_identity)
+    if payload.get("protocol") is None:
+        raise ValueError("frozen_identity protocol is required")
+    return _stable_id("cap", payload)
+
+
+def capture_attempt_id(operation_id: str, generation: int) -> str:
+    """Return the deterministic identity for one disposable generation."""
+
+    if not isinstance(operation_id, str) or _CAPTURE_ID.fullmatch(operation_id) is None:
+        raise ValueError("operation_id is invalid")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        raise ValueError("generation must be a positive integer")
+    return _stable_id(
+        "cat",
+        {"generation": generation, "operation_id": operation_id},
+    )
 
 
 def capture_candidate_id(operation_id: str, ordinal: int) -> str:

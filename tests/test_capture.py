@@ -848,6 +848,7 @@ class CaptureServiceTests(unittest.TestCase):
             CaptureStateError,
             CaptureTurnConflict,
             ExtractionValidationError,
+            validate_extraction_output,
         )
         from zdecision.capture.templates import TemplateCatalog
         from zdecision.private_store.filesystem import (
@@ -860,6 +861,7 @@ class CaptureServiceTests(unittest.TestCase):
         self.CaptureStateError = CaptureStateError
         self.CaptureTurnConflict = CaptureTurnConflict
         self.ExtractionValidationError = ExtractionValidationError
+        self.validate_extraction_output = validate_extraction_output
         self.PrivateStateCorrupt = PrivateStateCorrupt
         self.store = FilePrivateStore(self.state_dir)
         self.catalog = TemplateCatalog(self.template_root, ENVELOPE_ROOT)
@@ -919,6 +921,27 @@ class CaptureServiceTests(unittest.TestCase):
         self.assertEqual(expected.extraction_prompt, plan.extraction_prompt)
         self.assertEqual(plan.record, self.store.get_capture(plan.record.operation_id))
         self.assertNotIn("source_text", plan.record.to_dict())
+
+    def test_extracted_validator_preserves_legacy_v2_candidate_identity(
+        self,
+    ) -> None:
+        plan = self.prepare()
+        extraction = extraction_with_two_candidates()
+
+        candidates = self.validate_extraction_output(
+            plan.record.operation_id,
+            plan.record.source,
+            plan.record.product,
+            extraction,
+        )
+
+        self.assertEqual(
+            (
+                f"cand_{plan.record.operation_id[4:]}_01",
+                f"cand_{plan.record.operation_id[4:]}_02",
+            ),
+            tuple(candidate.candidate_id for candidate in candidates),
+        )
 
     def test_resume_uses_frozen_prompts_after_live_template_changes(self) -> None:
         plan = self.service.prepare(
