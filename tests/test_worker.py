@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import time
@@ -7,7 +8,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+from zdecision.agent import cli as agent_cli
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import (
     HookInvocation,
@@ -16,6 +19,7 @@ from zdecision.agent.events import (
     event_id_for,
 )
 from zdecision.agent.hooks import handle_hook
+from zdecision.agent.session_index import SessionIndex, SessionIndexEventProcessor
 from zdecision.ids import product_id
 
 try:
@@ -357,6 +361,47 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(1, cycle.consumed)
         self.assertEqual(0, cycle.sync_cursor)
         self.assertEqual("consumed", self.database.get_event(event.event_id).state)
+
+    def test_session_index_processor_records_stop_boundary_before_consuming(self) -> None:
+        event = self.database.record_hook(
+            self._invocation(4, event_name="Stop", session_id="thr_indexed")
+        )
+        index = SessionIndex.open(self.database_path)
+        try:
+            worker = self._worker(
+                self.database,
+                SessionIndexEventProcessor(index),
+            )
+
+            cycle = worker.run_once(FIXED_TIME)
+            frozen = index.freeze_sources(
+                "crq_" + "1" * 32,
+                self.snapshot.repository_id,
+                FIXED_TIME,
+            )
+        finally:
+            index.close()
+
+        self.assertEqual(1, cycle.consumed)
+        self.assertEqual("consumed", self.database.get_event(event.event_id).state)
+        self.assertEqual(["turn_4"], [item.upper_turn_id for item in frozen])
+
+    def test_worker_command_wires_the_session_index_processor(self) -> None:
+        state_root = self.root / "cli-state"
+        with (
+            patch.dict(
+                os.environ,
+                {"ZDECISION_STATE_DIR": str(state_root)},
+                clear=False,
+            ),
+            patch("zdecision.agent.worker.Worker") as worker_class,
+        ):
+            result = agent_cli.main(["worker"])
+
+        self.assertEqual(0, result)
+        processor = worker_class.call_args.kwargs["processor"]
+        self.assertIsInstance(processor, SessionIndexEventProcessor)
+        worker_class.return_value.run_until_idle.assert_called_once_with()
 
 
 if __name__ == "__main__":

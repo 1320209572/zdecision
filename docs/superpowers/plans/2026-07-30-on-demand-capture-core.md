@@ -279,7 +279,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'zdecision.agent.sessi
 
 - [ ] **Step 3: Implement the focused SQLite state store**
 
-`SessionIndex.open()` uses the existing Agent SQLite path, enables foreign keys, WAL, and a 5-second busy timeout, and creates exactly these focused tables:
+`SessionIndex.open()` uses the existing Agent SQLite path, enables foreign keys, WAL, and a 5-second busy timeout, and creates these focused tables. The request-level freeze row is required so an empty snapshot also replays as empty after a crash:
 
 ```sql
 CREATE TABLE IF NOT EXISTS session_checkpoints (
@@ -296,6 +296,13 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     handled_source_fingerprint TEXT,
     excluded_reason TEXT,
     UNIQUE(repository_id, session_id, lineage)
+);
+CREATE TABLE IF NOT EXISTS capture_request_freezes (
+    request_id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL,
+    frozen_at TEXT NOT NULL,
+    acknowledged_at TEXT,
+    acknowledgement_digest TEXT
 );
 CREATE TABLE IF NOT EXISTS capture_request_sources (
     request_id TEXT NOT NULL,

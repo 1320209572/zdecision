@@ -58,18 +58,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     database = AgentDatabase.open(state_path)
     try:
         if arguments.command == "worker":
+            from zdecision.agent.session_index import (
+                SessionIndex,
+                SessionIndexEventProcessor,
+            )
             from zdecision.agent.worker import (
-                LocalEventProcessor,
                 ProbeSyncPoller,
                 Worker,
             )
 
-            Worker(
-                database=database,
-                processor=LocalEventProcessor(),
-                sync_poller=ProbeSyncPoller(),
-                lock_path=state_path.parent / "worker.lock",
-            ).run_until_idle()
+            session_index = SessionIndex.open(state_path)
+            try:
+                Worker(
+                    database=database,
+                    processor=SessionIndexEventProcessor(session_index),
+                    sync_poller=ProbeSyncPoller(),
+                    lock_path=state_path.parent / "worker.lock",
+                ).run_until_idle()
+            finally:
+                session_index.close()
             return 0
         if arguments.command == "hook":
             raw = sys.stdin.buffer.read()

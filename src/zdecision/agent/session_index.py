@@ -1,0 +1,493 @@
+"""Durable local Session boundaries for on-demand decision Capture."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from zdecision.agent.events import AgentEvent
+from zdecision.jsonio import canonical_json_bytes
+
+
+_CAPTURE_REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
+_REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_EXCLUSION_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True)
+class FrozenSessionSource:
+    request_id: str
+    source_key: str
+    repository_id: str
+    session_id: str
+    cwd: str
+    lineage: str
+    previous_handled_turn_id: str | None
+    upper_turn_id: str
+    source_fingerprint: str
+
+
+class SessionIndex:
+    """A private SQLite index of changed Codex Session boundaries."""
+
+    def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
+        self.path = path
+        self._connection = connection
+
+    @classmethod
+    def open(cls, path: Path) -> "SessionIndex":
+        database_path = Path(path)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database_path, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS session_checkpoints (
+                    source_key TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    lineage TEXT NOT NULL,
+                    latest_turn_id TEXT NOT NULL,
+                    latest_event_id TEXT NOT NULL,
+                    latest_observed_at TEXT NOT NULL,
+                    latest_source_fingerprint TEXT NOT NULL,
+                    handled_turn_id TEXT,
+                    handled_source_fingerprint TEXT,
+                    excluded_reason TEXT,
+                    UNIQUE(repository_id, session_id, lineage)
+                );
+
+                CREATE TABLE IF NOT EXISTS capture_request_freezes (
+                    request_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    frozen_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    acknowledgement_digest TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS capture_request_sources (
+                    request_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    lineage TEXT NOT NULL,
+                    previous_handled_turn_id TEXT,
+                    upper_turn_id TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(
+                        state IN ('frozen','excluded','acknowledged')
+                    ),
+                    excluded_reason TEXT,
+                    frozen_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    acknowledgement_digest TEXT,
+                    PRIMARY KEY(request_id, source_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS session_checkpoints_repository
+                    ON session_checkpoints(repository_id);
+                CREATE INDEX IF NOT EXISTS capture_request_sources_request
+                    ON capture_request_sources(request_id, source_key);
+                """
+            )
+        return cls(database_path, connection)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def observe(self, event: AgentEvent) -> None:
+        invocation = event.invocation
+        if (
+            invocation.event_name != "Stop"
+            or invocation.repository_id is None
+            or invocation.turn_id is None
+            or invocation.worktree_root is None
+        ):
+            return
+        _require_repository_id(invocation.repository_id)
+        observed_at = _normalized_timestamp(invocation.occurred_at)
+        lineage = _stable_value(
+            "lin",
+            {
+                "branch": invocation.branch,
+                "repository_id": invocation.repository_id,
+                "worktree_root": invocation.worktree_root,
+            },
+        )
+        source_key = _stable_value(
+            "src",
+            {
+                "lineage": lineage,
+                "repository_id": invocation.repository_id,
+                "session_id": invocation.session_id,
+            },
+        )
+        source_fingerprint = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "head_commit": invocation.head_commit,
+                    "lineage": lineage,
+                    "session_id": invocation.session_id,
+                    "turn_id": invocation.turn_id,
+                }
+            )
+        ).hexdigest()
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._connection.execute(
+                """
+                SELECT repository_id, session_id, lineage,
+                       latest_observed_at, latest_event_id
+                FROM session_checkpoints
+                WHERE source_key = ?
+                """,
+                (source_key,),
+            ).fetchone()
+            if existing is not None:
+                identity = (
+                    existing["repository_id"],
+                    existing["session_id"],
+                    existing["lineage"],
+                )
+                expected = (
+                    invocation.repository_id,
+                    invocation.session_id,
+                    lineage,
+                )
+                if identity != expected:
+                    raise ValueError("Session source identity conflicts")
+                current_position = (
+                    existing["latest_observed_at"],
+                    existing["latest_event_id"],
+                )
+                if (observed_at, event.event_id) <= current_position:
+                    self._connection.commit()
+                    return
+                self._connection.execute(
+                    """
+                    UPDATE session_checkpoints
+                    SET cwd = ?,
+                        latest_turn_id = ?,
+                        latest_event_id = ?,
+                        latest_observed_at = ?,
+                        latest_source_fingerprint = ?
+                    WHERE source_key = ?
+                    """,
+                    (
+                        invocation.cwd,
+                        invocation.turn_id,
+                        event.event_id,
+                        observed_at,
+                        source_fingerprint,
+                        source_key,
+                    ),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    INSERT INTO session_checkpoints(
+                        source_key, repository_id, session_id, cwd, lineage,
+                        latest_turn_id, latest_event_id, latest_observed_at,
+                        latest_source_fingerprint, handled_turn_id,
+                        handled_source_fingerprint, excluded_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    """,
+                    (
+                        source_key,
+                        invocation.repository_id,
+                        invocation.session_id,
+                        invocation.cwd,
+                        lineage,
+                        invocation.turn_id,
+                        event.event_id,
+                        observed_at,
+                        source_fingerprint,
+                    ),
+                )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def freeze_sources(
+        self,
+        request_id: str,
+        repository_id: str,
+        frozen_at: datetime,
+    ) -> tuple[FrozenSessionSource, ...]:
+        _require_capture_request_id(request_id)
+        _require_repository_id(repository_id)
+        timestamp = _normalized_datetime(frozen_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing_freeze = self._connection.execute(
+                """
+                SELECT repository_id
+                FROM capture_request_freezes
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if existing_freeze is not None:
+                if existing_freeze["repository_id"] != repository_id:
+                    raise ValueError("Capture Request repository conflicts")
+                sources = self._request_sources(request_id)
+                self._connection.commit()
+                return sources
+
+            self._connection.execute(
+                """
+                INSERT INTO capture_request_freezes(
+                    request_id, repository_id, frozen_at,
+                    acknowledged_at, acknowledgement_digest
+                ) VALUES (?, ?, ?, NULL, NULL)
+                """,
+                (request_id, repository_id, timestamp),
+            )
+            checkpoints = self._connection.execute(
+                """
+                SELECT source_key, repository_id, session_id, cwd, lineage,
+                       handled_turn_id, latest_turn_id,
+                       latest_source_fingerprint
+                FROM session_checkpoints
+                WHERE repository_id = ?
+                  AND excluded_reason IS NULL
+                  AND (
+                      handled_turn_id IS NULL
+                      OR handled_source_fingerprint IS NULL
+                      OR handled_turn_id <> latest_turn_id
+                      OR handled_source_fingerprint <> latest_source_fingerprint
+                  )
+                ORDER BY source_key
+                """,
+                (repository_id,),
+            ).fetchall()
+            for checkpoint in checkpoints:
+                self._connection.execute(
+                    """
+                    INSERT INTO capture_request_sources(
+                        request_id, source_key, repository_id, session_id,
+                        cwd, lineage, previous_handled_turn_id, upper_turn_id,
+                        source_fingerprint, state, excluded_reason, frozen_at,
+                        acknowledged_at, acknowledgement_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'frozen', NULL, ?,
+                              NULL, NULL)
+                    """,
+                    (
+                        request_id,
+                        checkpoint["source_key"],
+                        checkpoint["repository_id"],
+                        checkpoint["session_id"],
+                        checkpoint["cwd"],
+                        checkpoint["lineage"],
+                        checkpoint["handled_turn_id"],
+                        checkpoint["latest_turn_id"],
+                        checkpoint["latest_source_fingerprint"],
+                        timestamp,
+                    ),
+                )
+            sources = self._request_sources(request_id)
+            self._connection.commit()
+            return sources
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def mark_excluded(self, request_id: str, source_key: str, reason: str) -> None:
+        _require_capture_request_id(request_id)
+        if not isinstance(source_key, str) or not source_key:
+            raise ValueError("source_key is invalid")
+        if not isinstance(reason, str) or _EXCLUSION_REASON.fullmatch(reason) is None:
+            raise ValueError("Exclusion reason is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            source = self._connection.execute(
+                """
+                SELECT state, excluded_reason
+                FROM capture_request_sources
+                WHERE request_id = ? AND source_key = ?
+                """,
+                (request_id, source_key),
+            ).fetchone()
+            if source is None:
+                raise ValueError("Frozen Session source does not exist")
+            if source["state"] == "acknowledged":
+                raise ValueError("Frozen Session source is already acknowledged")
+            if source["excluded_reason"] is not None:
+                if source["excluded_reason"] != reason:
+                    raise ValueError("Frozen Session exclusion conflicts")
+                self._connection.commit()
+                return
+            self._connection.execute(
+                """
+                UPDATE capture_request_sources
+                SET state = 'excluded', excluded_reason = ?
+                WHERE request_id = ? AND source_key = ?
+                """,
+                (reason, request_id, source_key),
+            )
+            self._connection.execute(
+                """
+                UPDATE session_checkpoints
+                SET excluded_reason = ?
+                WHERE source_key = ?
+                """,
+                (reason, source_key),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def acknowledge(
+        self,
+        request_id: str,
+        batch_digest: str,
+        acknowledged_at: datetime,
+    ) -> None:
+        _require_capture_request_id(request_id)
+        if not isinstance(batch_digest, str) or _DIGEST.fullmatch(batch_digest) is None:
+            raise ValueError("batch_digest is invalid")
+        timestamp = _normalized_datetime(acknowledged_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            freeze = self._connection.execute(
+                """
+                SELECT acknowledgement_digest
+                FROM capture_request_freezes
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if freeze is None:
+                raise ValueError("Capture Request has not been frozen")
+            if freeze["acknowledgement_digest"] is not None:
+                if freeze["acknowledgement_digest"] != batch_digest:
+                    raise ValueError("Capture Request acknowledgement conflicts")
+                self._connection.commit()
+                return
+            sources = self._connection.execute(
+                """
+                SELECT source_key, upper_turn_id, source_fingerprint
+                FROM capture_request_sources
+                WHERE request_id = ?
+                ORDER BY source_key
+                """,
+                (request_id,),
+            ).fetchall()
+            for source in sources:
+                self._connection.execute(
+                    """
+                    UPDATE session_checkpoints
+                    SET handled_turn_id = ?,
+                        handled_source_fingerprint = ?
+                    WHERE source_key = ?
+                    """,
+                    (
+                        source["upper_turn_id"],
+                        source["source_fingerprint"],
+                        source["source_key"],
+                    ),
+                )
+            self._connection.execute(
+                """
+                UPDATE capture_request_sources
+                SET state = 'acknowledged',
+                    acknowledged_at = ?,
+                    acknowledgement_digest = ?
+                WHERE request_id = ?
+                """,
+                (timestamp, batch_digest, request_id),
+            )
+            self._connection.execute(
+                """
+                UPDATE capture_request_freezes
+                SET acknowledged_at = ?, acknowledgement_digest = ?
+                WHERE request_id = ?
+                """,
+                (timestamp, batch_digest, request_id),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def _request_sources(
+        self, request_id: str
+    ) -> tuple[FrozenSessionSource, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT request_id, source_key, repository_id, session_id, cwd,
+                   lineage, previous_handled_turn_id, upper_turn_id,
+                   source_fingerprint
+            FROM capture_request_sources
+            WHERE request_id = ? AND excluded_reason IS NULL
+            ORDER BY source_key
+            """,
+            (request_id,),
+        ).fetchall()
+        return tuple(
+            FrozenSessionSource(
+                request_id=row["request_id"],
+                source_key=row["source_key"],
+                repository_id=row["repository_id"],
+                session_id=row["session_id"],
+                cwd=row["cwd"],
+                lineage=row["lineage"],
+                previous_handled_turn_id=row["previous_handled_turn_id"],
+                upper_turn_id=row["upper_turn_id"],
+                source_fingerprint=row["source_fingerprint"],
+            )
+            for row in rows
+        )
+
+
+class SessionIndexEventProcessor:
+    def __init__(self, index: SessionIndex) -> None:
+        self.index = index
+
+    def process(self, event: AgentEvent) -> None:
+        self.index.observe(event)
+
+
+def _stable_value(prefix: str, payload: object) -> str:
+    digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    return f"{prefix}_{digest[:32]}"
+
+
+def _require_capture_request_id(value: str) -> None:
+    if not isinstance(value, str) or _CAPTURE_REQUEST_ID.fullmatch(value) is None:
+        raise ValueError("request_id is invalid")
+
+
+def _require_repository_id(value: str) -> None:
+    if not isinstance(value, str) or _REPOSITORY_ID.fullmatch(value) is None:
+        raise ValueError("repository_id is invalid")
+
+
+def _normalized_datetime(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("Timestamp must be timezone-aware")
+    return value.astimezone(UTC).isoformat()
+
+
+def _normalized_timestamp(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Observed timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("Observed timestamp is invalid") from error
+    return _normalized_datetime(parsed)

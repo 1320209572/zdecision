@@ -75,13 +75,6 @@ class WorkerCycle:
     active_sessions: int
 
 
-class LocalEventProcessor:
-    """Task 2 processor boundary; later tasks replace this with Capture work."""
-
-    def process(self, event: AgentEvent) -> None:
-        return None
-
-
 class ProbeSyncPoller:
     """Local feasibility poller used until the central sync client exists."""
 
