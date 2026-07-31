@@ -10,6 +10,7 @@ from zdecision.agent.central_client import CentralClientError
 from zdecision.agent.capture_operation_store import (
     CaptureOperationStoreError,
 )
+from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.request_state import (
     BatchConflict,
@@ -64,6 +65,7 @@ class OnDemandCaptureProcessor:
         capture_runner,
         reconciliation_runner,
         request_state: RequestStateStore,
+        control_store: ControlBindingStore,
         clock: Callable[[], datetime],
     ) -> None:
         if not isinstance(database, AgentDatabase):
@@ -74,6 +76,10 @@ class OnDemandCaptureProcessor:
             raise TypeError(
                 "request_state must be a RequestStateStore"
             )
+        if not isinstance(control_store, ControlBindingStore):
+            raise TypeError(
+                "control_store must be a ControlBindingStore"
+            )
         if not callable(clock):
             raise TypeError("clock must be callable")
         self.database = database
@@ -81,6 +87,7 @@ class OnDemandCaptureProcessor:
         self.capture_runner = capture_runner
         self.reconciliation_runner = reconciliation_runner
         self.request_state = request_state
+        self.control_store = control_store
         self.clock = clock
 
     def process(
@@ -153,6 +160,7 @@ class OnDemandCaptureProcessor:
         request: ClaimedCaptureRequest,
         client,
     ) -> None:
+        selected_session_id = self._selected_session_id(request)
         self.capture_runner.sweep_archives()
         self.reconciliation_runner.sweep_archives()
         client.start(request.request_id, request.lease_token)
@@ -160,6 +168,8 @@ class OnDemandCaptureProcessor:
             request.request_id,
             request.repository_id,
             self._now(),
+            capture_scope=request.capture_scope,
+            selected_session_id=selected_session_id,
         )
         self._require_matching_local_mapping(request)
 
@@ -345,6 +355,27 @@ class OnDemandCaptureProcessor:
             request.lease_token,
             receipt.batch_digest,
         )
+
+    def _selected_session_id(
+        self, request: ClaimedCaptureRequest
+    ) -> str | None:
+        if request.capture_scope == "all_valid_sessions":
+            return None
+        binding = self.control_store.get_by_client_action_id(
+            request.client_action_id
+        )
+        if binding is None:
+            raise TerminalCaptureRequestError(
+                "current_session_intent_missing"
+            )
+        if (
+            binding.repository_id != request.repository_id
+            or binding.chosen_scope != request.capture_scope
+        ):
+            raise TerminalCaptureRequestError(
+                "current_session_intent_mismatch"
+            )
+        return binding.session_id
 
     def _now(self) -> datetime:
         value = self.clock()

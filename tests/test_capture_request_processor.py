@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,21 +36,26 @@ REQUEST_ID = "crq_" + "1" * 32
 SECOND_REQUEST_ID = "crq_" + "2" * 32
 REPOSITORY_ID = "repo_" + "3" * 32
 PRODUCT_ID = "prod_" + "4" * 32
+OTHER_REPOSITORY_ID = "repo_" + "9" * 32
 NOW = datetime(2026, 7, 31, 5, 0, tzinfo=UTC)
 SESSION_ID = "019fb100-0000-7000-8000-000000000001"
 TURN_1 = "019fb100-0000-7000-8000-000000000002"
 TURN_2 = "019fb100-0000-7000-8000-000000000003"
 
 
-def claimed_request() -> ClaimedCaptureRequest:
+def claimed_request(
+    *,
+    capture_scope: str = "all_valid_sessions",
+    client_action_id: str = "web_action_001",
+) -> ClaimedCaptureRequest:
     return ClaimedCaptureRequest(
         request_id=REQUEST_ID,
         repository_id=REPOSITORY_ID,
         product_id=PRODUCT_ID,
         product_name="ZDecision",
         template_id="business",
-        capture_scope="all_valid_sessions",
-        client_action_id="web_action_001",
+        capture_scope=capture_scope,  # type: ignore[arg-type]
+        client_action_id=client_action_id,
         lease_token="lease_0123456789abcdef",
         lease_expires_at="2026-07-31T05:00:30Z",
     )
@@ -248,6 +253,7 @@ class CaptureRequestProcessorTest(unittest.TestCase):
                 enabled=True,
             )
         )
+        from zdecision.agent.control_bindings import ControlBindingStore
         from zdecision.agent.request_state import RequestStateStore
         from zdecision.agent.session_index import SessionIndex
 
@@ -259,6 +265,10 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             self.root / "requests.sqlite3"
         )
         self.addCleanup(self.request_state.close)
+        self.control_store = ControlBindingStore.open(
+            self.root / "controls.sqlite3"
+        )
+        self.addCleanup(self.control_store.close)
         self.capture_runner = FakeCaptureRunner()
         self.reconciliation_runner = FakeReconciliationRunner(
             self.request_state
@@ -275,6 +285,7 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             capture_runner=self.capture_runner,
             reconciliation_runner=self.reconciliation_runner,
             request_state=self.request_state,
+            control_store=self.control_store,
             clock=lambda: NOW,
         )
         self.client = FakeCentralClient()
@@ -288,6 +299,32 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             )
         )
 
+    def choose_control(
+        self,
+        *,
+        control_id: str,
+        client_action_id: str,
+        repository_id: str = REPOSITORY_ID,
+        scope: str = "current_session",
+    ) -> None:
+        self.control_store.create_binding(
+            session_id=SESSION_ID,
+            render_turn_id=TURN_1,
+            cwd=str(self.root),
+            repository_id=repository_id,
+            product_id=PRODUCT_ID,
+            created_at=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            control_id=control_id,
+        )
+        self.control_store.choose_scope(
+            control_id,
+            expected_repository_id=repository_id,
+            scope=scope,  # type: ignore[arg-type]
+            proposed_client_action_id=client_action_id,
+            now=NOW,
+        )
+
     def test_checkpoint_advances_only_after_exact_upload_receipt(
         self,
     ) -> None:
@@ -297,7 +334,10 @@ class CaptureRequestProcessorTest(unittest.TestCase):
 
         self.observe_turn_1()
         source = self.session_index.freeze_sources(
-            REQUEST_ID, REPOSITORY_ID, NOW
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
         )[0]
         self.client.upload_error = ConnectionError("offline")
 
@@ -355,7 +395,10 @@ class CaptureRequestProcessorTest(unittest.TestCase):
 
         self.processor.process(claimed_request(), self.client)
         next_sources = self.session_index.freeze_sources(
-            SECOND_REQUEST_ID, REPOSITORY_ID, NOW
+            SECOND_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
         )
 
         self.assertEqual(1, len(next_sources))
@@ -485,6 +528,79 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             self.client.uploads[0].batch_digest,
             self.client.completed[0],
         )
+
+    def test_current_session_requires_a_private_action_binding_before_start(
+        self,
+    ) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        request = claimed_request(
+            capture_scope="current_session",
+            client_action_id="codex_action_missing",
+        )
+
+        with self.assertRaises(TerminalCaptureRequestError) as raised:
+            self.processor.process(request, self.client)
+
+        self.assertEqual("current_session_intent_missing", raised.exception.code)
+        self.assertEqual([], self.client.calls)
+        self.assertEqual(0, self.capture_runner.call_count)
+        self.assertEqual(0, self.reconciliation_runner.call_count)
+
+    def test_current_session_rejects_repository_or_scope_binding_mismatch(
+        self,
+    ) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        cases = (
+            (
+                "ctl_" + "1" * 32,
+                "codex_action_wrong_repository",
+                OTHER_REPOSITORY_ID,
+                "current_session",
+            ),
+            (
+                "ctl_" + "2" * 32,
+                "codex_action_wrong_scope",
+                REPOSITORY_ID,
+                "all_valid_sessions",
+            ),
+        )
+        for control_id, action_id, repository_id, scope in cases:
+            with self.subTest(scope=scope, repository_id=repository_id):
+                self.choose_control(
+                    control_id=control_id,
+                    client_action_id=action_id,
+                    repository_id=repository_id,
+                    scope=scope,
+                )
+                with self.assertRaises(TerminalCaptureRequestError) as raised:
+                    self.processor.process(
+                        claimed_request(
+                            capture_scope="current_session",
+                            client_action_id=action_id,
+                        ),
+                        self.client,
+                    )
+                self.assertEqual(
+                    "current_session_intent_mismatch", raised.exception.code
+                )
+                self.assertEqual([], self.client.calls)
+                self.assertEqual(0, self.capture_runner.call_count)
+                self.assertEqual(0, self.reconciliation_runner.call_count)
+
+    def test_all_valid_page_request_never_reads_private_action_binding(
+        self,
+    ) -> None:
+        with patch.object(
+            self.control_store,
+            "get_by_client_action_id",
+            side_effect=AssertionError("page request must not read a control"),
+        ):
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(1, len(self.client.uploads))
+        self.assertEqual((), self.client.uploads[0].items)
 
 
 if __name__ == "__main__":

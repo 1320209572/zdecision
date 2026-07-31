@@ -231,6 +231,7 @@ def configured_processor(
     from zdecision.agent.capture_operation_store import (
         CaptureOperationStore,
     )
+    from zdecision.agent.control_bindings import ControlBindingStore
     from zdecision.agent.request_state import RequestStateStore
     from zdecision.agent.session_index import SessionIndex
     from zdecision.app_server.gateway import AppServerGateway
@@ -248,6 +249,7 @@ def configured_processor(
     session_index = SessionIndex.open(local_state_path)
     operation_store = CaptureOperationStore.open(local_state_path)
     request_state = RequestStateStore.open(local_state_path)
+    control_store = ControlBindingStore.open(local_state_path)
     database.retire_legacy_automatic_capture()
     gateway = None
     try:
@@ -269,12 +271,14 @@ def configured_processor(
                 request_state=request_state,
             ),
             request_state=request_state,
+            control_store=control_store,
             clock=lambda: datetime.now(UTC),
         )
     except Exception:
         session_index.close()
         request_state.close()
         operation_store.close()
+        control_store.close()
         close_gateway = getattr(gateway, "close", None)
         if callable(close_gateway):
             close_gateway()

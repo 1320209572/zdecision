@@ -386,8 +386,10 @@ class AgentServiceTest(unittest.TestCase):
                 processor, OnDemandCaptureProcessor
             )
             connect.assert_called_once_with(database=database)
+            self.assertEqual(state_path, processor.control_store.path)
             processor.session_index.close()
             processor.request_state.close()
+            processor.control_store.close()
             processor.capture_runner.operation_store.close()
 
 

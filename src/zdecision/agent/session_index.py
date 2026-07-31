@@ -11,6 +11,7 @@ from pathlib import Path
 
 from zdecision.agent.events import AgentEvent
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.sync.contracts import CaptureScope
 
 
 _CAPTURE_REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
@@ -70,6 +71,12 @@ class SessionIndex:
                 CREATE TABLE IF NOT EXISTS capture_request_freezes (
                     request_id TEXT PRIMARY KEY,
                     repository_id TEXT NOT NULL,
+                    capture_scope TEXT NOT NULL CHECK(
+                        capture_scope IN (
+                            'current_session', 'all_valid_sessions'
+                        )
+                    ),
+                    selected_session_id TEXT,
                     frozen_at TEXT NOT NULL,
                     acknowledged_at TEXT,
                     acknowledgement_digest TEXT
@@ -101,6 +108,24 @@ class SessionIndex:
                     ON capture_request_sources(request_id, source_key);
                 """
             )
+            freeze_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(capture_request_freezes)"
+                ).fetchall()
+            }
+            if "capture_scope" not in freeze_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_freezes ADD COLUMN "
+                    "capture_scope TEXT NOT NULL DEFAULT "
+                    "'all_valid_sessions' CHECK(capture_scope IN "
+                    "('current_session', 'all_valid_sessions'))"
+                )
+            if "selected_session_id" not in freeze_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_freezes ADD COLUMN "
+                    "selected_session_id TEXT"
+                )
         return cls(database_path, connection)
 
     def close(self) -> None:
@@ -239,23 +264,45 @@ class SessionIndex:
         request_id: str,
         repository_id: str,
         frozen_at: datetime,
+        *,
+        capture_scope: CaptureScope,
+        selected_session_id: str | None = None,
     ) -> tuple[FrozenSessionSource, ...]:
         _require_capture_request_id(request_id)
         _require_repository_id(repository_id)
+        if capture_scope not in ("current_session", "all_valid_sessions"):
+            raise ValueError("capture_scope is invalid")
+        if capture_scope == "current_session":
+            if not isinstance(selected_session_id, str) or not selected_session_id:
+                raise ValueError("selected_session_id is required")
+        elif selected_session_id is not None:
+            raise ValueError(
+                "selected_session_id is invalid for all_valid_sessions"
+            )
         timestamp = _normalized_datetime(frozen_at)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             existing_freeze = self._connection.execute(
                 """
-                SELECT repository_id
+                SELECT repository_id, capture_scope, selected_session_id
                 FROM capture_request_freezes
                 WHERE request_id = ?
                 """,
                 (request_id,),
             ).fetchone()
             if existing_freeze is not None:
-                if existing_freeze["repository_id"] != repository_id:
-                    raise ValueError("Capture Request repository conflicts")
+                identity = (
+                    existing_freeze["repository_id"],
+                    existing_freeze["capture_scope"],
+                    existing_freeze["selected_session_id"],
+                )
+                expected = (
+                    repository_id,
+                    capture_scope,
+                    selected_session_id,
+                )
+                if identity != expected:
+                    raise ValueError("Capture Request freeze identity conflicts")
                 sources = self._request_sources(request_id)
                 self._connection.commit()
                 return sources
@@ -263,30 +310,56 @@ class SessionIndex:
             self._connection.execute(
                 """
                 INSERT INTO capture_request_freezes(
-                    request_id, repository_id, frozen_at,
+                    request_id, repository_id, capture_scope,
+                    selected_session_id, frozen_at,
                     acknowledged_at, acknowledgement_digest
-                ) VALUES (?, ?, ?, NULL, NULL)
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
                 """,
-                (request_id, repository_id, timestamp),
+                (
+                    request_id,
+                    repository_id,
+                    capture_scope,
+                    selected_session_id,
+                    timestamp,
+                ),
             )
-            checkpoints = self._connection.execute(
-                """
-                SELECT source_key, repository_id, session_id, cwd, lineage,
-                       handled_turn_id, latest_turn_id,
-                       latest_source_fingerprint
-                FROM session_checkpoints
-                WHERE repository_id = ?
-                  AND excluded_reason IS NULL
-                  AND (
-                      handled_turn_id IS NULL
-                      OR handled_source_fingerprint IS NULL
-                      OR handled_turn_id <> latest_turn_id
-                      OR handled_source_fingerprint <> latest_source_fingerprint
-                  )
-                ORDER BY source_key
-                """,
-                (repository_id,),
-            ).fetchall()
+            changed_clause = """
+                excluded_reason IS NULL
+                AND (
+                    handled_turn_id IS NULL
+                    OR handled_source_fingerprint IS NULL
+                    OR handled_turn_id <> latest_turn_id
+                    OR handled_source_fingerprint <> latest_source_fingerprint
+                )
+            """
+            if capture_scope == "current_session":
+                checkpoints = self._connection.execute(
+                    f"""
+                    SELECT source_key, repository_id, session_id, cwd, lineage,
+                           handled_turn_id, latest_turn_id,
+                           latest_source_fingerprint
+                    FROM session_checkpoints
+                    WHERE repository_id = ?
+                      AND session_id = ?
+                      AND {changed_clause}
+                    ORDER BY latest_observed_at DESC, latest_event_id DESC
+                    LIMIT 1
+                    """,
+                    (repository_id, selected_session_id),
+                ).fetchall()
+            else:
+                checkpoints = self._connection.execute(
+                    f"""
+                    SELECT source_key, repository_id, session_id, cwd, lineage,
+                           handled_turn_id, latest_turn_id,
+                           latest_source_fingerprint
+                    FROM session_checkpoints
+                    WHERE repository_id = ?
+                      AND {changed_clause}
+                    ORDER BY source_key
+                    """,
+                    (repository_id,),
+                ).fetchall()
             for checkpoint in checkpoints:
                 self._connection.execute(
                     """

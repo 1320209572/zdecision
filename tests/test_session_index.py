@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,6 +23,7 @@ else:
 
 
 REPOSITORY_ID = "repo_" + "a" * 32
+OTHER_REPOSITORY_ID = "repo_" + "b" * 32
 FIRST_REQUEST_ID = "crq_" + "1" * 32
 SECOND_REQUEST_ID = "crq_" + "2" * 32
 NOW = datetime(2026, 7, 30, 9, 30, tzinfo=UTC)
@@ -90,7 +93,12 @@ class SessionIndexTest(unittest.TestCase):
                 observed="2026-07-30T01:00:00+00:00",
             )
         )
-        first = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        first = self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
 
         self.index.observe(
             observed_event(
@@ -101,7 +109,12 @@ class SessionIndexTest(unittest.TestCase):
             )
         )
         self.index.acknowledge(FIRST_REQUEST_ID, "a" * 64, NOW)
-        second = self.index.freeze_sources(SECOND_REQUEST_ID, REPOSITORY_ID, NOW)
+        second = self.index.freeze_sources(
+            SECOND_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
 
         self.assertEqual(["turn_1"], [item.upper_turn_id for item in first])
         self.assertEqual(["turn_2"], [item.upper_turn_id for item in second])
@@ -110,10 +123,17 @@ class SessionIndexTest(unittest.TestCase):
     def test_failed_request_does_not_advance_handled_checkpoint(self) -> None:
         self.index.observe(observed_event("Stop", "session_a", "turn_1"))
 
-        first = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
-        replay = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        first = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
+        replay = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
         next_request = self.index.freeze_sources(
-            SECOND_REQUEST_ID, REPOSITORY_ID, NOW
+            SECOND_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
         )
 
         self.assertEqual(first, replay)
@@ -121,12 +141,19 @@ class SessionIndexTest(unittest.TestCase):
         self.assertIsNone(next_request[0].previous_handled_turn_id)
 
     def test_empty_snapshot_replays_empty_after_later_activity(self) -> None:
-        first = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        first = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
         self.index.observe(observed_event("Stop", "session_a", "turn_1"))
 
-        replay = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        replay = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
         next_request = self.index.freeze_sources(
-            SECOND_REQUEST_ID, REPOSITORY_ID, NOW
+            SECOND_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
         )
 
         self.assertEqual((), first)
@@ -151,7 +178,10 @@ class SessionIndexTest(unittest.TestCase):
             )
         )
 
-        frozen = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
 
         self.assertEqual("turn_2", frozen[0].upper_turn_id)
 
@@ -167,7 +197,10 @@ class SessionIndexTest(unittest.TestCase):
             )
         )
 
-        frozen = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
 
         self.assertEqual((), frozen)
 
@@ -182,7 +215,10 @@ class SessionIndexTest(unittest.TestCase):
             )
         )
 
-        frozen = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
 
         self.assertEqual(1, len(frozen))
         self.assertEqual("turn_1", frozen[0].upper_turn_id)
@@ -190,16 +226,23 @@ class SessionIndexTest(unittest.TestCase):
     def test_excluded_source_is_removed_from_replay_and_future_requests(self) -> None:
         self.index.observe(observed_event("Stop", "session_a", "turn_1"))
         self.index.observe(observed_event("Stop", "session_b", "turn_1"))
-        frozen = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
         excluded = next(item for item in frozen if item.session_id == "session_a")
 
         self.index.mark_excluded(
             FIRST_REQUEST_ID, excluded.source_key, "subagent_session"
         )
-        replay = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        replay = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
         self.index.acknowledge(FIRST_REQUEST_ID, "a" * 64, NOW)
         next_request = self.index.freeze_sources(
-            SECOND_REQUEST_ID, REPOSITORY_ID, NOW
+            SECOND_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
         )
 
         self.assertEqual(["session_b"], [item.session_id for item in replay])
@@ -210,12 +253,167 @@ class SessionIndexTest(unittest.TestCase):
         self.index.close()
         self.index = SessionIndex.open(self.database_path)
 
-        first = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        first = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
         self.index.close()
         self.index = SessionIndex.open(self.database_path)
-        replay = self.index.freeze_sources(FIRST_REQUEST_ID, REPOSITORY_ID, NOW)
+        replay = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
+            capture_scope="all_valid_sessions",
+        )
 
         self.assertEqual(first, replay)
+
+    def test_scope_selects_current_session_or_all_remaining_sessions(self) -> None:
+        self.index.observe(observed_event("Stop", "session_a", "turn_a"))
+        self.index.observe(observed_event("Stop", "session_b", "turn_b"))
+
+        current = self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="current_session",
+            selected_session_id="session_a",
+        )
+        self.index.acknowledge(FIRST_REQUEST_ID, "a" * 64, NOW)
+        remaining = self.index.freeze_sources(
+            SECOND_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+
+        self.assertEqual(["session_a"], [item.session_id for item in current])
+        self.assertEqual(["session_b"], [item.session_id for item in remaining])
+
+    def test_scope_and_selected_session_arguments_must_agree(self) -> None:
+        with self.assertRaises(ValueError):
+            self.index.freeze_sources(
+                FIRST_REQUEST_ID,
+                REPOSITORY_ID,
+                NOW,
+                capture_scope="current_session",
+            )
+        with self.assertRaises(ValueError):
+            self.index.freeze_sources(
+                FIRST_REQUEST_ID,
+                REPOSITORY_ID,
+                NOW,
+                capture_scope="all_valid_sessions",
+                selected_session_id="session_a",
+            )
+
+    def test_current_session_freezes_only_its_newest_changed_lineage(self) -> None:
+        self.index.observe(
+            observed_event(
+                "Stop", "session_a", "turn_old",
+                observed="2026-07-30T01:00:00+00:00",
+                branch="main",
+            )
+        )
+        self.index.observe(
+            observed_event(
+                "Stop", "session_a", "turn_new",
+                observed="2026-07-30T01:01:00+00:00",
+                branch="feature",
+            )
+        )
+
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="current_session",
+            selected_session_id="session_a",
+        )
+
+        self.assertEqual(1, len(frozen))
+        self.assertEqual("turn_new", frozen[0].upper_turn_id)
+
+    def test_current_session_is_empty_when_only_another_session_changed(self) -> None:
+        self.index.observe(observed_event("Stop", "session_b", "turn_b"))
+
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="current_session",
+            selected_session_id="session_a",
+        )
+
+        self.assertEqual((), frozen)
+
+    def test_freeze_replay_rejects_repository_scope_or_session_mismatch(self) -> None:
+        self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="current_session",
+            selected_session_id="session_a",
+        )
+        mismatches = (
+            (OTHER_REPOSITORY_ID, "current_session", "session_a"),
+            (REPOSITORY_ID, "all_valid_sessions", None),
+            (REPOSITORY_ID, "current_session", "session_b"),
+        )
+        for repository_id, capture_scope, selected_session_id in mismatches:
+            with self.subTest(
+                repository_id=repository_id,
+                capture_scope=capture_scope,
+                selected_session_id=selected_session_id,
+            ), self.assertRaises(ValueError):
+                self.index.freeze_sources(
+                    FIRST_REQUEST_ID,
+                    repository_id,
+                    NOW,
+                    capture_scope=capture_scope,
+                    selected_session_id=selected_session_id,
+                )
+
+    def test_open_migrates_old_freezes_to_all_valid_scope(self) -> None:
+        self.index.close()
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute("DROP TABLE capture_request_freezes")
+            connection.execute(
+                """
+                CREATE TABLE capture_request_freezes (
+                    request_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    frozen_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    acknowledgement_digest TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO capture_request_freezes(
+                    request_id, repository_id, frozen_at,
+                    acknowledged_at, acknowledgement_digest
+                ) VALUES (?, ?, ?, NULL, NULL)
+                """,
+                (FIRST_REQUEST_ID, REPOSITORY_ID, NOW.isoformat()),
+            )
+        self.index = SessionIndex.open(self.database_path)
+
+        replay = self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+
+        self.assertEqual((), replay)
+        with self.assertRaises(ValueError):
+            self.index.freeze_sources(
+                FIRST_REQUEST_ID,
+                REPOSITORY_ID,
+                NOW,
+                capture_scope="current_session",
+                selected_session_id="session_a",
+            )
 
 
 if __name__ == "__main__":
