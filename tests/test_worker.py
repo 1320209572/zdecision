@@ -378,6 +378,7 @@ class WorkerTests(unittest.TestCase):
                 "crq_" + "1" * 32,
                 self.snapshot.repository_id,
                 FIXED_TIME,
+                capture_scope="all_valid_sessions",
             )
         finally:
             index.close()
