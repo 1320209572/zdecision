@@ -73,7 +73,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     state_path = database_path(os.environ)
     if arguments.command == "mcp":
-        run_mcp(database_path=state_path, cwd=os.getcwd())
+        run_mcp(
+            database_path=state_path,
+            config_locator_path=config_locator_path(os.environ),
+            cwd=os.getcwd(),
+        )
         return 0
     if arguments.command == "service":
         return _run_service_command(arguments, state_path)

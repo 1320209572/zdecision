@@ -60,6 +60,30 @@ class AgentConfigLocatorTests(unittest.TestCase):
             self.root / "state" / "agent" / "config-locator.json", path
         )
 
+    def test_mcp_receives_the_fixed_locator_without_reading_config_in_cli(
+        self,
+    ) -> None:
+        from zdecision.agent.cli import main
+
+        state_root = self.root / "mcp-state"
+        cwd = str(self.root / "repository")
+        with (
+            patch.dict(
+                os.environ,
+                {"ZDECISION_STATE_DIR": str(state_root)},
+                clear=True,
+            ),
+            patch("zdecision.agent.cli.os.getcwd", return_value=cwd),
+            patch("zdecision.agent.cli.run_mcp") as run_mcp,
+        ):
+            self.assertEqual(0, main(["mcp"]))
+
+        run_mcp.assert_called_once_with(
+            database_path=state_root / "agent" / "zdecision.sqlite3",
+            config_locator_path=state_root / "agent" / "config-locator.json",
+            cwd=cwd,
+        )
+
     def test_publish_is_canonical_owner_only_and_atomically_replaceable(self) -> None:
         published = publish_agent_config_locator(self.locator, self.config)
         first_inode = self.locator.stat().st_ino
