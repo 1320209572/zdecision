@@ -109,6 +109,46 @@ class CentralStore:
                     PRIMARY KEY(request_id, sequence)
                 );
 
+                CREATE TABLE IF NOT EXISTS candidate_batches (
+                    request_id TEXT PRIMARY KEY
+                        REFERENCES capture_requests(request_id),
+                    organization_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    batch_digest TEXT NOT NULL,
+                    batch_json TEXT NOT NULL,
+                    batch_record_digest TEXT NOT NULL,
+                    item_count INTEGER NOT NULL CHECK(item_count >= 0),
+                    receipt_json TEXT NOT NULL,
+                    receipt_digest TEXT NOT NULL,
+                    acknowledged_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_revisions (
+                    organization_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    revision_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    PRIMARY KEY(
+                        organization_id, repository_id,
+                        family_id, revision
+                    ),
+                    UNIQUE(organization_id, revision_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_family_heads (
+                    organization_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    revision_id TEXT NOT NULL,
+                    PRIMARY KEY(
+                        organization_id, repository_id, family_id
+                    )
+                );
+
                 CREATE UNIQUE INDEX IF NOT EXISTS
                     one_active_capture_per_repository
                 ON capture_requests(organization_id, repository_id)

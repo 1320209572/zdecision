@@ -5,9 +5,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.agent.db import AgentDatabase
-from zdecision.sync.contracts import ClaimedCaptureRequest
+from zdecision.sync.contracts import (
+    ClaimedCaptureRequest,
+    RepositoryView,
+)
 
 try:
     from zdecision.agent.service import (
@@ -16,6 +20,7 @@ try:
         AgentServiceConfigError,
         RetryableCaptureRequestError,
         TerminalCaptureRequestError,
+        configured_processor,
         load_agent_config,
         mirror_repository_mappings,
     )
@@ -194,6 +199,48 @@ class AgentServiceTest(unittest.TestCase):
                 AgentServiceConfigError, "agent_config_permissions_invalid"
             ):
                 load_agent_config(path)
+
+    def test_configured_service_builds_the_on_demand_processor(
+        self,
+    ) -> None:
+        config = AgentConfig(
+            central_url="http://127.0.0.1:8765",
+            organization_id="org_demo",
+            device_id="device_demo",
+            device_token="device-secret-token",
+            repositories=(
+                RepositoryView(
+                    repository_id=REPOSITORY_ID,
+                    product_id=PRODUCT_ID,
+                    product_name="ZDecision",
+                    enabled=True,
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state_path = root / "agent" / "zdecision.sqlite3"
+            database = AgentDatabase.open(state_path)
+            self.addCleanup(database.close)
+            fake_gateway = object()
+            with patch(
+                "zdecision.app_server.gateway.AppServerGateway.connect",
+                return_value=fake_gateway,
+            ) as connect:
+                processor = configured_processor(
+                    database, config, state_path
+                )
+
+            from zdecision.agent.capture_processor import (
+                OnDemandCaptureProcessor,
+            )
+
+            self.assertIsInstance(
+                processor, OnDemandCaptureProcessor
+            )
+            connect.assert_called_once_with(database=database)
+            processor.session_index.close()
+            processor.request_state.close()
 
 
 if __name__ == "__main__":

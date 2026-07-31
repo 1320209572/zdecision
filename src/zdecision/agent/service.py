@@ -8,6 +8,7 @@ import stat
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -209,12 +210,62 @@ def configured_processor(
     config: AgentConfig,
     state_path: Path,
 ) -> CaptureRequestProcessor | None:
-    """Task 8 replaces this safe idle boundary with the Capture pipeline."""
-
     if not isinstance(database, AgentDatabase):
         raise TypeError("database must be an AgentDatabase")
     if not isinstance(config, AgentConfig):
         raise TypeError("config must be an AgentConfig")
     if not Path(state_path).is_absolute():
         raise ValueError("state_path must be absolute")
-    return None
+    from zdecision.agent.capture_processor import (
+        OnDemandCaptureProcessor,
+    )
+    from zdecision.agent.request_state import RequestStateStore
+    from zdecision.agent.session_index import SessionIndex
+    from zdecision.app_server.gateway import AppServerGateway
+    from zdecision.app_server.reconciliation_runner import (
+        ReconciliationRunner,
+    )
+    from zdecision.app_server.requested_capture import (
+        RequestedCaptureRunner,
+    )
+    from zdecision.capture.service import CaptureService
+    from zdecision.capture.templates import TemplateCatalog
+    from zdecision.private_store.filesystem import FilePrivateStore
+
+    local_state_path = Path(state_path)
+    package_root = Path(__file__).resolve().parents[1]
+    repository_root = package_root.parents[1]
+    session_index = SessionIndex.open(local_state_path)
+    request_state = RequestStateStore.open(local_state_path)
+    gateway = None
+    try:
+        gateway = AppServerGateway.connect(database=database)
+        capture_service = CaptureService(
+            FilePrivateStore(local_state_path.parents[1]),
+            TemplateCatalog(
+                repository_root / "decision-templates",
+                package_root / "capture" / "prompt_contracts",
+            ),
+        )
+        return OnDemandCaptureProcessor(
+            database=database,
+            session_index=session_index,
+            capture_runner=RequestedCaptureRunner(
+                gateway=gateway,
+                capture_service=capture_service,
+                request_state=request_state,
+            ),
+            reconciliation_runner=ReconciliationRunner(
+                gateway=gateway,
+                request_state=request_state,
+            ),
+            request_state=request_state,
+            clock=lambda: datetime.now(UTC),
+        )
+    except Exception:
+        session_index.close()
+        request_state.close()
+        close_gateway = getattr(gateway, "close", None)
+        if callable(close_gateway):
+            close_gateway()
+        raise

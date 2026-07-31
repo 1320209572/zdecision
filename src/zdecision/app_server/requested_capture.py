@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -75,6 +76,7 @@ class RequestedCaptureRunner:
         *,
         product_name: str,
         template_id: str,
+        heartbeat: Callable[[], None] | None = None,
     ) -> SessionCaptureResult:
         if not isinstance(source, FrozenSessionSource):
             raise TypeError("source must be a FrozenSessionSource")
@@ -133,6 +135,7 @@ class RequestedCaptureRunner:
 
         if record.status in {"fork_attached", "inventory_running"}:
             inventory_tag = f"zdecision/{operation_id}/inventory"
+            _heartbeat(heartbeat)
             inventory_receipt = self.native_calls.resolve_structured_turn(
                 request_id=source.request_id,
                 operation_key=source.source_key,
@@ -150,6 +153,7 @@ class RequestedCaptureRunner:
                     client_user_message_id=inventory_tag,
                 ),
             )
+            _heartbeat(heartbeat)
             _verify_receipt(inventory_receipt, fork_thread_id, profile)
             self.capture_service.attach_stage_turn(
                 operation_id, "inventory", inventory_receipt.turn_id
@@ -163,6 +167,7 @@ class RequestedCaptureRunner:
 
         if record.status in {"inventory_completed", "extraction_running"}:
             extraction_tag = f"zdecision/{operation_id}/extraction"
+            _heartbeat(heartbeat)
             extraction_receipt = self.native_calls.resolve_structured_turn(
                 request_id=source.request_id,
                 operation_key=source.source_key,
@@ -180,6 +185,7 @@ class RequestedCaptureRunner:
                     client_user_message_id=extraction_tag,
                 ),
             )
+            _heartbeat(heartbeat)
             _verify_receipt(extraction_receipt, fork_thread_id, profile)
             self.capture_service.attach_stage_turn(
                 operation_id, "extraction", extraction_receipt.turn_id
@@ -280,3 +286,8 @@ def _nonempty(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _heartbeat(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()

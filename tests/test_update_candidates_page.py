@@ -82,6 +82,30 @@ class UpdateCandidatesPageTest(unittest.TestCase):
             r"template_id:\s*['\"]business['\"],\s*client_action_id",
         )
 
+    def test_terminal_request_refreshes_safe_candidate_fields(
+        self,
+    ) -> None:
+        html = self.client.get("/").text
+
+        self.assertIn("loadCandidates", html)
+        self.assertIn(
+            "/api/v1/repositories/${repositoryId}/candidates",
+            html,
+        )
+        for field in (
+            "claim",
+            "future_action",
+            "scope_summary",
+            "invalidation_conditions",
+        ):
+            self.assertIn(field, html)
+        self.assertIn("candidateList.replaceChildren()", html)
+        self.assertIn("textContent", html)
+        self.assertNotIn("innerHTML", html)
+        self.assertNotIn("acceptCandidate", html)
+        self.assertNotIn("rejectCandidate", html)
+        self.assertNotIn("publishCandidate", html)
+
 
 if __name__ == "__main__":
     unittest.main()

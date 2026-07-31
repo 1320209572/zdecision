@@ -6,10 +6,17 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
+from zdecision.capture.models import CandidateContent
 from zdecision.central.auth import DemoIdentityProvider
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
-from zdecision.sync.contracts import RepositoryView
+from zdecision.ids import candidate_family_id, candidate_revision_id
+from zdecision.jsonio import canonical_json_bytes
+from zdecision.sync.contracts import (
+    CandidateBatchUpload,
+    CandidateRevisionUpload,
+    RepositoryView,
+)
 
 try:
     from fastapi.testclient import TestClient
@@ -27,6 +34,59 @@ NOW = datetime(2026, 7, 31, 2, 0, tzinfo=UTC)
 EMPTY_BATCH_DIGEST = (
     "e813d564bccbeefe1db875d1c9abb55d63c52b639acc61134a5f1d19cc489b67"
 )
+
+
+def candidate_batch(
+    request_id: str,
+    *,
+    repository_id: str = REPOSITORY_ID,
+    claim: str = "页面操作是 Candidate 采集授权边界。",
+    product: str = "ZDecision",
+    family_id: str | None = None,
+    revision: int = 1,
+) -> CandidateBatchUpload:
+    content = CandidateContent(
+        product=product,
+        claim=claim,
+        future_action="只有页面请求才运行本地 Capture。",
+        scope_summary="按需 Candidate 采集",
+        repositories=("zdecision",),
+        paths=(),
+        invalidation_conditions=("产品重新定义采集边界",),
+    )
+    content_digest = hashlib.sha256(
+        canonical_json_bytes(content.to_dict())
+    ).hexdigest()
+    selected_family_id = family_id or candidate_family_id(
+        repository_id, "cand_" + "4" * 32 + "_01"
+    )
+    item = CandidateRevisionUpload(
+        family_id=selected_family_id,
+        revision_id=candidate_revision_id(
+            selected_family_id, revision, content_digest
+        ),
+        revision=revision,
+        content=content,
+        content_digest=content_digest,
+        evidence_digest="5" * 64,
+    )
+    return CandidateBatchUpload(
+        request_id=request_id,
+        repository_id=repository_id,
+        items=(item,),
+        batch_digest=hashlib.sha256(
+            canonical_json_bytes({"items": [item.to_dict()]})
+        ).hexdigest(),
+    )
+
+
+def empty_batch(request_id: str) -> CandidateBatchUpload:
+    return CandidateBatchUpload(
+        request_id=request_id,
+        repository_id=REPOSITORY_ID,
+        items=(),
+        batch_digest=EMPTY_BATCH_DIGEST,
+    )
 
 
 class CentralApiTest(unittest.TestCase):
@@ -72,17 +132,56 @@ class CentralApiTest(unittest.TestCase):
     def authorization(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {DEVICE_TOKEN}"}
 
-    def create_request(self) -> str:
+    def create_request(
+        self, action_id: str = "web_action_001"
+    ) -> str:
         response = self.client.post(
             "/api/v1/capture-requests",
             json={
                 "repository_id": REPOSITORY_ID,
                 "template_id": "business",
-                "client_action_id": "web_action_001",
+                "client_action_id": action_id,
             },
         )
         self.assertEqual(200, response.status_code, response.text)
         return response.json()["request_id"]
+
+    def start_request(
+        self, action_id: str = "web_action_001"
+    ) -> tuple[str, str]:
+        request_id = self.create_request(action_id)
+        claimed = self.client.post(
+            "/api/v1/agent/capture-requests/claim",
+            headers=self.authorization,
+            json={},
+        )
+        self.assertEqual(200, claimed.status_code, claimed.text)
+        lease_token = claimed.json()["lease_token"]
+        started = self.client.post(
+            f"/api/v1/agent/capture-requests/{request_id}/start",
+            headers=self.authorization,
+            json={"lease_token": lease_token},
+        )
+        self.assertEqual(200, started.status_code, started.text)
+        return request_id, lease_token
+
+    def upload(
+        self,
+        request_id: str,
+        lease_token: str,
+        batch: CandidateBatchUpload,
+    ):
+        return self.client.post(
+            (
+                "/api/v1/agent/capture-requests/"
+                f"{request_id}/candidates"
+            ),
+            headers=self.authorization,
+            json={
+                "lease_token": lease_token,
+                "batch": batch.to_dict(),
+            },
+        )
 
     def test_browser_routes_derive_identity_and_return_registered_repositories(
         self,
@@ -152,18 +251,9 @@ class CentralApiTest(unittest.TestCase):
         self.assertNotIn(DEVICE_TOKEN, wrong.text)
 
     def test_device_routes_expose_only_bounded_lifecycle_values(self) -> None:
-        request_id = self.create_request()
-        claimed_response = self.client.post(
-            "/api/v1/agent/capture-requests/claim",
-            headers=self.authorization,
-            json={},
-        )
-        claimed = claimed_response.json()
-        lease_token = claimed["lease_token"]
-        start = self.client.post(
-            f"/api/v1/agent/capture-requests/{request_id}/start",
-            headers=self.authorization,
-            json={"lease_token": lease_token},
+        request_id, lease_token = self.start_request()
+        start = self.client.get(
+            f"/api/v1/capture-requests/{request_id}"
         )
         progress = self.client.post(
             f"/api/v1/agent/capture-requests/{request_id}/progress",
@@ -172,6 +262,9 @@ class CentralApiTest(unittest.TestCase):
                 "lease_token": lease_token,
                 "code": "extracting_candidates",
             },
+        )
+        upload = self.upload(
+            request_id, lease_token, empty_batch(request_id)
         )
         complete = self.client.post(
             f"/api/v1/agent/capture-requests/{request_id}/complete",
@@ -184,11 +277,175 @@ class CentralApiTest(unittest.TestCase):
 
         self.assertEqual("running", start.json()["state"])
         self.assertEqual("extracting_candidates", progress.json()["code"])
+        self.assertEqual(200, upload.status_code, upload.text)
         self.assertEqual("succeeded_no_candidates", complete.json()["state"])
-        for response in (start, progress, complete):
+        for response in (start, progress, upload, complete):
             self.assertNotIn("session_id", response.text)
             self.assertNotIn("turn_id", response.text)
             self.assertNotIn(lease_token, response.text)
+
+    def test_duplicate_batch_replays_receipt_and_conflict_is_409(
+        self,
+    ) -> None:
+        request_id, lease_token = self.start_request()
+        batch = candidate_batch(request_id)
+
+        first = self.upload(request_id, lease_token, batch)
+        replay = self.upload(request_id, lease_token, batch)
+        conflict = self.upload(
+            request_id,
+            lease_token,
+            candidate_batch(
+                request_id,
+                claim="不同的批次不能覆盖原始请求结果。",
+            ),
+        )
+
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual(first.json(), replay.json())
+        self.assertEqual(409, conflict.status_code)
+        self.assertEqual(
+            {"error": "batch_conflict"}, conflict.json()
+        )
+
+    def test_page_lists_only_current_repository_candidates(
+        self,
+    ) -> None:
+        request_id, lease_token = self.start_request()
+        batch = candidate_batch(request_id)
+        uploaded = self.upload(request_id, lease_token, batch)
+        self.assertEqual(200, uploaded.status_code, uploaded.text)
+
+        response = self.client.get(
+            f"/api/v1/repositories/{REPOSITORY_ID}/candidates"
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(
+            [batch.items[0].revision_id],
+            [
+                item["revision_id"]
+                for item in response.json()["items"]
+            ],
+        )
+        self.assertEqual(
+            batch.items[0].content.claim,
+            response.json()["items"][0]["content"]["claim"],
+        )
+        for forbidden in (
+            "session_id",
+            "turn_id",
+            "source-thread",
+            "/Users/",
+            "prompt",
+            "diff",
+        ):
+            self.assertNotIn(forbidden, response.text)
+
+    def test_completion_requires_the_exact_stored_batch(self) -> None:
+        request_id, lease_token = self.start_request()
+        premature = self.client.post(
+            f"/api/v1/agent/capture-requests/{request_id}/complete",
+            headers=self.authorization,
+            json={
+                "lease_token": lease_token,
+                "batch_digest": EMPTY_BATCH_DIGEST,
+            },
+        )
+        self.assertEqual(409, premature.status_code)
+
+        upload = self.upload(
+            request_id, lease_token, empty_batch(request_id)
+        )
+        completed = self.client.post(
+            f"/api/v1/agent/capture-requests/{request_id}/complete",
+            headers=self.authorization,
+            json={
+                "lease_token": lease_token,
+                "batch_digest": EMPTY_BATCH_DIGEST,
+            },
+        )
+
+        self.assertEqual(200, upload.status_code, upload.text)
+        self.assertEqual(
+            "succeeded_no_candidates", completed.json()["state"]
+        )
+
+    def test_candidate_product_must_match_server_mapping(self) -> None:
+        request_id, lease_token = self.start_request()
+
+        response = self.upload(
+            request_id,
+            lease_token,
+            candidate_batch(request_id, product="Wrong Product"),
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            {"error": "candidate_product_mismatch"},
+            response.json(),
+        )
+
+    def test_later_revision_replaces_only_the_current_head(self) -> None:
+        first_request, first_lease = self.start_request(
+            "web_action_first"
+        )
+        first_batch = candidate_batch(first_request)
+        first_upload = self.upload(
+            first_request, first_lease, first_batch
+        )
+        self.assertEqual(
+            200, first_upload.status_code, first_upload.text
+        )
+        completed = self.client.post(
+            (
+                "/api/v1/agent/capture-requests/"
+                f"{first_request}/complete"
+            ),
+            headers=self.authorization,
+            json={
+                "lease_token": first_lease,
+                "batch_digest": first_batch.batch_digest,
+            },
+        )
+        self.assertEqual(200, completed.status_code, completed.text)
+
+        second_request, second_lease = self.start_request(
+            "web_action_second"
+        )
+        second_batch = candidate_batch(
+            second_request,
+            claim="后续产品决策推翻并替换了原始约束。",
+            family_id=first_batch.items[0].family_id,
+            revision=2,
+        )
+        second_upload = self.upload(
+            second_request, second_lease, second_batch
+        )
+        self.assertEqual(
+            200, second_upload.status_code, second_upload.text
+        )
+
+        response = self.client.get(
+            f"/api/v1/repositories/{REPOSITORY_ID}/candidates"
+        )
+        self.assertEqual(
+            [second_batch.items[0].revision_id],
+            [
+                item["revision_id"]
+                for item in response.json()["items"]
+            ],
+        )
+        history_count = self.store.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM candidate_revisions
+            WHERE organization_id = 'org_demo'
+              AND repository_id = ?
+            """,
+            (REPOSITORY_ID,),
+        ).fetchone()["count"]
+        self.assertEqual(2, history_count)
 
 
 if __name__ == "__main__":

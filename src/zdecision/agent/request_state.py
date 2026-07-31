@@ -621,6 +621,50 @@ class RequestStateStore:
             )
         )
 
+    def staged_batch(
+        self, request_id: str
+    ) -> CandidateBatchUpload | None:
+        request = _request_id(request_id)
+        row = self._connection.execute(
+            """
+            SELECT batch_json, batch_digest
+            FROM candidate_outbox
+            WHERE request_id = ?
+            """,
+            (request,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CandidateBatchUpload.from_dict(
+            _read_canonical(
+                row["batch_json"],
+                row["batch_digest"],
+                "Candidate batch",
+            )
+        )
+
+    def upload_receipt(
+        self, request_id: str
+    ) -> UploadReceipt | None:
+        request = _request_id(request_id)
+        row = self._connection.execute(
+            """
+            SELECT receipt_json, receipt_digest
+            FROM candidate_outbox
+            WHERE request_id = ? AND state = 'uploaded'
+            """,
+            (request,),
+        ).fetchone()
+        if row is None:
+            return None
+        return UploadReceipt.from_dict(
+            _read_canonical(
+                row["receipt_json"],
+                row["receipt_digest"],
+                "Upload receipt",
+            )
+        )
+
     def mark_uploaded(self, receipt: UploadReceipt) -> None:
         if not isinstance(receipt, UploadReceipt):
             raise TypeError("receipt must be an UploadReceipt")

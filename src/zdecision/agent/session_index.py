@@ -106,6 +106,19 @@ class SessionIndex:
     def close(self) -> None:
         self._connection.close()
 
+    def handled_turn(self, source_key: str) -> str | None:
+        if not isinstance(source_key, str) or not source_key:
+            raise ValueError("source_key is invalid")
+        row = self._connection.execute(
+            """
+            SELECT handled_turn_id
+            FROM session_checkpoints
+            WHERE source_key = ?
+            """,
+            (source_key,),
+        ).fetchone()
+        return None if row is None else row["handled_turn_id"]
+
     def observe(self, event: AgentEvent) -> None:
         invocation = event.invocation
         if (

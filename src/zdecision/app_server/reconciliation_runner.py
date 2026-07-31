@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from importlib.resources import files
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class ReconciliationRunner:
         observations: tuple[Candidate, ...],
         current: tuple[CandidateFamilyRevision, ...],
         profile: FeasibilityModelProfile,
+        heartbeat: Callable[[], None] | None = None,
     ) -> ReconciliationResult:
         if not isinstance(cwd, str) or not Path(cwd).is_absolute():
             raise ValueError("cwd must be an absolute path")
@@ -124,6 +126,7 @@ class ReconciliationRunner:
         client_message_id = (
             f"zdecision/{request_id}/reconciliation"
         )
+        _heartbeat(heartbeat)
         receipt = self.native_calls.resolve_structured_turn(
             request_id=request_id,
             operation_key=request_id,
@@ -156,6 +159,7 @@ class ReconciliationRunner:
                 client_user_message_id=client_message_id,
             ),
         )
+        _heartbeat(heartbeat)
         _verify_receipt(receipt, thread_id, profile)
         decisions = validate_reconciliation(
             receipt.structured_output, ordered, current
@@ -233,3 +237,8 @@ def _verify_receipt(
         raise ReconciliationRunnerError(
             "Structured Turn returned the wrong model profile"
         )
+
+
+def _heartbeat(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()

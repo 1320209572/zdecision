@@ -25,7 +25,10 @@ from zdecision.central.service import (
     RepositoryUnavailable,
     RequestNotFound,
 )
-from zdecision.sync.contracts import CaptureRequestCreate
+from zdecision.sync.contracts import (
+    CandidateBatchUpload,
+    CaptureRequestCreate,
+)
 
 
 class _StrictBody(BaseModel):
@@ -52,6 +55,10 @@ class _ProgressBody(_LeaseBody):
 
 class _CompleteBody(_LeaseBody):
     batch_digest: str = Field(min_length=64, max_length=64)
+
+
+class _CandidateBatchBody(_LeaseBody):
+    batch: dict[str, object]
 
 
 class _FailBody(_ProgressBody):
@@ -142,6 +149,19 @@ def create_app(
             ]
         }
 
+    @app.get("/api/v1/repositories/{repository_id}/candidates")
+    async def list_current_candidates(
+        repository_id: str,
+    ) -> dict[str, object]:
+        return {
+            "items": [
+                item.to_dict()
+                for item in service.list_current_candidates(
+                    browser(), repository_id
+                )
+            ]
+        }
+
     @app.post("/api/v1/capture-requests")
     async def create_capture_request(
         body: _CaptureRequestBody,
@@ -222,6 +242,24 @@ def create_app(
             request_id,
             body.lease_token,
             body.code,
+            current_time(),
+        ).to_dict()
+
+    @app.post(
+        "/api/v1/agent/capture-requests/{request_id}/candidates"
+    )
+    async def accept_candidate_batch(
+        request_id: str,
+        body: _CandidateBatchBody,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        batch = CandidateBatchUpload.from_dict(body.batch)
+        if batch.request_id != request_id:
+            raise ValueError("Candidate batch request conflicts")
+        return service.accept_candidate_batch(
+            device(authorization),
+            body.lease_token,
+            batch,
             current_time(),
         ).to_dict()
 

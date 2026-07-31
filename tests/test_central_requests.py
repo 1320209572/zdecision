@@ -6,7 +6,11 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from zdecision.sync.contracts import CaptureRequestCreate, RepositoryView
+from zdecision.sync.contracts import (
+    CandidateBatchUpload,
+    CaptureRequestCreate,
+    RepositoryView,
+)
 
 try:
     from zdecision.central.auth import (
@@ -48,6 +52,15 @@ OTHER_DEVICE = (
     if CENTRAL_IMPORT_ERROR
     else Principal("device", "org_demo", "device_other", "device_other")
 )
+
+
+def empty_batch(request_id: str) -> CandidateBatchUpload:
+    return CandidateBatchUpload(
+        request_id=request_id,
+        repository_id=REPOSITORY_ID,
+        items=(),
+        batch_digest=EMPTY_BATCH_DIGEST,
+    )
 
 
 class CentralRequestServiceTest(unittest.TestCase):
@@ -167,6 +180,12 @@ class CentralRequestServiceTest(unittest.TestCase):
 
         claimed = self.claim()
         self.service.start(DEVICE, first.request_id, claimed.lease_token, NOW)
+        self.service.accept_candidate_batch(
+            DEVICE,
+            claimed.lease_token,
+            empty_batch(first.request_id),
+            NOW,
+        )
         self.service.complete(
             DEVICE,
             first.request_id,
@@ -304,6 +323,12 @@ class CentralRequestServiceTest(unittest.TestCase):
             claimed.lease_token,
             "extracting_candidates",
             NOW + timedelta(seconds=11),
+        )
+        self.service.accept_candidate_batch(
+            DEVICE,
+            claimed.lease_token,
+            empty_batch(created.request_id),
+            NOW + timedelta(seconds=12),
         )
         completed = self.service.complete(
             DEVICE,

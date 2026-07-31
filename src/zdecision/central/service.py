@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import sqlite3
@@ -16,11 +17,14 @@ from zdecision.central.store import CentralStore
 from zdecision.ids import capture_request_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
+    CandidateBatchUpload,
+    CandidateRevisionUpload,
     CaptureRequestCreate,
     CaptureRequestView,
     ClaimedCaptureRequest,
     ProgressEvent,
     RepositoryView,
+    UploadReceipt,
 )
 
 
@@ -31,11 +35,6 @@ _ACTIVE_STATES = ("queued", "claimed", "running", "failed_retryable")
 _SUCCESS_STATES = ("succeeded", "succeeded_no_candidates")
 _MAX_SEQUENCE = 2_147_483_647
 _RETRY_DELAYS = (5, 30, 120, 300)
-_EMPTY_BATCH_DIGEST = hashlib.sha256(
-    canonical_json_bytes({"items": []})
-).hexdigest()
-
-
 class CentralRequestError(Exception):
     def __init__(self, code: str) -> None:
         self.code = code
@@ -95,6 +94,48 @@ class CaptureRequestService:
                 product_id=row["product_id"],
                 product_name=row["product_name"],
                 enabled=bool(row["enabled"]),
+            )
+            for row in rows
+        )
+
+    def list_current_candidates(
+        self,
+        user: Principal,
+        repository_id: str,
+    ) -> tuple[CandidateRevisionUpload, ...]:
+        principal = _require_user(user)
+        mapping = self.store.connection.execute(
+            """
+            SELECT repository_id
+            FROM repository_mappings
+            WHERE organization_id = ? AND repository_id = ?
+            """,
+            (principal.organization_id, repository_id),
+        ).fetchone()
+        if mapping is None:
+            raise RepositoryUnavailable("repository_unavailable")
+        rows = self.store.connection.execute(
+            """
+            SELECT revisions.record_json, revisions.record_digest
+            FROM candidate_family_heads AS heads
+            JOIN candidate_revisions AS revisions
+              ON revisions.organization_id = heads.organization_id
+             AND revisions.repository_id = heads.repository_id
+             AND revisions.family_id = heads.family_id
+             AND revisions.revision_id = heads.revision_id
+            WHERE heads.organization_id = ?
+              AND heads.repository_id = ?
+            ORDER BY heads.family_id
+            """,
+            (principal.organization_id, repository_id),
+        ).fetchall()
+        return tuple(
+            CandidateRevisionUpload.from_dict(
+                _read_canonical(
+                    row["record_json"],
+                    row["record_digest"],
+                    "Candidate revision",
+                )
             )
             for row in rows
         )
@@ -451,6 +492,112 @@ class CaptureRequestService:
                 occurred_at=timestamp,
             )
 
+    def accept_candidate_batch(
+        self,
+        device: Principal,
+        lease_token: str,
+        batch: CandidateBatchUpload,
+        now: datetime,
+    ) -> UploadReceipt:
+        principal = _require_device(device)
+        if not isinstance(batch, CandidateBatchUpload):
+            raise TypeError("batch must be a CandidateBatchUpload")
+        timestamp = _timestamp(now)
+        batch_json, batch_record_digest = _canonical_record(
+            batch.to_dict()
+        )
+        connection = self.store.connection
+        with _immediate(connection):
+            row = _request_row(connection, batch.request_id)
+            _require_device_ownership(row, principal)
+            _require_token(row, lease_token)
+            existing = connection.execute(
+                """
+                SELECT batch_digest, batch_json, batch_record_digest,
+                       receipt_json, receipt_digest
+                FROM candidate_batches
+                WHERE request_id = ?
+                """,
+                (batch.request_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["batch_digest"] != batch.batch_digest
+                    or existing["batch_json"] != batch_json
+                    or existing["batch_record_digest"]
+                    != batch_record_digest
+                ):
+                    raise RequestConflict("batch_conflict")
+                return UploadReceipt.from_dict(
+                    _read_canonical(
+                        existing["receipt_json"],
+                        existing["receipt_digest"],
+                        "Upload receipt",
+                    )
+                )
+
+            _require_live_lease(
+                row, principal, lease_token, now
+            )
+            if row["state"] != "running":
+                raise InvalidTransition(
+                    "capture_request_not_running"
+                )
+            if batch.repository_id != row["repository_id"]:
+                raise RequestConflict("batch_repository_conflict")
+            if any(
+                item.content.product != row["product_name"]
+                for item in batch.items
+            ):
+                raise RequestConflict(
+                    "candidate_product_mismatch"
+                )
+            family_ids = [
+                item.family_id for item in batch.items
+            ]
+            if len(set(family_ids)) != len(family_ids):
+                raise RequestConflict(
+                    "candidate_family_repeated"
+                )
+            for item in batch.items:
+                _save_candidate_revision(
+                    connection,
+                    principal.organization_id,
+                    batch.repository_id,
+                    item,
+                )
+            receipt = UploadReceipt(
+                request_id=batch.request_id,
+                batch_digest=batch.batch_digest,
+                acknowledged_at=timestamp,
+            )
+            receipt_json, receipt_digest = _canonical_record(
+                receipt.to_dict()
+            )
+            connection.execute(
+                """
+                INSERT INTO candidate_batches(
+                    request_id, organization_id, repository_id,
+                    batch_digest, batch_json, batch_record_digest,
+                    item_count, receipt_json, receipt_digest,
+                    acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch.request_id,
+                    principal.organization_id,
+                    batch.repository_id,
+                    batch.batch_digest,
+                    batch_json,
+                    batch_record_digest,
+                    len(batch.items),
+                    receipt_json,
+                    receipt_digest,
+                    timestamp,
+                ),
+            )
+            return receipt
+
     def complete(
         self,
         device: Principal,
@@ -474,9 +621,25 @@ class CaptureRequestService:
             _require_live_lease(row, principal, lease_token, now)
             if row["state"] != "running":
                 raise InvalidTransition("capture_request_not_running")
+            stored_batch = connection.execute(
+                """
+                SELECT batch_digest, item_count
+                FROM candidate_batches
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if stored_batch is None:
+                raise InvalidTransition(
+                    "candidate_batch_required"
+                )
+            if stored_batch["batch_digest"] != digest:
+                raise InvalidTransition(
+                    "completion_digest_conflict"
+                )
             state = (
                 "succeeded_no_candidates"
-                if digest == _EMPTY_BATCH_DIGEST
+                if stored_batch["item_count"] == 0
                 else "succeeded"
             )
             code = (
@@ -798,6 +961,160 @@ def _require_code(value: str) -> str:
 def _require_digest(value: str, field_name: str) -> str:
     if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
         raise ValueError(f"{field_name} is invalid")
+    return value
+
+
+def _save_candidate_revision(
+    connection: sqlite3.Connection,
+    organization_id: str,
+    repository_id: str,
+    item: CandidateRevisionUpload,
+) -> None:
+    record_json, record_digest = _canonical_record(
+        item.to_dict()
+    )
+    rows = connection.execute(
+        """
+        SELECT organization_id, repository_id, family_id, revision,
+               revision_id, record_json, record_digest
+        FROM candidate_revisions
+        WHERE (
+            organization_id = ?
+            AND repository_id = ?
+            AND family_id = ?
+            AND revision = ?
+        ) OR (
+            organization_id = ? AND revision_id = ?
+        )
+        """,
+        (
+            organization_id,
+            repository_id,
+            item.family_id,
+            item.revision,
+            organization_id,
+            item.revision_id,
+        ),
+    ).fetchall()
+    for row in rows:
+        if (
+            row["organization_id"] != organization_id
+            or row["repository_id"] != repository_id
+            or row["family_id"] != item.family_id
+            or row["revision"] != item.revision
+            or row["revision_id"] != item.revision_id
+            or row["record_json"] != record_json
+            or row["record_digest"] != record_digest
+        ):
+            raise RequestConflict(
+                "candidate_revision_conflict"
+            )
+    if not rows:
+        try:
+            connection.execute(
+                """
+                INSERT INTO candidate_revisions(
+                    organization_id, repository_id, family_id,
+                    revision, revision_id, record_json, record_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    organization_id,
+                    repository_id,
+                    item.family_id,
+                    item.revision,
+                    item.revision_id,
+                    record_json,
+                    record_digest,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise RequestConflict(
+                "candidate_revision_conflict"
+            ) from error
+
+    head = connection.execute(
+        """
+        SELECT revision, revision_id
+        FROM candidate_family_heads
+        WHERE organization_id = ?
+          AND repository_id = ?
+          AND family_id = ?
+        """,
+        (organization_id, repository_id, item.family_id),
+    ).fetchone()
+    if head is None:
+        if item.revision != 1:
+            raise RequestConflict(
+                "candidate_revision_not_monotonic"
+            )
+        connection.execute(
+            """
+            INSERT INTO candidate_family_heads(
+                organization_id, repository_id, family_id,
+                revision, revision_id
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                organization_id,
+                repository_id,
+                item.family_id,
+                item.revision,
+                item.revision_id,
+            ),
+        )
+        return
+    if head["revision_id"] == item.revision_id:
+        return
+    if item.revision != head["revision"] + 1:
+        raise RequestConflict(
+            "candidate_revision_not_monotonic"
+        )
+    connection.execute(
+        """
+        UPDATE candidate_family_heads
+        SET revision = ?, revision_id = ?
+        WHERE organization_id = ?
+          AND repository_id = ?
+          AND family_id = ?
+        """,
+        (
+            item.revision,
+            item.revision_id,
+            organization_id,
+            repository_id,
+            item.family_id,
+        ),
+    )
+
+
+def _canonical_record(value: object) -> tuple[str, str]:
+    payload = canonical_json_bytes(value)
+    return payload.decode("utf-8"), hashlib.sha256(payload).hexdigest()
+
+
+def _read_canonical(
+    payload: object,
+    expected_digest: object,
+    record_name: str,
+) -> object:
+    if (
+        not isinstance(payload, str)
+        or not isinstance(expected_digest, str)
+        or _DIGEST.fullmatch(expected_digest) is None
+    ):
+        raise RequestConflict("central_candidate_state_corrupt")
+    encoded = payload.encode("utf-8")
+    if hashlib.sha256(encoded).hexdigest() != expected_digest:
+        raise RequestConflict("central_candidate_state_corrupt")
+    try:
+        value = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RequestConflict(
+            "central_candidate_state_corrupt"
+        ) from error
+    if canonical_json_bytes(value) != encoded:
+        raise RequestConflict("central_candidate_state_corrupt")
     return value
 
 

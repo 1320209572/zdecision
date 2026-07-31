@@ -142,6 +142,45 @@
       gap: 12px;
     }
 
+    .candidate-list {
+      display: grid;
+      grid-column: 1 / -1;
+      gap: 12px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+    }
+
+    .candidate {
+      display: grid;
+      gap: 9px;
+      padding: 18px 20px;
+      border-left: 3px solid var(--accent);
+      background: rgba(243, 241, 233, 0.72);
+    }
+
+    .candidate h3,
+    .candidate p,
+    .candidate ul {
+      margin: 0;
+    }
+
+    .candidate h3 {
+      font-size: 18px;
+      font-weight: 600;
+      line-height: 1.5;
+    }
+
+    .candidate p,
+    .candidate li,
+    .candidate-empty {
+      color: var(--muted);
+      font: 500 13px/1.65 "Noto Sans SC", "PingFang SC", sans-serif;
+    }
+
+    .candidate ul {
+      padding-left: 20px;
+    }
+
     button {
       width: 100%;
       min-height: 52px;
@@ -321,6 +360,67 @@
       return response.status === 204 ? null : response.json();
     }
 
+    function candidateLine(label, value) {
+      const line = document.createElement("p");
+      line.textContent = `${label}：${value}`;
+      return line;
+    }
+
+    function renderCandidate(candidate) {
+      const card = document.createElement("section");
+      card.className = "candidate";
+      const claim = document.createElement("h3");
+      claim.textContent = candidate.content.claim;
+      const futureAction = candidateLine(
+        "后续约束",
+        candidate.content.future_action
+      );
+      const scopeSummary = candidateLine(
+        "适用范围",
+        candidate.content.scope_summary
+      );
+      const invalidationTitle = candidateLine("失效条件", "");
+      const invalidationConditions = document.createElement("ul");
+      for (const condition of candidate.content.invalidation_conditions) {
+        const item = document.createElement("li");
+        item.textContent = condition;
+        invalidationConditions.append(item);
+      }
+      card.append(
+        claim,
+        futureAction,
+        scopeSummary,
+        invalidationTitle,
+        invalidationConditions
+      );
+      return card;
+    }
+
+    async function loadCandidates(repositoryId, view) {
+      const candidateList = view.candidateList;
+      candidateList.replaceChildren();
+      try {
+        const result = await requestJson(
+          `/api/v1/repositories/${repositoryId}/candidates`
+        );
+        if (!result.items.length) {
+          const empty = document.createElement("p");
+          empty.className = "candidate-empty";
+          empty.textContent = "当前还没有候选决策。";
+          candidateList.append(empty);
+          return;
+        }
+        for (const candidate of result.items) {
+          candidateList.append(renderCandidate(candidate));
+        }
+      } catch {
+        const failure = document.createElement("p");
+        failure.className = "candidate-empty";
+        failure.textContent = "暂时无法读取候选决策。";
+        candidateList.append(failure);
+      }
+    }
+
     async function follow(repositoryId, view, saved) {
       let requestId = saved.request_id;
       let lastSequence = saved.last_sequence;
@@ -329,7 +429,10 @@
         lastSequence = Math.max(lastSequence, current.last_sequence);
         writeProgress(repositoryId, requestId, lastSequence);
         setStatus(view, current.state);
-        if (!activeStates.has(current.state)) return;
+        if (!activeStates.has(current.state)) {
+          await loadCandidates(repositoryId, view);
+          return;
+        }
 
         const result = await requestJson(
           `/api/v1/capture-requests/${requestId}/events?after_sequence=${saved.last_sequence}`
@@ -345,6 +448,8 @@
             () => follow(repositoryId, view, {request_id: requestId, last_sequence: lastSequence}),
             1500
           );
+        } else {
+          await loadCandidates(repositoryId, view);
         }
       } catch {
         view.status.textContent = "暂时无法读取进度";
@@ -407,12 +512,15 @@
       status.className = "status";
       status.textContent = repository.enabled ? "尚未发起更新" : "此仓库未启用";
       action.append(button, status);
-      article.append(identity, action);
+      const candidateList = document.createElement("div");
+      candidateList.className = "candidate-list";
+      article.append(identity, action, candidateList);
       repositoryList.append(article);
 
       const view = {
         button,
         status,
+        candidateList,
         enabled: repository.enabled
       };
       button.disabled = !repository.enabled;
@@ -421,6 +529,8 @@
       if (saved) {
         button.disabled = true;
         follow(repository.repository_id, view, saved);
+      } else {
+        loadCandidates(repository.repository_id, view);
       }
     }
 

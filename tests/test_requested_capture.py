@@ -221,6 +221,21 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         self.assertEqual((), result.observations)
         self.assertEqual("completed", result.status)
 
+    def test_heartbeat_wraps_each_structured_turn(self) -> None:
+        heartbeats: list[str] = []
+
+        self.runner.run(
+            self.source,
+            product_name="ZDecision",
+            template_id="business",
+            heartbeat=lambda: heartbeats.append("renewed"),
+        )
+
+        self.assertEqual(
+            ["renewed", "renewed", "renewed", "renewed"],
+            heartbeats,
+        )
+
     def test_noninteractive_or_wrong_cwd_source_is_excluded(self) -> None:
         from zdecision.app_server.requested_capture import SourceNotInteractive
 

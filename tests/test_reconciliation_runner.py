@@ -229,6 +229,21 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertEqual(1, self.gateway.started_threads)
         self.assertEqual(1, self.gateway.started_turns)
 
+    def test_heartbeat_wraps_the_structured_turn(self) -> None:
+        heartbeats: list[str] = []
+
+        self.runner.run(
+            request_id=REQUEST_ID,
+            repository_id=REPOSITORY_ID,
+            cwd=str(self.root),
+            observations=(self.observation,),
+            current=(),
+            profile=self.gateway.profile,
+            heartbeat=lambda: heartbeats.append("renewed"),
+        )
+
+        self.assertEqual(["renewed", "renewed"], heartbeats)
+
     def test_unknown_turn_result_is_adopted_without_duplicate(self) -> None:
         from zdecision.agent.request_state import CaptureResultUnknown
 
