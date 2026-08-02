@@ -37,6 +37,7 @@ def render_launch_agent(
         ],
         "EnvironmentVariables": {
             "ZDECISION_STATE_DIR": state_path,
+            "PATH": os.environ.get("PATH") or os.defpath,
         },
         "RunAtLoad": True,
         "KeepAlive": True,

@@ -4,6 +4,7 @@ import plistlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from zdecision.agent.launchd import (
@@ -41,13 +42,15 @@ class LaunchAgentTest(unittest.TestCase):
         )
 
     def test_plist_runs_persistent_service_without_secrets_in_arguments(self) -> None:
-        rendered = render_launch_agent(
-            executable="/opt/zdecision/bin/zdecision-agent",
-            state_dir="/Users/demo/Library/Application Support/ZDecision",
-            config_path=(
-                "/Users/demo/Library/Application Support/ZDecision/agent.json"
-            ),
-        )
+        launch_path = "/opt/codex/bin:/opt/node/bin:/usr/bin:/bin"
+        with patch.dict("os.environ", {"PATH": launch_path}):
+            rendered = render_launch_agent(
+                executable="/opt/zdecision/bin/zdecision-agent",
+                state_dir="/Users/demo/Library/Application Support/ZDecision",
+                config_path=(
+                    "/Users/demo/Library/Application Support/ZDecision/agent.json"
+                ),
+            )
         parsed = plistlib.loads(rendered.encode("utf-8"))
 
         self.assertEqual(LABEL, parsed["Label"])
@@ -64,6 +67,10 @@ class LaunchAgentTest(unittest.TestCase):
         self.assertTrue(parsed["RunAtLoad"])
         self.assertTrue(parsed["KeepAlive"])
         self.assertEqual(10, parsed["ThrottleInterval"])
+        self.assertEqual(
+            launch_path,
+            parsed["EnvironmentVariables"]["PATH"],
+        )
         self.assertIn("<key>KeepAlive</key><true/>", compact(rendered))
         self.assertNotIn(DEVICE_TOKEN, rendered)
 
