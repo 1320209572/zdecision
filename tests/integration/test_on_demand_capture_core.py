@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -143,6 +144,10 @@ class FakeAppServerGateway:
             discovery_digest="a" * 64,
             discovered_at="2026-07-31T06:00:00Z",
         )
+        self.catalog_digest = "a" * 64
+        self.active_profile_resolutions = 0
+        self.frozen_profile_checks = 0
+        self.observed_catalog_digests: list[str] = []
         self.capture_source_by_fork: dict[str, tuple[str, str]] = {}
         self.source_context_by_boundary: dict[tuple[str, str], str] = {}
         self.source_context_by_fork: dict[str, str] = {}
@@ -202,6 +207,27 @@ class FakeAppServerGateway:
         self, boundary: SourceBoundary
     ) -> FeasibilityModelProfile:
         return self.profile
+
+    def resolve_active_profile(self) -> FeasibilityModelProfile:
+        self.active_profile_resolutions += 1
+        self.observed_catalog_digests.append(self.catalog_digest)
+        return self.profile
+
+    def require_supported_profile(
+        self, profile: FeasibilityModelProfile
+    ) -> FeasibilityModelProfile:
+        self.frozen_profile_checks += 1
+        self.observed_catalog_digests.append(self.catalog_digest)
+        if (
+            profile.model_id != self.profile.model_id
+            or profile.reasoning_effort != self.profile.reasoning_effort
+        ):
+            from zdecision.app_server.gateway import (
+                FrozenModelProfileUnavailable,
+            )
+
+            raise FrozenModelProfileUnavailable("profile is unsupported")
+        return profile
 
     def fork_disposable_thread(
         self,
@@ -421,6 +447,93 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             "succeeded", events.json()["events"][-1]["state"]
         )
         self._assert_central_has_no_raw_source()
+
+    def test_catalog_change_keeps_one_request_profile_across_restart(
+        self,
+    ) -> None:
+        self._observe(SESSION_A, TURN_A1, self.registered_repository)
+        self._observe(SESSION_B, TURN_B1, self.registered_repository)
+        self._drain_hooks()
+        request_id = self._click("web_action_profile_restart")
+        self.gateway.drop_next_stage_result = "inventory"
+
+        self.assertTrue(self._run_agent_once())
+        self.assertEqual(
+            "failed_retryable", self._request(request_id)["state"]
+        )
+        sources = self.session_index.freeze_sources(
+            request_id,
+            self.repository_id,
+            self.clock(),
+            capture_scope="all_valid_sessions",
+        )
+        frozen_profile = self.session_index.request_model_profile(request_id)
+        self.assertIsNotNone(frozen_profile)
+
+        self.gateway.catalog_digest = "b" * 64
+        self._restart_local()
+        self._retry_request()
+
+        self.assertEqual("succeeded", self._request(request_id)["state"])
+        replayed_profile = self.session_index.request_model_profile(request_id)
+        self.assertEqual(frozen_profile, replayed_profile)
+        with closing(sqlite3.connect(self.agent_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT frozen_json, status
+                FROM capture_operations
+                WHERE request_id = ?
+                ORDER BY source_key
+                """,
+                (request_id,),
+            ).fetchall()
+        self.assertEqual(2, len(rows))
+        self.assertEqual({"committed"}, {row[1] for row in rows})
+        self.assertEqual(
+            {frozen_profile.profile_id},
+            {
+                json.loads(row[0])["model_profile_id"]
+                for row in rows
+            },
+        )
+        self.assertEqual(1, self.gateway.active_profile_resolutions)
+        self.assertEqual(1, self.gateway.frozen_profile_checks)
+        self.assertEqual(
+            ["a" * 64, "b" * 64],
+            self.gateway.observed_catalog_digests,
+        )
+        self.assertTrue(
+            all(
+                self.session_index.handled_turn(source.source_key)
+                == source.upper_turn_id
+                for source in sources
+            )
+        )
+        self.assertEqual(1, self._central_count("candidate_batches", request_id))
+
+    def test_pre_amendment_null_profile_is_filled_before_first_operation(
+        self,
+    ) -> None:
+        self._observe(SESSION_A, TURN_A1, self.registered_repository)
+        self._drain_hooks()
+        request_id = self._click("web_action_pre_amendment_profile")
+        self.session_index.freeze_sources(
+            request_id,
+            self.repository_id,
+            self.clock(),
+            capture_scope="all_valid_sessions",
+        )
+        self.assertIsNone(
+            self.session_index.request_model_profile(request_id)
+        )
+        self._restart_local()
+
+        self.assertTrue(self._run_agent_once())
+
+        profile = self.session_index.request_model_profile(request_id)
+        self.assertIsNotNone(profile)
+        operation = self._capture_operation(request_id)
+        self.assertEqual(profile.profile_id, operation.frozen.model_profile_id)
 
     def test_no_click_runs_no_model_and_zero_candidates_is_success(
         self,
