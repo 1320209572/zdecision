@@ -91,7 +91,26 @@ class LocalMcpTools:
         self, control_id: str | None = None
     ) -> CallToolResult:
         binding = self._valid_binding(control_id)
-        enabled = binding is not None
+        selected = binding is not None and binding.chosen_scope is not None
+        request_attached = bool(
+            binding is not None and binding.central_request_id is not None
+        )
+        enabled = binding is not None and not selected
+        safe_state = (
+            "ready"
+            if enabled
+            else "queued"
+            if request_attached
+            else "submitting"
+            if selected
+            else "disabled"
+        )
+        meta: dict[str, object] = {}
+        if binding is not None:
+            meta["zdecision/control_id"] = binding.control_id
+        if selected:
+            meta["zdecision/chosen_scope"] = binding.chosen_scope
+            meta["zdecision/request_attached"] = request_attached
         return CallToolResult(
             content=[
                 TextContent(
@@ -101,13 +120,9 @@ class LocalMcpTools:
             ],
             structuredContent={
                 "actions_enabled": enabled,
-                "safe_state": "ready" if enabled else "disabled",
+                "safe_state": safe_state,
             },
-            _meta=(
-                {"zdecision/control_id": binding.control_id}
-                if binding is not None
-                else {}
-            ),
+            _meta=meta,
         )
 
     def start_zdecision_candidate_refresh(
@@ -138,6 +153,11 @@ class LocalMcpTools:
         if binding.central_request_id is not None:
             return self._read_request(binding)
 
+        return self._create_and_attach_request(binding)
+
+    def _create_and_attach_request(
+        self, binding: ControlBinding
+    ) -> dict[str, object]:
         command = CaptureRequestCreate(
             repository_id=binding.repository_id,
             template_id="business",
@@ -149,6 +169,11 @@ class LocalMcpTools:
         except CentralClientError as error:
             if error.code == "repository_capture_busy":
                 return _safe_output("busy")
+            if error.code in (
+                "central_connection_unavailable",
+                "central_temporarily_unavailable",
+            ):
+                return _safe_output("submitting")
             return _safe_output("unavailable")
         except Exception:
             return _safe_output("unavailable")
@@ -169,8 +194,12 @@ class LocalMcpTools:
         self, control_id: str
     ) -> dict[str, object]:
         binding = self._valid_binding(control_id)
-        if binding is None or binding.central_request_id is None:
+        if binding is None:
             return _safe_output("unavailable")
+        if binding.central_request_id is None:
+            return _safe_output(
+                "submitting" if binding.chosen_scope is not None else "unavailable"
+            )
         return self._read_request(binding)
 
     def _read_request(self, binding: ControlBinding) -> dict[str, object]:

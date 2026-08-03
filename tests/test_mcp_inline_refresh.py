@@ -386,7 +386,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.binding_store.get(busy_control).central_request_id
         )
 
-    async def test_lost_response_replay_adopts_request_with_same_action(
+    async def test_lost_response_stays_submitting_until_same_action_is_adopted(
         self,
     ) -> None:
         domain = self.domain()
@@ -399,7 +399,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             CONTROL_ID, "current_session"
         )
 
-        self.assertEqual("unavailable", lost["safe_state"])
+        self.assertEqual("submitting", lost["safe_state"])
         self.assertEqual("queued", replay["safe_state"])
         self.assertEqual(2, len(self.client.create_calls))
         self.assertEqual(
@@ -410,6 +410,24 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             REQUEST_ID,
             self.binding_store.get(CONTROL_ID).central_request_id,
         )
+
+    async def test_pending_submission_status_tool_remains_read_only(self) -> None:
+        domain = self.domain()
+        self.client.lose_first_response = True
+
+        started = domain.start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+        status = domain.get_zdecision_candidate_refresh(CONTROL_ID)
+
+        self.assertEqual("submitting", started["safe_state"])
+        self.assertEqual("submitting", status["safe_state"])
+        self.assertEqual(1, len(self.client.create_calls))
+        self.assertEqual([], self.client.get_calls)
+        binding = self.binding_store.get(CONTROL_ID)
+        self.assertEqual("current_session", binding.chosen_scope)
+        self.assertEqual("codex_action_first", binding.client_action_id)
+        self.assertIsNone(binding.central_request_id)
 
     async def test_selected_request_status_uses_frozen_binding_without_git(
         self,
@@ -818,6 +836,158 @@ vm.runInThisContext(shippedScript);
             completed.stderr or completed.stdout,
         )
         self.assertEqual("bridge-regression-ok", completed.stdout)
+
+    async def test_widget_remount_replays_only_pending_persisted_scope(
+        self,
+    ) -> None:
+        html = mcp_server.UPDATE_CANDIDATES_PATH.read_text("utf-8")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        harness = f"""
+const vm = require("node:vm");
+const shippedScript = {json.dumps(script)};
+
+function check(condition, message) {{
+  if (!condition) throw new Error(message);
+}}
+
+async function mount(renderResult) {{
+  const outbound = [];
+  const timers = [];
+  let messageHandler = null;
+
+  class Element {{
+    constructor() {{
+      this.disabled = false;
+      this.hidden = false;
+      this.textContent = "";
+      this.listeners = new Map();
+    }}
+
+    addEventListener(name, listener) {{
+      const listeners = this.listeners.get(name) || [];
+      listeners.push(listener);
+      this.listeners.set(name, listeners);
+    }}
+  }}
+
+  const elements = Object.fromEntries(
+    ["current", "all", "open-page", "page-address", "status"].map(
+      (id) => [id, new Element()],
+    ),
+  );
+  const host = {{ postMessage(message) {{ outbound.push(message); }} }};
+  const sandbox = {{
+    document: {{ getElementById: (id) => elements[id] }},
+    window: {{
+      parent: host,
+      addEventListener(name, listener) {{
+        if (name === "message") messageHandler = listener;
+      }},
+    }},
+    setTimeout(callback, delay) {{
+      timers.push({{ callback, delay }});
+      return timers.length;
+    }},
+    clearTimeout() {{}},
+  }};
+  vm.runInNewContext(shippedScript, sandbox);
+
+  function deliver(message) {{
+    messageHandler({{ source: host, data: message }});
+  }}
+
+  function latestToolCall(name) {{
+    return [...outbound].reverse().find(
+      (message) => message.method === "tools/call" && message.params?.name === name,
+    );
+  }}
+
+  const initialize = outbound.find((message) => message.method === "ui/initialize");
+  check(initialize, "widget did not initialize the bridge");
+  deliver({{
+    jsonrpc: "2.0",
+    id: initialize.id,
+    result: {{ hostCapabilities: {{ serverTools: {{}} }} }},
+  }});
+  await Promise.resolve();
+  deliver({{
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: renderResult,
+  }});
+  await Promise.resolve();
+  return {{ elements, timers, latestToolCall }};
+}}
+
+(async () => {{
+  const controlId = "ctl_11111111111111111111111111111111";
+  const pending = await mount({{
+    content: [],
+    structuredContent: {{ actions_enabled: false, safe_state: "submitting" }},
+    _meta: {{
+      "zdecision/control_id": controlId,
+      "zdecision/chosen_scope": "all_valid_sessions",
+      "zdecision/request_attached": false,
+    }},
+  }});
+  check(
+    pending.elements.current.disabled && pending.elements.all.disabled,
+    "persisted selection did not lock both actions",
+  );
+  const replay = pending.latestToolCall("start_zdecision_candidate_refresh");
+  check(replay, "pending remount did not replay the authorized submission");
+  check(replay.params.arguments.control_id === controlId, "replay lost trusted control");
+  check(
+    replay.params.arguments.scope === "all_valid_sessions",
+    "replay replaced the persisted scope",
+  );
+
+  const attached = await mount({{
+    content: [],
+    structuredContent: {{ actions_enabled: false, safe_state: "queued" }},
+    _meta: {{
+      "zdecision/control_id": controlId,
+      "zdecision/chosen_scope": "current_session",
+      "zdecision/request_attached": true,
+    }},
+  }});
+  check(
+    attached.elements.current.disabled && attached.elements.all.disabled,
+    "attached remount did not lock both actions",
+  );
+  check(
+    !attached.latestToolCall("start_zdecision_candidate_refresh"),
+    "attached remount submitted again",
+  );
+  if (!attached.latestToolCall("get_zdecision_candidate_refresh") && attached.timers.length) {{
+    attached.timers.shift().callback();
+    await Promise.resolve();
+  }}
+  check(
+    attached.latestToolCall("get_zdecision_candidate_refresh"),
+    "attached remount did not use the read-only status tool",
+  );
+  process.stdout.write("remount-recovery-ok");
+}})().catch((error) => {{
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+}});
+"""
+
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(
+            0,
+            completed.returncode,
+            completed.stderr or completed.stdout,
+        )
+        self.assertEqual("remount-recovery-ok", completed.stdout)
 
     async def test_widget_reports_open_page_result_and_remains_retryable(
         self,

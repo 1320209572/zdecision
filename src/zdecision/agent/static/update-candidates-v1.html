@@ -204,6 +204,7 @@
       ]);
       const labels = {
         creating: "正在创建更新请求",
+        submitting: "正在提交更新请求",
         queued: "等待本地设备",
         capturing: "正在整理候选决策",
         syncing: "正在同步候选决策",
@@ -218,6 +219,9 @@
       let initialized = false;
       let initialResultAccepted = false;
       let selected = false;
+      let chosenScope = null;
+      let requestAttached = false;
+      let recoveryStarted = false;
       let controlId = null;
       let safeState = "disabled";
       let pageUrl = null;
@@ -272,8 +276,8 @@
           };
         }
         const knownStates = new Set([
-          "queued", "capturing", "syncing", "retrying", "busy",
-          "unavailable", "failed", "empty", "succeeded",
+          "submitting", "queued", "capturing", "syncing", "retrying",
+          "busy", "unavailable", "failed", "empty", "succeeded",
         ]);
         const candidateRevisionCount =
           Number.isSafeInteger(value.candidate_revision_count) &&
@@ -311,16 +315,38 @@
       function acceptInitialResult(result) {
         const initial = result?.structuredContent;
         const enabled = initial?.actions_enabled;
-        const expectedState = enabled === true ? "ready" : "disabled";
+        const meta = result?._meta;
+        const metaControl = meta?.["zdecision/control_id"];
+        const persistedScope = meta?.["zdecision/chosen_scope"];
+        const hasPersistedScope =
+          persistedScope === "current_session"
+          || persistedScope === "all_valid_sessions";
+        const persistedRequestAttached = meta?.["zdecision/request_attached"];
+        const hasPersistedSelection =
+          hasPersistedScope && typeof persistedRequestAttached === "boolean";
+        const expectedState = enabled === true
+          ? "ready"
+          : hasPersistedSelection
+          ? persistedRequestAttached ? "queued" : "submitting"
+          : "disabled";
         const isRenderResult =
           typeof enabled === "boolean" && initial?.safe_state === expectedState;
         if (initialResultAccepted || selected || !isRenderResult) return;
 
-        const metaControl = result?._meta?.["zdecision/control_id"];
         if (enabled && typeof metaControl !== "string") return;
+        if (hasPersistedSelection && typeof metaControl !== "string") return;
         initialResultAccepted = true;
-        controlId = enabled && typeof metaControl === "string" ? metaControl : null;
-        safeState = controlId ? "ready" : "disabled";
+        controlId = typeof metaControl === "string" ? metaControl : null;
+        if (hasPersistedSelection) {
+          selected = true;
+          chosenScope = persistedScope;
+          requestAttached = persistedRequestAttached;
+          renderResult(result);
+          lockActions();
+          resumeSelectedBinding();
+          return;
+        }
+        safeState = controlId && enabled ? "ready" : "disabled";
         status.textContent = "";
         updateInitialAvailability();
       }
@@ -363,9 +389,10 @@
         if (activeStates.has(safeState)) setTimeout(poll, 1500);
       }
 
-      async function start(scope) {
-        if (selected || !controlId) return;
+      async function start(scope, replay = false) {
+        if ((!replay && selected) || !controlId) return;
         selected = true;
+        chosenScope = scope;
         lockActions();
         safeState = "creating";
         status.textContent = labels.creating;
@@ -378,6 +405,16 @@
           if (activeStates.has(safeState)) setTimeout(poll, 1500);
         } catch {
           renderResult({ structuredContent: { safe_state: "unavailable" } });
+        }
+      }
+
+      function resumeSelectedBinding() {
+        if (!initialized || recoveryStarted || !selected || !controlId) return;
+        recoveryStarted = true;
+        if (safeState === "submitting" && !requestAttached) {
+          start(chosenScope, true);
+        } else if (requestAttached && activeStates.has(safeState)) {
+          setTimeout(poll, 1500);
         }
       }
 
@@ -414,6 +451,7 @@
           initialized = true;
           notify("ui/notifications/initialized", {});
           updateInitialAvailability();
+          resumeSelectedBinding();
         })
         .catch(() => {
           lockActions();
