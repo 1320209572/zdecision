@@ -26,6 +26,9 @@ CaptureRequestState = Literal[
 ]
 CaptureScope = Literal["current_session", "all_valid_sessions"]
 
+CAPTURE_REQUEST_LEASE_SECONDS = 30
+CAPTURE_REQUEST_RENEW_INTERVAL_SECONDS = 10.0
+
 _REQUEST_STATES = frozenset(
     (
         "queued",

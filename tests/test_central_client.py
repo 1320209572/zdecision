@@ -364,6 +364,33 @@ class CentralClientTest(unittest.TestCase):
             client.close()
         self.assertEqual(2, len(transport.requests))
 
+    def test_ambiguous_transport_failure_is_sanitized_without_retry(self) -> None:
+        transport = RecordingTransport(
+            [
+                httpx.ReadTimeout(
+                    "contains-secret",
+                    request=httpx.Request("POST", BASE_URL),
+                )
+            ]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(transport),
+            sleeper=lambda _: self.fail(
+                "ambiguous transport failure must not retry"
+            ),
+        )
+        try:
+            with self.assertRaisesRegex(
+                CentralClientError, "central_connection_unavailable"
+            ):
+                client.claim_next()
+        finally:
+            client.close()
+
+        self.assertEqual(1, len(transport.requests))
+
 
 if __name__ == "__main__":
     unittest.main()

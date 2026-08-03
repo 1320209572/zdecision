@@ -229,6 +229,10 @@ class CentralClient:
                     ) from error
                 self.sleeper(_retry_delay(attempt))
                 continue
+            except httpx.TransportError as error:
+                raise CentralClientError(
+                    "central_connection_unavailable"
+                ) from error
             try:
                 if _retryable_status(response.status_code):
                     if attempt + 1 == _MAX_ATTEMPTS:

@@ -26,6 +26,7 @@ from zdecision.central.service import (
     RequestNotFound,
 )
 from zdecision.sync.contracts import (
+    CAPTURE_REQUEST_LEASE_SECONDS,
     CandidateBatchUpload,
     CaptureRequestCreate,
 )
@@ -218,7 +219,7 @@ def create_app(
         claimed = service.claim_next(
             device(authorization),
             current_time(),
-            lease_seconds=30,
+            lease_seconds=CAPTURE_REQUEST_LEASE_SECONDS,
         )
         if claimed is None:
             return Response(status_code=204)
@@ -248,7 +249,7 @@ def create_app(
             request_id,
             body.lease_token,
             current_time(),
-            lease_seconds=30,
+            lease_seconds=CAPTURE_REQUEST_LEASE_SECONDS,
         )
         return Response(status_code=204)
 
