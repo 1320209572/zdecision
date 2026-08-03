@@ -11,6 +11,7 @@ from pathlib import Path
 from zdecision.agent.db import (
     AgentDatabase,
     FeasibilityModelProfileConflict,
+    StoredFeasibilityModelProfile,
 )
 from zdecision.app_server.jsonl import (
     AppServerTransport,
@@ -43,6 +44,14 @@ class IncompleteSourceTurn(AppServerGatewayError):
 
 class ModelDiscoveryConflict(AppServerGatewayError):
     """The model catalog changed after the Gate 3 profile was frozen."""
+
+
+class ActiveModelProfileResolutionConflict(AppServerGatewayError):
+    """A concurrent active profile cannot run against the observed catalog."""
+
+
+class FrozenModelProfileUnavailable(AppServerGatewayError):
+    """A profile frozen by a Capture operation is no longer supported."""
 
 
 class StructuredTurnFailed(AppServerGatewayError):
@@ -243,6 +252,50 @@ class AppServerGateway:
             discovery_digest=stored.discovery_digest,
             discovered_at=stored.discovered_at,
         )
+
+    def resolve_active_profile(self) -> FeasibilityModelProfile:
+        catalog = self._discover_models()
+        stored = self.database.get_feasibility_model_profile()
+        active = None if stored is None else _stored_profile(stored)
+        if active is not None and _profile_supported(catalog, active):
+            return active
+
+        default_model, default_effort = _select_default_model(catalog)
+        discovery_digest = hashlib.sha256(
+            canonical_json_bytes({"models": catalog})
+        ).hexdigest()
+        proposed = FeasibilityModelProfile.create(
+            model_id=default_model,
+            reasoning_effort=default_effort,
+            discovery_digest=discovery_digest,
+            discovered_at=_format_datetime(self.clock()),
+        )
+        winner = self.database.activate_feasibility_model_profile(
+            expected_profile_id=None if active is None else active.profile_id,
+            profile_id=proposed.profile_id,
+            model_id=proposed.model_id,
+            reasoning_effort=proposed.reasoning_effort,
+            discovery_digest=proposed.discovery_digest,
+            discovered_at=proposed.discovered_at,
+        )
+        resolved = _stored_profile(winner)
+        if not _profile_supported(catalog, resolved):
+            raise ActiveModelProfileResolutionConflict(
+                "The active model profile changed during discovery"
+            )
+        return resolved
+
+    def require_supported_profile(
+        self, profile: FeasibilityModelProfile
+    ) -> FeasibilityModelProfile:
+        if not isinstance(profile, FeasibilityModelProfile):
+            raise TypeError("profile must be a FeasibilityModelProfile")
+        catalog = self._discover_models()
+        if not _profile_supported(catalog, profile):
+            raise FrozenModelProfileUnavailable(
+                "The frozen Capture model profile is unavailable"
+            )
+        return profile
 
     def list_interactive_thread_ids(self, cwd: str) -> frozenset[str]:
         resolved_cwd = _resolved_cwd(cwd)
@@ -561,6 +614,54 @@ def _validate_model(model: Mapping[str, object]) -> None:
         seen.add(effort)
 
 
+def _stored_profile(
+    stored: StoredFeasibilityModelProfile,
+) -> FeasibilityModelProfile:
+    return FeasibilityModelProfile(
+        profile_id=stored.profile_id,
+        model_id=stored.model_id,
+        reasoning_effort=stored.reasoning_effort,
+        discovery_digest=stored.discovery_digest,
+        discovered_at=stored.discovered_at,
+    )
+
+
+def _profile_supported(
+    catalog: list[dict[str, object]], profile: FeasibilityModelProfile
+) -> bool:
+    model = next(
+        (value for value in catalog if value["id"] == profile.model_id),
+        None,
+    )
+    if model is None:
+        return False
+    return profile.reasoning_effort in {
+        value["reasoningEffort"]
+        for value in model["supportedReasoningEfforts"]
+    }
+
+
+def _select_default_model(
+    catalog: list[dict[str, object]],
+) -> tuple[str, str]:
+    defaults = [value for value in catalog if value["isDefault"] is True]
+    if len(defaults) != 1:
+        raise InvalidAppServerResponse(
+            "model/list must return exactly one default model"
+        )
+    selected = defaults[0]
+    default_effort = selected["defaultReasoningEffort"]
+    supported = {
+        value["reasoningEffort"]
+        for value in selected["supportedReasoningEfforts"]
+    }
+    if default_effort not in supported:
+        raise InvalidAppServerResponse(
+            "default reasoning effort is not supported"
+        )
+    return selected["id"], default_effort
+
+
 def _select_model(
     catalog: list[dict[str, object]], boundary: SourceBoundary
 ) -> tuple[str, str]:
@@ -575,12 +676,7 @@ def _select_model(
             }
             if boundary.reasoning_effort in supported:
                 return boundary.model_id, boundary.reasoning_effort
-    defaults = [value for value in catalog if value["isDefault"] is True]
-    if len(defaults) != 1:
-        raise InvalidAppServerResponse(
-            "model/list must return exactly one default model"
-        )
-    return defaults[0]["id"], defaults[0]["defaultReasoningEffort"]
+    return _select_default_model(catalog)
 
 
 def _is_completed_turn_notification(

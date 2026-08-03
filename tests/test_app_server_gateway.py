@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import queue
 import tempfile
@@ -9,13 +10,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from zdecision.agent.db import AgentDatabase
+from zdecision.agent.db import AgentDatabase, StoredFeasibilityModelProfile
 from zdecision.app_server.gateway import (
+    ActiveModelProfileResolutionConflict,
     AppServerGateway,
     AppServerUnavailable,
+    FrozenModelProfileUnavailable,
     IncompleteSourceTurn,
     InvalidAppServerResponse,
-    ModelDiscoveryConflict,
     UnknownSourceTurn,
 )
 from zdecision.app_server.jsonl import (
@@ -29,6 +31,7 @@ from zdecision.app_server.jsonl import (
     UnexpectedServerRequest,
 )
 from zdecision.app_server.models import FeasibilityModelProfile, SourceBoundary
+from zdecision.jsonio import canonical_json_bytes
 
 
 FIXED_TIME = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
@@ -138,35 +141,58 @@ class FakeProcess:
         self.returncode = -9
 
 
-def model_catalog(*, default_model: str = "model-default") -> dict[str, object]:
-    return {
-        "data": [
+def model_catalog(
+    *,
+    default_model: str = "model-default",
+    extra_model: str | None = None,
+    omit_model: str | None = None,
+) -> dict[str, object]:
+    models = [
+        {
+            "id": "model-source",
+            "model": "model-source",
+            "displayName": "Source",
+            "description": "Source fixture",
+            "hidden": False,
+            "isDefault": False,
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low", "description": "Low"},
+                {"reasoningEffort": "high", "description": "High"},
+            ],
+        },
+        {
+            "id": default_model,
+            "model": default_model,
+            "displayName": "Default",
+            "description": "Default fixture",
+            "hidden": False,
+            "isDefault": True,
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "medium", "description": "Medium"},
+            ],
+        },
+    ]
+    if extra_model is not None:
+        models.append(
             {
-                "id": "model-source",
-                "model": "model-source",
-                "displayName": "Source",
-                "description": "Source fixture",
+                "id": extra_model,
+                "model": extra_model,
+                "displayName": "Extra",
+                "description": "Extra fixture",
                 "hidden": False,
                 "isDefault": False,
                 "defaultReasoningEffort": "medium",
                 "supportedReasoningEfforts": [
-                    {"reasoningEffort": "low", "description": "Low"},
-                    {"reasoningEffort": "high", "description": "High"},
-                ],
-            },
-            {
-                "id": default_model,
-                "model": default_model,
-                "displayName": "Default",
-                "description": "Default fixture",
-                "hidden": False,
-                "isDefault": True,
-                "defaultReasoningEffort": "medium",
-                "supportedReasoningEfforts": [
                     {"reasoningEffort": "medium", "description": "Medium"},
                 ],
-            },
-        ],
+            }
+        )
+    if omit_model is not None:
+        models = [model for model in models if model["id"] != omit_model]
+    return {
+        "data": models,
         "nextCursor": None,
     }
 
@@ -535,24 +561,120 @@ class AppServerGatewayTests(unittest.TestCase):
         self.assertEqual("medium", profile.reasoning_effort)
         self.assertTrue(profile.profile_id.startswith("fmp_"))
 
-    def test_conflicting_catalog_digest_stops_gate_three(self):
-        boundary = SourceBoundary(
-            thread_id=SOURCE_THREAD,
-            turn_id=SOURCE_TURN,
-            cwd=str(self.root),
-            status="completed",
-            model_id=None,
-            reasoning_effort=None,
-        )
-        gateway = self._gateway(
-            ScriptedClient(
-                [model_catalog(), model_catalog(default_model="changed-default")]
-            )
-        )
-        gateway.discover_and_freeze_profile(boundary)
+    def test_catalog_change_reuses_still_supported_active_profile(self):
+        first_catalog = model_catalog()
+        changed_catalog = model_catalog(extra_model="model-added")
+        gateway = self._gateway(ScriptedClient([first_catalog, changed_catalog]))
 
-        with self.assertRaises(ModelDiscoveryConflict):
-            gateway.discover_and_freeze_profile(boundary)
+        first = gateway.resolve_active_profile()
+        replay = gateway.resolve_active_profile()
+
+        self.assertEqual(first, replay)
+        self.assertNotEqual(
+            hashlib.sha256(
+                canonical_json_bytes({"models": first_catalog["data"]})
+            ).hexdigest(),
+            hashlib.sha256(
+                canonical_json_bytes({"models": changed_catalog["data"]})
+            ).hexdigest(),
+        )
+
+    def test_removed_active_profile_rotates_to_returned_default(self):
+        gateway = self._gateway(
+            ScriptedClient([
+                model_catalog(default_model="model-old"),
+                model_catalog(default_model="model-new", omit_model="model-old"),
+            ])
+        )
+
+        old = gateway.resolve_active_profile()
+        new = gateway.resolve_active_profile()
+
+        self.assertEqual("model-old", old.model_id)
+        self.assertEqual("model-new", new.model_id)
+        self.assertNotEqual(old.profile_id, new.profile_id)
+        self.assertEqual(
+            new.profile_id,
+            self.database.get_feasibility_model_profile().profile_id,
+        )
+
+    def test_stale_profile_rotation_returns_the_cas_winner(self):
+        other = AgentDatabase.open(self.root / "agent.sqlite3")
+        self.addCleanup(other.close)
+
+        def activate(database, expected_profile_id, model_id, digest):
+            profile = FeasibilityModelProfile.create(
+                model_id=model_id,
+                reasoning_effort="medium",
+                discovery_digest=digest,
+                discovered_at="2026-07-30T12:00:00.000000Z",
+            )
+            return database.activate_feasibility_model_profile(
+                expected_profile_id=expected_profile_id,
+                profile_id=profile.profile_id,
+                model_id=profile.model_id,
+                reasoning_effort=profile.reasoning_effort,
+                discovery_digest=profile.discovery_digest,
+                discovered_at=profile.discovered_at,
+            )
+
+        old = activate(self.database, None, "model-old", "a" * 64)
+        winner = activate(
+            self.database, old.profile_id, "model-winner", "b" * 64
+        )
+
+        stale_result = activate(
+            other, old.profile_id, "model-loser", "c" * 64
+        )
+
+        self.assertEqual(winner, stale_result)
+        self.assertEqual(
+            winner,
+            self.database.get_feasibility_model_profile(),
+        )
+
+    def test_supported_frozen_profile_is_returned_unchanged(self):
+        profile = FeasibilityModelProfile.create(
+            model_id="model-default",
+            reasoning_effort="medium",
+            discovery_digest="a" * 64,
+            discovered_at="2026-07-30T12:00:00.000000Z",
+        )
+        gateway = self._gateway(ScriptedClient([model_catalog()]))
+
+        result = gateway.require_supported_profile(profile)
+
+        self.assertIs(profile, result)
+
+    def test_unsupported_frozen_profile_fails_without_substitution(self):
+        profile = FeasibilityModelProfile.create(
+            model_id="model-removed",
+            reasoning_effort="medium",
+            discovery_digest="a" * 64,
+            discovered_at="2026-07-30T12:00:00.000000Z",
+        )
+        gateway = self._gateway(ScriptedClient([model_catalog()]))
+
+        with self.assertRaises(FrozenModelProfileUnavailable):
+            gateway.require_supported_profile(profile)
+
+    def test_unsupported_concurrent_rotation_winner_requires_fresh_discovery(self):
+        unsupported = StoredFeasibilityModelProfile(
+            profile_id="fmp_" + "1" * 32,
+            model_id="model-concurrent",
+            reasoning_effort="medium",
+            discovery_digest="a" * 64,
+            discovered_at="2026-07-30T12:00:00.000000Z",
+        )
+        gateway = self._gateway(ScriptedClient([model_catalog()]))
+
+        with patch.object(
+            self.database,
+            "activate_feasibility_model_profile",
+            return_value=unsupported,
+        ):
+            with self.assertRaises(ActiveModelProfileResolutionConflict):
+                gateway.resolve_active_profile()
 
     def test_structured_turn_pins_profile_and_returns_native_completed_receipt(self):
         profile = FeasibilityModelProfile.create(

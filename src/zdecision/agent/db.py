@@ -664,6 +664,91 @@ class AgentDatabase:
             )
         return stored
 
+    def activate_feasibility_model_profile(
+        self,
+        *,
+        expected_profile_id: str | None,
+        profile_id: str,
+        model_id: str,
+        reasoning_effort: str,
+        discovery_digest: str,
+        discovered_at: str,
+    ) -> StoredFeasibilityModelProfile:
+        """Activate a profile when the caller still owns the observed version."""
+        if expected_profile_id is not None and (
+            _MODEL_PROFILE_ID.fullmatch(expected_profile_id) is None
+        ):
+            raise ValueError("expected_profile_id is invalid")
+        if _MODEL_PROFILE_ID.fullmatch(profile_id) is None:
+            raise ValueError("profile_id is invalid")
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError("model_id is invalid")
+        if not isinstance(reasoning_effort, str) or not reasoning_effort:
+            raise ValueError("reasoning_effort is invalid")
+        if _DIGEST.fullmatch(discovery_digest) is None:
+            raise ValueError("discovery_digest is invalid")
+        _parse_datetime(discovered_at)
+
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                """
+                SELECT profile_id, model_id, reasoning_effort,
+                       discovery_digest, discovered_at
+                FROM feasibility_model_profile WHERE singleton_id = 1
+                """
+            ).fetchone()
+            current = (
+                None
+                if row is None
+                else StoredFeasibilityModelProfile(
+                    profile_id=row["profile_id"],
+                    model_id=row["model_id"],
+                    reasoning_effort=row["reasoning_effort"],
+                    discovery_digest=row["discovery_digest"],
+                    discovered_at=row["discovered_at"],
+                )
+            )
+            current_id = None if current is None else current.profile_id
+            if current_id != expected_profile_id:
+                self._connection.commit()
+                if current is None:
+                    raise RuntimeError("Active model profile disappeared")
+                return current
+            cursor.execute(
+                """
+                INSERT INTO feasibility_model_profile (
+                    singleton_id, profile_id, model_id, reasoning_effort,
+                    discovery_digest, discovered_at
+                ) VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    model_id = excluded.model_id,
+                    reasoning_effort = excluded.reasoning_effort,
+                    discovery_digest = excluded.discovery_digest,
+                    discovered_at = excluded.discovered_at
+                """,
+                (
+                    profile_id,
+                    model_id,
+                    reasoning_effort,
+                    discovery_digest,
+                    discovered_at,
+                ),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
+        finally:
+            cursor.close()
+
+        stored = self.get_feasibility_model_profile()
+        if stored is None:
+            raise RuntimeError("Active model profile could not be read back")
+        return stored
+
     def record_app_server_route(
         self,
         *,
