@@ -279,8 +279,10 @@ supported extraction profile.
 
 The local Agent maintains one active extraction profile containing an exact
 `model_id`, reasoning effort, profile ID, discovery digest, and discovery time.
-When a new Capture Request is first processed, the Agent discovers the current
-app-server catalog and resolves the request profile exactly once:
+When a new Capture Request with at least one changed source is first processed,
+the Agent discovers the current app-server catalog and resolves the request
+profile exactly once. A request with no changed source performs no model
+discovery and completes with zero Candidates:
 
 1. If the active profile's exact model and reasoning effort are still
    supported, the Agent reuses that profile even when the complete catalog
