@@ -9,7 +9,10 @@ from unittest.mock import patch
 from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.agent.session_index import FrozenSessionSource
-from zdecision.app_server.gateway import UnknownSourceTurn
+from zdecision.app_server.gateway import (
+    FrozenModelProfileUnavailable,
+    UnknownSourceTurn,
+)
 from zdecision.app_server.jsonl import AppServerTimeout
 from zdecision.app_server.models import (
     AppServerTurnReceipt,
@@ -43,6 +46,8 @@ class FakeGateway:
             discovered_at="2026-07-30T12:00:00.000000Z",
         )
         self.discover_count = 0
+        self.support_check_count = 0
+        self.profile_available = True
         self.stage_names: list[str] = []
         self.extraction_output: dict[str, object] = {
             "candidates": [
@@ -95,6 +100,18 @@ class FakeGateway:
     ) -> FeasibilityModelProfile:
         self.discover_count += 1
         return self.profile
+
+    def resolve_active_profile(self) -> FeasibilityModelProfile:
+        self.discover_count += 1
+        return self.profile
+
+    def require_supported_profile(
+        self, profile: FeasibilityModelProfile
+    ) -> FeasibilityModelProfile:
+        self.support_check_count += 1
+        if not self.profile_available:
+            raise FrozenModelProfileUnavailable("model removed")
+        return profile
 
     def fork_disposable_thread(
         self, thread_id: str, last_turn_id: str
@@ -154,6 +171,7 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         self.template_root = self.root / "decision-templates"
         shutil.copytree(TEMPLATE_ROOT, self.template_root)
         self.gateway = FakeGateway(str(self.root))
+        self.request_profile = self.gateway.profile
         self.operation_store = CaptureOperationStore.open(
             self.root / "capture-operations.sqlite3"
         )
@@ -189,7 +207,47 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
             self.source,
             product_name="ZDecision",
             template_id="business",
+            model_profile=self.request_profile,
         )
+
+    def test_new_operation_uses_supplied_request_profile(self) -> None:
+        supplied = self.request_profile
+
+        self._run()
+
+        operation = self.operation_store.operation_for_source(
+            self.source.request_id, self.source.source_key
+        )
+        self.assertEqual(
+            supplied.profile_id,
+            operation.frozen.model_profile_id,
+        )
+        self.assertEqual(0, self.gateway.discover_count)
+
+    def test_operation_profile_reads_frozen_replay_profile(self) -> None:
+        self._run()
+
+        self.assertEqual(
+            self.request_profile,
+            self.runner.operation_profile(self.source),
+        )
+
+    def test_request_profile_resolution_discovers_only_when_missing(self) -> None:
+        active = self.runner.resolve_request_profile(None)
+        frozen = self.runner.resolve_request_profile(self.request_profile)
+
+        self.assertEqual(self.gateway.profile, active)
+        self.assertIs(self.request_profile, frozen)
+        self.assertEqual(1, self.gateway.discover_count)
+        self.assertEqual(1, self.gateway.support_check_count)
+
+    def test_unavailable_frozen_profile_is_explicit(self) -> None:
+        from zdecision.app_server.requested_capture import FrozenModelUnavailable
+
+        self.gateway.profile_available = False
+
+        with self.assertRaises(FrozenModelUnavailable):
+            self.runner.resolve_request_profile(self.request_profile)
 
     def test_request_runs_inventory_then_extraction_without_assessment(
         self,
@@ -223,6 +281,7 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
             self.source,
             product_name="ZDecision",
             template_id="business",
+            model_profile=self.request_profile,
             heartbeat=lambda: heartbeats.append("renewed"),
         )
 
@@ -320,7 +379,7 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         replayed = self.operation_store.operation_for_source(
             REQUEST_ID, self.source.source_key
         )
-        self.assertEqual(1, self.gateway.discover_count)
+        self.assertEqual(0, self.gateway.discover_count)
         self.assertEqual(first_profile, result.model_profile.profile_id)
         self.assertEqual(
             frozen_prompt, replayed.frozen.template.inventory_prompt
@@ -329,6 +388,25 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
             "A changed live policy.",
             replayed.frozen.template.inventory_prompt,
         )
+
+    def test_replay_rejects_a_different_request_profile(self) -> None:
+        from zdecision.app_server.requested_capture import RequestedCaptureFailed
+
+        self._run()
+        changed = FeasibilityModelProfile.create(
+            model_id="changed-model",
+            reasoning_effort="high",
+            discovery_digest="b" * 64,
+            discovered_at="2026-07-31T12:00:00.000000Z",
+        )
+
+        with self.assertRaises(RequestedCaptureFailed):
+            self.runner.run(
+                self.source,
+                product_name="ZDecision",
+                template_id="business",
+                model_profile=changed,
+            )
 
     def test_completed_operation_replay_starts_no_native_work(self) -> None:
         first = self._run()

@@ -174,17 +174,20 @@ class DisposableAttemptsLiveAppServerTest(unittest.TestCase):
                 source,
                 product_name="ZDecision",
                 template_id="business",
+                model_profile=profile,
             )
         result = runner.run(
             source,
             product_name="ZDecision",
             template_id="business",
+            model_profile=profile,
         )
         model_calls_before_replay = self._model_call_count(transport.requests)
         replay = runner.run(
             source,
             product_name="ZDecision",
             template_id="business",
+            model_profile=profile,
         )
 
         self.assertTrue(transport.dropped)

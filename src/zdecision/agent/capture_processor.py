@@ -21,13 +21,19 @@ from zdecision.agent.service import (
     RetryableCaptureRequestError,
     TerminalCaptureRequestError,
 )
-from zdecision.agent.session_index import SessionIndex
+from zdecision.agent.session_index import (
+    RequestModelProfileConflict,
+    RequestModelProfileCorrupt,
+    SessionIndex,
+)
+from zdecision.app_server.models import FeasibilityModelProfile
 from zdecision.app_server.reconciliation_runner import (
     ReconciliationAttemptRetryable,
     ReconciliationRunnerError,
 )
 from zdecision.app_server.requested_capture import (
     CaptureAttemptRetryable,
+    FrozenModelUnavailable,
     RequestedCaptureFailed,
     SessionCaptureResult,
     SourceBoundaryUnavailable,
@@ -126,6 +132,18 @@ class OnDemandCaptureProcessor:
             raise RetryableCaptureRequestError(
                 "capture_attempt_retryable"
             ) from error
+        except FrozenModelUnavailable as error:
+            raise TerminalCaptureRequestError(
+                "frozen_model_unavailable"
+            ) from error
+        except RequestModelProfileConflict as error:
+            raise TerminalCaptureRequestError(
+                "model_profile_mismatch"
+            ) from error
+        except RequestModelProfileCorrupt as error:
+            raise TerminalCaptureRequestError(
+                "local_capture_state_invalid"
+            ) from error
         except SourceBoundaryUnavailable as error:
             raise TerminalCaptureRequestError(
                 "source_boundary_unavailable"
@@ -183,9 +201,52 @@ class OnDemandCaptureProcessor:
         result = self.request_state.get_reconciliation(
             request.request_id
         )
+        request_profile: FeasibilityModelProfile | None = None
+        if result is None and sources:
+            frozen_profile = self.session_index.request_model_profile(
+                request.request_id
+            )
+            operation_profiles = tuple(
+                profile
+                for source in sources
+                if (
+                    profile := self.capture_runner.operation_profile(source)
+                ) is not None
+            )
+            distinct_profiles = set(operation_profiles)
+            if len(distinct_profiles) > 1:
+                raise TerminalCaptureRequestError(
+                    "model_profile_mismatch"
+                )
+            operation_profile = next(iter(distinct_profiles), None)
+            if (
+                frozen_profile is not None
+                and operation_profile is not None
+                and operation_profile != frozen_profile
+            ):
+                raise TerminalCaptureRequestError(
+                    "model_profile_mismatch"
+                )
+            candidate_profile = (
+                frozen_profile
+                if frozen_profile is not None
+                else operation_profile
+            )
+            request_profile = self.capture_runner.resolve_request_profile(
+                candidate_profile
+            )
+            if not isinstance(request_profile, FeasibilityModelProfile):
+                raise TerminalCaptureRequestError(
+                    "model_profile_mismatch"
+                )
+            request_profile = (
+                self.session_index.freeze_request_model_profile(
+                    request.request_id, request_profile
+                )
+            )
         if result is None:
             captures = self._capture_sources(
-                request, client, sources
+                request, client, sources, request_profile
             )
             observations = tuple(
                 observation
@@ -256,8 +317,10 @@ class OnDemandCaptureProcessor:
         request: ClaimedCaptureRequest,
         client,
         sources,
+        model_profile: FeasibilityModelProfile | None,
     ) -> tuple[tuple[object, SessionCaptureResult], ...]:
         if sources:
+            assert model_profile is not None
             client.progress(
                 request.request_id,
                 request.lease_token,
@@ -275,6 +338,7 @@ class OnDemandCaptureProcessor:
                     source,
                     product_name=request.product_name,
                     template_id=request.template_id,
+                    model_profile=model_profile,
                     heartbeat=lambda: client.heartbeat(
                         request.request_id,
                         request.lease_token,
@@ -297,6 +361,10 @@ class OnDemandCaptureProcessor:
             if capture.source_key != source.source_key:
                 raise TerminalCaptureRequestError(
                     "capture_source_mismatch"
+                )
+            if capture.model_profile != model_profile:
+                raise TerminalCaptureRequestError(
+                    "model_profile_mismatch"
                 )
             captures.append((source, capture))
             client.heartbeat(

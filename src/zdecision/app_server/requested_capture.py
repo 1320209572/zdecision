@@ -13,6 +13,7 @@ from zdecision.agent.session_index import FrozenSessionSource
 from zdecision.app_server.gateway import (
     AppServerGateway,
     AppServerGatewayError,
+    FrozenModelProfileUnavailable,
     IncompleteSourceTurn,
     InvalidAppServerResponse,
     UnknownSourceTurn,
@@ -66,6 +67,10 @@ class RequestedCaptureFailed(RequestedCaptureError):
     """The persisted Capture cannot continue safely."""
 
 
+class FrozenModelUnavailable(RequestedCaptureError):
+    """The exact model profile frozen for the request cannot run."""
+
+
 @dataclass(frozen=True)
 class SessionCaptureResult:
     status: Literal["completed"]
@@ -104,10 +109,13 @@ class RequestedCaptureRunner:
         *,
         product_name: str,
         template_id: str,
+        model_profile: FeasibilityModelProfile,
         heartbeat: Callable[[], None] | None = None,
     ) -> SessionCaptureResult:
         if not isinstance(source, FrozenSessionSource):
             raise TypeError("source must be a FrozenSessionSource")
+        if not isinstance(model_profile, FeasibilityModelProfile):
+            raise TypeError("model_profile must be a FeasibilityModelProfile")
         product = _nonempty(product_name, "product_name")
         template_id_value = _nonempty(template_id, "template_id")
         self.sweep_archives()
@@ -149,7 +157,7 @@ class RequestedCaptureRunner:
             )
 
         if existing is None:
-            profile = self.gateway.discover_and_freeze_profile(boundary)
+            profile = model_profile
             template = self.template_catalog.render(
                 template_id_value, product
             )
@@ -177,9 +185,13 @@ class RequestedCaptureRunner:
         else:
             operation = existing
             self._verify_replay_input(
-                operation, source, product, template_id_value
+                operation,
+                source,
+                product,
+                template_id_value,
+                model_profile,
             )
-            profile = _profile(operation.frozen)
+            profile = model_profile
 
         if operation.status == "failed_terminal":
             raise SourceBoundaryUnavailable(
@@ -311,6 +323,36 @@ class RequestedCaptureRunner:
             )
         return self._result(source, committed, profile)
 
+    def operation_profile(
+        self, source: FrozenSessionSource
+    ) -> FeasibilityModelProfile | None:
+        if not isinstance(source, FrozenSessionSource):
+            raise TypeError("source must be a FrozenSessionSource")
+        operation = self.operation_store.operation_for_source(
+            source.request_id, source.source_key
+        )
+        return None if operation is None else _profile(operation.frozen)
+
+    def resolve_request_profile(
+        self, profile: FeasibilityModelProfile | None
+    ) -> FeasibilityModelProfile:
+        if profile is not None and not isinstance(
+            profile, FeasibilityModelProfile
+        ):
+            raise TypeError("profile must be a FeasibilityModelProfile or None")
+        try:
+            if profile is None:
+                return self.gateway.resolve_active_profile()
+            return self.gateway.require_supported_profile(profile)
+        except FrozenModelProfileUnavailable as error:
+            raise FrozenModelUnavailable(
+                "Frozen Capture model is unavailable"
+            ) from error
+        except (AppServerError, AppServerGatewayError) as error:
+            raise CaptureAttemptRetryable(
+                "Capture model resolution must be retried"
+            ) from error
+
     def sweep_archives(self) -> None:
         """Retry archive work without reopening model computation."""
 
@@ -343,6 +385,7 @@ class RequestedCaptureRunner:
         source: FrozenSessionSource,
         product: str,
         template_id: str,
+        profile: FeasibilityModelProfile,
     ) -> None:
         frozen = operation.frozen
         expected = (
@@ -357,6 +400,11 @@ class RequestedCaptureRunner:
             source.source_fingerprint,
             product,
             template_id,
+            profile.profile_id,
+            profile.model_id,
+            profile.reasoning_effort,
+            profile.discovery_digest,
+            profile.discovered_at,
         )
         actual = (
             frozen.request_id,
@@ -370,6 +418,11 @@ class RequestedCaptureRunner:
             frozen.source_fingerprint,
             frozen.product,
             frozen.template.template_id,
+            frozen.model_profile_id,
+            frozen.model_id,
+            frozen.reasoning_effort,
+            frozen.model_discovery_digest,
+            frozen.model_discovered_at,
         )
         if actual != expected:
             raise RequestedCaptureFailed(

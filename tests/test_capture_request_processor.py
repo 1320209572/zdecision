@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -39,8 +40,10 @@ PRODUCT_ID = "prod_" + "4" * 32
 OTHER_REPOSITORY_ID = "repo_" + "9" * 32
 NOW = datetime(2026, 7, 31, 5, 0, tzinfo=UTC)
 SESSION_ID = "019fb100-0000-7000-8000-000000000001"
+SECOND_SESSION_ID = "019fb100-0000-7000-8000-000000000004"
 TURN_1 = "019fb100-0000-7000-8000-000000000002"
 TURN_2 = "019fb100-0000-7000-8000-000000000003"
+SECOND_SESSION_TURN = "019fb100-0000-7000-8000-000000000005"
 
 
 def claimed_request(
@@ -61,11 +64,17 @@ def claimed_request(
     )
 
 
-def stop_event(cwd: str, turn_id: str, observed_at: str) -> AgentEvent:
+def stop_event(
+    cwd: str,
+    turn_id: str,
+    observed_at: str,
+    *,
+    session_id: str = SESSION_ID,
+) -> AgentEvent:
     invocation = HookInvocation.from_dict(
         {
             "hook_event_name": "Stop",
-            "session_id": SESSION_ID,
+            "session_id": session_id,
             "turn_id": turn_id,
             "cwd": cwd,
         },
@@ -111,7 +120,12 @@ class FakeCaptureRunner:
         self.call_count = 0
         self.sweep_count = 0
         self.error: Exception | None = None
+        self.resolve_error: Exception | None = None
         self.after_freeze = None
+        self.resolve_calls: list[FeasibilityModelProfile | None] = []
+        self.run_profiles: list[FeasibilityModelProfile] = []
+        self.operation_profiles: dict[str, FeasibilityModelProfile] = {}
+        self.empty_observations = False
         self.profile = FeasibilityModelProfile.create(
             model_id="model-default",
             reasoning_effort="medium",
@@ -119,15 +133,26 @@ class FakeCaptureRunner:
             discovered_at="2026-07-31T05:00:00Z",
         )
 
+    def operation_profile(self, source):
+        return self.operation_profiles.get(source.source_key)
+
+    def resolve_request_profile(self, profile):
+        self.resolve_calls.append(profile)
+        if self.resolve_error is not None:
+            raise self.resolve_error
+        return self.profile if profile is None else profile
+
     def run(
         self,
         source,
         *,
         product_name: str,
         template_id: str,
+        model_profile: FeasibilityModelProfile,
         heartbeat=None,
     ) -> SessionCaptureResult:
         self.call_count += 1
+        self.run_profiles.append(model_profile)
         if self.error is not None:
             raise self.error
         if self.after_freeze is not None:
@@ -140,9 +165,13 @@ class FakeCaptureRunner:
             capture_operation_id="cap_" + "5" * 32,
             inventory_turn_id="inventory-turn",
             extraction_turn_id="extraction-turn",
-            observations=(observation(source.upper_turn_id),),
+            observations=(
+                ()
+                if self.empty_observations
+                else (observation(source.upper_turn_id),)
+            ),
             evidence_digest="b" * 64,
-            model_profile=self.profile,
+            model_profile=model_profile,
         )
 
     def sweep_archives(self) -> None:
@@ -346,6 +375,7 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         self.assertIsNone(
             self.session_index.handled_turn(source.source_key)
         )
+        self.assertEqual(1, len(self.capture_runner.resolve_calls))
 
         self.client.upload_error = None
         self.processor.process(claimed_request(), self.client)
@@ -359,6 +389,7 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             1, self.reconciliation_runner.call_count
         )
         self.assertEqual(2, len(self.client.uploads))
+        self.assertEqual(1, len(self.capture_runner.resolve_calls))
 
     def test_uploaded_receipt_resumes_completion_without_reupload(
         self,
@@ -524,10 +555,219 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         self.assertEqual(1, len(self.client.uploads))
         self.assertEqual((), self.client.uploads[0].items)
         self.assertEqual(0, self.capture_runner.call_count)
+        self.assertEqual([], self.capture_runner.resolve_calls)
         self.assertEqual(
             self.client.uploads[0].batch_digest,
             self.client.completed[0],
         )
+
+    def test_committed_reconciliation_replay_skips_profile_resolution(
+        self,
+    ) -> None:
+        self.observe_turn_1()
+        self.processor.process(claimed_request(), self.client)
+        self.assertEqual(1, len(self.capture_runner.resolve_calls))
+
+        with patch.object(
+            self.request_state,
+            "staged_batch",
+            return_value=None,
+        ):
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(1, len(self.capture_runner.resolve_calls))
+        self.assertEqual(1, self.capture_runner.call_count)
+
+    def test_two_changed_sources_share_one_request_profile(self) -> None:
+        self.observe_turn_1()
+        self.session_index.observe(
+            stop_event(
+                str(self.root),
+                SECOND_SESSION_TURN,
+                "2026-07-31T05:00:01Z",
+                session_id=SECOND_SESSION_ID,
+            )
+        )
+        self.capture_runner.empty_observations = True
+
+        self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual([None], self.capture_runner.resolve_calls)
+        self.assertEqual(2, len(self.capture_runner.run_profiles))
+        self.assertTrue(
+            all(
+                profile is self.capture_runner.profile
+                for profile in self.capture_runner.run_profiles
+            )
+        )
+
+    def test_pre_amendment_request_resolves_and_stores_profile_once(self) -> None:
+        self.observe_turn_1()
+        self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        self.assertIsNone(
+            self.session_index.request_model_profile(REQUEST_ID)
+        )
+
+        self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual([None], self.capture_runner.resolve_calls)
+        self.assertEqual(
+            self.capture_runner.profile,
+            self.session_index.request_model_profile(REQUEST_ID),
+        )
+
+    def test_existing_operation_profile_seeds_remaining_sources(self) -> None:
+        self.observe_turn_1()
+        self.session_index.observe(
+            stop_event(
+                str(self.root),
+                SECOND_SESSION_TURN,
+                "2026-07-31T05:00:01Z",
+                session_id=SECOND_SESSION_ID,
+            )
+        )
+        sources = self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        self.capture_runner.operation_profiles[sources[0].source_key] = (
+            self.capture_runner.profile
+        )
+        self.capture_runner.empty_observations = True
+
+        self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(
+            [self.capture_runner.profile],
+            self.capture_runner.resolve_calls,
+        )
+        self.assertEqual(
+            [self.capture_runner.profile, self.capture_runner.profile],
+            self.capture_runner.run_profiles,
+        )
+
+    def test_mixed_operation_profiles_fail_before_model_work(self) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        self.observe_turn_1()
+        self.session_index.observe(
+            stop_event(
+                str(self.root),
+                SECOND_SESSION_TURN,
+                "2026-07-31T05:00:01Z",
+                session_id=SECOND_SESSION_ID,
+            )
+        )
+        sources = self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        other_profile = FeasibilityModelProfile.create(
+            model_id="model-other",
+            reasoning_effort="medium",
+            discovery_digest="c" * 64,
+            discovered_at="2026-07-31T05:00:00Z",
+        )
+        self.capture_runner.operation_profiles = {
+            sources[0].source_key: self.capture_runner.profile,
+            sources[1].source_key: other_profile,
+        }
+
+        with self.assertRaises(TerminalCaptureRequestError) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual("model_profile_mismatch", raised.exception.code)
+        self.assertEqual([], self.capture_runner.resolve_calls)
+        self.assertEqual(0, self.capture_runner.call_count)
+
+    def test_unavailable_frozen_profile_is_terminal(self) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+        from zdecision.app_server.requested_capture import FrozenModelUnavailable
+
+        self.observe_turn_1()
+        self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        self.session_index.freeze_request_model_profile(
+            REQUEST_ID, self.capture_runner.profile
+        )
+        self.capture_runner.resolve_error = FrozenModelUnavailable(
+            "removed"
+        )
+
+        with self.assertRaises(TerminalCaptureRequestError) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(
+            "frozen_model_unavailable", raised.exception.code
+        )
+
+    def test_corrupt_private_request_profile_fails_closed(self) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        self.observe_turn_1()
+        self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        with sqlite3.connect(self.root / "sessions.sqlite3") as connection:
+            connection.execute(
+                """
+                UPDATE capture_request_freezes
+                SET model_profile_json = 'not-json'
+                WHERE request_id = ?
+                """,
+                (REQUEST_ID,),
+            )
+
+        with self.assertRaises(TerminalCaptureRequestError) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual(
+            "local_capture_state_invalid", raised.exception.code
+        )
+
+    def test_request_and_operation_profile_conflict_is_terminal(self) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        self.observe_turn_1()
+        source = self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )[0]
+        self.session_index.freeze_request_model_profile(
+            REQUEST_ID, self.capture_runner.profile
+        )
+        self.capture_runner.operation_profiles[source.source_key] = (
+            FeasibilityModelProfile.create(
+                model_id="model-other",
+                reasoning_effort="medium",
+                discovery_digest="c" * 64,
+                discovered_at="2026-07-31T05:00:00Z",
+            )
+        )
+
+        with self.assertRaises(TerminalCaptureRequestError) as raised:
+            self.processor.process(claimed_request(), self.client)
+
+        self.assertEqual("model_profile_mismatch", raised.exception.code)
+        self.assertEqual([], self.capture_runner.resolve_calls)
 
     def test_current_session_requires_a_private_action_binding_before_start(
         self,

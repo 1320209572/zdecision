@@ -13,9 +13,13 @@ from zdecision.agent.events import (
     RepositorySnapshot,
     event_id_for,
 )
+from zdecision.app_server.models import FeasibilityModelProfile
 
 try:
-    from zdecision.agent.session_index import SessionIndex
+    from zdecision.agent.session_index import (
+        RequestModelProfileConflict,
+        SessionIndex,
+    )
 except ModuleNotFoundError as error:
     SESSION_INDEX_IMPORT_ERROR: ModuleNotFoundError | None = error
 else:
@@ -27,6 +31,15 @@ OTHER_REPOSITORY_ID = "repo_" + "b" * 32
 FIRST_REQUEST_ID = "crq_" + "1" * 32
 SECOND_REQUEST_ID = "crq_" + "2" * 32
 NOW = datetime(2026, 7, 30, 9, 30, tzinfo=UTC)
+
+
+def model_profile(model_id: str, digest: str) -> FeasibilityModelProfile:
+    return FeasibilityModelProfile.create(
+        model_id=model_id,
+        reasoning_effort="medium",
+        discovery_digest=digest,
+        discovered_at="2026-08-03T02:00:00.000000Z",
+    )
 
 
 def observed_event(
@@ -371,6 +384,90 @@ class SessionIndexTest(unittest.TestCase):
                     capture_scope=capture_scope,
                     selected_session_id=selected_session_id,
                 )
+
+    def test_request_profile_freezes_once_and_survives_restart(self) -> None:
+        self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        profile = model_profile("model-a", "a" * 64)
+
+        stored = self.index.freeze_request_model_profile(
+            FIRST_REQUEST_ID, profile
+        )
+        self.index.close()
+        self.index = SessionIndex.open(self.database_path)
+
+        self.assertEqual(profile, stored)
+        self.assertEqual(
+            profile,
+            self.index.request_model_profile(FIRST_REQUEST_ID),
+        )
+
+    def test_request_profile_replay_rejects_a_different_profile(self) -> None:
+        self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        self.index.freeze_request_model_profile(
+            FIRST_REQUEST_ID, model_profile("model-a", "a" * 64)
+        )
+
+        with self.assertRaisesRegex(
+            RequestModelProfileConflict, "profile conflicts"
+        ):
+            self.index.freeze_request_model_profile(
+                FIRST_REQUEST_ID,
+                model_profile("model-b", "b" * 64),
+            )
+
+    def test_old_request_freeze_migrates_with_null_profile(self) -> None:
+        self.index.close()
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute("DROP TABLE capture_request_freezes")
+            connection.execute(
+                """
+                CREATE TABLE capture_request_freezes (
+                    request_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    capture_scope TEXT NOT NULL,
+                    selected_session_id TEXT,
+                    frozen_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    acknowledgement_digest TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO capture_request_freezes(
+                    request_id, repository_id, capture_scope,
+                    selected_session_id, frozen_at,
+                    acknowledged_at, acknowledgement_digest
+                ) VALUES (?, ?, 'all_valid_sessions', NULL, ?, NULL, NULL)
+                """,
+                (FIRST_REQUEST_ID, REPOSITORY_ID, NOW.isoformat()),
+            )
+            connection.commit()
+
+        self.index = SessionIndex.open(self.database_path)
+
+        self.assertIsNone(
+            self.index.request_model_profile(FIRST_REQUEST_ID)
+        )
+
+    def test_profile_cannot_be_stored_for_an_unknown_request(self) -> None:
+        with self.assertRaisesRegex(
+            RequestModelProfileConflict, "has not been frozen"
+        ):
+            self.index.freeze_request_model_profile(
+                FIRST_REQUEST_ID,
+                model_profile("model-a", "a" * 64),
+            )
 
     def test_open_migrates_old_freezes_to_all_valid_scope(self) -> None:
         self.index.close()

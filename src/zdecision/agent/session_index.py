@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from zdecision.agent.events import AgentEvent
+from zdecision.app_server.models import FeasibilityModelProfile
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import CaptureScope
 
@@ -31,6 +33,14 @@ class FrozenSessionSource:
     previous_handled_turn_id: str | None
     upper_turn_id: str
     source_fingerprint: str
+
+
+class RequestModelProfileConflict(Exception):
+    """A Capture Request already froze a different model profile."""
+
+
+class RequestModelProfileCorrupt(Exception):
+    """The private Capture Request profile cannot be trusted."""
 
 
 class SessionIndex:
@@ -79,7 +89,8 @@ class SessionIndex:
                     selected_session_id TEXT,
                     frozen_at TEXT NOT NULL,
                     acknowledged_at TEXT,
-                    acknowledgement_digest TEXT
+                    acknowledgement_digest TEXT,
+                    model_profile_json TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS capture_request_sources (
@@ -125,6 +136,11 @@ class SessionIndex:
                 connection.execute(
                     "ALTER TABLE capture_request_freezes ADD COLUMN "
                     "selected_session_id TEXT"
+                )
+            if "model_profile_json" not in freeze_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_freezes ADD COLUMN "
+                    "model_profile_json TEXT"
                 )
         return cls(database_path, connection)
 
@@ -437,6 +453,75 @@ class SessionIndex:
             self._connection.rollback()
             raise
 
+    def request_model_profile(
+        self, request_id: str
+    ) -> FeasibilityModelProfile | None:
+        _require_capture_request_id(request_id)
+        row = self._connection.execute(
+            """
+            SELECT model_profile_json
+            FROM capture_request_freezes
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise RequestModelProfileConflict(
+                "Capture Request has not been frozen"
+            )
+        encoded = row["model_profile_json"]
+        if encoded is None:
+            return None
+        return _parse_model_profile_json(encoded)
+
+    def freeze_request_model_profile(
+        self,
+        request_id: str,
+        profile: FeasibilityModelProfile,
+    ) -> FeasibilityModelProfile:
+        _require_capture_request_id(request_id)
+        if not isinstance(profile, FeasibilityModelProfile):
+            raise TypeError("profile must be a FeasibilityModelProfile")
+        encoded = canonical_json_bytes(_model_profile_dict(profile)).decode(
+            "utf-8"
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                """
+                SELECT model_profile_json
+                FROM capture_request_freezes
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise RequestModelProfileConflict(
+                    "Capture Request has not been frozen"
+                )
+            existing = row["model_profile_json"]
+            if existing is not None:
+                stored = _parse_model_profile_json(existing)
+                if existing != encoded:
+                    raise RequestModelProfileConflict(
+                        "Capture Request model profile conflicts"
+                    )
+                self._connection.commit()
+                return stored
+            self._connection.execute(
+                """
+                UPDATE capture_request_freezes
+                SET model_profile_json = ?
+                WHERE request_id = ? AND model_profile_json IS NULL
+                """,
+                (encoded, request_id),
+            )
+            self._connection.commit()
+            return profile
+        except Exception:
+            self._connection.rollback()
+            raise
+
     def acknowledge(
         self,
         request_id: str,
@@ -551,6 +636,61 @@ class SessionIndexEventProcessor:
 def _stable_value(prefix: str, payload: object) -> str:
     digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
     return f"{prefix}_{digest[:32]}"
+
+
+def _model_profile_dict(profile: FeasibilityModelProfile) -> dict[str, str]:
+    return {
+        "profile_id": profile.profile_id,
+        "model_id": profile.model_id,
+        "reasoning_effort": profile.reasoning_effort,
+        "discovery_digest": profile.discovery_digest,
+        "discovered_at": profile.discovered_at,
+    }
+
+
+def _parse_model_profile_json(value: object) -> FeasibilityModelProfile:
+    if not isinstance(value, str):
+        raise RequestModelProfileCorrupt(
+            "Capture Request model profile is corrupt"
+        )
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        raise RequestModelProfileCorrupt(
+            "Capture Request model profile is corrupt"
+        ) from None
+    fields = {
+        "profile_id",
+        "model_id",
+        "reasoning_effort",
+        "discovery_digest",
+        "discovered_at",
+    }
+    if not isinstance(parsed, dict) or set(parsed) != fields:
+        raise RequestModelProfileCorrupt(
+            "Capture Request model profile is corrupt"
+        )
+    if canonical_json_bytes(parsed).decode("utf-8") != value:
+        raise RequestModelProfileCorrupt(
+            "Capture Request model profile is not canonical"
+        )
+    try:
+        profile = FeasibilityModelProfile(**parsed)
+        derived = FeasibilityModelProfile.create(
+            model_id=profile.model_id,
+            reasoning_effort=profile.reasoning_effort,
+            discovery_digest=profile.discovery_digest,
+            discovered_at=profile.discovered_at,
+        )
+    except (TypeError, ValueError):
+        raise RequestModelProfileCorrupt(
+            "Capture Request model profile is corrupt"
+        ) from None
+    if derived.profile_id != profile.profile_id:
+        raise RequestModelProfileCorrupt(
+            "Capture Request model profile identity is corrupt"
+        )
+    return profile
 
 
 def _require_capture_request_id(value: str) -> None:
