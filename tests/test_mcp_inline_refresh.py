@@ -1276,6 +1276,63 @@ __SCENARIO__
             "reused-iframe-rebound-ok",
         )
 
+    async def test_widget_ignores_late_restore_from_replaced_control(
+        self,
+    ) -> None:
+        self._run_widget_recovery_scenario(
+            """
+  const widget = await mount();
+  const oldRestore = widget.latestToolCall(
+    "get_zdecision_candidate_refresh",
+  );
+  check(oldRestore, "initial control did not start restoration");
+  const nextControlId = "ctl_22222222222222222222222222222222";
+
+  widget.deliver({
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-input",
+    params: { control_id: nextControlId },
+  });
+  widget.deliver({
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: {
+      content: [],
+      structuredContent: { actions_enabled: true, safe_state: "ready" },
+      _meta: { "zdecision/control_id": nextControlId },
+    },
+  });
+  await flush();
+
+  const restores = widget.toolCalls("get_zdecision_candidate_refresh");
+  check(restores.length === 2, "new control did not start restoration");
+  await widget.respond(restores[1], state("ready", "ready"));
+  check(
+    !widget.elements.current.disabled && !widget.elements.all.disabled,
+    "new control did not restore ready actions",
+  );
+
+  await widget.respond(oldRestore, {
+    content: [],
+    structuredContent: {
+      safe_state: "unavailable",
+      candidate_revision_count: null,
+      candidate_page_url: null,
+    },
+  });
+  check(
+    !widget.elements.current.disabled && !widget.elements.all.disabled,
+    "late old restoration overwrote the newer ready control",
+  );
+  check(
+    widget.elements.status.textContent === "",
+    "late old restoration replaced the newer ready status",
+  );
+  process.stdout.write("late-old-restore-ignored-ok");
+""",
+            "late-old-restore-ignored-ok",
+        )
+
     async def test_widget_attached_and_terminal_remounts_never_submit(
         self,
     ) -> None:

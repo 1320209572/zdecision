@@ -469,14 +469,17 @@
 
       async function restoreBinding() {
         if (!initialized || !initialResultAccepted || !controlId) return;
+        const requestedControlId = controlId;
         lockActions();
         try {
           const result = await request("tools/call", {
             name: "get_zdecision_candidate_refresh",
-            arguments: { control_id: controlId },
+            arguments: { control_id: requestedControlId },
           });
+          if (controlId !== requestedControlId) return;
           applyBindingResult(result, "restore");
         } catch {
+          if (controlId !== requestedControlId) return;
           safeState = "unavailable";
           status.textContent = labels.unavailable;
           lockActions();
