@@ -1117,6 +1117,7 @@ async function mount() {
   });
   await flush();
   return {
+    deliver,
     elements,
     timers,
     latestToolCall,
@@ -1232,6 +1233,47 @@ __SCENARIO__
   process.stdout.write("same-mount-retry-ok");
 """,
             "same-mount-retry-ok",
+        )
+
+    async def test_widget_reused_iframe_rebinds_unselected_latest_control(
+        self,
+    ) -> None:
+        self._run_widget_recovery_scenario(
+            """
+  const widget = await mount();
+  await activateReady(widget);
+  const nextControlId = "ctl_22222222222222222222222222222222";
+
+  widget.deliver({
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-input",
+    params: { control_id: nextControlId },
+  });
+  widget.deliver({
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: {
+      content: [],
+      structuredContent: { actions_enabled: true, safe_state: "ready" },
+      _meta: { "zdecision/control_id": nextControlId },
+    },
+  });
+  await flush();
+
+  const restores = widget.toolCalls("get_zdecision_candidate_refresh");
+  check(restores.length === 2, "reused iframe ignored the newer render result");
+  check(
+    restores[1].params.arguments.control_id === nextControlId,
+    "reused iframe restored the expired control instead of the latest control",
+  );
+  await widget.respond(restores[1], state("ready", "ready"));
+  check(
+    !widget.elements.current.disabled && !widget.elements.all.disabled,
+    "latest control did not restore ready actions",
+  );
+  process.stdout.write("reused-iframe-rebound-ok");
+""",
+            "reused-iframe-rebound-ok",
         )
 
     async def test_widget_attached_and_terminal_remounts_never_submit(

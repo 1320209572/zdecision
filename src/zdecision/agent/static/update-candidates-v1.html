@@ -354,17 +354,22 @@
         const enabled = initial?.actions_enabled;
         const meta = result?._meta;
         const metaControl = meta?.["zdecision/control_id"];
+        const nextControlId = typeof metaControl === "string" ? metaControl : null;
         const isRenderResult = typeof enabled === "boolean"
           && (initial?.safe_state === "ready"
             || initial?.safe_state === "disabled"
             || initial?.safe_state === "submitting"
             || initial?.safe_state === "queued");
-        if (initialResultAccepted || selected || !isRenderResult) return;
+        if (selected || !isRenderResult) return;
+        if (initialResultAccepted && nextControlId === controlId) return;
 
         if (enabled === true && initial.safe_state !== "ready") return;
         if (enabled && typeof metaControl !== "string") return;
         initialResultAccepted = true;
-        controlId = typeof metaControl === "string" ? metaControl : null;
+        restorationStarted = false;
+        submissionState = null;
+        chosenScope = null;
+        controlId = nextControlId;
         lockActions();
         restoreInitialBinding();
       }
