@@ -1202,6 +1202,24 @@ __SCENARIO__
             "real-remount-recovery-ok",
         )
 
+    async def test_widget_restores_from_wrapped_tool_result(self) -> None:
+        self._run_widget_recovery_scenario(
+            """
+  const widget = await mount();
+  const restore = widget.latestToolCall("get_zdecision_candidate_refresh");
+  check(restore, "ready card did not request restoration");
+  await widget.respond(restore, {
+    toolResult: state("ready", "ready"),
+  });
+  check(
+    !widget.elements.current.disabled && !widget.elements.all.disabled,
+    "wrapped tool result did not restore ready actions",
+  );
+  process.stdout.write("wrapped-tool-result-ok");
+""",
+            "wrapped-tool-result-ok",
+        )
+
     async def test_widget_same_mount_retries_durable_pending_submission(
         self,
     ) -> None:

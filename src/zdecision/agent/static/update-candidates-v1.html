@@ -271,8 +271,15 @@
       }
 
       function boundedResult(result) {
-        const value = result?.structuredContent;
-        if (!value || typeof value.safe_state !== "string") {
+        const toolResult = result?.structuredContent
+          ? result
+          : result?.toolResult;
+        const value = toolResult?.structuredContent;
+        if (
+          toolResult?.isError === true
+          || !value
+          || typeof value.safe_state !== "string"
+        ) {
           return {
             valid: false,
             safe_state: "unavailable",
