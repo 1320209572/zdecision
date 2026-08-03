@@ -453,3 +453,22 @@ After implementation, run one focused suite, one complete suite, and one real
 Codex Desktop acceptance. A confirmed blocking defect permits one focused
 correction. Record other improvements for later work and stop; do not begin a
 new broad architecture audit.
+
+## 14. Deferred known gap: task roots above an enabled repository
+
+Real Codex Desktop acceptance on 2026-08-03 exposed a repository-binding gap.
+When a Codex task starts in a parent directory and later performs its actual
+work inside one registered, enabled child Git repository, the current Hook and
+MCP process still resolve only the task-level `cwd`. The repository therefore
+appears unregistered, no active Session boundary is associated with the child
+repository, and the inline actions are disabled. Filesystem access to the child
+repository and shell commands executed with that repository as their working
+directory do not change the host-owned task binding.
+
+This gap is deferred and must not be hidden by using the central page's legacy
+Capture button as the normal entry point. A later design must establish a
+trusted active-repository binding without accepting repository paths or Session
+identity from model or widget input. At minimum, acceptance must cover a task
+started above exactly one enabled child repository; zero eligible repositories
+or ambiguous activity across multiple repositories must continue to fail
+closed.
