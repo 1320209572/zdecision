@@ -116,6 +116,7 @@
         display: flex;
         min-height: 41px;
         align-items: center;
+        flex-wrap: wrap;
         justify-content: space-between;
         gap: 12px;
         padding: 9px 16px 10px;
@@ -130,6 +131,21 @@
       }
 
       #status:empty {
+        display: none;
+      }
+
+      #page-address {
+        flex: 1 0 100%;
+        margin: 0;
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 9px;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+        user-select: text;
+      }
+
+      #page-address[hidden] {
         display: none;
       }
 
@@ -172,6 +188,7 @@
       <footer>
         <p id="status" role="status" aria-live="polite"></p>
         <button id="open-page" type="button" hidden>打开候选决策页面</button>
+        <p id="page-address" aria-label="候选决策页面地址" hidden></p>
       </footer>
     </main>
 
@@ -179,6 +196,7 @@
       const currentButton = document.getElementById("current");
       const allButton = document.getElementById("all");
       const openPageButton = document.getElementById("open-page");
+      const pageAddress = document.getElementById("page-address");
       const status = document.getElementById("status");
       const pending = new Map();
       const activeStates = new Set(["creating", "queued", "capturing", "syncing"]);
@@ -202,11 +220,27 @@
       let pageUrl = null;
       let hostCapabilities = {};
 
-      function request(method, params) {
+      function request(method, params, timeoutMs = null) {
         const id = nextRequestId++;
         window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
         return new Promise((resolve, reject) => {
-          pending.set(id, { resolve, reject });
+          let timeoutId = null;
+          pending.set(id, {
+            resolve(value) {
+              if (timeoutId !== null) clearTimeout(timeoutId);
+              resolve(value);
+            },
+            reject(error) {
+              if (timeoutId !== null) clearTimeout(timeoutId);
+              reject(error);
+            },
+          });
+          if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+            timeoutId = setTimeout(() => {
+              if (!pending.delete(id)) return;
+              reject(new Error("request_timeout"));
+            }, timeoutMs);
+          }
         });
       }
 
@@ -348,10 +382,22 @@
       allButton.addEventListener("click", () => start("all_valid_sessions"));
       openPageButton.addEventListener("click", async () => {
         if (!hostCapabilities?.openLinks || typeof pageUrl !== "string") return;
+        const targetUrl = pageUrl;
+        openPageButton.disabled = true;
+        pageAddress.hidden = true;
+        status.textContent = "正在打开候选决策页面";
         try {
-          await request("ui/open-link", { url: pageUrl });
+          const result = await request("ui/open-link", { url: targetUrl }, 5000);
+          if (result?.isError === true) throw new Error("open_link_rejected");
+          status.textContent = "已请求在右侧浏览器打开";
+          openPageButton.textContent = "再次打开候选决策页面";
         } catch {
-          openPageButton.disabled = true;
+          status.textContent = "页面未打开，请重试";
+          openPageButton.textContent = "重试打开候选决策页面";
+          pageAddress.textContent = targetUrl;
+          pageAddress.hidden = false;
+        } finally {
+          openPageButton.disabled = false;
         }
       });
 

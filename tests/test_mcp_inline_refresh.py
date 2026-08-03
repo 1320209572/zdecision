@@ -743,6 +743,167 @@ vm.runInThisContext(shippedScript);
         )
         self.assertEqual("bridge-regression-ok", completed.stdout)
 
+    async def test_widget_reports_open_page_result_and_remains_retryable(
+        self,
+    ) -> None:
+        html = mcp_server.UPDATE_CANDIDATES_PATH.read_text("utf-8")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        harness = f"""
+const vm = require("node:vm");
+const shippedScript = {json.dumps(script)};
+const outbound = [];
+const timers = new Map();
+let messageHandler = null;
+let nextTimerId = 1;
+
+class Element {{
+  constructor() {{
+    this.disabled = false;
+    this.hidden = false;
+    this.textContent = "";
+    this.listeners = new Map();
+  }}
+
+  addEventListener(name, listener) {{
+    const listeners = this.listeners.get(name) || [];
+    listeners.push(listener);
+    this.listeners.set(name, listeners);
+  }}
+
+  dispatch(name) {{
+    return Promise.all((this.listeners.get(name) || []).map((listener) => listener()));
+  }}
+}}
+
+const elementIds = ["current", "all", "open-page", "page-address", "status"];
+const elements = Object.fromEntries(elementIds.map((id) => [id, new Element()]));
+const host = {{
+  postMessage(message) {{ outbound.push(message); }},
+}};
+global.document = {{ getElementById: (id) => elements[id] }};
+global.window = {{
+  parent: host,
+  addEventListener(name, listener) {{
+    if (name === "message") messageHandler = listener;
+  }},
+}};
+global.setTimeout = (callback, delay) => {{
+  const id = nextTimerId++;
+  timers.set(id, {{ callback, delay }});
+  return id;
+}};
+global.clearTimeout = (id) => timers.delete(id);
+
+function check(condition, message) {{
+  if (!condition) throw new Error(message);
+}}
+
+function deliver(message) {{
+  messageHandler({{ source: host, data: message }});
+}}
+
+function latestCall(method) {{
+  return [...outbound].reverse().find((message) => message.method === method);
+}}
+
+function takeTimer(delay) {{
+  const entry = [...timers.entries()].find(([, timer]) => timer.delay === delay);
+  check(entry, `missing ${{delay}}ms timer`);
+  timers.delete(entry[0]);
+  return entry[1].callback;
+}}
+
+vm.runInThisContext(shippedScript);
+
+(async () => {{
+  const initialize = latestCall("ui/initialize");
+  check(initialize, "widget did not initialize the bridge");
+  deliver({{
+    jsonrpc: "2.0",
+    id: initialize.id,
+    result: {{ hostCapabilities: {{ openLinks: {{}} }} }},
+  }});
+  await Promise.resolve();
+
+  const trustedControl = "ctl_11111111111111111111111111111111";
+  deliver({{
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-result",
+    params: {{
+      content: [{{ type: "text", text: "ready" }}],
+      structuredContent: {{ actions_enabled: true, safe_state: "ready" }},
+      _meta: {{ "zdecision/control_id": trustedControl }},
+    }},
+  }});
+
+  const refreshClick = elements.current.dispatch("click");
+  const start = latestCall("tools/call");
+  const candidateUrl = "http://127.0.0.1:8765/?repository_id=repo_22222222222222222222222222222222";
+  deliver({{
+    jsonrpc: "2.0",
+    id: start.id,
+    result: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "succeeded",
+        candidate_revision_count: 12,
+        candidate_page_url: candidateUrl,
+      }},
+    }},
+  }});
+  await refreshClick;
+  check(!elements["open-page"].hidden, "terminal success did not show open action");
+
+  const successfulClick = elements["open-page"].dispatch("click");
+  const successfulOpen = latestCall("ui/open-link");
+  check(successfulOpen.params.url === candidateUrl, "open action changed the safe page URL");
+  check(elements.status.textContent === "正在打开候选决策页面", "open action had no immediate feedback");
+  check(elements["open-page"].disabled, "open action allowed a duplicate request");
+  deliver({{ jsonrpc: "2.0", id: successfulOpen.id, result: {{ isError: false }} }});
+  await successfulClick;
+  check(elements.status.textContent === "已请求在右侧浏览器打开", "successful open was not reported");
+  check(!elements["open-page"].disabled, "successful open was not retryable");
+  check(elements["page-address"].hidden, "successful open exposed the fallback address");
+
+  const deniedClick = elements["open-page"].dispatch("click");
+  const deniedOpen = latestCall("ui/open-link");
+  deliver({{ jsonrpc: "2.0", id: deniedOpen.id, result: {{ isError: true }} }});
+  await deniedClick;
+  check(elements.status.textContent === "页面未打开，请重试", "host denial was silent");
+  check(!elements["open-page"].disabled, "host denial prevented retry");
+  check(!elements["page-address"].hidden, "host denial hid the fallback address");
+  check(elements["page-address"].textContent === candidateUrl, "fallback address was not exact");
+
+  const timeoutClick = elements["open-page"].dispatch("click");
+  const timedOutOpen = latestCall("ui/open-link");
+  takeTimer(5000)();
+  await timeoutClick;
+  check(elements.status.textContent === "页面未打开，请重试", "open timeout was silent");
+  check(!elements["open-page"].disabled, "open timeout prevented retry");
+  deliver({{ jsonrpc: "2.0", id: timedOutOpen.id, result: {{ isError: false }} }});
+  check(elements.status.textContent === "页面未打开，请重试", "late response changed timeout state");
+  process.stdout.write("open-page-regression-ok");
+}})().catch((error) => {{
+  process.stderr.write(error.stack || String(error));
+  process.exitCode = 1;
+}});
+"""
+
+        completed = subprocess.run(
+            ["node", "-e", harness],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(
+            0,
+            completed.returncode,
+            completed.stderr or completed.stdout,
+        )
+        self.assertEqual("open-page-regression-ok", completed.stdout)
+
     async def test_run_mcp_starts_with_disabled_card_when_locator_unavailable(
         self,
     ) -> None:
