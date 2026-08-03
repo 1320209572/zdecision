@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +22,7 @@ NOW = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
 CONTROL_ID = "ctl_0123456789abcdef0123456789abcdef"
 MODEL_CONTROL_ID = "ctl_ffffffffffffffffffffffffffffffff"
 TOOL_NAME = "mcp__zdecision_local__show_zdecision_update"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EMPTY_INPUT_OUTPUT = {
     "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -64,7 +67,8 @@ class ControlBindingHookTests(unittest.TestCase):
         self._git(
             "remote", "add", "origin", "https://github.com/OpenAI/example.git"
         )
-        self.database_path = self.root / "state" / "zdecision.sqlite3"
+        self.state_root = self.root / "state"
+        self.database_path = self.state_root / "agent" / "zdecision.sqlite3"
         self.database = AgentDatabase.open(self.database_path)
         self.addCleanup(self.database.close)
         self.control_store = ControlBindingStore.open(self.database_path)
@@ -270,6 +274,68 @@ class ControlBindingHookTests(unittest.TestCase):
                 )
                 self.assertEqual(expected, response.output)
                 self.assertTrue(store.closed)
+
+    def test_cli_pre_tool_hook_does_not_load_unrelated_runtime_stacks(self) -> None:
+        """A render hook must not load MCP, HTTP, or worker runtime stacks."""
+
+        guard_directory = self.root / "import-guard"
+        guard_directory.mkdir()
+        (guard_directory / "sitecustomize.py").write_text(
+            """
+import builtins
+
+_original_import = builtins.__import__
+_blocked_modules = (
+    "httpx",
+    "mcp",
+    "zdecision.agent.central_client",
+    "zdecision.agent.launchd",
+    "zdecision.agent.mcp_server",
+    "zdecision.agent.service",
+    "zdecision.agent.worker",
+)
+
+
+def _guarded_import(name, *arguments, **keyword_arguments):
+    if name in _blocked_modules or name.startswith(
+        tuple(f"{module}." for module in _blocked_modules)
+    ):
+        raise ImportError(f"blocked import: {name}")
+    return _original_import(name, *arguments, **keyword_arguments)
+
+
+builtins.__import__ = _guarded_import
+""".lstrip(),
+            "utf-8",
+        )
+        environment = os.environ.copy()
+        existing_python_path = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            value
+            for value in (str(guard_directory), existing_python_path)
+            if value
+        )
+        environment["ZDECISION_STATE_DIR"] = str(self.state_root)
+
+        result = subprocess.run(
+            [str(REPOSITORY_ROOT / ".venv" / "bin" / "zdecision-agent"), "hook"],
+            cwd=self.repository,
+            input=json.dumps(self._raw()),
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        output = json.loads(result.stdout)
+        hook_output = output["hookSpecificOutput"]
+        self.assertEqual("PreToolUse", hook_output["hookEventName"])
+        self.assertEqual("allow", hook_output["permissionDecision"])
+        control_id = hook_output["updatedInput"]["control_id"]
+        self.assertRegex(control_id, r"^ctl_[0-9a-f]{32}$")
+        binding = self.control_store.get(control_id)
+        self.assertIsNotNone(binding)
+        self.assertEqual(self.snapshot.repository_id, binding.repository_id)
 
 
 if __name__ == "__main__":

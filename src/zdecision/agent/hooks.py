@@ -13,7 +13,6 @@ from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import HookInvocation, HookResponse, InvalidHookInvocation
 from zdecision.agent.repository import RepositoryResolver
-from zdecision.agent.worker import wake_worker
 
 
 INVALID_HOOK_OUTPUT = {"systemMessage": "ZDecision ignored an invalid hook event."}
@@ -85,7 +84,11 @@ def handle_hook(
                 expires_at=expires_at,
                 create=False,
             )
-        (worker_waker or wake_worker)(database.path)
+        if worker_waker is None:
+            from zdecision.agent.worker import wake_worker
+
+            worker_waker = wake_worker
+        worker_waker(database.path)
         return HookResponse(event_id=event.event_id, output={})
     except (InvalidHookInvocation, UnicodeDecodeError, json.JSONDecodeError, TypeError):
         return HookResponse(event_id="", output=INVALID_HOOK_OUTPUT)

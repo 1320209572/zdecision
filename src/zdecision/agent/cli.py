@@ -4,21 +4,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-import httpx
-
-from zdecision.agent.db import AgentDatabase
-from zdecision.agent.events import TestRepositoryMapping
-from zdecision.agent.hooks import handle_hook
-from zdecision.agent.mcp_server import LocalMcpTools, run_mcp
-from zdecision.agent.repository import RepositoryResolver
-from zdecision.ids import canonical_product_name, product_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.private_store.filesystem import private_state_root
 
@@ -29,6 +19,14 @@ def database_path(environ: Mapping[str, str]) -> Path:
 
 def config_locator_path(environ: Mapping[str, str]) -> Path:
     return private_state_root(environ) / "agent" / "config-locator.json"
+
+
+def run_mcp(**arguments: object) -> None:
+    """Load the MCP runtime only when its command is invoked."""
+
+    from zdecision.agent.mcp_server import run_mcp as run_mcp_server
+
+    run_mcp_server(**arguments)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,6 +81,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if arguments.command == "service":
         return _run_service_command(arguments, state_path)
+    from zdecision.agent.db import AgentDatabase
+
     database = AgentDatabase.open(state_path)
     try:
         if arguments.command == "worker":
@@ -106,6 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session_index.close()
             return 0
         if arguments.command == "hook":
+            from zdecision.agent.hooks import handle_hook
+
             raw = sys.stdin.buffer.read()
             response = handle_hook(
                 raw,
@@ -115,6 +117,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.buffer.write(canonical_json_bytes(dict(response.output)))
             return 0
         if arguments.command == "status":
+            from zdecision.agent.mcp_server import LocalMcpTools
+
             tools = LocalMcpTools(
                 database=database,
                 cwd=os.getcwd(),
@@ -130,6 +134,10 @@ def _configure_test_repository(
     arguments: argparse.Namespace,
     database: AgentDatabase,
 ) -> int:
+    from zdecision.agent.events import TestRepositoryMapping
+    from zdecision.agent.repository import RepositoryResolver
+    from zdecision.ids import canonical_product_name, product_id
+
     snapshot = RepositoryResolver().resolve(Path(arguments.cwd).expanduser().resolve())
     if snapshot is None:
         _write_error("repository_not_resolved")
@@ -175,6 +183,11 @@ def _run_service_command(
     arguments: argparse.Namespace,
     state_path: Path,
 ) -> int:
+    import httpx
+    import shutil
+    import subprocess
+
+    from zdecision.agent.db import AgentDatabase
     from zdecision.agent.launchd import (
         install_launch_agent,
         launch_agent_status,
