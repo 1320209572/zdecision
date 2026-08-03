@@ -199,12 +199,15 @@
       const pageAddress = document.getElementById("page-address");
       const status = document.getElementById("status");
       const pending = new Map();
-      const activeStates = new Set(["creating", "queued", "capturing", "syncing"]);
+      const activeStates = new Set([
+        "creating", "queued", "capturing", "syncing", "retrying",
+      ]);
       const labels = {
         creating: "正在创建更新请求",
         queued: "等待本地设备",
         capturing: "正在整理候选决策",
         syncing: "正在同步候选决策",
+        retrying: "连接暂时中断，正在重试",
         busy: "已有更新正在进行",
         unavailable: "暂时无法更新",
         failed: "本次更新未完成",
@@ -269,8 +272,8 @@
           };
         }
         const knownStates = new Set([
-          "queued", "capturing", "syncing", "busy", "unavailable",
-          "failed", "empty", "succeeded",
+          "queued", "capturing", "syncing", "retrying", "busy",
+          "unavailable", "failed", "empty", "succeeded",
         ]);
         const candidateRevisionCount =
           Number.isSafeInteger(value.candidate_revision_count) &&

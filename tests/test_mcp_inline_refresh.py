@@ -58,8 +58,11 @@ def request_view(
 class StaticRepositoryResolver:
     def __init__(self, repository_id: str = REPOSITORY_ID) -> None:
         self.repository_id = repository_id
+        self.available = True
 
-    def resolve(self, cwd: str) -> RepositorySnapshot:
+    def resolve(self, cwd: str) -> RepositorySnapshot | None:
+        if not self.available:
+            return None
         return RepositorySnapshot(
             repository_id=self.repository_id,
             worktree_root=cwd,
@@ -77,6 +80,7 @@ class RecordingCentralClient:
         self.before_create = None
         self.busy = False
         self.lose_first_response = False
+        self.get_error: Exception | None = None
         self.next_view = request_view()
 
     def create_capture_request(
@@ -98,6 +102,8 @@ class RecordingCentralClient:
 
     def get_capture_request(self, request_id: str) -> CaptureRequestView:
         self.get_calls.append(request_id)
+        if self.get_error is not None:
+            raise self.get_error
         return self.views_by_request[request_id]
 
 
@@ -150,6 +156,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         *,
         now: datetime = NOW,
         client: RecordingCentralClient | None = None,
+        cwd: str | None = None,
     ) -> LocalMcpTools:
         required = {
             "binding_store",
@@ -166,7 +173,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         )
         return LocalMcpTools(
             database=self.database,
-            cwd=self.cwd,
+            cwd=self.cwd if cwd is None else cwd,
             binding_store=self.binding_store,
             central_client=self.client if client is None else client,
             central_base_url=CENTRAL_BASE_URL,
@@ -402,6 +409,56 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             REQUEST_ID,
             self.binding_store.get(CONTROL_ID).central_request_id,
+        )
+
+    async def test_selected_request_status_uses_frozen_binding_without_git(
+        self,
+    ) -> None:
+        domain = self.domain()
+        started = domain.start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+        self.resolver.available = False
+
+        status = domain.get_zdecision_candidate_refresh(CONTROL_ID)
+
+        self.assertEqual("queued", started["safe_state"])
+        self.assertEqual("queued", status["safe_state"])
+
+    async def test_selected_control_rejects_another_mcp_working_directory(
+        self,
+    ) -> None:
+        domain = self.domain()
+        domain.start_zdecision_candidate_refresh(CONTROL_ID, "current_session")
+        another_cwd = self.root / "another-repository"
+        another_cwd.mkdir()
+
+        status = self.domain(cwd=str(another_cwd)).get_zdecision_candidate_refresh(
+            CONTROL_ID
+        )
+
+        self.assertEqual("unavailable", status["safe_state"])
+
+    async def test_transient_central_status_failure_is_retryable(self) -> None:
+        domain = self.domain()
+        domain.start_zdecision_candidate_refresh(CONTROL_ID, "current_session")
+        self.client.get_error = CentralClientError("central_connection_unavailable")
+
+        status = domain.get_zdecision_candidate_refresh(CONTROL_ID)
+
+        self.assertEqual(
+            {
+                "safe_state": "retrying",
+                "candidate_revision_count": None,
+                "candidate_page_url": None,
+            },
+            status,
+        )
+
+        self.client.get_error = CentralClientError("central_request_rejected")
+        self.assertEqual(
+            "unavailable",
+            domain.get_zdecision_candidate_refresh(CONTROL_ID)["safe_state"],
         )
 
     async def test_status_maps_only_allowlisted_safe_state_count_and_url(
@@ -713,13 +770,32 @@ vm.runInThisContext(shippedScript);
     result: {{
       content: [],
       structuredContent: {{
-        safe_state: "failed",
+        safe_state: "retrying",
         candidate_revision_count: null,
         candidate_page_url: null,
       }},
     }},
   }});
   await secondPoll;
+  check(elements.status.textContent === "连接暂时中断，正在重试", "transient status failure was not reported");
+  check(timers.length === 1 && timers[0].delay === 1500, "transient status failure stopped polling");
+
+  const finalPoll = timers.shift().callback();
+  const finalStatusCall = latestToolCall("get_zdecision_candidate_refresh");
+  check(finalStatusCall.id !== secondStatusCall.id, "retry did not request fresh status");
+  deliver({{
+    jsonrpc: "2.0",
+    id: finalStatusCall.id,
+    result: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "failed",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+      }},
+    }},
+  }});
+  await finalPoll;
   check(timers.length === 0, "terminal state scheduled another poll");
   process.stdout.write("bridge-regression-ok");
 }})().catch((error) => {{

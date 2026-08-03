@@ -178,6 +178,13 @@ class LocalMcpTools:
             view = self.central_client.get_capture_request(
                 binding.central_request_id
             )
+        except CentralClientError as error:
+            if error.code in (
+                "central_connection_unavailable",
+                "central_temporarily_unavailable",
+            ):
+                return _safe_output("retrying")
+            return _safe_output("unavailable")
         except Exception:
             return _safe_output("unavailable")
         if (
@@ -219,22 +226,26 @@ class LocalMcpTools:
         ):
             return None
         try:
-            snapshot = self.repository_resolver.resolve(self.cwd)
-            if snapshot is None:
+            binding = self.binding_store.get(control_id)
+            if binding is None or os.path.normpath(binding.cwd) != self.cwd:
                 return None
-            mapping = self.database.get_repository_mapping(snapshot.repository_id)
+            mapping = self.database.get_repository_mapping(
+                binding.repository_id
+            )
             if mapping is None or not mapping.enabled:
                 return None
-            binding = self.binding_store.get(control_id)
             if (
-                binding is None
-                or binding.repository_id != snapshot.repository_id
-                or binding.repository_id != mapping.repository_id
+                binding.repository_id != mapping.repository_id
                 or binding.product_id != mapping.product_id
             ):
                 return None
-            if binding.chosen_scope is None and self.clock() >= _timestamp(
-                binding.expires_at
+            if binding.chosen_scope is not None:
+                return binding
+            snapshot = self.repository_resolver.resolve(self.cwd)
+            if (
+                snapshot is None
+                or snapshot.repository_id != binding.repository_id
+                or self.clock() >= _timestamp(binding.expires_at)
             ):
                 return None
             return binding
