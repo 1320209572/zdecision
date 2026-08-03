@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from argparse import Namespace
 from io import BytesIO
@@ -10,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from zdecision.agent.db import AgentDatabase
+from zdecision.agent.central_client import CentralClientError
 from zdecision.sync.contracts import (
     ClaimedCaptureRequest,
     RepositoryView,
@@ -52,9 +54,18 @@ def claimed_request() -> ClaimedCaptureRequest:
 
 
 class FakeCentralClient:
-    def __init__(self, claims: list[object]) -> None:
+    def __init__(
+        self,
+        claims: list[object],
+        *,
+        on_fail=None,
+    ) -> None:
         self.claims = list(claims)
         self.failures: list[tuple[str, str, str, bool]] = []
+        self.heartbeats: list[tuple[str, str]] = []
+        self.progresses: list[tuple[str, str, str]] = []
+        self.calls: list[str] = []
+        self.on_fail = on_fail
 
     def claim_next(self):
         result = self.claims.pop(0)
@@ -69,7 +80,38 @@ class FakeCentralClient:
         code: str,
         retryable: bool,
     ) -> None:
+        if self.on_fail is not None:
+            self.on_fail()
+        self.calls.append("fail")
         self.failures.append((request_id, lease_token, code, retryable))
+
+    def heartbeat(self, request_id: str, lease_token: str) -> None:
+        self.calls.append("heartbeat")
+        self.heartbeats.append((request_id, lease_token))
+
+    def progress(
+        self,
+        request_id: str,
+        lease_token: str,
+        code: str,
+    ) -> None:
+        self.calls.append("progress")
+        self.progresses.append((request_id, lease_token, code))
+
+
+class FakeLeaseClient:
+    def __init__(self, failure: Exception | None = None) -> None:
+        self.failure = failure
+        self.heartbeat_seen = threading.Event()
+        self.closed = threading.Event()
+
+    def heartbeat(self, request_id: str, lease_token: str) -> None:
+        self.heartbeat_seen.set()
+        if self.failure is not None:
+            raise self.failure
+
+    def close(self) -> None:
+        self.closed.set()
 
 
 class FakeProcessor:
@@ -101,6 +143,7 @@ class AgentServiceTest(unittest.TestCase):
         service = AgentService(
             client=client,
             processor=processor,
+            lease_client_factory=FakeLeaseClient,
             sleeper=lambda _: None,
         )
 
@@ -132,6 +175,7 @@ class AgentServiceTest(unittest.TestCase):
                 service = AgentService(
                     client=client,
                     processor=FakeProcessor(error),
+                    lease_client_factory=FakeLeaseClient,
                     sleeper=lambda _: None,
                 )
 
@@ -160,12 +204,94 @@ class AgentServiceTest(unittest.TestCase):
         service = AgentService(
             client=FakeCentralClient([ConnectionError("offline"), None]),
             processor=FakeProcessor(),
+            lease_client_factory=FakeLeaseClient,
             sleeper=stop_after_two,
         )
 
         with self.assertRaises(StopLoop):
             service.run_forever()
         self.assertEqual([5.0, 5.0], delays)
+
+    def test_service_renews_lease_while_processor_is_blocked(self) -> None:
+        lease_client = FakeLeaseClient()
+
+        class BlockingProcessor:
+            def process(self, request, client) -> None:
+                if not lease_client.heartbeat_seen.wait(timeout=1.0):
+                    raise AssertionError(
+                        "independent renewal did not run"
+                    )
+
+        service = AgentService(
+            client=FakeCentralClient([claimed_request()]),
+            processor=BlockingProcessor(),
+            lease_client_factory=lambda: lease_client,
+            lease_interval_seconds=0.001,
+            sleeper=lambda _: None,
+        )
+
+        self.assertTrue(service.run_once())
+        self.assertTrue(lease_client.closed.is_set())
+
+    def test_renewal_failure_blocks_mutations_and_old_token_failure(
+        self,
+    ) -> None:
+        lease_client = FakeLeaseClient(
+            CentralClientError("central_request_rejected")
+        )
+        client = FakeCentralClient([claimed_request()])
+
+        class MutatingProcessor:
+            def process(self, request, guarded_client) -> None:
+                if not lease_client.heartbeat_seen.wait(timeout=1.0):
+                    raise AssertionError("renewal failure was not observed")
+                guarded_client.progress(
+                    request.request_id,
+                    request.lease_token,
+                    "capturing_sessions",
+                )
+
+        service = AgentService(
+            client=client,
+            processor=MutatingProcessor(),
+            lease_client_factory=lambda: lease_client,
+            lease_interval_seconds=0.001,
+            sleeper=lambda _: None,
+        )
+
+        self.assertTrue(service.run_once())
+
+        self.assertEqual([], client.progresses)
+        self.assertEqual([], client.failures)
+        self.assertTrue(lease_client.closed.is_set())
+
+    def test_processor_failure_quiesces_before_heartbeat_and_fail(
+        self,
+    ) -> None:
+        lease_client = FakeLeaseClient()
+
+        def require_closed() -> None:
+            if not lease_client.closed.is_set():
+                raise AssertionError("renewal client is still active")
+
+        client = FakeCentralClient(
+            [claimed_request()], on_fail=require_closed
+        )
+        service = AgentService(
+            client=client,
+            processor=FakeProcessor(
+                RetryableCaptureRequestError(
+                    "central_temporarily_unavailable"
+                )
+            ),
+            lease_client_factory=lambda: lease_client,
+            sleeper=lambda _: None,
+        )
+
+        self.assertTrue(service.run_once())
+
+        self.assertTrue(lease_client.closed.is_set())
+        self.assertEqual(["heartbeat", "fail"], client.calls)
 
     def test_config_is_owner_only_and_mirrors_repository_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

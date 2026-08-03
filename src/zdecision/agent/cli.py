@@ -11,6 +11,8 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
+
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import handle_hook
@@ -228,11 +230,22 @@ def _run_service_command(
             from zdecision.agent.central_client import CentralClient
 
             client = CentralClient(config.central_url, config.device_token)
+            lease_timeout = httpx.Timeout(
+                5.0,
+                connect=3.0,
+                write=5.0,
+                pool=3.0,
+            )
             try:
                 AgentService(
                     client=client,
                     processor=configured_processor(
                         database, config, state_path
+                    ),
+                    lease_client_factory=lambda: CentralClient(
+                        config.central_url,
+                        config.device_token,
+                        timeout=lease_timeout,
                     ),
                 ).run_forever()
             finally:

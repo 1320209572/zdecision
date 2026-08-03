@@ -13,10 +13,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from zdecision.agent.central_client import CentralClient
+from zdecision.agent.central_client import CentralClient, CentralClientError
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
-from zdecision.sync.contracts import ClaimedCaptureRequest, RepositoryView
+from zdecision.agent.request_lease import (
+    LeaseAwareCentralClient,
+    RequestLeaseSession,
+)
+from zdecision.sync.contracts import (
+    CAPTURE_REQUEST_RENEW_INTERVAL_SECONDS,
+    ClaimedCaptureRequest,
+    RepositoryView,
+)
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -49,7 +57,7 @@ class CaptureRequestProcessor(Protocol):
     def process(
         self,
         request: ClaimedCaptureRequest,
-        client: CentralClient,
+        client: object,
     ) -> None: ...
 
 
@@ -98,10 +106,18 @@ class AgentService:
         *,
         client: CentralClient,
         processor: CaptureRequestProcessor | None,
+        lease_client_factory: Callable[[], object],
+        lease_interval_seconds: float = (
+            CAPTURE_REQUEST_RENEW_INTERVAL_SECONDS
+        ),
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
+        if not callable(lease_client_factory):
+            raise TypeError("lease_client_factory must be callable")
         self.client = client
         self.processor = processor
+        self.lease_client_factory = lease_client_factory
+        self.lease_interval_seconds = lease_interval_seconds
         self.sleeper = sleeper or time.sleep
 
     def run_once(self) -> bool:
@@ -110,29 +126,44 @@ class AgentService:
         request = self.client.claim_next()
         if request is None:
             return False
+        session = RequestLeaseSession(
+            request.request_id,
+            request.lease_token,
+            client_factory=self.lease_client_factory,
+            interval_seconds=self.lease_interval_seconds,
+        )
+        failure: tuple[str, bool] | None = None
         try:
-            self.processor.process(request, self.client)
+            session.start()
+            guarded_client = LeaseAwareCentralClient(
+                self.client, session
+            )
+            self.processor.process(request, guarded_client)
         except RetryableCaptureRequestError as error:
-            self.client.fail(
-                request.request_id,
-                request.lease_token,
-                error.code,
-                retryable=True,
-            )
+            failure = (error.code, True)
         except TerminalCaptureRequestError as error:
-            self.client.fail(
-                request.request_id,
-                request.lease_token,
-                error.code,
-                retryable=False,
-            )
+            failure = (error.code, False)
         except Exception:
-            self.client.fail(
-                request.request_id,
-                request.lease_token,
-                "unexpected_processor_error",
-                retryable=True,
-            )
+            failure = ("unexpected_processor_error", True)
+        finally:
+            try:
+                session.quiesce()
+            except CentralClientError:
+                pass
+        if failure is not None and not session.uncertain:
+            try:
+                self.client.heartbeat(
+                    request.request_id, request.lease_token
+                )
+            except Exception as error:
+                session.mark_uncertain(error)
+            if not session.uncertain:
+                self.client.fail(
+                    request.request_id,
+                    request.lease_token,
+                    failure[0],
+                    retryable=failure[1],
+                )
         return True
 
     def run_forever(self) -> None:
