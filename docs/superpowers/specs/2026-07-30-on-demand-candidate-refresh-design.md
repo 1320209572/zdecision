@@ -1,6 +1,7 @@
 # ZDecision On-Demand Candidate Refresh Design
 
-**Status:** Packet 1 Gates A–C implemented and accepted on 2026-07-31.
+**Status:** Packet 1 Gates A–C implemented and accepted on 2026-07-31;
+runtime model-profile lifecycle amendment under review on 2026-08-03.
 
 **Scope:** Pre-Demo technical loop for the installable Codex Plugin.
 
@@ -268,6 +269,52 @@ thread/read at durable upper checkpoint
 There is no eligibility assessment Turn. The user's page action is the Capture
 boundary. Zero Candidates is a successful result.
 
+### 8.1 Runtime model-profile lifecycle
+
+The feasibility-only rule that permanently froze the first complete
+`model/list` digest does not apply to the long-running Plugin. Codex may add,
+remove, or reorder model catalog entries without invalidating an otherwise
+supported extraction profile.
+
+The local Agent maintains one active extraction profile containing an exact
+`model_id`, reasoning effort, profile ID, discovery digest, and discovery time.
+When a new Capture Request is first processed, the Agent discovers the current
+app-server catalog and resolves the request profile exactly once:
+
+1. If the active profile's exact model and reasoning effort are still
+   supported, the Agent reuses that profile even when the complete catalog
+   digest changed.
+2. If no active profile exists, or its exact model and effort are no longer
+   supported, the Agent selects the default model and explicit default effort
+   returned by app-server discovery and atomically rotates the active profile
+   to a new profile ID. It never guesses a model slug.
+3. The selected profile is persisted in the private request freeze before any
+   source operation is created. Every new source operation in that request
+   copies the same complete profile into its immutable input.
+
+Rotation uses compare-and-swap against the previously active profile. A
+concurrent loser rereads the winner and may continue only when that exact
+winner is supported by its observed catalog. A catalog change by itself is
+never a `ModelDiscoveryConflict` and must not surface as an
+`unexpected_processor_error`.
+
+An existing source operation never consults or adopts a later active profile.
+All retries and disposable generations use the profile frozen in that
+operation. If app-server no longer accepts that frozen model, the operation
+stops with an explicit `frozen_model_unavailable` terminal result; it does not
+silently change model mid-operation. Because the handled Session checkpoint
+has not advanced, a later user refresh can create a new request using the then
+active profile.
+
+The existing singleton profile row is reinterpreted in place as the initial
+active-profile record. Rotation replaces that record through compare-and-swap;
+immutable source operations retain every historical profile needed for replay
+and audit. No Capture artifact, Candidate, or handled checkpoint is deleted
+during migration. A pre-amendment request that already froze Session sources
+but has not created a source operation fills its missing request profile once
+on its next retry; a request with any existing source operation derives the
+request profile from that operation and rejects a mixed-profile replay.
+
 Strict existing limits, frozen prompts, output digests, and native Turn IDs
 remain in force. The durable business operation is separate from native model
 execution. If a fork or Turn result is unknown, the whole native attempt is
@@ -467,6 +514,17 @@ implementation plan must begin from this design after written-spec approval.
 - A late abandoned generation cannot alter the winning Candidate family or
   outbox batch.
 - Handled checkpoints advance only after central acknowledgement.
+- An unrelated model-catalog change reuses the still-supported active profile
+  and does not fail the request.
+- Removal of the active model before request freezing rotates once to a new
+  supported profile; every source operation in that request freezes the same
+  profile ID.
+- Replaying an existing operation after active-profile rotation continues to
+  use its original frozen profile, while an unavailable frozen model produces
+  `frozen_model_unavailable` rather than an implicit substitution or an
+  unexpected processor failure.
+- Concurrent profile resolution produces one active winner and no request
+  containing mixed source-operation profiles.
 
 ### Gate D: Web Review and publication
 
