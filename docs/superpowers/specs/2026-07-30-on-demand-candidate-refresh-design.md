@@ -1,7 +1,8 @@
 # ZDecision On-Demand Candidate Refresh Design
 
 **Status:** Packet 1 Gates A–C implemented and accepted on 2026-07-31;
-runtime model-profile lifecycle amendment under review on 2026-08-03.
+runtime model-profile lifecycle amendment approved for implementation planning
+on 2026-08-03.
 
 **Scope:** Pre-Demo technical loop for the installable Codex Plugin.
 
