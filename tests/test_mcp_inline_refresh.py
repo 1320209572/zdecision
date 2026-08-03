@@ -58,13 +58,17 @@ def request_view(
 class StaticRepositoryResolver:
     def __init__(self, repository_id: str = REPOSITORY_ID) -> None:
         self.repository_id = repository_id
+        self.repository_ids_by_cwd: dict[str, str | None] = {}
         self.available = True
 
     def resolve(self, cwd: str) -> RepositorySnapshot | None:
         if not self.available:
             return None
+        repository_id = self.repository_ids_by_cwd.get(cwd, self.repository_id)
+        if repository_id is None:
+            return None
         return RepositorySnapshot(
-            repository_id=self.repository_id,
+            repository_id=repository_id,
             worktree_root=cwd,
             branch="main",
             head_commit="a" * 40,
@@ -271,7 +275,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, disabled.meta)
         self.assertNotIn("reason", disabled.model_dump(by_alias=True))
 
-    async def test_invalid_expired_and_cross_repository_controls_are_rejected(
+    async def test_invalid_expired_and_bound_repository_mismatch_are_rejected(
         self,
     ) -> None:
         expired_id = "ctl_" + "5" * 32
@@ -499,6 +503,51 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.client.create_calls)
         self.assertEqual([], self.client.get_calls)
 
+    async def test_app_status_restores_binding_across_mcp_working_directories(
+        self,
+    ) -> None:
+        another_cwd = self.root / "another-mcp-process"
+        another_cwd.mkdir()
+        self.resolver.repository_ids_by_cwd[str(another_cwd)] = (
+            OTHER_REPOSITORY_ID
+        )
+
+        another_domain = self.domain(cwd=str(another_cwd))
+        render = another_domain.show_zdecision_update(CONTROL_ID)
+        status = another_domain.get_zdecision_candidate_refresh(CONTROL_ID)
+
+        self.assertEqual("disabled", render.structuredContent["safe_state"])
+        self.assertEqual(
+            {
+                "safe_state": "ready",
+                "candidate_revision_count": None,
+                "candidate_page_url": None,
+                "submission_state": "ready",
+                "chosen_scope": None,
+            },
+            status,
+        )
+        self.assertEqual([], self.client.create_calls)
+        self.assertEqual([], self.client.get_calls)
+
+    async def test_app_start_uses_binding_across_mcp_working_directories(
+        self,
+    ) -> None:
+        another_cwd = self.root / "another-mcp-process"
+        another_cwd.mkdir()
+        self.resolver.repository_ids_by_cwd[str(another_cwd)] = (
+            OTHER_REPOSITORY_ID
+        )
+
+        result = self.domain(cwd=str(another_cwd)).start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+
+        self.assertEqual("queued", result["safe_state"])
+        self.assertEqual("current_session", result["chosen_scope"])
+        self.assertEqual(1, len(self.client.create_calls))
+        self.assertEqual(REPOSITORY_ID, self.client.create_calls[0].repository_id)
+
     async def test_selected_request_status_uses_frozen_binding_without_git(
         self,
     ) -> None:
@@ -513,7 +562,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("queued", started["safe_state"])
         self.assertEqual("queued", status["safe_state"])
 
-    async def test_selected_control_rejects_another_mcp_working_directory(
+    async def test_app_status_uses_selected_binding_across_mcp_directories(
         self,
     ) -> None:
         domain = self.domain()
@@ -525,7 +574,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             CONTROL_ID
         )
 
-        self.assertEqual("unavailable", status["safe_state"])
+        self.assertEqual("queued", status["safe_state"])
 
     async def test_transient_central_status_failure_is_retryable(self) -> None:
         domain = self.domain()

@@ -90,7 +90,7 @@ class LocalMcpTools:
     def show_zdecision_update(
         self, control_id: str | None = None
     ) -> CallToolResult:
-        binding = self._valid_binding(control_id)
+        binding = self._valid_binding(control_id, require_current_cwd=True)
         selected = binding is not None and binding.chosen_scope is not None
         request_attached = bool(
             binding is not None and binding.central_request_id is not None
@@ -130,7 +130,7 @@ class LocalMcpTools:
         control_id: str,
         scope: CaptureScope,
     ) -> dict[str, object]:
-        binding = self._valid_binding(control_id)
+        binding = self._valid_binding(control_id, require_current_cwd=False)
         if binding is None or self.binding_store is None:
             return _safe_output("unavailable")
         if scope not in ("current_session", "all_valid_sessions"):
@@ -215,7 +215,7 @@ class LocalMcpTools:
     def get_zdecision_candidate_refresh(
         self, control_id: str
     ) -> dict[str, object]:
-        binding = self._valid_binding(control_id)
+        binding = self._valid_binding(control_id, require_current_cwd=False)
         if binding is None:
             return _safe_output("unavailable")
         if binding.submission_state == "ready":
@@ -275,7 +275,12 @@ class LocalMcpTools:
             candidate_page_url=page_url,
         )
 
-    def _valid_binding(self, control_id: object) -> ControlBinding | None:
+    def _valid_binding(
+        self,
+        control_id: object,
+        *,
+        require_current_cwd: bool,
+    ) -> ControlBinding | None:
         if (
             self.binding_store is None
             or self.central_client is None
@@ -285,7 +290,12 @@ class LocalMcpTools:
             return None
         try:
             binding = self.binding_store.get(control_id)
-            if binding is None or os.path.normpath(binding.cwd) != self.cwd:
+            if binding is None:
+                return None
+            if (
+                require_current_cwd
+                and os.path.normpath(binding.cwd) != self.cwd
+            ):
                 return None
             mapping = self.database.get_repository_mapping(
                 binding.repository_id
@@ -299,11 +309,12 @@ class LocalMcpTools:
                 return None
             if binding.chosen_scope is not None:
                 return binding
-            snapshot = self.repository_resolver.resolve(self.cwd)
+            if self.clock() >= _timestamp(binding.expires_at):
+                return None
+            snapshot = self.repository_resolver.resolve(binding.cwd)
             if (
                 snapshot is None
                 or snapshot.repository_id != binding.repository_id
-                or self.clock() >= _timestamp(binding.expires_at)
             ):
                 return None
             return binding
