@@ -355,8 +355,7 @@
           status.textContent = labels[safeState] || labels.unavailable;
         }
         const canOpen = (safeState === "succeeded" || safeState === "empty")
-          && typeof pageUrl === "string"
-          && Boolean(hostCapabilities?.openLinks);
+          && typeof pageUrl === "string";
         openPageButton.hidden = !canOpen;
       }
 
@@ -512,21 +511,33 @@
       currentButton.addEventListener("click", () => start("current_session"));
       allButton.addEventListener("click", () => start("all_valid_sessions"));
       openPageButton.addEventListener("click", async () => {
-        if (!hostCapabilities?.openLinks || typeof pageUrl !== "string") return;
+        if (typeof pageUrl !== "string") return;
         const targetUrl = pageUrl;
+        let targetProtocol = null;
+        try {
+          targetProtocol = new URL(targetUrl).protocol;
+        } catch {
+          targetProtocol = null;
+        }
+        pageAddress.textContent = targetUrl;
+        pageAddress.hidden = false;
+        if (!hostCapabilities?.openLinks || targetProtocol !== "https:") {
+          status.textContent = targetProtocol === "http:"
+            ? "当前本地页面无法自动打开，请使用下方地址"
+            : "当前页面无法自动打开，请使用下方地址";
+          openPageButton.textContent = "再次显示候选决策页面地址";
+          return;
+        }
         openPageButton.disabled = true;
-        pageAddress.hidden = true;
         status.textContent = "正在打开候选决策页面";
         try {
           const result = await request("ui/open-link", { url: targetUrl }, 5000);
           if (result?.isError === true) throw new Error("open_link_rejected");
-          status.textContent = "已请求在右侧浏览器打开";
+          status.textContent = "已提交浏览器打开请求；未打开请使用下方地址";
           openPageButton.textContent = "再次打开候选决策页面";
         } catch {
           status.textContent = "页面未打开，请重试";
           openPageButton.textContent = "重试打开候选决策页面";
-          pageAddress.textContent = targetUrl;
-          pageAddress.hidden = false;
         } finally {
           openPageButton.disabled = false;
         }

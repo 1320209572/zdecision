@@ -326,9 +326,17 @@ Safe user-facing states are:
 `N` is the number of Candidate revisions in this request's acknowledged
 upload batch, not the total number of Candidates currently in the product.
 
-On terminal success, the card shows **打开候选决策页面** and uses the
-host-supported external-navigation method to open the repository's central
-Candidate page. It does not receive or render Candidate content itself.
+On terminal success, the card shows **打开候选决策页面**. For an HTTPS
+Candidate URL and a host that advertises external navigation, the card submits
+the host-supported open-link request. The host acknowledgement proves only
+that the request was accepted, not that a browser navigated, so the card keeps
+the exact page address visible as a fallback and never claims that the page
+opened in a particular browser surface. For HTTP or otherwise unsupported
+URLs, the card does not submit an open-link request and instead exposes the
+exact address for manual use. The card does not receive or render Candidate
+content itself. A one-click deployed Demo therefore requires the central page
+to have an HTTPS URL; the local HTTP technical-demo page intentionally uses
+the manual-address fallback.
 
 ## 10. Failure and recovery
 

@@ -1428,7 +1428,7 @@ __SCENARIO__
             "terminal-remounts-closed-ok",
         )
 
-    async def test_widget_reports_open_page_result_and_remains_retryable(
+    async def test_widget_only_requests_https_page_and_never_claims_navigation(
         self,
     ) -> None:
         html = mcp_server.UPDATE_CANDIDATES_PATH.read_text("utf-8")
@@ -1543,7 +1543,7 @@ vm.runInThisContext(shippedScript);
 
   const refreshClick = elements.current.dispatch("click");
   const start = latestCall("tools/call");
-  const candidateUrl = "http://127.0.0.1:8765/?repository_id=repo_22222222222222222222222222222222";
+  const candidateUrl = "https://decisions.example.test/?repository_id=repo_22222222222222222222222222222222";
   deliver({{
     jsonrpc: "2.0",
     id: start.id,
@@ -1568,9 +1568,13 @@ vm.runInThisContext(shippedScript);
   check(elements["open-page"].disabled, "open action allowed a duplicate request");
   deliver({{ jsonrpc: "2.0", id: successfulOpen.id, result: {{ isError: false }} }});
   await successfulClick;
-  check(elements.status.textContent === "已请求在右侧浏览器打开", "successful open was not reported");
+  check(
+    elements.status.textContent === "已提交浏览器打开请求；未打开请使用下方地址",
+    "host acknowledgement was reported as confirmed navigation",
+  );
   check(!elements["open-page"].disabled, "successful open was not retryable");
-  check(elements["page-address"].hidden, "successful open exposed the fallback address");
+  check(!elements["page-address"].hidden, "host acknowledgement hid the fallback address");
+  check(elements["page-address"].textContent === candidateUrl, "acknowledged open lost the exact address");
 
   const deniedClick = elements["open-page"].dispatch("click");
   const deniedOpen = latestCall("ui/open-link");
@@ -1589,6 +1593,23 @@ vm.runInThisContext(shippedScript);
   check(!elements["open-page"].disabled, "open timeout prevented retry");
   deliver({{ jsonrpc: "2.0", id: timedOutOpen.id, result: {{ isError: false }} }});
   check(elements.status.textContent === "页面未打开，请重试", "late response changed timeout state");
+
+  const localCandidateUrl = "http://127.0.0.1:8765/?repository_id=repo_22222222222222222222222222222222";
+  vm.runInThisContext(`pageUrl = ${{JSON.stringify(localCandidateUrl)}}`);
+  const openCallCount = outbound.filter((message) => message.method === "ui/open-link").length;
+  const localClick = elements["open-page"].dispatch("click");
+  await Promise.resolve();
+  check(
+    outbound.filter((message) => message.method === "ui/open-link").length === openCallCount,
+    "local HTTP page was sent to a host that silently rejects it",
+  );
+  await localClick;
+  check(
+    elements.status.textContent === "当前本地页面无法自动打开，请使用下方地址",
+    "local HTTP limitation was not reported",
+  );
+  check(!elements["page-address"].hidden, "local HTTP page address stayed hidden");
+  check(elements["page-address"].textContent === localCandidateUrl, "local HTTP fallback address was not exact");
   process.stdout.write("open-page-regression-ok");
 }})().catch((error) => {{
   process.stderr.write(error.stack || String(error));
