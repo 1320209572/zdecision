@@ -354,6 +354,22 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             now=NOW,
         )
 
+    def test_empty_result_checks_lease_immediately_before_local_commit(
+        self,
+    ) -> None:
+        original = self.request_state.commit_candidate_result
+
+        def checked_commit(request_id, result, batch):
+            self.assertEqual("heartbeat", self.client.calls[-1])
+            return original(request_id, result, batch)
+
+        with patch.object(
+            self.request_state,
+            "commit_candidate_result",
+            side_effect=checked_commit,
+        ):
+            self.processor.process(claimed_request(), self.client)
+
     def test_checkpoint_advances_only_after_exact_upload_receipt(
         self,
     ) -> None:

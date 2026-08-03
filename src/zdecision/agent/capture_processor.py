@@ -297,6 +297,9 @@ class OnDemandCaptureProcessor:
             raise TerminalCaptureRequestError(
                 "reconciliation_repository_mismatch"
             )
+        client.heartbeat(
+            request.request_id, request.lease_token
+        )
         batch = _candidate_batch(
             request.request_id,
             request.repository_id,

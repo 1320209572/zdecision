@@ -6,7 +6,9 @@ import json
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
+from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -70,12 +72,15 @@ TRANSCRIPT_PATH_SENTINEL = "TRANSCRIPT-PATH-MUST-NEVER-BE-OPENED"
 class MutableClock:
     def __init__(self) -> None:
         self.value = datetime(2026, 7, 31, 6, 0, tzinfo=UTC)
+        self._lock = threading.Lock()
 
     def __call__(self) -> datetime:
-        return self.value
+        with self._lock:
+            return self.value
 
     def advance(self, seconds: int) -> None:
-        self.value += timedelta(seconds=seconds)
+        with self._lock:
+            self.value += timedelta(seconds=seconds)
 
 
 class TestClientBridge:
@@ -85,6 +90,8 @@ class TestClientBridge:
         self.owner = owner
         self.records: list[tuple[str, bytes, bytes]] = []
         self.drop_upload_responses = 0
+        self.condition = threading.Condition()
+        self.request_lock = threading.Lock()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         browser = self.owner.browser
@@ -98,14 +105,19 @@ class TestClientBridge:
             for key, value in request.headers.items()
             if key.lower() not in {"host", "content-length"}
         }
-        response = browser.request(
-            request.method,
-            path,
-            headers=headers,
-            content=request.content,
-        )
+        with self.request_lock:
+            response = browser.request(
+                request.method,
+                path,
+                headers=headers,
+                content=request.content,
+            )
         response_body = bytes(response.content)
-        self.records.append((request.url.path, bytes(request.content), response_body))
+        with self.condition:
+            self.records.append(
+                (request.url.path, bytes(request.content), response_body)
+            )
+            self.condition.notify_all()
         if (
             request.url.path.endswith("/candidates")
             and self.drop_upload_responses > 0
@@ -120,6 +132,31 @@ class TestClientBridge:
             content=response_body,
             request=request,
         )
+
+    def heartbeat_count(self, request_id: str) -> int:
+        suffix = f"/{request_id}/heartbeat"
+        with self.condition:
+            return sum(
+                path.endswith(suffix) for path, _, _ in self.records
+            )
+
+    def wait_for_heartbeat(
+        self,
+        request_id: str,
+        *,
+        after_count: int,
+        timeout: float,
+    ) -> bool:
+        suffix = f"/{request_id}/heartbeat"
+        with self.condition:
+            return self.condition.wait_for(
+                lambda: sum(
+                    path.endswith(suffix)
+                    for path, _, _ in self.records
+                )
+                > after_count,
+                timeout=timeout,
+            )
 
 
 class FakeAppServerGateway:
@@ -167,6 +204,7 @@ class FakeAppServerGateway:
         self.drop_next_fork_result = False
         self.drop_next_stage_result: str | None = None
         self.extraction_claims: list[str] = []
+        self.before_inventory_result: Callable[[], None] | None = None
         self.version_by_session = {
             SESSION_A: "A 初始",
             SESSION_B: "B 初始",
@@ -284,6 +322,13 @@ class FakeAppServerGateway:
             raise AssertionError("Unexpected structured Turn")
         self.structured_turn_creates[stage] += 1
         self.turn_creates += 1
+        if (
+            stage == "inventory"
+            and self.before_inventory_result is not None
+        ):
+            callback = self.before_inventory_result
+            self.before_inventory_result = None
+            callback()
         receipt = AppServerTurnReceipt.create(
             thread_id=thread_id,
             turn_id=f"{stage}-turn-{self.turn_creates}",
@@ -447,6 +492,46 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             "succeeded", events.json()["events"][-1]["state"]
         )
         self._assert_central_has_no_raw_source()
+
+    def test_blocking_inventory_keeps_one_live_lease_past_thirty_seconds(
+        self,
+    ) -> None:
+        self._observe(SESSION_A, TURN_A1, self.registered_repository)
+        self._drain_hooks()
+        request_id = self._click("web_action_long_inventory")
+
+        def cross_lease_window() -> None:
+            for _ in range(4):
+                self.clock.advance(9)
+                before = self.bridge.heartbeat_count(request_id)
+                self.assertTrue(
+                    self.bridge.wait_for_heartbeat(
+                        request_id,
+                        after_count=before,
+                        timeout=1.0,
+                    )
+                )
+
+        self.gateway.before_inventory_result = cross_lease_window
+
+        self.assertTrue(self._run_agent_once())
+
+        request = self._request(request_id)
+        event_codes = [
+            item["code"]
+            for item in self.browser.get(
+                f"/api/v1/capture-requests/{request_id}/events"
+            ).json()["events"]
+        ]
+        record = self.central_store.get_request_record(request_id)
+        self.assertEqual(
+            "succeeded",
+            request["state"],
+            (request, event_codes),
+        )
+        self.assertEqual(1, record.attempt_count)
+        self.assertNotIn("lease_expired_requeued", event_codes)
+        self.assertNotIn("retry_exhausted", event_codes)
 
     def test_catalog_change_keeps_one_request_profile_across_restart(
         self,
@@ -999,6 +1084,13 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.agent_service = AgentService(
             client=self.central_client,
             processor=processor,
+            lease_client_factory=lambda: CentralClient(
+                "http://central.test",
+                DEVICE_TOKEN,
+                transport=httpx.MockTransport(self.bridge),
+                sleeper=lambda _: None,
+            ),
+            lease_interval_seconds=0.001,
         )
 
     def _stop_local(self) -> None:
