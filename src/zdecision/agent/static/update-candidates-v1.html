@@ -218,10 +218,10 @@
       let nextRequestId = 1;
       let initialized = false;
       let initialResultAccepted = false;
+      let restorationStarted = false;
       let selected = false;
       let chosenScope = null;
-      let requestAttached = false;
-      let recoveryStarted = false;
+      let submissionState = null;
       let controlId = null;
       let safeState = "disabled";
       let pageUrl = null;
@@ -261,7 +261,11 @@
       }
 
       function updateInitialAvailability() {
-        const enabled = initialized && !selected && typeof controlId === "string";
+        const enabled = initialized
+          && initialResultAccepted
+          && submissionState === "ready"
+          && !selected
+          && typeof controlId === "string";
         currentButton.disabled = !enabled;
         allButton.disabled = !enabled;
       }
@@ -270,15 +274,41 @@
         const value = result?.structuredContent;
         if (!value || typeof value.safe_state !== "string") {
           return {
+            valid: false,
             safe_state: "unavailable",
             candidate_revision_count: null,
             candidate_page_url: null,
+            submission_state: null,
+            chosen_scope: null,
           };
         }
         const knownStates = new Set([
-          "submitting", "queued", "capturing", "syncing", "retrying",
+          "ready", "submitting", "queued", "capturing", "syncing", "retrying",
           "busy", "unavailable", "failed", "empty", "succeeded",
         ]);
+        const knownSubmissionStates = new Set([
+          "ready", "pending", "attached", "busy", "rejected", "legacy_unknown",
+        ]);
+        const persistedScope = value.chosen_scope;
+        const hasPersistedScope =
+          persistedScope === "current_session"
+          || persistedScope === "all_valid_sessions";
+        const stateIsConsistent =
+          (value.submission_state === "ready"
+            && value.safe_state === "ready"
+            && persistedScope === null)
+          || (value.submission_state === "pending"
+            && value.safe_state === "submitting"
+            && hasPersistedScope)
+          || (value.submission_state === "attached"
+            && !["ready", "submitting", "busy"].includes(value.safe_state)
+            && hasPersistedScope)
+          || (value.submission_state === "busy"
+            && value.safe_state === "busy"
+            && hasPersistedScope)
+          || (["rejected", "legacy_unknown"].includes(value.submission_state)
+            && value.safe_state === "failed"
+            && hasPersistedScope);
         const candidateRevisionCount =
           Number.isSafeInteger(value.candidate_revision_count) &&
           value.candidate_revision_count >= 0
@@ -288,19 +318,26 @@
           ? value.candidate_page_url
           : null;
         return {
-          safe_state: knownStates.has(value.safe_state)
-            ? value.safe_state
-            : "unavailable",
+          valid: knownStates.has(value.safe_state)
+            && knownSubmissionStates.has(value.submission_state)
+            && stateIsConsistent,
+          safe_state: knownStates.has(value.safe_state) && stateIsConsistent
+            ? value.safe_state : "unavailable",
           candidate_revision_count: candidateRevisionCount,
           candidate_page_url: candidatePageUrl,
+          submission_state: stateIsConsistent ? value.submission_state : null,
+          chosen_scope: hasPersistedScope ? persistedScope : null,
         };
       }
 
-      function renderResult(result) {
-        const value = boundedResult(result);
+      function renderResult(value) {
         safeState = value.safe_state;
         pageUrl = value.candidate_page_url;
-        if (safeState === "succeeded" && value.candidate_revision_count > 0) {
+        if (safeState === "ready") {
+          status.textContent = "";
+        } else if (
+          safeState === "succeeded" && value.candidate_revision_count > 0
+        ) {
           status.textContent =
             `本次同步 ${value.candidate_revision_count} 条候选决策`;
         } else {
@@ -317,38 +354,19 @@
         const enabled = initial?.actions_enabled;
         const meta = result?._meta;
         const metaControl = meta?.["zdecision/control_id"];
-        const persistedScope = meta?.["zdecision/chosen_scope"];
-        const hasPersistedScope =
-          persistedScope === "current_session"
-          || persistedScope === "all_valid_sessions";
-        const persistedRequestAttached = meta?.["zdecision/request_attached"];
-        const hasPersistedSelection =
-          hasPersistedScope && typeof persistedRequestAttached === "boolean";
-        const expectedState = enabled === true
-          ? "ready"
-          : hasPersistedSelection
-          ? persistedRequestAttached ? "queued" : "submitting"
-          : "disabled";
-        const isRenderResult =
-          typeof enabled === "boolean" && initial?.safe_state === expectedState;
+        const isRenderResult = typeof enabled === "boolean"
+          && (initial?.safe_state === "ready"
+            || initial?.safe_state === "disabled"
+            || initial?.safe_state === "submitting"
+            || initial?.safe_state === "queued");
         if (initialResultAccepted || selected || !isRenderResult) return;
 
+        if (enabled === true && initial.safe_state !== "ready") return;
         if (enabled && typeof metaControl !== "string") return;
-        if (hasPersistedSelection && typeof metaControl !== "string") return;
         initialResultAccepted = true;
         controlId = typeof metaControl === "string" ? metaControl : null;
-        if (hasPersistedSelection) {
-          selected = true;
-          chosenScope = persistedScope;
-          requestAttached = persistedRequestAttached;
-          renderResult(result);
-          lockActions();
-          resumeSelectedBinding();
-          return;
-        }
-        safeState = controlId && enabled ? "ready" : "disabled";
-        status.textContent = "";
-        updateInitialAvailability();
+        lockActions();
+        restoreInitialBinding();
       }
 
       window.addEventListener(
@@ -376,23 +394,30 @@
       );
 
       async function poll() {
-        if (!activeStates.has(safeState)) return;
+        if (submissionState !== "attached" || !activeStates.has(safeState)) {
+          return;
+        }
         try {
           const result = await request("tools/call", {
             name: "get_zdecision_candidate_refresh",
             arguments: { control_id: controlId },
           });
-          renderResult(result);
+          applyBindingResult(result, "poll");
         } catch {
-          renderResult({ structuredContent: { safe_state: "unavailable" } });
+          safeState = "unavailable";
+          status.textContent = labels.unavailable;
         }
-        if (activeStates.has(safeState)) setTimeout(poll, 1500);
       }
 
       async function start(scope, replay = false) {
-        if ((!replay && selected) || !controlId) return;
-        selected = true;
-        chosenScope = scope;
+        const canStart = replay
+          ? submissionState === "pending" && scope === chosenScope
+          : submissionState === "ready" && !selected;
+        if (!canStart || !controlId) return;
+        if (!replay) {
+          selected = true;
+          chosenScope = scope;
+        }
         lockActions();
         safeState = "creating";
         status.textContent = labels.creating;
@@ -401,20 +426,67 @@
             name: "start_zdecision_candidate_refresh",
             arguments: { control_id: controlId, scope },
           });
-          renderResult(result);
-          if (activeStates.has(safeState)) setTimeout(poll, 1500);
+          applyBindingResult(result, "start");
         } catch {
-          renderResult({ structuredContent: { safe_state: "unavailable" } });
+          safeState = "unavailable";
+          status.textContent = labels.unavailable;
+          setTimeout(restoreBinding, 1500);
         }
       }
 
-      function resumeSelectedBinding() {
-        if (!initialized || recoveryStarted || !selected || !controlId) return;
-        recoveryStarted = true;
-        if (safeState === "submitting" && !requestAttached) {
-          start(chosenScope, true);
-        } else if (requestAttached && activeStates.has(safeState)) {
+      function applyBindingResult(result, source) {
+        const value = boundedResult(result);
+        if (!value.valid) {
+          submissionState = null;
+          safeState = "unavailable";
+          lockActions();
+          status.textContent = labels.unavailable;
+          return;
+        }
+        submissionState = value.submission_state;
+        chosenScope = value.chosen_scope;
+        selected = submissionState !== "ready";
+        renderResult(value);
+        if (submissionState === "ready") {
+          updateInitialAvailability();
+          return;
+        }
+        lockActions();
+        if (submissionState === "pending") {
+          if (source === "restore") start(chosenScope, true);
+          else setTimeout(() => start(chosenScope, true), 1500);
+        } else if (
+          submissionState === "attached" && activeStates.has(safeState)
+        ) {
           setTimeout(poll, 1500);
+        }
+      }
+
+      async function restoreBinding() {
+        if (!initialized || !initialResultAccepted || !controlId) return;
+        lockActions();
+        try {
+          const result = await request("tools/call", {
+            name: "get_zdecision_candidate_refresh",
+            arguments: { control_id: controlId },
+          });
+          applyBindingResult(result, "restore");
+        } catch {
+          safeState = "unavailable";
+          status.textContent = labels.unavailable;
+          lockActions();
+        }
+      }
+
+      function restoreInitialBinding() {
+        if (restorationStarted || !initialized || !initialResultAccepted) return;
+        restorationStarted = true;
+        if (controlId) {
+          restoreBinding();
+        } else {
+          safeState = "disabled";
+          status.textContent = "";
+          lockActions();
         }
       }
 
@@ -450,8 +522,7 @@
           hostCapabilities = result?.hostCapabilities || {};
           initialized = true;
           notify("ui/notifications/initialized", {});
-          updateInitialAvailability();
-          resumeSelectedBinding();
+          restoreInitialBinding();
         })
         .catch(() => {
           lockActions();

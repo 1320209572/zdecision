@@ -22,9 +22,11 @@ from zdecision.agent.mcp_server import LocalMcpTools
 
 CONTROL_A = "ctl_" + "a" * 32
 CONTROL_ALL = "ctl_" + "b" * 32
+CONTROL_ALL_RETRY = "ctl_" + "d" * 32
 MODEL_CONTROL = "ctl_" + "c" * 32
 RENDER_TURN_A = "render-turn-a-raw-sentinel"
 RENDER_TURN_B = "render-turn-b-raw-sentinel"
+RENDER_TURN_B_RETRY = "render-turn-b-retry-raw-sentinel"
 RAW_DIFF = "DIFF-RAW-SENTINEL-DO-NOT-SYNC"
 RAW_TOOL_OUTPUT = "TOOL-OUTPUT-RAW-SENTINEL-DO-NOT-SYNC"
 
@@ -75,7 +77,11 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 harness, SESSION_B, RENDER_TURN_B, CONTROL_ALL
             )
             action_ids = iter(
-                ("codex_action_current", "codex_action_all_valid")
+                (
+                    "codex_action_current",
+                    "codex_action_all_busy",
+                    "codex_action_all_valid",
+                )
             )
             tools = LocalMcpTools(
                 database=harness.agent_database,
@@ -147,18 +153,28 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 ),
             )
 
-            started_all = tools.start_zdecision_candidate_refresh(
+            busy_replay = tools.start_zdecision_candidate_refresh(
                 all_control, "all_valid_sessions"
+            )
+            self.assertEqual(busy, busy_replay)
+            all_retry_control = self._render_control(
+                harness,
+                SESSION_B,
+                RENDER_TURN_B_RETRY,
+                CONTROL_ALL_RETRY,
+            )
+            started_all = tools.start_zdecision_candidate_refresh(
+                all_retry_control, "all_valid_sessions"
             )
             mcp_outputs.append(started_all)
             self.assertEqual("queued", started_all["safe_state"])
             request_b = harness.control_store.get(
-                all_control
+                all_retry_control
             ).central_request_id
             self.assertIsNotNone(request_b)
             self.assertNotEqual(request_a, request_b)
             self.assertTrue(harness._run_agent_once())
-            status_b = tools.get_zdecision_candidate_refresh(all_control)
+            status_b = tools.get_zdecision_candidate_refresh(all_retry_control)
             mcp_outputs.append(status_b)
             self.assertEqual("succeeded", status_b["safe_state"])
             self.assertEqual(1, status_b["candidate_revision_count"])
@@ -256,6 +272,7 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 TURN_CHILD,
                 RENDER_TURN_A,
                 RENDER_TURN_B,
+                RENDER_TURN_B_RETRY,
                 str(harness.registered_repository),
                 LOCAL_PATH_SENTINEL,
                 RAW_PROMPT,
@@ -264,6 +281,7 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 RAW_TOOL_OUTPUT,
                 CONTROL_A,
                 CONTROL_ALL,
+                CONTROL_ALL_RETRY,
                 MODEL_CONTROL,
             ):
                 with self.subTest(forbidden=forbidden):

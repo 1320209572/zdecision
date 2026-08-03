@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -57,6 +58,8 @@ class ControlBindingStoreTests(unittest.TestCase):
     def test_scope_choice_is_durable_idempotent_and_conflict_checked(self) -> None:
         control = self.create_binding()
 
+        self.assertEqual("ready", control.submission_state)
+
         first = self.store.choose_scope(
             control.control_id,
             expected_repository_id=REPOSITORY_ID,
@@ -73,6 +76,7 @@ class ControlBindingStoreTests(unittest.TestCase):
         )
 
         self.assertEqual(ACTION_ID, first.client_action_id)
+        self.assertEqual("pending", first.submission_state)
         self.assertEqual(ACTION_ID, replay.client_action_id)
         with self.assertRaises(ControlScopeConflict):
             self.store.choose_scope(
@@ -101,8 +105,131 @@ class ControlBindingStoreTests(unittest.TestCase):
         self.store = ControlBindingStore.open(self.path)
 
         self.assertEqual(attached, self.store.get_by_client_action_id(ACTION_ID))
+        self.assertEqual("attached", attached.submission_state)
         self.assertEqual(REQUEST_ID, self.store.get(CONTROL_ID).central_request_id)
         self.assertEqual(attached, self.store.get(CONTROL_ID))
+
+    def test_terminal_submission_dispositions_are_durable_and_not_reopened(
+        self,
+    ) -> None:
+        cases = (
+            ("busy", "ctl_" + "5" * 32, "codex_action_busy"),
+            ("rejected", "ctl_" + "6" * 32, "codex_action_rejected"),
+        )
+
+        for disposition, control_id, action_id in cases:
+            with self.subTest(disposition=disposition):
+                self.create_binding(control_id=control_id)
+                chosen = self.store.choose_scope(
+                    control_id,
+                    expected_repository_id=REPOSITORY_ID,
+                    scope="current_session",
+                    proposed_client_action_id=action_id,
+                    now=NOW,
+                )
+                terminal = self.store.finish_submission(
+                    control_id,
+                    client_action_id=chosen.client_action_id,
+                    disposition=disposition,
+                )
+                replay = self.store.choose_scope(
+                    control_id,
+                    expected_repository_id=REPOSITORY_ID,
+                    scope="current_session",
+                    proposed_client_action_id="codex_action_ignored",
+                    now=NOW + timedelta(days=1),
+                )
+
+                self.assertEqual(disposition, terminal.submission_state)
+                self.assertEqual(disposition, replay.submission_state)
+                with self.assertRaises(ControlRequestConflict):
+                    self.store.attach_request(
+                        control_id,
+                        client_action_id=action_id,
+                        central_request_id="crq_" + "7" * 32,
+                    )
+
+        self.store.close()
+        self.store = ControlBindingStore.open(self.path)
+        self.assertEqual(
+            "busy", self.store.get("ctl_" + "5" * 32).submission_state
+        )
+        self.assertEqual(
+            "rejected", self.store.get("ctl_" + "6" * 32).submission_state
+        )
+
+    def test_legacy_selected_rows_fail_closed_while_attached_rows_migrate(
+        self,
+    ) -> None:
+        legacy_path = self.root / "legacy" / "zdecision.sqlite3"
+        legacy_path.parent.mkdir(parents=True)
+        connection = sqlite3.connect(legacy_path)
+        connection.executescript(
+            """
+            CREATE TABLE control_bindings (
+                control_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                render_turn_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                repository_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                chosen_scope TEXT,
+                client_action_id TEXT UNIQUE,
+                central_request_id TEXT UNIQUE
+            );
+            """
+        )
+        rows = (
+            (
+                "ctl_" + "7" * 32,
+                "current_session",
+                "codex_action_legacy_unknown",
+                None,
+            ),
+            (
+                "ctl_" + "8" * 32,
+                "all_valid_sessions",
+                "codex_action_legacy_attached",
+                "crq_" + "9" * 32,
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO control_bindings(
+                control_id, session_id, render_turn_id, cwd,
+                repository_id, product_id, created_at, expires_at,
+                chosen_scope, client_action_id, central_request_id
+            ) VALUES (?, 'session', 'turn', '/private/repository', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    control_id,
+                    REPOSITORY_ID,
+                    PRODUCT_ID,
+                    "2026-07-31T03:00:00.000000Z",
+                    "2026-07-31T03:15:00.000000Z",
+                    scope,
+                    action_id,
+                    request_id,
+                )
+                for control_id, scope, action_id, request_id in rows
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = ControlBindingStore.open(legacy_path)
+        self.addCleanup(migrated.close)
+
+        self.assertEqual(
+            "legacy_unknown",
+            migrated.get("ctl_" + "7" * 32).submission_state,
+        )
+        self.assertEqual(
+            "attached", migrated.get("ctl_" + "8" * 32).submission_state
+        )
 
     def test_concurrent_double_clicks_share_the_first_persisted_action(self) -> None:
         self.create_binding()

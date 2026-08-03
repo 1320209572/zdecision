@@ -150,8 +150,14 @@ class LocalMcpTools:
         except (ControlBindingError, OSError, ValueError):
             return _safe_output("unavailable")
 
-        if binding.central_request_id is not None:
+        if binding.submission_state == "attached":
             return self._read_request(binding)
+        if binding.submission_state == "busy":
+            return _binding_output(binding, "busy")
+        if binding.submission_state in ("rejected", "legacy_unknown"):
+            return _binding_output(binding, "failed")
+        if binding.submission_state != "pending":
+            return _safe_output("unavailable")
 
         return self._create_and_attach_request(binding)
 
@@ -168,27 +174,43 @@ class LocalMcpTools:
             view = self.central_client.create_capture_request(command)
         except CentralClientError as error:
             if error.code == "repository_capture_busy":
-                return _safe_output("busy")
+                return self._finish_submission(binding, "busy", "busy")
             if error.code in (
                 "central_connection_unavailable",
                 "central_temporarily_unavailable",
             ):
-                return _safe_output("submitting")
-            return _safe_output("unavailable")
+                return _binding_output(binding, "submitting")
+            return self._finish_submission(binding, "rejected", "failed")
         except Exception:
-            return _safe_output("unavailable")
+            return self._finish_submission(binding, "rejected", "failed")
 
         if not _request_matches_binding(view, binding):
-            return _safe_output("unavailable")
+            return self._finish_submission(binding, "rejected", "failed")
         try:
-            self.binding_store.attach_request(
+            attached = self.binding_store.attach_request(
                 binding.control_id,
                 client_action_id=binding.client_action_id,
                 central_request_id=view.request_id,
             )
         except (ControlBindingError, OSError, ValueError):
+            return _binding_output(binding, "submitting")
+        return self._safe_request_output(view, attached)
+
+    def _finish_submission(
+        self,
+        binding: ControlBinding,
+        disposition: str,
+        safe_state: str,
+    ) -> dict[str, object]:
+        try:
+            finished = self.binding_store.finish_submission(
+                binding.control_id,
+                client_action_id=binding.client_action_id,
+                disposition=disposition,
+            )
+        except (ControlBindingError, OSError, ValueError):
             return _safe_output("unavailable")
-        return self._safe_request_output(view, binding)
+        return _binding_output(finished, safe_state)
 
     def get_zdecision_candidate_refresh(
         self, control_id: str
@@ -196,11 +218,17 @@ class LocalMcpTools:
         binding = self._valid_binding(control_id)
         if binding is None:
             return _safe_output("unavailable")
-        if binding.central_request_id is None:
-            return _safe_output(
-                "submitting" if binding.chosen_scope is not None else "unavailable"
-            )
-        return self._read_request(binding)
+        if binding.submission_state == "ready":
+            return _binding_output(binding, "ready")
+        if binding.submission_state == "pending":
+            return _binding_output(binding, "submitting")
+        if binding.submission_state == "attached":
+            return self._read_request(binding)
+        if binding.submission_state == "busy":
+            return _binding_output(binding, "busy")
+        if binding.submission_state in ("rejected", "legacy_unknown"):
+            return _binding_output(binding, "failed")
+        return _safe_output("unavailable")
 
     def _read_request(self, binding: ControlBinding) -> dict[str, object]:
         try:
@@ -212,15 +240,15 @@ class LocalMcpTools:
                 "central_connection_unavailable",
                 "central_temporarily_unavailable",
             ):
-                return _safe_output("retrying")
-            return _safe_output("unavailable")
+                return _binding_output(binding, "retrying")
+            return _binding_output(binding, "unavailable")
         except Exception:
-            return _safe_output("unavailable")
+            return _binding_output(binding, "unavailable")
         if (
             view.request_id != binding.central_request_id
             or not _request_matches_binding(view, binding)
         ):
-            return _safe_output("unavailable")
+            return _binding_output(binding, "unavailable")
         return self._safe_request_output(view, binding)
 
     def _safe_request_output(
@@ -230,7 +258,7 @@ class LocalMcpTools:
     ) -> dict[str, object]:
         safe_state = _safe_request_state(view)
         if safe_state is None:
-            return _safe_output("unavailable")
+            return _binding_output(binding, "unavailable")
         terminal_success = safe_state in ("empty", "succeeded")
         count = view.candidate_revision_count if terminal_success else None
         page_url = (
@@ -239,8 +267,9 @@ class LocalMcpTools:
             else None
         )
         if terminal_success and page_url is None:
-            return _safe_output("unavailable")
-        return _safe_output(
+            return _binding_output(binding, "unavailable")
+        return _binding_output(
+            binding,
             safe_state,
             candidate_revision_count=count,
             candidate_page_url=page_url,
@@ -462,6 +491,24 @@ def _safe_output(
         "safe_state": safe_state,
         "candidate_revision_count": candidate_revision_count,
         "candidate_page_url": candidate_page_url,
+    }
+
+
+def _binding_output(
+    binding: ControlBinding,
+    safe_state: str,
+    *,
+    candidate_revision_count: int | None = None,
+    candidate_page_url: str | None = None,
+) -> dict[str, object]:
+    return {
+        **_safe_output(
+            safe_state,
+            candidate_revision_count=candidate_revision_count,
+            candidate_page_url=candidate_page_url,
+        ),
+        "submission_state": binding.submission_state,
+        "chosen_scope": binding.chosen_scope,
     }
 
 

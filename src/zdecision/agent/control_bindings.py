@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from zdecision.sync.contracts import CaptureScope
 
@@ -19,6 +20,15 @@ _CENTRAL_REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _SCOPES = frozenset(("current_session", "all_valid_sessions"))
+SubmissionState = Literal[
+    "ready",
+    "pending",
+    "attached",
+    "busy",
+    "rejected",
+    "legacy_unknown",
+]
+_TERMINAL_SUBMISSION_STATES = frozenset(("busy", "rejected"))
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,7 @@ class ControlBinding:
     chosen_scope: CaptureScope | None
     client_action_id: str | None
     central_request_id: str | None
+    submission_state: SubmissionState
 
 
 class ControlBindingError(Exception):
@@ -99,13 +110,60 @@ class ControlBindingStore:
                     ),
                     client_action_id TEXT UNIQUE,
                     central_request_id TEXT UNIQUE,
+                    submission_state TEXT NOT NULL DEFAULT 'ready' CHECK(
+                        submission_state IN (
+                            'ready', 'pending', 'attached', 'busy',
+                            'rejected', 'legacy_unknown'
+                        )
+                    ),
                     CHECK(
                         (chosen_scope IS NULL AND client_action_id IS NULL) OR
                         (chosen_scope IS NOT NULL AND client_action_id IS NOT NULL)
+                    ),
+                    CHECK(
+                        (submission_state = 'ready' AND
+                            chosen_scope IS NULL AND
+                            central_request_id IS NULL) OR
+                        (submission_state IN (
+                            'pending', 'busy', 'rejected', 'legacy_unknown'
+                        ) AND chosen_scope IS NOT NULL AND
+                            central_request_id IS NULL) OR
+                        (submission_state = 'attached' AND
+                            chosen_scope IS NOT NULL AND
+                            central_request_id IS NOT NULL)
                     )
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(control_bindings)"
+                ).fetchall()
+            }
+            if "submission_state" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE control_bindings
+                    ADD COLUMN submission_state TEXT NOT NULL
+                    DEFAULT 'legacy_unknown' CHECK(
+                        submission_state IN (
+                            'ready', 'pending', 'attached', 'busy',
+                            'rejected', 'legacy_unknown'
+                        )
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE control_bindings
+                    SET submission_state = CASE
+                        WHEN central_request_id IS NOT NULL THEN 'attached'
+                        WHEN chosen_scope IS NULL THEN 'ready'
+                        ELSE 'legacy_unknown'
+                    END
+                    """
+                )
         return cls(database_path, connection)
 
     def close(self) -> None:
@@ -140,8 +198,9 @@ class ControlBindingStore:
                     INSERT INTO control_bindings(
                         control_id, session_id, render_turn_id, cwd,
                         repository_id, product_id, created_at, expires_at,
-                        chosen_scope, client_action_id, central_request_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                        chosen_scope, client_action_id, central_request_id,
+                        submission_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'ready')
                     """,
                     (
                         control,
@@ -198,7 +257,8 @@ class ControlBindingStore:
                 self._connection.execute(
                     """
                     UPDATE control_bindings
-                    SET chosen_scope = ?, client_action_id = ?
+                    SET chosen_scope = ?, client_action_id = ?,
+                        submission_state = 'pending'
                     WHERE control_id = ?
                     """,
                     (scope, action, control),
@@ -241,11 +301,15 @@ class ControlBindingStore:
                 binding = _binding(row)
                 self._connection.commit()
                 return binding
+            if row["submission_state"] != "pending":
+                raise ControlRequestConflict(
+                    "submission disposition does not allow attachment"
+                )
             try:
                 self._connection.execute(
                     """
                     UPDATE control_bindings
-                    SET central_request_id = ?
+                    SET central_request_id = ?, submission_state = 'attached'
                     WHERE control_id = ?
                     """,
                     (request, control),
@@ -254,6 +318,47 @@ class ControlBindingStore:
                 raise ControlRequestConflict(
                     "central request ID already belongs to another control"
                 ) from error
+            binding = self._required(control)
+            self._connection.commit()
+            return binding
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def finish_submission(
+        self,
+        control_id: str,
+        *,
+        client_action_id: str,
+        disposition: Literal["busy", "rejected"],
+    ) -> ControlBinding:
+        control = _matching(control_id, _CONTROL_ID, "control_id")
+        action = _matching(client_action_id, _CLIENT_ACTION_ID, "client_action_id")
+        if disposition not in _TERMINAL_SUBMISSION_STATES:
+            raise ValueError("disposition is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._row(control)
+            if row is None:
+                raise ControlBindingNotFound("control binding was not found")
+            if row["client_action_id"] != action:
+                raise ControlRequestConflict("client action ID does not match")
+            if row["submission_state"] == disposition:
+                binding = _binding(row)
+                self._connection.commit()
+                return binding
+            if row["submission_state"] != "pending":
+                raise ControlRequestConflict(
+                    "submission disposition is already frozen"
+                )
+            self._connection.execute(
+                """
+                UPDATE control_bindings
+                SET submission_state = ?
+                WHERE control_id = ?
+                """,
+                (disposition, control),
+            )
             binding = self._required(control)
             self._connection.commit()
             return binding
@@ -300,6 +405,7 @@ def _binding(row: sqlite3.Row) -> ControlBinding:
         chosen_scope=row["chosen_scope"],
         client_action_id=row["client_action_id"],
         central_request_id=row["central_request_id"],
+        submission_state=row["submission_state"],
     )
 
 

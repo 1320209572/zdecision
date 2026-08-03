@@ -324,6 +324,7 @@ builtins.__import__ = _guarded_import
             capture_output=True,
             text=True,
             env=environment,
+            timeout=3,
         )
 
         self.assertEqual(0, result.returncode, result.stderr)
@@ -333,6 +334,7 @@ builtins.__import__ = _guarded_import
         self.assertEqual("allow", hook_output["permissionDecision"])
         control_id = hook_output["updatedInput"]["control_id"]
         self.assertRegex(control_id, r"^ctl_[0-9a-f]{32}$")
+        self.assertNotEqual(MODEL_CONTROL_ID, control_id)
         binding = self.control_store.get(control_id)
         self.assertIsNotNone(binding)
         self.assertEqual(self.snapshot.repository_id, binding.repository_id)
