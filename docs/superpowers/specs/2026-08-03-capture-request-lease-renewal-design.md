@@ -1,8 +1,6 @@
 # Capture Request Lease Renewal Design
 
-**Status:** Draft for written review. The independent renewal direction was
-confirmed on 2026-08-03; implementation remains blocked until this written
-contract is accepted.
+**Status:** Approved for implementation planning on 2026-08-03.
 
 **Scope:** One focused correction to Gate C of the approved on-demand Candidate
 refresh design. This document does not change Candidate extraction, model
