@@ -1220,6 +1220,30 @@ __SCENARIO__
             "wrapped-tool-result-ok",
         )
 
+    async def test_widget_ready_result_allows_omitted_scope(self) -> None:
+        self._run_widget_recovery_scenario(
+            """
+  const widget = await mount();
+  const restore = widget.latestToolCall("get_zdecision_candidate_refresh");
+  check(restore, "ready card did not request restoration");
+  await widget.respond(restore, {
+    content: [],
+    structuredContent: {
+      safe_state: "ready",
+      candidate_revision_count: null,
+      candidate_page_url: null,
+      submission_state: "ready",
+    },
+  });
+  check(
+    !widget.elements.current.disabled && !widget.elements.all.disabled,
+    "omitted ready scope did not restore unselected actions",
+  );
+  process.stdout.write("omitted-ready-scope-ok");
+""",
+            "omitted-ready-scope-ok",
+        )
+
     async def test_widget_same_mount_retries_durable_pending_submission(
         self,
     ) -> None:

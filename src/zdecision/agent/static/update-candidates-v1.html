@@ -296,7 +296,11 @@
         const knownSubmissionStates = new Set([
           "ready", "pending", "attached", "busy", "rejected", "legacy_unknown",
         ]);
-        const persistedScope = value.chosen_scope;
+        const persistedScope =
+          value.submission_state === "ready"
+          && value.chosen_scope === undefined
+            ? null
+            : value.chosen_scope;
         const hasPersistedScope =
           persistedScope === "current_session"
           || persistedScope === "all_valid_sessions";
