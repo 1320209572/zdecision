@@ -14,6 +14,7 @@ from zdecision.ids import candidate_family_id, candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
+    CaptureRequestView,
     CandidateRevisionUpload,
     RepositoryView,
 )
@@ -297,6 +298,24 @@ class CentralApiTest(unittest.TestCase):
                     headers=headers,
                 )
                 self.assertEqual(401, rejected.status_code)
+
+    def test_plugin_create_response_passes_the_strict_client_contract(
+        self,
+    ) -> None:
+        response = self.client.post(
+            "/api/v1/plugin/capture-requests",
+            headers=self.authorization,
+            json={
+                "repository_id": REPOSITORY_ID,
+                "template_id": "business",
+                "capture_scope": "current_session",
+                "client_action_id": "codex_action_strict-client",
+            },
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        parsed = CaptureRequestView.from_dict(response.json())
+        self.assertEqual(response.json()["request_id"], parsed.request_id)
 
     def test_plugin_create_rejects_identity_and_local_source_fields(self) -> None:
         command = {

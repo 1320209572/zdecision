@@ -19,6 +19,22 @@ import { AsyncState } from "../../shared/AsyncState";
 import { CompanyOverviewPage } from "../company-overview/CompanyOverviewPage";
 
 
+type CandidateStateFilter =
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "published"
+  | "all";
+
+const candidateStates = new Set<CandidateStateFilter>([
+  "pending",
+  "accepted",
+  "rejected",
+  "published",
+  "all",
+]);
+
+
 export function RepositoryEntryPage() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -61,13 +77,28 @@ export function RepositoryEntryPage() {
 
 export function CandidateReviewPage() {
   const { productId = "" } = useParams();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const routedRepository = searchParams.get("repository_id") ?? "";
-  const captureRequestId = searchParams.get("capture_request_id");
+  const captureRequestId = searchParams.get("capture_request_id") ?? "";
+  const routedSearch = searchParams.get("search") ?? "";
+  const requestedState = searchParams.get("state") ?? "pending";
+  const routedState: CandidateStateFilter = candidateStates.has(
+    requestedState as CandidateStateFilter,
+  )
+    ? (requestedState as CandidateStateFilter)
+    : "pending";
   const [inbox, setInbox] = useState<CandidateInbox | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [reload, setReload] = useState(0);
   const [selectedRepository, setSelectedRepository] = useState(routedRepository);
+  const [filterSearch, setFilterSearch] = useState(routedSearch);
+  const [filterRepository, setFilterRepository] = useState(routedRepository);
+  const [filterCaptureRequest, setFilterCaptureRequest] = useState(
+    captureRequestId,
+  );
+  const [filterState, setFilterState] = useState<CandidateStateFilter>(
+    routedState,
+  );
   const [draftVersion, setDraftVersion] = useState(0);
   const [draftByFamily, setDraftByFamily] = useState(
     () => new Map<string, ReviewDraftItem>(),
@@ -79,8 +110,10 @@ export function CandidateReviewPage() {
     setInbox(null);
     setLoadFailed(false);
     const query = new URLSearchParams();
+    query.set("search", routedSearch);
     if (routedRepository) query.set("repository_id", routedRepository);
     if (captureRequestId) query.set("capture_request_id", captureRequestId);
+    query.set("state", routedState);
     const suffix = query.size ? `?${query.toString()}` : "";
     api<CandidateInbox>(
       `/api/v1/web/products/${productId}/candidates${suffix}`,
@@ -102,7 +135,14 @@ export function CandidateReviewPage() {
     return () => {
       active = false;
     };
-  }, [captureRequestId, productId, reload, routedRepository]);
+  }, [captureRequestId, productId, reload, routedRepository, routedSearch, routedState]);
+
+  useEffect(() => {
+    setFilterSearch(routedSearch);
+    setFilterRepository(routedRepository);
+    setFilterCaptureRequest(captureRequestId);
+    setFilterState(routedState);
+  }, [captureRequestId, routedRepository, routedSearch, routedState]);
 
   const refreshCompleted = useCallback(() => {
     setReload((value) => value + 1);
@@ -156,6 +196,18 @@ export function CandidateReviewPage() {
         setSaveMessage("审核草稿保存失败");
       }
     }
+  }
+
+  function applyFilters(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const next = new URLSearchParams();
+    if (filterSearch) next.set("search", filterSearch);
+    if (filterRepository) next.set("repository_id", filterRepository);
+    if (filterCaptureRequest) {
+      next.set("capture_request_id", filterCaptureRequest);
+    }
+    next.set("state", filterState);
+    setSearchParams(next);
   }
 
   if (loadFailed) {
@@ -215,6 +267,62 @@ export function CandidateReviewPage() {
           ) : null}
         </div>
       </header>
+
+      <form className="candidate-filters" onSubmit={applyFilters}>
+        <label className="candidate-filters__search">
+          <span>搜索候选决策</span>
+          <input
+            type="search"
+            aria-label="搜索候选决策"
+            maxLength={200}
+            value={filterSearch}
+            onChange={(event) => setFilterSearch(event.target.value)}
+          />
+        </label>
+        <label>
+          <span>筛选仓库</span>
+          <select
+            aria-label="筛选仓库"
+            value={filterRepository}
+            onChange={(event) => setFilterRepository(event.target.value)}
+          >
+            <option value="">全部仓库</option>
+            {inbox.repositories.map((repository) => (
+              <option
+                value={repository.repository_id}
+                key={repository.repository_id}
+              >
+                {repository.repository_id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Capture Request ID</span>
+          <input
+            aria-label="Capture Request ID"
+            value={filterCaptureRequest}
+            onChange={(event) => setFilterCaptureRequest(event.target.value)}
+          />
+        </label>
+        <label>
+          <span>审核状态</span>
+          <select
+            aria-label="审核状态"
+            value={filterState}
+            onChange={(event) =>
+              setFilterState(event.target.value as CandidateStateFilter)
+            }
+          >
+            <option value="pending">待审核</option>
+            <option value="accepted">已接受</option>
+            <option value="rejected">已拒绝</option>
+            <option value="published">已发布</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
+        <button className="filter-button" type="submit">应用筛选</button>
+      </form>
 
       <div className="candidate-toolbar">
         <div>

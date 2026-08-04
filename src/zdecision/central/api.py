@@ -236,7 +236,7 @@ def create_app(
         result = service.create_request(
             plugin(authorization), command, current_time()
         )
-        return {**result.to_dict(), "capture_scope": command.capture_scope}
+        return result.to_dict()
 
     @app.get("/api/v1/plugin/capture-requests/{request_id}")
     async def get_plugin_capture_request(

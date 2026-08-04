@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { RouterProvider } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -87,7 +87,10 @@ function json(value: unknown, status = 200): Promise<Response> {
 }
 
 beforeEach(() => localStorage.clear());
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 it("refreshes one owned repository and restores a partial draft", async () => {
   let captureBody: unknown;
@@ -141,6 +144,128 @@ it("refreshes one owned repository and restores a partial draft", async () => {
     repository_id: REPOSITORY_ID,
     last_sequence: 1,
   });
+});
+
+it("exposes safe Inbox filters and sends every approved filter", async () => {
+  const candidateUrls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/candidates")) {
+        candidateUrls.push(url);
+        return json(inbox());
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(
+    `/products/${PRODUCT_ID}/candidates?repository_id=${REPOSITORY_ID}` +
+      `&capture_request_id=${REQUEST_ID}&search=explicit&state=accepted`,
+  );
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  const search = await screen.findByRole("searchbox", {
+    name: "搜索候选决策",
+  });
+  expect(search).toHaveValue("explicit");
+  expect(screen.getByLabelText("筛选仓库")).toHaveValue(REPOSITORY_ID);
+  expect(screen.getByLabelText("Capture Request ID")).toHaveValue(REQUEST_ID);
+  const state = screen.getByLabelText("审核状态");
+  expect(state).toHaveValue("accepted");
+  for (const label of ["待审核", "已接受", "已拒绝", "已发布", "全部"]) {
+    expect(within(state).getByRole("option", { name: label })).toBeVisible();
+  }
+
+  await user.clear(search);
+  await user.type(search, "durable review");
+  await user.selectOptions(state, "published");
+  await user.click(screen.getByRole("button", { name: "应用筛选" }));
+
+  await waitFor(() => expect(candidateUrls).toHaveLength(2));
+  const request = new URL(candidateUrls.at(-1)!, "https://example.test");
+  expect(Object.fromEntries(request.searchParams)).toEqual({
+    search: "durable review",
+    repository_id: REPOSITORY_ID,
+    capture_request_id: REQUEST_ID,
+    state: "published",
+  });
+});
+
+it("renders exact safe Candidate provenance as text, never markup", async () => {
+  const view = inbox();
+  view.items[0].capture_request_ids = [REQUEST_ID];
+  view.items[0].content.claim = "<img src=x onerror=alert(1)>";
+  vi.stubGlobal("fetch", vi.fn(() => json(view)));
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  render(<RouterProvider router={router} />);
+
+  const card = (await screen.findByText("<img src=x onerror=alert(1)>")).closest(
+    "article",
+  )!;
+  expect(within(card).getByText(REVISION_ID)).toBeVisible();
+  expect(within(card).getByText(DIGEST)).toBeVisible();
+  expect(within(card).getByText(REPOSITORY_ID)).toBeVisible();
+  expect(within(card).getByText(REQUEST_ID)).toBeVisible();
+  expect(within(card).queryByRole("img")).not.toBeInTheDocument();
+});
+
+it("does not let a resolved stale repository poll schedule more work", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const secondRepository = "repo_" + "2".repeat(32);
+  const view = inbox();
+  view.repositories.push({
+    repository_id: secondRepository,
+    product_id: PRODUCT_ID,
+    product_name: "ZDecision",
+    enabled: true,
+  });
+  localStorage.setItem(
+    `zdecision:capture:${REPOSITORY_ID}`,
+    JSON.stringify({
+      request_id: REQUEST_ID,
+      repository_id: REPOSITORY_ID,
+      last_sequence: 4,
+    }),
+  );
+  let resolveEvents!: (response: Response) => void;
+  const deferredEvents = new Promise<Response>((resolve) => {
+    resolveEvents = resolve;
+  });
+  const eventUrls: string[] = [];
+  let candidateReads = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/candidates")) {
+        candidateReads += 1;
+        return json(view);
+      }
+      if (url.includes("/events")) {
+        eventUrls.push(url);
+        return deferredEvents;
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  render(<RouterProvider router={router} />);
+  const repository = await screen.findByLabelText("登记仓库");
+  await waitFor(() => expect(eventUrls).toHaveLength(1));
+
+  fireEvent.change(repository, { target: { value: secondRepository } });
+  resolveEvents(
+    new Response(JSON.stringify({ events: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+  await vi.advanceTimersByTimeAsync(1100);
+
+  expect(eventUrls).toHaveLength(1);
+  expect(candidateReads).toBe(1);
 });
 
 it("keeps local actions visible when draft compare-and-swap conflicts", async () => {

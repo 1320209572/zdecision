@@ -55,9 +55,11 @@ export function useCandidateRefresh(
   const [message, setMessage] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const timer = useRef<number | null>(null);
+  const generation = useRef(0);
 
   const reconnect = useCallback(
-    async (cursor: CaptureCursor) => {
+    async (cursor: CaptureCursor, expectedGeneration: number) => {
+      if (generation.current !== expectedGeneration) return;
       setRunning(true);
       setFailed(false);
       setMessage("正在等待本地设备处理更新");
@@ -65,6 +67,7 @@ export function useCandidateRefresh(
         const result = await api<{ events: ProgressEvent[] }>(
           `/api/v1/capture-requests/${cursor.request_id}/events?after_sequence=${cursor.last_sequence}`,
         );
+        if (generation.current !== expectedGeneration) return;
         const latest = result.events.at(-1);
         if (latest) {
           cursor = { ...cursor, last_sequence: latest.sequence };
@@ -89,8 +92,12 @@ export function useCandidateRefresh(
           }
           setMessage(`更新处理中 · ${latest.code}`);
         }
-        timer.current = window.setTimeout(() => reconnect(cursor), 1000);
+        timer.current = window.setTimeout(
+          () => void reconnect(cursor, expectedGeneration),
+          1000,
+        );
       } catch {
+        if (generation.current !== expectedGeneration) return;
         setRunning(false);
         setFailed(true);
         setMessage("无法恢复候选决策更新进度");
@@ -100,16 +107,22 @@ export function useCandidateRefresh(
   );
 
   useEffect(() => {
+    const currentGeneration = ++generation.current;
+    setRunning(false);
+    setMessage(null);
+    setFailed(false);
     if (!repositoryId) return;
     const cursor = readCursor(repositoryId);
-    if (cursor) void reconnect(cursor);
+    if (cursor) void reconnect(cursor, currentGeneration);
     return () => {
+      if (generation.current === currentGeneration) generation.current += 1;
       if (timer.current !== null) window.clearTimeout(timer.current);
     };
   }, [reconnect, repositoryId]);
 
   const refresh = useCallback(async () => {
     if (!repositoryId || running) return;
+    const currentGeneration = generation.current;
     setRunning(true);
     setFailed(false);
     setMessage("正在创建候选决策更新");
@@ -123,14 +136,16 @@ export function useCandidateRefresh(
           client_action_id: `web_action_${crypto.randomUUID()}`,
         }),
       });
+      if (generation.current !== currentGeneration) return;
       const cursor: CaptureCursor = {
         request_id: request.request_id,
         repository_id: repositoryId,
         last_sequence: request.last_sequence,
       };
       writeCursor(cursor);
-      await reconnect(cursor);
+      await reconnect(cursor, currentGeneration);
     } catch {
+      if (generation.current !== currentGeneration) return;
       setRunning(false);
       setFailed(true);
       setMessage("候选决策更新失败");

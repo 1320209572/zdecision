@@ -64,6 +64,31 @@ export function ReviewEditor({ item, action, onChange }: ReviewEditorProps) {
         ) : null}
       </div>
 
+      <div className="candidate-card__provenance" aria-label="候选来源标识">
+        <span>
+          <b>REVISION ID</b>
+          <code>{item.revision_id}</code>
+        </span>
+        <span>
+          <b>CONTENT DIGEST</b>
+          <code>{item.content_digest}</code>
+        </span>
+        <span>
+          <b>OWNING REPOSITORY</b>
+          <code>{item.repository_id}</code>
+        </span>
+        <span>
+          <b>CAPTURE REQUESTS</b>
+          {item.capture_request_ids.length ? (
+            item.capture_request_ids.map((requestId) => (
+              <code key={requestId}>{requestId}</code>
+            ))
+          ) : (
+            <em>—</em>
+          )}
+        </span>
+      </div>
+
       <div className="candidate-card__content">
         <div className="candidate-card__claim">
           <span>DECISION CLAIM</span>
