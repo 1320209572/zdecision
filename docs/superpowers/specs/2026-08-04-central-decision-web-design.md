@@ -1,6 +1,6 @@
 # Central Decision Web Application Design
 
-**Status:** Awaiting written-spec review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Define Packet 2 of the active Plugin architecture: the shared,
 product-isolated Web application from synchronized Candidate revisions through
