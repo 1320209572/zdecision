@@ -1,15 +1,36 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 
 import zstackLogo from "../assets/zstack-logo.svg";
 
 const navigation = [
   { to: "/", label: "公司总览", end: true, marker: "01" },
-  { to: "/reviews", label: "候选审核", marker: "02" },
-  { to: "/decisions", label: "正式决策", marker: "03" },
-  { to: "/publications", label: "发布历史", marker: "04" },
+  {
+    to: "/reviews",
+    label: "候选审核",
+    marker: "02",
+    owns: (path: string) =>
+      path.startsWith("/publication-previews/") ||
+      (path.startsWith("/products/") && path.endsWith("/candidates")),
+  },
+  {
+    to: "/decisions",
+    label: "正式决策",
+    marker: "03",
+    owns: (path: string) =>
+      path.startsWith("/products/") && path.includes("/decisions"),
+  },
+  {
+    to: "/publications",
+    label: "发布历史",
+    marker: "04",
+    owns: (path: string) =>
+      path.startsWith("/products/") && path.endsWith("/publications"),
+  },
 ];
 
 export function AppShell() {
+  const { pathname } = useLocation();
+
   return (
     <div className="app-frame">
       <aside className="rail">
@@ -19,21 +40,25 @@ export function AppShell() {
           <span className="brand__product">ZDecision</span>
         </div>
         <nav className="rail__nav" aria-label="主导航">
-          {navigation.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.end}
-              className={({ isActive }) =>
-                `rail__link${isActive ? " rail__link--active" : ""}`
-              }
-            >
-              <span className="rail__marker" aria-hidden="true">
-                {item.marker}
-              </span>
-              <span>{item.label}</span>
-            </NavLink>
-          ))}
+          {navigation.map((item) => {
+            const ownsPath = item.owns?.(pathname) ?? false;
+            return (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                end={item.end}
+                aria-current={ownsPath ? "page" : undefined}
+                className={({ isActive }) =>
+                  `rail__link${isActive || ownsPath ? " rail__link--active" : ""}`
+                }
+              >
+                <span className="rail__marker" aria-hidden="true">
+                  {item.marker}
+                </span>
+                <span>{item.label}</span>
+              </NavLink>
+            );
+          })}
         </nav>
         <div className="rail__foot">
           <span className="rail__pulse" aria-hidden="true" />

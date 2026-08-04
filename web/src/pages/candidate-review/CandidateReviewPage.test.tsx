@@ -222,22 +222,24 @@ it("exposes safe Inbox filters and sends every approved filter", async () => {
   });
 });
 
-it("renders exact safe Candidate provenance as text, never markup", async () => {
+it("never executes Candidate markup and preserves exact provenance", async () => {
   const view = inbox();
   view.items[0].capture_request_ids = [REQUEST_ID];
-  view.items[0].content.claim = "<img src=x onerror=alert(1)>";
+  view.items[0].content.claim =
+    '<button onclick="fetch(\'/secret\')">run</button>';
   vi.stubGlobal("fetch", vi.fn(() => json(view)));
   await router.navigate(`/products/${PRODUCT_ID}/candidates`);
   render(<RouterProvider router={router} />);
 
-  const card = (await screen.findByText("<img src=x onerror=alert(1)>")).closest(
-    "article",
-  )!;
+  const card = (await screen.findByText(/onclick=/)).closest("article")!;
+  expect(screen.getByRole("link", { name: "候选审核" })).toHaveClass(
+    "rail__link--active",
+  );
   expect(within(card).getByText(REVISION_ID)).toBeVisible();
   expect(within(card).getByText(DIGEST)).toBeVisible();
   expect(within(card).getByText(REPOSITORY_ID)).toBeVisible();
   expect(within(card).getByText(REQUEST_ID)).toBeVisible();
-  expect(within(card).queryByRole("img")).not.toBeInTheDocument();
+  expect(document.querySelector("button[onclick]")).toBeNull();
 });
 
 it("does not let a resolved stale repository poll schedule more work", async () => {

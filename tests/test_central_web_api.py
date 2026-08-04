@@ -317,12 +317,25 @@ class CentralWebApiTest(unittest.TestCase):
     def test_spa_fallback_serves_browser_routes_but_never_api_misses(
         self,
     ) -> None:
-        browser = self.client.get(f"/products/{PRODUCT_ID}/reviews")
+        browser_routes = (
+            "/",
+            "/reviews",
+            f"/products/{PRODUCT_ID}/candidates",
+            "/publication-previews/pub_" + "2" * 32,
+            "/decisions",
+            f"/products/{PRODUCT_ID}/decisions/{self.formal_decision.decision_id}",
+            "/publications",
+            "/publications/plb_" + "3" * 32,
+        )
+        browsers = [self.client.get(path) for path in browser_routes]
         api = self.client.get("/api/v1/web/not-a-route")
         asset = self.client.get("/assets/shell.css")
 
-        self.assertEqual(200, browser.status_code)
-        self.assertIn("central shell", browser.text)
+        self.assertTrue(all(response.status_code == 200 for response in browsers))
+        self.assertEqual(
+            {"<!doctype html><title>central shell</title>"},
+            {response.text for response in browsers},
+        )
         self.assertEqual(404, api.status_code)
         self.assertEqual({"detail": "Not Found"}, api.json())
         self.assertEqual("body{}", asset.text)
@@ -636,6 +649,15 @@ class CentralWebApiTest(unittest.TestCase):
         self.assertEqual("completed", published.json()["state"])
         self.assertEqual(published.json(), replay.json())
         self.assertEqual(published.json(), resumed.json())
+        self.assertEqual(published.json(), detail.json())
+        self.assertTrue(
+            {
+                "organization_id",
+                "confirm_action_id",
+                "confirm_request_digest",
+                "approval",
+            }.isdisjoint(published.json())
+        )
         self.assertEqual(200, history.status_code, history.text)
         self.assertEqual(history.json(), product_history.json())
         self.assertEqual(1, history.json()["total"])

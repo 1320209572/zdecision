@@ -8,7 +8,6 @@ from datetime import datetime
 from zdecision.central.auth import Principal
 from zdecision.central.web.contracts import (
     CandidateInboxView,
-    CentralPublication,
     DraftItem,
     ReviewDraft,
 )
@@ -186,9 +185,12 @@ class CentralWebApplication:
         preview_id: str,
         client_action_id: str,
         now: str | datetime,
-    ) -> CentralPublication:
-        return self._publication_service().confirm(
+    ) -> PublicationView:
+        publication = self._publication_service().confirm(
             principal, preview_id, client_action_id, now
+        )
+        return self._publication_service().get(
+            principal, publication.publication_id
         )
 
     def resume_publication(
@@ -197,9 +199,12 @@ class CentralWebApplication:
         publication_id: str,
         client_action_id: str,
         now: str | datetime,
-    ) -> CentralPublication:
-        return self._publication_service().resume(
+    ) -> PublicationView:
+        publication = self._publication_service().resume(
             principal, publication_id, client_action_id, now
+        )
+        return self._publication_service().get(
+            principal, publication.publication_id
         )
 
     def get_publication(

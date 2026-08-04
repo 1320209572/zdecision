@@ -50,7 +50,7 @@ class _SaveDraftBody(_StrictBody):
 
 class _SubmitReviewBody(_StrictBody):
     client_action_id: str = Field(
-        pattern=r"^web_action_[A-Za-z0-9-]{1,96}$"
+        pattern=r"^web_action_[A-Za-z0-9_-]{1,96}$"
     )
     expected_draft_version: int = Field(ge=0)
     items: list[_DraftItemBody] = Field(min_length=1, max_length=20)
@@ -58,7 +58,7 @@ class _SubmitReviewBody(_StrictBody):
 
 class _ActionBody(_StrictBody):
     client_action_id: str = Field(
-        pattern=r"^web_action_[A-Za-z0-9-]{1,96}$"
+        pattern=r"^web_action_[A-Za-z0-9_-]{1,96}$"
     )
 
 

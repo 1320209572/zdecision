@@ -106,7 +106,7 @@ async function renderPreviewPage(value: PublicationPreview) {
     }),
   )));
   await router.navigate(`/publication-previews/${PREVIEW_ID}`);
-  render(<RouterProvider router={router} />);
+  return render(<RouterProvider router={router} />);
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -143,6 +143,19 @@ it("renders untrusted Decision text inertly and exposes every canonical byte", a
     expect(exact).toBeVisible();
     expect(exact.textContent).toBe(document.content);
   }
+});
+
+it("restores the same preview after browser remount", async () => {
+  const first = await renderPreviewPage(preview());
+  expect((await screen.findAllByText(PREVIEW_ID))[0]).toBeVisible();
+  expect(screen.getByRole("link", { name: "候选审核" })).toHaveClass(
+    "rail__link--active",
+  );
+
+  first.unmount();
+  await renderPreviewPage(preview());
+
+  expect((await screen.findAllByText(PREVIEW_ID))[0]).toBeVisible();
 });
 
 it.each([

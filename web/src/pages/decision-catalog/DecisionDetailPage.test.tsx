@@ -66,6 +66,9 @@ it("renders Decision text inert and exposes no mutation controls", async () => {
   expect(
     await screen.findByText('<img src=x onerror="alert(1)">'),
   ).toBeVisible();
+  expect(screen.getByRole("link", { name: "正式决策" })).toHaveClass(
+    "rail__link--active",
+  );
   expect(document.querySelector("img[src='x']")).toBeNull();
   expect(screen.getByText("产品归属发生变化")).toBeVisible();
   expect(screen.getByText("opaque-thread")).toBeVisible();

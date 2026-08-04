@@ -30,7 +30,7 @@ _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _CANDIDATE_FAMILY_ID = re.compile(r"^cfm_[0-9a-f]{32}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_WEB_ACTION_ID = re.compile(r"^web_action_[A-Za-z0-9-]{1,96}$")
+_WEB_ACTION_ID = re.compile(r"^web_action_[A-Za-z0-9_-]{1,96}$")
 _PREVIEW_ID = re.compile(r"^pub_[0-9a-f]{32}$")
 _CONTENT_FIELDS = frozenset(
     (
