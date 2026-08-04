@@ -30,6 +30,8 @@ _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _CANDIDATE_FAMILY_ID = re.compile(r"^cfm_[0-9a-f]{32}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_WEB_ACTION_ID = re.compile(r"^web_action_[A-Za-z0-9-]{1,96}$")
+_PREVIEW_ID = re.compile(r"^pub_[0-9a-f]{32}$")
 _CONTENT_FIELDS = frozenset(
     (
         "product",
@@ -182,6 +184,138 @@ def candidate_revision_id(
             "revision": revision,
         },
     )
+
+
+def publication_candidate_id(family_id: str) -> str:
+    """Return the sole V1 publication Candidate identity for a family."""
+
+    if (
+        not isinstance(family_id, str)
+        or _CANDIDATE_FAMILY_ID.fullmatch(family_id) is None
+    ):
+        raise ValueError("family_id is invalid")
+    return f"cand_{family_id.removeprefix('cfm_')}_01"
+
+
+def central_review_batch_id(
+    organization_id: str,
+    actor_id: str,
+    product_id_value: str,
+    client_action_id: str,
+    ordered_items: Sequence[Mapping[str, object]],
+) -> str:
+    """Return the replay-stable identity for an ordered central Web Review."""
+
+    organization = _nonempty_string(organization_id, "organization_id")
+    actor = _nonempty_string(actor_id, "actor_id")
+    if (
+        not isinstance(product_id_value, str)
+        or _PRODUCT_ID.fullmatch(product_id_value) is None
+    ):
+        raise ValueError("product_id is invalid")
+    if (
+        not isinstance(client_action_id, str)
+        or _WEB_ACTION_ID.fullmatch(client_action_id) is None
+    ):
+        raise ValueError("client_action_id is invalid")
+    if isinstance(ordered_items, (str, bytes)) or not isinstance(
+        ordered_items, Sequence
+    ):
+        raise ValueError("ordered_items must be a sequence")
+    if not 1 <= len(ordered_items) <= 20:
+        raise ValueError("ordered_items must contain between 1 and 20 items")
+
+    normalized_items: list[dict[str, object]] = []
+    seen_families: set[str] = set()
+    draft_fields = frozenset(
+        (
+            "family_id",
+            "repository_id",
+            "revision_id",
+            "revision",
+            "content_digest",
+            "action",
+            "effective_content",
+            "note",
+        )
+    )
+    for item in ordered_items:
+        if not isinstance(item, Mapping) or frozenset(item) != draft_fields:
+            raise ValueError("Central Review identity item has invalid fields")
+        family_id = item["family_id"]
+        if (
+            not isinstance(family_id, str)
+            or _CANDIDATE_FAMILY_ID.fullmatch(family_id) is None
+        ):
+            raise ValueError("family_id is invalid")
+        if family_id in seen_families:
+            raise ValueError("Central Review identity items contain a duplicate family")
+        seen_families.add(family_id)
+        repository_id = item["repository_id"]
+        if (
+            not isinstance(repository_id, str)
+            or _REPOSITORY_ID.fullmatch(repository_id) is None
+        ):
+            raise ValueError("repository_id is invalid")
+        revision = item["revision"]
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise ValueError("revision is invalid")
+        content_digest = item["content_digest"]
+        if not isinstance(content_digest, str) or _DIGEST.fullmatch(content_digest) is None:
+            raise ValueError("content_digest is invalid")
+        revision_id = item["revision_id"]
+        if (
+            not isinstance(revision_id, str)
+            or revision_id != candidate_revision_id(
+                family_id, revision, content_digest
+            )
+        ):
+            raise ValueError("revision_id is invalid")
+        action = item["action"]
+        if action not in ("accept", "edit_accept", "reject", "skip"):
+            raise ValueError("Review action is invalid")
+        effective_content = item["effective_content"]
+        if action == "edit_accept":
+            normalized_content: dict[str, object] | None = _normalized_content(
+                effective_content
+            )
+        elif effective_content is not None:
+            raise ValueError("Only edit_accept may contain effective_content")
+        else:
+            normalized_content = None
+        note = item["note"]
+        if note is not None and not isinstance(note, str):
+            raise ValueError("note is invalid")
+        normalized_items.append(
+            {
+                "family_id": family_id,
+                "repository_id": repository_id,
+                "revision_id": revision_id,
+                "revision": revision,
+                "content_digest": content_digest,
+                "action": action,
+                "effective_content": normalized_content,
+                "note": note,
+            }
+        )
+    return _stable_id(
+        "rvb",
+        {
+            "actor_id": actor,
+            "client_action_id": client_action_id,
+            "items": normalized_items,
+            "organization_id": organization,
+            "product_id": product_id_value,
+        },
+    )
+
+
+def central_publication_id(preview_id: str) -> str:
+    """Return the stable central-publication identity for one preview."""
+
+    if not isinstance(preview_id, str) or _PREVIEW_ID.fullmatch(preview_id) is None:
+        raise ValueError("preview_id is invalid")
+    return _stable_id("plb", {"preview_id": preview_id})
 
 
 def review_batch_id(

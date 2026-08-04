@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zdecision.central.auth import require_id
+from zdecision.central.web.schema import initialize_web_schema
 from zdecision.ids import capture_request_id
 from zdecision.sync.contracts import RepositoryView
 
@@ -179,6 +180,7 @@ class CentralStore:
                 """
             )
             _migrate_capture_requests(connection)
+            initialize_web_schema(connection)
         return cls(database_path, connection)
 
     def close(self) -> None:

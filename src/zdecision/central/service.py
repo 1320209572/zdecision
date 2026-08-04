@@ -14,6 +14,7 @@ from typing import Iterator
 
 from zdecision.central.auth import Principal
 from zdecision.central.store import CentralStore
+from zdecision.central.web.schema import record_candidate_revision_batch
 from zdecision.ids import capture_request_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
@@ -560,7 +561,9 @@ class CaptureRequestService:
                     connection,
                     principal.organization_id,
                     batch.repository_id,
+                    batch.request_id,
                     item,
+                    timestamp,
                 )
             receipt = UploadReceipt(
                 request_id=batch.request_id,
@@ -983,7 +986,9 @@ def _save_candidate_revision(
     connection: sqlite3.Connection,
     organization_id: str,
     repository_id: str,
+    request_id: str,
     item: CandidateRevisionUpload,
+    observed_at: str,
 ) -> None:
     record_json, record_digest = _canonical_record(
         item.to_dict()
@@ -1078,8 +1083,14 @@ def _save_candidate_revision(
                 item.revision_id,
             ),
         )
+        record_candidate_revision_batch(
+            connection, organization_id, repository_id, request_id, item, observed_at
+        )
         return
     if head["revision_id"] == item.revision_id:
+        record_candidate_revision_batch(
+            connection, organization_id, repository_id, request_id, item, observed_at
+        )
         return
     if item.revision != head["revision"] + 1:
         raise RequestConflict(
@@ -1100,6 +1111,9 @@ def _save_candidate_revision(
             repository_id,
             item.family_id,
         ),
+    )
+    record_candidate_revision_batch(
+        connection, organization_id, repository_id, request_id, item, observed_at
     )
 
 
