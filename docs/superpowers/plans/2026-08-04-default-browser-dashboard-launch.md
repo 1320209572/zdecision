@@ -23,6 +23,97 @@
 
 ---
 
+### Task 0: Close the already-accepted v2 card-freshness baseline
+
+**Files:**
+- Modify: `src/zdecision/agent/mcp_server.py`
+- Modify: `src/zdecision/agent/static/update-candidates-v1.html`
+- Modify: `tests/test_mcp_inline_refresh.py`
+
+**Interfaces:**
+- Consumes: the existing uncommitted v2 resource and current/historical card-state behavior.
+- Produces: one independently green baseline commit with the failed clickable-anchor probe removed.
+
+- [ ] **Step 1: Change the fallback test to require non-clickable text**
+
+In `test_widget_only_requests_https_page_and_never_claims_navigation`, change
+the markup assertions to:
+
+```python
+self.assertEqual("p", markup.tag)
+self.assertNotIn("target", markup.attributes)
+self.assertNotIn("rel", markup.attributes)
+```
+
+In the local-HTTP runtime assertions, require:
+
+```javascript
+check(
+  elements.status.textContent
+    === "当前本地页面无法自动打开，请使用下方地址",
+  "local HTTP limitation was not reported",
+);
+check(!elements["page-address"].hidden, "local HTTP page address stayed hidden");
+check(
+  elements["page-address"].textContent === localCandidateUrl,
+  "local HTTP fallback address was not exact",
+);
+```
+
+Delete the assertion on `elements["page-address"].href`.
+
+- [ ] **Step 2: Run the fallback test and verify RED**
+
+Run:
+
+```bash
+.venv/bin/python -m unittest \
+  tests.test_mcp_inline_refresh.McpInlineRefreshTests.test_widget_only_requests_https_page_and_never_claims_navigation
+```
+
+Expected: FAIL because `page-address` is still a clickable `<a>`.
+
+- [ ] **Step 3: Remove only the failed anchor probe**
+
+Restore the widget markup to:
+
+```html
+<p id="page-address" aria-label="候选决策页面地址" hidden></p>
+```
+
+Remove the probe-only underline style and `pageAddress.href = targetUrl`.
+Restore the local HTTP copy to:
+
+```javascript
+"当前本地页面无法自动打开，请使用下方地址"
+```
+
+Keep all current/historical card-state logic and the v2 resource URI intact.
+
+- [ ] **Step 4: Verify the complete v2 card module**
+
+Run:
+
+```bash
+.venv/bin/python -m unittest tests.test_mcp_inline_refresh
+git diff --check
+```
+
+Expected: the complete inline-card module passes and `git diff --check` emits
+no output.
+
+- [ ] **Step 5: Commit the accepted freshness baseline**
+
+```bash
+git add \
+  src/zdecision/agent/mcp_server.py \
+  src/zdecision/agent/static/update-candidates-v1.html \
+  tests/test_mcp_inline_refresh.py
+git commit -m "fix: distinguish current candidate refresh cards"
+```
+
+---
+
 ### Task 1: Add the testable default-browser boundary
 
 **Files:**
@@ -649,9 +740,9 @@ Run:
 
 Expected: all tests pass with only the repository's two known skips.
 
-- [ ] **Step 7: Commit the v3 card and current freshness changes**
+- [ ] **Step 7: Commit the v3 card**
 
-Review `git diff --stat` and confirm only the planned launcher/card files and existing freshness files are included, then commit:
+Review `git diff --stat` and confirm only the planned launcher/card files are included, then commit:
 
 ```bash
 git add \
