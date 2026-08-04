@@ -1,6 +1,6 @@
 # ZDecision Inline Card Freshness Amendment
 
-Status: Draft for written review
+Status: Approved for implementation planning
 
 This amendment refines only the presentation and resource identity of the
 approved Codex inline Candidate-refresh card. It does not change Capture,
