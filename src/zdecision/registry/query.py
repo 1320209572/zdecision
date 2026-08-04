@@ -128,6 +128,7 @@ class RegistryQuery:
             raise ValueError("Registry path is invalid")
         tree_entry = self._git(
             "git",
+            "--no-replace-objects",
             "ls-tree",
             "-z",
             "--full-tree",
@@ -151,7 +152,9 @@ class RegistryQuery:
             or decoded_path != relative_path
         ):
             raise ValueError("Registry Git entry is invalid")
-        raw = self._git("git", "cat-file", "blob", decoded_blob)
+        raw = self._git(
+            "git", "--no-replace-objects", "cat-file", "blob", decoded_blob
+        )
         value = json.loads(
             raw.decode("utf-8"),
             parse_constant=lambda _: self._reject_constant(),

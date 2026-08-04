@@ -118,6 +118,16 @@ commit, requires an exact regular blob entry, reads that object with
 `git cat-file`, and applies the existing canonical JSON and strict V1 ownership
 checks to those immutable bytes. The isolated regression then passed 1/1.
 
+Fix round 2 demonstrated that a repository-local `refs/replace` could redirect
+`git cat-file blob <original-sha>` to different canonical bytes while the
+synchronized `origin/main` commit SHA remained unchanged. The real Git
+regression failed with
+`'committed formal decision' != 'replacement canonical decision'`. Both the
+`ls-tree` resolution and `cat-file` blob read now use
+`git --no-replace-objects`, preventing replacement commits, trees, or blobs
+from altering the commit-bound snapshot. The isolated regression then passed
+1/1.
+
 ### Frontend RED
 
 After installing the exact lockfile dependencies, command:
@@ -158,9 +168,9 @@ Command:
 .venv/bin/python -m unittest tests.test_central_web_queries tests.test_central_web_api tests.test_central_api -v
 ```
 
-Final fresh result after review fixes: exit 0, 22/22 passed, including the real
-Git dirty-Registry reproducer, latest-Review semantics, Web API, and all Packet
-1 Central API compatibility cases.
+Final fresh result after review fixes: exit 0, 23/23 passed, including the real
+Git `assume-unchanged` and replacement-object reproducers, latest-Review
+semantics, Web API, and all Packet 1 Central API compatibility cases.
 
 Command:
 
@@ -187,8 +197,9 @@ database/config paths.
 - Confirmed Registry failures never become an available empty snapshot and that
   declared canonical paths and strict V1 ownership are checked before data is
   exposed. Every document is read from a regular blob in the synchronized commit
-  object, and that synchronized commit is revalidated before returning the
-  snapshot; mutable worktree bytes and index cleanliness are not read inputs.
+  object with replacement-object processing disabled, and that synchronized
+  commit is revalidated before returning the snapshot; mutable worktree bytes,
+  index cleanliness, and repository-local replacement refs are not read inputs.
 - Confirmed existing Packet 1 API tests pass and the SPA catch-all explicitly
   refuses `/api` and `/api/...` paths.
 - Confirmed frontend source contains no representative hard-coded product
@@ -197,9 +208,10 @@ database/config paths.
 - Independent review reported no Critical findings. Its package-hygiene finding
   was addressed before the Task 2 commit. Its follow-up `assume-unchanged`
   reproducer showed the first worktree defense was incomplete; fix round 1 now
-  removes the worktree from the read boundary entirely. The reviewer reported no
-  other correctness, isolation, SQL, SPA/API, CLI, frontend, or lockfile finding
-  and no remaining scope creep.
+  removes the worktree from the read boundary entirely. Fix round 2 closes the
+  replacement-object bypass for both tree resolution and blob reads. The
+  reviewer reported no other correctness, isolation, SQL, SPA/API, CLI,
+  frontend, or lockfile finding and no remaining scope creep.
 
 ## Concerns
 
