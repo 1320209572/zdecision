@@ -488,6 +488,55 @@ class CentralWebQueriesTest(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 queries.list_decisions(self.user, **arguments)
 
+    def test_publication_metadata_requires_the_revision_preview_id(self) -> None:
+        revision = _decision()
+        mismatched_preview = "pub_" + "8" * 32
+        self._insert_completed_publication_metadata(
+            revision.decision_id, mismatched_preview, "8"
+        )
+        queries = CentralWebQueries(
+            self.store.connection, _RegistryQuery(decisions=(revision,))
+        )
+
+        catalog = queries.list_decisions(self.user)
+        filtered = queries.list_decisions(
+            self.user, published_after="2026-08-04T00:00:00Z"
+        )
+        detail = queries.get_decision(
+            self.user, PRODUCT_ID, revision.decision_id
+        )
+
+        self.assertEqual(1, catalog.total)
+        self.assertIsNone(catalog.items[0].publication_id)
+        self.assertIsNone(catalog.items[0].published_at)
+        self.assertIsNone(catalog.items[0].commit_sha)
+        self.assertEqual(0, filtered.total)
+        self.assertIsNone(detail.publication_id)
+        self.assertIsNone(detail.published_at)
+        self.assertIsNone(detail.commit_sha)
+
+    def test_dashboard_excludes_registry_name_mismatch_from_active_counts(
+        self,
+    ) -> None:
+        revision = _decision()
+        self.store.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                PRODUCT_REPOSITORY_ID,
+                PRODUCT_ID,
+                "Mismatched Product Name",
+                True,
+            ),
+        )
+        queries = CentralWebQueries(
+            self.store.connection, _RegistryQuery(decisions=(revision,))
+        )
+
+        dashboard = queries.dashboard(self.user)
+
+        self.assertEqual(0, dashboard.products[0].active_decision_count)
+        self.assertEqual(0, dashboard.metrics.active_decision_count)
+
     def test_dashboard_derives_products_and_counts_from_owned_sources(
         self,
     ) -> None:
@@ -618,6 +667,76 @@ class CentralWebQueriesTest(unittest.TestCase):
                     action,
                 ),
             )
+
+    def _insert_completed_publication_metadata(
+        self, decision: str, preview: str, ordinal: str
+    ) -> None:
+        publication = CentralPublication(
+            publication_id=central_publication_id(preview),
+            organization_id="org_demo",
+            actor_id="user_demo",
+            product_id=PRODUCT_ID,
+            preview_id=preview,
+            confirm_action_id=f"web_action_catalog-{ordinal}",
+            confirm_request_digest=ordinal * 64,
+            state="completed",
+            approval=ApprovalRef(
+                "user",
+                "publish-thread",
+                f"publish-turn-{ordinal}",
+                "2026-08-03T11:00:00Z",
+            ),
+            commit_sha=ordinal * 40,
+            recovery_code=None,
+            created_at="2026-08-03T11:00:00Z",
+            updated_at="2026-08-04T12:30:00Z",
+        )
+        encoded = canonical_json_bytes(publication.to_dict())
+        self.store.connection.execute("PRAGMA foreign_keys = OFF")
+        with self.store.connection:
+            self.store.connection.execute(
+                """
+                INSERT INTO web_publications(
+                    organization_id, product_id, publication_id, preview_id,
+                    actor_id, state, recovery_code, commit_sha, record_json,
+                    record_digest, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    publication.organization_id,
+                    publication.product_id,
+                    publication.publication_id,
+                    publication.preview_id,
+                    publication.actor_id,
+                    publication.state,
+                    publication.recovery_code,
+                    publication.commit_sha,
+                    encoded.decode("utf-8"),
+                    hashlib.sha256(encoded).hexdigest(),
+                    publication.created_at,
+                    publication.updated_at,
+                ),
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO web_candidate_receipts(
+                    organization_id, product_id, family_id,
+                    publication_candidate_id, decision_id, preview_id,
+                    commit_sha, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "org_demo",
+                    PRODUCT_ID,
+                    "cfm_" + ordinal * 32,
+                    "cand_" + ordinal * 32 + "_01",
+                    decision,
+                    preview,
+                    publication.commit_sha,
+                    publication.created_at,
+                ),
+            )
+        self.store.connection.execute("PRAGMA foreign_keys = ON")
 
 
 if __name__ == "__main__":

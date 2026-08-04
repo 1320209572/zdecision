@@ -216,6 +216,7 @@ class DecisionDetailView:
 @dataclass(frozen=True)
 class _DecisionPublication:
     publication_id: str
+    preview_id: str
     published_at: str
     commit_sha: str
 
@@ -286,7 +287,11 @@ class CentralWebQueries:
             if repository and repository not in revision.repositories:
                 continue
             publication = publications.get(
-                (revision.product_id, revision.decision_id)
+                (
+                    revision.product_id,
+                    revision.decision_id,
+                    revision.publication_preview_id,
+                )
             )
             if threshold is not None and (
                 publication is None
@@ -330,7 +335,7 @@ class CentralWebQueries:
             raise DecisionNotFound("not_found")
         publication = self._decision_publications(
             principal, frozenset((product_id,))
-        ).get((product_id, decision_id))
+        ).get((product_id, decision_id, revision.publication_preview_id))
         return DecisionDetailView(
             registry_commit=snapshot.commit_sha,
             decision=revision,
@@ -800,7 +805,7 @@ class CentralWebQueries:
 
     def _decision_publications(
         self, principal: Principal, product_ids: frozenset[str]
-    ) -> dict[tuple[str, str], _DecisionPublication]:
+    ) -> dict[tuple[str, str, str], _DecisionPublication]:
         if not product_ids:
             return {}
         placeholders = ", ".join("?" for _ in product_ids)
@@ -827,7 +832,7 @@ class CentralWebQueries:
             """,
             (principal.organization_id, *sorted(product_ids)),
         ).fetchall()
-        joined: dict[tuple[str, str], _DecisionPublication] = {}
+        joined: dict[tuple[str, str, str], _DecisionPublication] = {}
         for row in rows:
             publication = cast(
                 CentralPublication,
@@ -851,11 +856,16 @@ class CentralWebQueries:
                 or publication.commit_sha is None
             ):
                 raise WebRecordCorrupt("publication")
-            key = (publication.product_id, row["decision_id"])
+            key = (
+                publication.product_id,
+                row["decision_id"],
+                publication.preview_id,
+            )
             if key in joined:
                 raise WebRecordCorrupt("candidate_receipt")
             joined[key] = _DecisionPublication(
                 publication.publication_id,
+                publication.preview_id,
                 publication.updated_at,
                 publication.commit_sha,
             )
@@ -951,7 +961,12 @@ class CentralWebQueries:
                         principal.organization_id, product_id
                     ),
                     active_decision_count=(
-                        len(snapshot.active_decisions(product_id))
+                        sum(
+                            revision.product_name == product_name
+                            for revision in snapshot.active_decisions(
+                                product_id
+                            )
+                        )
                         if snapshot is not None
                         else None
                     ),
