@@ -1,6 +1,6 @@
 # ZDecision Default-Browser Dashboard Launch Amendment
 
-**Status:** Draft for written review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Replace the failed inline-card navigation experiment with a trusted
 handoff from the ZDecision Plugin to the independent central decision system
@@ -41,6 +41,12 @@ Codex in-app Browser.
 The Plugin must therefore stop using `ui/open-link`, `window.open`, or an HTML
 anchor as the dashboard-launch mechanism. It also must not claim that a host
 acknowledgement proves navigation.
+
+A disposable real-host probe on 2026-08-04 then confirmed the selected
+replacement boundary: one card click called an app-only local MCP tool, the
+tool passed its locally derived dashboard URL to macOS, and the operating
+system's default browser opened the central page. The probe accepted no URL
+from the widget and was removed immediately after acceptance.
 
 ## 3. Selected architecture
 
