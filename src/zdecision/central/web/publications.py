@@ -202,6 +202,9 @@ class CentralPublicationService:
                     self._require_owned(principal, concurrent)
                     publication = concurrent
                 else:
+                    self.previews.require_current_central_state(
+                        principal, preview
+                    )
                     self.store.put_publication(publication)
                     self.store.claim_publication_families(
                         publication, self._family_ids(publication, preview)

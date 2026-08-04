@@ -396,17 +396,25 @@ class GitRegistryAdapter:
     ) -> subprocess.CompletedProcess[bytes]:
         if not command or command[0] != "git":
             raise error_type("Git operation is invalid")
-        safe_command = ("git", "--no-replace-objects", *command[1:])
+        safe_command = (
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            *command[1:],
+        )
         environment = os.environ.copy()
-        for name in (
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_REPLACE_REF_BASE",
-        ):
-            environment.pop(name, None)
+        credential_environment = {
+            name: environment[name]
+            for name in ("GIT_ASKPASS", "GIT_TERMINAL_PROMPT")
+            if name in environment
+        }
+        for name in tuple(environment):
+            if name.startswith("GIT_"):
+                environment.pop(name)
+        environment.update(credential_environment)
         try:
             result = subprocess.run(
                 safe_command,

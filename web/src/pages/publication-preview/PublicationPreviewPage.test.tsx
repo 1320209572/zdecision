@@ -199,3 +199,69 @@ it("publishes once and shows pending push without claiming success", async () =>
     expect.objectContaining({ method: "POST" }),
   );
 });
+
+it("routes an already claimed preview to its publication without another publish", async () => {
+  const value = {
+    ...preview(),
+    publication_id: "plb_" + "a".repeat(32),
+  };
+  await renderPreviewPage(value);
+
+  expect(await screen.findByRole("link", { name: "查看发布状态" })).toHaveAttribute(
+    "href", `/publications/${value.publication_id}`,
+  );
+  expect(screen.queryByRole("button", {
+    name: "确认发布 1 条决策",
+  })).not.toBeInTheDocument();
+});
+
+it("resolves an ambiguous publish to detail without issuing a second publish", async () => {
+  const publicationId = "plb_" + "b".repeat(32);
+  const initial = preview();
+  const claimed = { ...initial, publication_id: publicationId };
+  const ambiguous = {
+    publication_id: publicationId,
+    preview_id: PREVIEW_ID,
+    product_id: PRODUCT_ID,
+    product_name: "ZDecision",
+    decision_count: 1,
+    decision_ids: [DECISION_ID],
+    actor_id: "user_demo",
+    approved_at: "2026-08-04T08:02:00Z",
+    state: "ambiguous",
+    recovery_code: "ambiguous",
+    commit_sha: null,
+  };
+  let previewReads = 0;
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (init?.method === "POST") {
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: "publication_ambiguous" }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ));
+    }
+    const body = path.includes("publication-previews")
+      ? (++previewReads === 1 ? initial : claimed)
+      : ambiguous;
+    return Promise.resolve(new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  await router.navigate(`/publication-previews/${PREVIEW_ID}`);
+  render(<RouterProvider router={router} />);
+
+  await userEvent.click(await screen.findByRole("button", {
+    name: "确认发布 1 条决策",
+  }));
+
+  expect(await screen.findByText("需要人工处理")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "继续安全推送" }))
+    .not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /确认发布/ }))
+    .not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"))
+    .toHaveLength(1);
+});

@@ -277,6 +277,48 @@ class GitRegistryAdapterTests(unittest.TestCase):
         self.assertEqual(commit_sha, self.head())
         self.assertFalse(alternate_index.exists())
 
+    def test_exact_commit_ignores_injected_config_common_refs_and_hooks(self) -> None:
+        base = self.adapter.fetch_and_require_exact_main()
+        catalog, _, draft = self.draft()
+        catalog.write_exact(draft.changed_files)
+        hooks = self.root / "injected-hooks"
+        hooks.mkdir()
+        marker = self.root / "hook-executed"
+        hook = hooks / "pre-commit"
+        hook.write_text(
+            f"#!/bin/sh\nprintf executed > '{marker}'\n",
+            "utf-8",
+        )
+        hook.chmod(0o700)
+        injected = {
+            "GIT_DIR": str(self.root / "injected-git-dir"),
+            "GIT_COMMON_DIR": str(self.root / "injected-common"),
+            "GIT_WORK_TREE": str(self.root / "injected-worktree"),
+            "GIT_INDEX_FILE": str(self.root / "injected-index"),
+            "GIT_OBJECT_DIRECTORY": str(self.root / "injected-objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                self.root / "injected-alternate-objects"
+            ),
+            "GIT_REPLACE_REF_BASE": "refs/injected-replacements",
+            "GIT_NAMESPACE": "injected-namespace",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(hooks),
+        }
+
+        with patch.dict("os.environ", injected, clear=False):
+            commit_sha = self.adapter.commit_exact(
+                base, self.publication_message(), draft.changed_files
+            )
+
+        self.assertEqual(commit_sha, self.head())
+        self.assertFalse(marker.exists())
+        changed = self.git(
+            "git", "diff-tree", "--no-commit-id", "--name-only", "-r",
+            commit_sha, cwd=self.local,
+        ).stdout.decode().splitlines()
+        self.assertEqual(sorted(draft.changed_files), sorted(changed))
+
     def test_reconcile_ignores_replace_refs_when_proving_exact_commit(self) -> None:
         base = self.adapter.fetch_and_require_exact_main()
         catalog, _, draft = self.draft()

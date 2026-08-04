@@ -64,3 +64,41 @@ their exact bytes are read but never rewritten.
 
 - FastAPI emits the repository's existing `StarletteDeprecationWarning` for
   `TestClient`; it does not affect test results or Task 6 behavior.
+
+## Fix round 1 — confirmation race, one-shot UI, and Git environment
+
+### RED → GREEN evidence
+
+- RED confirmation race: the new Candidate-head race regression failed because
+  `PreviewStale` was not raised after the pre-transaction Preview read.
+- RED Git isolation: the disposable injected `GIT_COMMON_DIR`, namespace, and
+  `GIT_CONFIG_*` regression failed with `RegistryOutOfSync` before exact commit.
+- RED Preview UI: the two new page regressions failed because an existing
+  `publication_id` had no status route and an ambiguous 409 left confirmation
+  available instead of routing to the ambiguous publication detail.
+- GREEN regressions: both focused Python regressions passed individually, and
+  `npm test -- PublicationPreviewPage.test.tsx` passed 7/7 tests.
+- GREEN compatibility: `.venv/bin/python -m unittest
+  tests.test_central_web_publication tests.test_central_web_api
+  tests.test_git_registry tests.test_registry tests.test_central_web_preview -v`
+  passed 60/60 tests. `npm run typecheck` passed, and the Preview/History command
+  passed 9/9 tests.
+
+### Boundary and self-review
+
+- `BEGIN IMMEDIATE` is now the confirmation linearization point: latest Review,
+  current Candidate revision, unpublished receipt, frozen Review IDs, and frozen
+  Candidate IDs are revalidated before the first publication insert and family
+  claim. Git/network work remains outside the transaction.
+- An already confirmed publication is resumed without rerunning mutable Preview
+  freshness, so later Candidate revisions cannot invalidate its frozen proof.
+- The Preview page routes an already claimed preview to detail. After any failed
+  confirmation response it performs one read-back only; a missing claim remains
+  disabled, while a found claim routes to detail. It never automatically issues
+  a second publish request, and ambiguous detail exposes no safe-resume action.
+- Publication Git subprocesses discard inherited `GIT_*` repository, common-dir,
+  ref, object, index, worktree, namespace, and config overrides while retaining
+  explicit credential prompting variables. Command-line config disables hooks
+  and filesystem monitors; the disposable hook did not execute and exact changed
+  paths remained exact.
+- `git diff --check` passed. No Task 7 work or repository push was performed.

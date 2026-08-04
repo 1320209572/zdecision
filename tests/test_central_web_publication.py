@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 from unittest.mock import patch
 
 from tests import test_central_web_preview as preview_fixtures
+from zdecision.central.web.previews import PreviewStale
 from zdecision.central.web.publications import (
     CandidateAlreadyPublishing,
     CentralPublicationService,
     PublicationAmbiguous,
 )
 from zdecision.central.web.store import WebActionConflict, WebRecordConflict
-from zdecision.ids import central_publication_id
+from zdecision.ids import candidate_revision_id, central_publication_id
+from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter, RegistryPushFailed
+from zdecision.sync.contracts import CandidateRevisionUpload
 
 
 class InjectedCrash(Exception):
@@ -88,6 +92,78 @@ class CentralPublicationServiceTest(unittest.TestCase):
         self.assertIsNotNone(stored)
         self.assertEqual("confirmed", stored.state)
         self.assertIsNone(stored.commit_sha)
+        self.assertEqual(1, self.commit_count())
+
+    def test_candidate_head_race_before_confirmation_persists_nothing(self) -> None:
+        original_get = self.fixture.service.get
+
+        def load_then_advance_candidate(*args):
+            view = original_get(*args)
+            candidate_content = preview_fixtures.content("newer claim")
+            digest = hashlib.sha256(
+                canonical_json_bytes(candidate_content.to_dict())
+            ).hexdigest()
+            revision = CandidateRevisionUpload(
+                family_id=preview_fixtures.FAMILY_ID,
+                revision_id=candidate_revision_id(
+                    preview_fixtures.FAMILY_ID, 2, digest
+                ),
+                revision=2,
+                content=candidate_content,
+                content_digest=digest,
+                evidence_digest="f" * 64,
+            )
+            payload = canonical_json_bytes(revision.to_dict())
+            with self.fixture.central.connection:
+                self.fixture.central.connection.execute(
+                    """
+                    INSERT INTO candidate_revisions(
+                        organization_id, repository_id, family_id, revision,
+                        revision_id, record_json, record_digest
+                    ) VALUES ('org_demo', ?, ?, 2, ?, ?, ?)
+                    """,
+                    (
+                        preview_fixtures.REPOSITORY_ID,
+                        revision.family_id,
+                        revision.revision_id,
+                        payload.decode("utf-8"),
+                        hashlib.sha256(payload).hexdigest(),
+                    ),
+                )
+                self.fixture.central.connection.execute(
+                    """
+                    UPDATE candidate_family_heads
+                    SET revision = 2, revision_id = ?
+                    WHERE organization_id = 'org_demo'
+                      AND repository_id = ? AND family_id = ?
+                    """,
+                    (
+                        revision.revision_id,
+                        preview_fixtures.REPOSITORY_ID,
+                        revision.family_id,
+                    ),
+                )
+            return view
+
+        with patch.object(
+            self.fixture.service, "get", side_effect=load_then_advance_candidate
+        ):
+            with self.assertRaises(PreviewStale):
+                self.confirm("web_action_publish-head-race")
+
+        self.assertIsNone(self.stored())
+        self.assertEqual(
+            0,
+            self.fixture.central.connection.execute(
+                "SELECT COUNT(*) FROM web_publication_families"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.fixture.central.connection.execute(
+                "SELECT COUNT(*) FROM web_action_results WHERE action_kind = 'publish'"
+            ).fetchone()[0],
+        )
         self.assertEqual(1, self.commit_count())
 
     def test_commit_success_before_state_write_is_adopted_once(self) -> None:

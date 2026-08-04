@@ -322,6 +322,26 @@ class CentralPreviewService:
             return "registry_unavailable"
         return "publishable"
 
+    def require_current_central_state(
+        self,
+        principal: Principal,
+        record: PublicationRecord,
+    ) -> None:
+        """Revalidate mutable Central state at the confirmation boundary."""
+
+        self._require_user(principal)
+        batch = self._owned_batch(principal, record.review_batch_id)
+        accepted = self._accepted(batch)
+        if not accepted:
+            raise PreviewStale("preview_stale")
+        self._require_latest_and_unpublished(principal, batch, accepted)
+        if (
+            tuple(item.review_id for item in accepted) != record.review_ids
+            or tuple(item.publication_candidate_id for item in accepted)
+            != record.candidate_ids
+        ):
+            raise PreviewStale("preview_stale")
+
     def _known_registry_base_changed(self, expected_base: str) -> bool:
         values: list[str] = []
         for revision in ("HEAD", "refs/remotes/origin/main"):

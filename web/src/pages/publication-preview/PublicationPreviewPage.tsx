@@ -110,18 +110,22 @@ export function PublicationPreviewPage() {
     return <AsyncState kind="loading" title="正在验证精确发布预览" />;
   }
 
+  const hasPublication = preview.publication_id !== null;
   const isPublishable = preview.publishability === "publishable";
-  const status = preview.publishability === "stale"
-    ? "预览已过期"
-    : preview.publishability === "registry_unavailable"
-      ? "Registry 暂不可用"
-      : "可确认发布";
-  const statusTone = isPublishable
+  const canPublish = isPublishable && !hasPublication;
+  const status = hasPublication
+    ? "已进入发布流程"
+    : preview.publishability === "stale"
+      ? "预览已过期"
+      : preview.publishability === "registry_unavailable"
+        ? "Registry 暂不可用"
+        : "可确认发布";
+  const statusTone = hasPublication || isPublishable
     ? "success"
     : preview.publishability === "stale" ? "danger" : "warning";
 
   async function publish() {
-    if (!isPublishable || publishing) return;
+    if (!canPublish || publishing) return;
     setPublishing(true);
     setPublishFailed(false);
     const clientActionId = `web_action_publish-${Date.now().toString(36)}`;
@@ -135,8 +139,18 @@ export function PublicationPreviewPage() {
       );
       await navigate(`/publications/${result.publication_id}`);
     } catch {
+      try {
+        const refreshed = await api<PublicationPreview>(
+          `/api/v1/web/publication-previews/${previewId}`,
+        );
+        if (refreshed.publication_id !== null) {
+          await navigate(`/publications/${refreshed.publication_id}`);
+          return;
+        }
+      } catch {
+        // The confirmation outcome remains unknown; never issue it again here.
+      }
       setPublishFailed(true);
-      setPublishing(false);
     }
   }
 
@@ -156,7 +170,7 @@ export function PublicationPreviewPage() {
         </div>
       </header>
 
-      {!isPublishable ? (
+      {preview.publishability !== "publishable" && !hasPublication ? (
         <section className="preview-alert" aria-live="polite">
           <strong>{status}</strong>
           <span>
@@ -241,14 +255,23 @@ export function PublicationPreviewPage() {
               ? "发布状态未能确认，请从发布历史检查。"
               : "仅本次明确确认会启动精确写入"}
           </span>
-          <button
-            className="primary-button preview-publish"
-            type="button"
-            disabled={!isPublishable || publishing}
-            onClick={publish}
-          >
-            {publishing ? "正在证明提交…" : `确认发布 ${preview.decisions.length} 条决策`}
-          </button>
+          {hasPublication ? (
+            <Link
+              className="primary-button preview-publish"
+              to={`/publications/${preview.publication_id}`}
+            >
+              查看发布状态
+            </Link>
+          ) : (
+            <button
+              className="primary-button preview-publish"
+              type="button"
+              disabled={!canPublish || publishing}
+              onClick={publish}
+            >
+              {publishing ? "正在证明提交…" : `确认发布 ${preview.decisions.length} 条决策`}
+            </button>
+          )}
         </div>
       </footer>
     </div>
