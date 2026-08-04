@@ -48,6 +48,14 @@ class _SaveDraftBody(_StrictBody):
     items: list[_DraftItemBody] = Field(max_length=100)
 
 
+class _SubmitReviewBody(_StrictBody):
+    client_action_id: str = Field(
+        pattern=r"^web_action_[A-Za-z0-9-]{1,96}$"
+    )
+    expected_draft_version: int = Field(ge=0)
+    items: list[_DraftItemBody] = Field(min_length=1, max_length=20)
+
+
 router = APIRouter(prefix="/api/v1/web")
 
 
@@ -111,6 +119,21 @@ async def save_review_draft(
         identity_provider.browser_principal(),
         product_id,
         body.expected_version,
+        tuple(item.to_contract() for item in body.items),
+        request.app.state.current_time(),
+    ).to_dict()
+
+
+@router.post("/products/{product_id}/reviews")
+async def submit_review(
+    request: Request, product_id: str, body: _SubmitReviewBody
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).submit_review(
+        identity_provider.browser_principal(),
+        product_id,
+        body.client_action_id,
+        body.expected_draft_version,
         tuple(item.to_contract() for item in body.items),
         request.app.state.current_time(),
     ).to_dict()

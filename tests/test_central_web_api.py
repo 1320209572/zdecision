@@ -266,6 +266,94 @@ class CentralWebApiTest(unittest.TestCase):
             {"error": "product_ownership_conflict"}, cross_product.json()
         )
 
+    def test_review_route_returns_only_safe_submission_results(self) -> None:
+        draft = self.client.put(
+            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            json=self.draft_body(action="accept"),
+        )
+        body = {
+            "client_action_id": "web_action_api-review",
+            "expected_draft_version": draft.json()["version"],
+            "items": draft.json()["items"],
+        }
+
+        submitted = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews", json=body
+        )
+
+        self.assertEqual(200, submitted.status_code, submitted.text)
+        self.assertEqual(
+            {
+                "review_batch_id",
+                "items",
+                "preview_eligible",
+                "remaining_pending_count",
+                "draft_version",
+            },
+            set(submitted.json()),
+        )
+        self.assertTrue(submitted.json()["preview_eligible"])
+        self.assertEqual(0, submitted.json()["remaining_pending_count"])
+        self.assertEqual(2, submitted.json()["draft_version"])
+        self.assertEqual("accept", submitted.json()["items"][0]["action"])
+        self.assertNotIn("note", submitted.json()["items"][0])
+        self.assertNotIn("effective_content", submitted.json()["items"][0])
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM web_publication_previews"
+            ).fetchone()[0],
+        )
+
+    def test_review_route_is_strict_and_reports_only_stale_family_ids(
+        self,
+    ) -> None:
+        draft = self.client.put(
+            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            json=self.draft_body(action="reject"),
+        ).json()
+        malformed = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            json={
+                "client_action_id": "not-a-web-action",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+                "actor_id": "untrusted_actor",
+            },
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                """
+                UPDATE candidate_family_heads
+                SET revision_id = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ?
+                """,
+                ("crv_" + "f" * 32, REPOSITORY_ID, self.revision.family_id),
+            )
+        stale = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            json={
+                "client_action_id": "web_action_api-stale",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        )
+
+        self.assertEqual(422, malformed.status_code)
+        self.assertEqual({"error": "invalid_request"}, malformed.json())
+        self.assertEqual(409, stale.status_code, stale.text)
+        self.assertEqual(
+            {"error": "review_stale", "family_ids": [self.revision.family_id]},
+            stale.json(),
+        )
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM web_review_batches"
+            ).fetchone()[0],
+        )
+
 
 class CentralWebCliCompositionTest(unittest.TestCase):
     def test_registry_root_must_be_an_absolute_git_directory(self) -> None:

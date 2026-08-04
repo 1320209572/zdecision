@@ -8,7 +8,10 @@ from datetime import datetime
 from zdecision.central.auth import Principal
 from zdecision.central.web.contracts import CandidateInboxView, DraftItem, ReviewDraft
 from zdecision.central.web.queries import CentralWebQueries, DashboardView
-from zdecision.central.web.reviews import CentralReviewService
+from zdecision.central.web.reviews import (
+    CentralReviewService,
+    ReviewSubmissionResult,
+)
 from zdecision.central.web.store import CentralWebStore
 
 
@@ -65,4 +68,22 @@ class CentralWebApplication:
     ) -> ReviewDraft:
         return self.reviews.save_draft(
             principal, product_id, expected_version, items, now
+        )
+
+    def submit_review(
+        self,
+        principal: Principal,
+        product_id: str,
+        client_action_id: str,
+        expected_draft_version: int,
+        items: Sequence[DraftItem],
+        now: str | datetime,
+    ) -> ReviewSubmissionResult:
+        return self.reviews.submit(
+            principal,
+            product_id,
+            client_action_id,
+            expected_draft_version,
+            items,
+            now,
         )

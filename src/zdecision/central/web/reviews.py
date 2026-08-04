@@ -4,17 +4,32 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.auth import Principal
 from zdecision.central.web.contracts import (
     CandidateInboxView,
+    CentralReviewBatch,
+    CentralReviewItem,
     DraftItem,
     ReviewDraft,
 )
 from zdecision.central.web.queries import CentralWebQueries
-from zdecision.central.web.store import CentralWebStore, DraftConflict
-from zdecision.ids import candidate_revision_id
+from zdecision.central.web.store import (
+    CentralWebStore,
+    DraftConflict,
+    WebActionConflict,
+    WebRecordCorrupt,
+    immediate,
+)
+from zdecision.ids import (
+    candidate_revision_id,
+    central_review_batch_id,
+    publication_candidate_id,
+    review_item_id,
+)
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import CandidateRevisionUpload
 
@@ -35,6 +50,43 @@ class ProductNotFound(CentralReviewError):
 
 class ProductOwnershipConflict(CentralReviewError):
     code = "product_ownership_conflict"
+
+
+class ReviewStale(CentralReviewError):
+    code = "review_stale"
+
+    def __init__(self, family_ids: Sequence[str]) -> None:
+        self.family_ids = tuple(family_ids)
+        super().__init__(self.code)
+
+
+@dataclass(frozen=True)
+class ReviewSubmissionResult:
+    batch: CentralReviewBatch
+    preview_eligible: bool
+    remaining_pending: tuple[str, ...]
+    draft_version: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "review_batch_id": self.batch.review_batch_id,
+            "items": [
+                {
+                    "review_id": item.review_id,
+                    "family_id": item.family_id,
+                    "publication_candidate_id": item.publication_candidate_id,
+                    "repository_id": item.repository_id,
+                    "revision_id": item.revision_id,
+                    "revision": item.revision,
+                    "content_digest": item.content_digest,
+                    "action": item.action,
+                }
+                for item in self.batch.items
+            ],
+            "preview_eligible": self.preview_eligible,
+            "remaining_pending_count": len(self.remaining_pending),
+            "draft_version": self.draft_version,
+        }
 
 
 class CentralReviewService:
@@ -148,6 +200,213 @@ class CentralReviewService:
             self._validate_draft_item(principal, product_id, item)
         return self.store.replace_draft(
             current, draft_items, self._timestamp(now)
+        )
+
+    def submit(
+        self,
+        principal: Principal,
+        product_id: str,
+        client_action_id: str,
+        expected_draft_version: int,
+        items: Sequence[DraftItem],
+        now: str | datetime,
+    ) -> ReviewSubmissionResult:
+        self._require_user(principal)
+        self._require_product(principal, product_id)
+        if (
+            not isinstance(expected_draft_version, int)
+            or isinstance(expected_draft_version, bool)
+            or expected_draft_version < 0
+        ):
+            raise ValueError("expected_draft_version is invalid")
+        if isinstance(items, (str, bytes)) or not isinstance(items, Sequence):
+            raise ValueError("items are invalid")
+        ordered = tuple(items)
+        if not 1 <= len(ordered) <= 20 or any(
+            not isinstance(item, DraftItem) for item in ordered
+        ):
+            raise ValueError("items are invalid")
+        if len({item.family_id for item in ordered}) != len(ordered):
+            raise ValueError("items contain a duplicate family")
+        timestamp = self._timestamp(now)
+        request_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "draft_version": expected_draft_version,
+                    "items": [item.to_dict() for item in ordered],
+                    "product_id": product_id,
+                }
+            )
+        ).hexdigest()
+
+        with immediate(self.store.connection):
+            replay = self.store.action_result(
+                principal.organization_id,
+                principal.actor_id,
+                "review",
+                client_action_id,
+            )
+            if replay is not None:
+                if replay.request_digest != request_digest:
+                    raise WebActionConflict("web_action_conflict")
+                batch = self.store.get_review_batch(
+                    principal.organization_id, product_id, replay.result_id
+                )
+                if batch is None:
+                    raise WebRecordCorrupt("review_action_result")
+                return self._submission_result(
+                    principal,
+                    batch,
+                    draft_version=expected_draft_version + 1,
+                )
+
+            draft = self.store.get_draft(
+                principal.organization_id, principal.actor_id, product_id
+            )
+            if draft.version != expected_draft_version:
+                raise DraftConflict("review_draft_conflict")
+            draft_by_family = {item.family_id: item for item in draft.items}
+            if any(
+                draft_by_family.get(item.family_id) != item for item in ordered
+            ):
+                raise DraftConflict("review_draft_conflict")
+
+            repositories = self.queries.product_repositories(
+                principal, product_id
+            )
+            product_name = repositories[0].product_name
+            if any(item.product_name != product_name for item in repositories):
+                raise WebRecordCorrupt("repository_mapping")
+            current_items: list[tuple[DraftItem, CandidateRevisionUpload]] = []
+            stale_families: list[str] = []
+            for item in ordered:
+                self._require_repository(
+                    principal, product_id, item.repository_id
+                )
+                current = self.queries.current_candidate_revision(
+                    principal, item.repository_id, item.family_id
+                )
+                if current is None or (
+                    current.revision_id != item.revision_id
+                    or current.revision != item.revision
+                    or current.content_digest != item.content_digest
+                ):
+                    stale_families.append(item.family_id)
+                    continue
+                self._validate_draft_item(principal, product_id, item)
+                current_items.append((item, current))
+            if stale_families:
+                raise ReviewStale(stale_families)
+
+            identity_items = tuple(item.to_dict() for item in ordered)
+            batch_id = central_review_batch_id(
+                principal.organization_id,
+                principal.actor_id,
+                product_id,
+                client_action_id,
+                identity_items,
+            )
+            frozen_items = tuple(
+                self._freeze_item(batch_id, item, current)
+                for item, current in current_items
+            )
+            batch = CentralReviewBatch(
+                review_batch_id=batch_id,
+                organization_id=principal.organization_id,
+                actor_id=principal.actor_id,
+                product_id=product_id,
+                product_name=product_name,
+                client_action_id=client_action_id,
+                request_digest=request_digest,
+                approval=ApprovalRef(
+                    actor="user",
+                    thread_id=f"web_review_{batch_id.removeprefix('rvb_')}",
+                    turn_id=client_action_id,
+                    recorded_at=timestamp,
+                ),
+                items=frozen_items,
+                created_at=timestamp,
+            )
+            self.store.put_review_batch(batch)
+            updated_draft = self.store.clear_submitted_draft_items(
+                draft, ordered, timestamp
+            )
+            self.store.record_action(
+                principal.organization_id,
+                principal.actor_id,
+                "review",
+                client_action_id,
+                request_digest,
+                batch.review_batch_id,
+                timestamp,
+            )
+            return self._submission_result(
+                principal, batch, draft_version=updated_draft.version
+            )
+
+    @staticmethod
+    def _freeze_item(
+        batch_id: str,
+        item: DraftItem,
+        current: CandidateRevisionUpload,
+    ) -> CentralReviewItem:
+        candidate_id = publication_candidate_id(item.family_id)
+        effective_content = (
+            item.effective_content
+            if item.action == "edit_accept"
+            else current.content if item.action == "accept" else None
+        )
+        return CentralReviewItem(
+            review_id=review_item_id(batch_id, candidate_id),
+            family_id=item.family_id,
+            publication_candidate_id=candidate_id,
+            repository_id=item.repository_id,
+            revision_id=item.revision_id,
+            revision=item.revision,
+            content_digest=item.content_digest,
+            action=item.action,
+            effective_content=effective_content,
+            note=item.note,
+        )
+
+    def _submission_result(
+        self,
+        principal: Principal,
+        batch: CentralReviewBatch,
+        *,
+        draft_version: int | None = None,
+    ) -> ReviewSubmissionResult:
+        pending: list[str] = []
+        offset = 0
+        while True:
+            page = self.list_candidates(
+                principal,
+                batch.product_id,
+                state="pending",
+                limit=100,
+                offset=offset,
+            )
+            pending.extend(item.family_id for item in page.items)
+            if len(page.items) < 100:
+                break
+            offset += 100
+        version = (
+            draft_version
+            if draft_version is not None
+            else self.store.get_draft(
+                principal.organization_id,
+                principal.actor_id,
+                batch.product_id,
+            ).version
+        )
+        return ReviewSubmissionResult(
+            batch=batch,
+            preview_eligible=any(
+                item.action in ("accept", "edit_accept")
+                for item in batch.items
+            ),
+            remaining_pending=tuple(pending),
+            draft_version=version,
         )
 
     def _validate_draft_item(

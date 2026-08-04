@@ -255,6 +255,52 @@ class CentralWebQueries:
             raise WebRecordCorrupt("candidate_revision")
         return candidate
 
+    def current_candidate_revision(
+        self,
+        principal: Principal,
+        repository_id: str,
+        family_id: str,
+    ) -> CandidateRevisionUpload | None:
+        """Return the exact current head for one owned Candidate family."""
+
+        self._require_user(principal)
+        row = self.connection.execute(
+            """
+            SELECT revision.family_id, revision.revision,
+                   revision.revision_id, revision.record_json,
+                   revision.record_digest
+            FROM candidate_family_heads AS head
+            JOIN candidate_revisions AS revision
+              ON revision.organization_id = head.organization_id
+             AND revision.repository_id = head.repository_id
+             AND revision.family_id = head.family_id
+             AND revision.revision = head.revision
+             AND revision.revision_id = head.revision_id
+            WHERE head.organization_id = ?
+              AND head.repository_id = ?
+              AND head.family_id = ?
+            """,
+            (principal.organization_id, repository_id, family_id),
+        ).fetchone()
+        if row is None:
+            return None
+        candidate = cast(
+            CandidateRevisionUpload,
+            self._read_record(
+                row["record_json"],
+                row["record_digest"],
+                CandidateRevisionUpload,
+                "candidate_revision",
+            ),
+        )
+        if (
+            candidate.family_id != row["family_id"]
+            or candidate.revision != row["revision"]
+            or candidate.revision_id != row["revision_id"]
+        ):
+            raise WebRecordCorrupt("candidate_revision")
+        return candidate
+
     def candidate_inbox(
         self,
         principal: Principal,

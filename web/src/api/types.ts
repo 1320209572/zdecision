@@ -89,6 +89,25 @@ export interface ReviewDraft {
   updated_at: string | null;
 }
 
+export interface ReviewSubmissionItem {
+  review_id: string;
+  family_id: string;
+  publication_candidate_id: string;
+  repository_id: string;
+  revision_id: string;
+  revision: number;
+  content_digest: string;
+  action: ReviewAction;
+}
+
+export interface ReviewSubmissionResult {
+  review_batch_id: string;
+  items: ReviewSubmissionItem[];
+  preview_eligible: boolean;
+  remaining_pending_count: number;
+  draft_version: number;
+}
+
 export interface CandidateInboxItem {
   family_id: string;
   repository_id: string;

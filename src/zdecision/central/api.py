@@ -30,8 +30,9 @@ from zdecision.central.web.application import CentralWebApplication
 from zdecision.central.web.reviews import (
     ProductNotFound,
     ProductOwnershipConflict,
+    ReviewStale,
 )
-from zdecision.central.web.store import DraftConflict
+from zdecision.central.web.store import DraftConflict, WebActionConflict
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_LEASE_SECONDS,
     CandidateBatchUpload,
@@ -169,6 +170,23 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(
             status_code=409, content={"error": "review_draft_conflict"}
+        )
+
+    @app.exception_handler(ReviewStale)
+    async def review_stale_handler(
+        request: Request, error: ReviewStale
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"error": error.code, "family_ids": list(error.family_ids)},
+        )
+
+    @app.exception_handler(WebActionConflict)
+    async def web_action_conflict_handler(
+        request: Request, error: WebActionConflict
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409, content={"error": "web_action_conflict"}
         )
 
     @app.exception_handler(ValueError)

@@ -17,9 +17,11 @@ from zdecision.central.web.reviews import (
     ProductNotFound,
     ProductOwnershipConflict,
 )
+from zdecision.central.web import reviews as review_module
 from zdecision.central.web.store import (
     CentralWebStore,
     DraftConflict,
+    WebActionConflict,
     WebRecordCorrupt,
 )
 from zdecision.ids import candidate_revision_id, product_id
@@ -39,6 +41,8 @@ OTHER_PRODUCT_NAME = "Other Product"
 OTHER_PRODUCT_ID = product_id(OTHER_PRODUCT_NAME)
 OTHER_REPOSITORY_ID = "repo_" + "2" * 32
 OTHER_FAMILY_ID = "cfm_" + "b" * 32
+FAMILY_B = "cfm_" + "c" * 32
+FAMILY_C = "cfm_" + "d" * 32
 
 
 class _RegistryQuery:
@@ -198,6 +202,26 @@ class CentralWebReviewTest(unittest.TestCase):
                 ),
             )
 
+    def add_current(
+        self, family_id: str, claim: str, *, revision_number: int = 1
+    ) -> CandidateRevisionUpload:
+        item = revision(
+            family_id,
+            revision_number,
+            candidate_content(claim=claim),
+        )
+        with self.store.connection:
+            self._insert_revision("org_demo", REPOSITORY_ID, item, True)
+        return item
+
+    def count_rows(self, table: str) -> int:
+        allowed = {"web_review_batches", "web_publication_previews"}
+        if table not in allowed:
+            raise ValueError("unexpected table")
+        return self.store.connection.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0]
+
     @staticmethod
     def draft_item(
         item: CandidateRevisionUpload,
@@ -354,6 +378,153 @@ class CentralWebReviewTest(unittest.TestCase):
                 (self.draft_item(self.current, REPOSITORY_ID),),
                 NOW,
             )
+
+    def test_partial_review_records_only_classified_items(self) -> None:
+        family_b = self.add_current(FAMILY_B, "reject this revision")
+        self.add_current(FAMILY_C, "leave this revision pending")
+        accepted = self.draft_item(self.current, REPOSITORY_ID)
+        rejected = self.draft_item(
+            family_b, REPOSITORY_ID, action="reject", note="private note"
+        )
+        self.service.save_draft(
+            self.user, PRODUCT_ID, 0, (accepted, rejected), NOW
+        )
+
+        result = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_review-partial",
+            1,
+            (accepted, rejected),
+            NOW,
+        )
+
+        self.assertEqual(
+            (FAMILY_ID, FAMILY_B),
+            tuple(item.family_id for item in result.batch.items),
+        )
+        self.assertEqual((FAMILY_C,), result.remaining_pending)
+        self.assertTrue(result.preview_eligible)
+        self.assertEqual(2, result.draft_version)
+        self.assertEqual(
+            self.current.content, result.batch.items[0].effective_content
+        )
+        self.assertEqual("private note", result.batch.items[1].note)
+        self.assertEqual(0, self.count_rows("web_publication_previews"))
+
+    def test_one_changed_revision_writes_no_batch_and_keeps_draft(self) -> None:
+        family_b = self.add_current(FAMILY_B, "original revision")
+        accepted_a = self.draft_item(self.current, REPOSITORY_ID)
+        accepted_b = self.draft_item(family_b, REPOSITORY_ID)
+        saved = self.service.save_draft(
+            self.user, PRODUCT_ID, 0, (accepted_a, accepted_b), NOW
+        )
+        replacement = revision(
+            FAMILY_B, 2, candidate_content(claim="new current revision")
+        )
+        with self.store.connection:
+            self._insert_revision("org_demo", REPOSITORY_ID, replacement, False)
+            self.store.connection.execute(
+                """
+                UPDATE candidate_family_heads
+                SET revision = ?, revision_id = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ?
+                """,
+                (
+                    replacement.revision,
+                    replacement.revision_id,
+                    REPOSITORY_ID,
+                    FAMILY_B,
+                ),
+            )
+
+        with self.assertRaises(review_module.ReviewStale) as raised:
+            self.service.submit(
+                self.user,
+                PRODUCT_ID,
+                "web_action_review-stale",
+                1,
+                (accepted_a, accepted_b),
+                NOW,
+            )
+
+        self.assertEqual((FAMILY_B,), raised.exception.family_ids)
+        self.assertEqual(0, self.count_rows("web_review_batches"))
+        self.assertEqual(saved, self.service.get_draft(self.user, PRODUCT_ID))
+
+    def test_identical_action_replays_and_changed_bytes_conflict(self) -> None:
+        accepted = self.draft_item(self.current, REPOSITORY_ID)
+        self.service.save_draft(self.user, PRODUCT_ID, 0, (accepted,), NOW)
+
+        first = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_review-replay",
+            1,
+            (accepted,),
+            NOW,
+        )
+        replay = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_review-replay",
+            1,
+            (accepted,),
+            NOW,
+        )
+        changed = self.draft_item(
+            self.current, REPOSITORY_ID, action="reject"
+        )
+        with self.assertRaises(WebActionConflict):
+            self.service.submit(
+                self.user,
+                PRODUCT_ID,
+                "web_action_review-replay",
+                1,
+                (changed,),
+                NOW,
+            )
+
+        self.assertEqual(first, replay)
+        self.assertEqual(1, self.count_rows("web_review_batches"))
+
+    def test_reject_and_skip_are_processed_without_preview_eligibility(
+        self,
+    ) -> None:
+        family_b = self.add_current(FAMILY_B, "skip this revision")
+        rejected = self.draft_item(
+            self.current, REPOSITORY_ID, action="reject"
+        )
+        skipped = self.draft_item(family_b, REPOSITORY_ID, action="skip")
+        self.service.save_draft(
+            self.user, PRODUCT_ID, 0, (rejected, skipped), NOW
+        )
+
+        result = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_review-no-preview",
+            1,
+            (rejected, skipped),
+            NOW,
+        )
+
+        self.assertFalse(result.preview_eligible)
+        self.assertEqual((FAMILY_B,), result.remaining_pending)
+        self.assertEqual(
+            (), self.service.list_candidates(self.user, PRODUCT_ID, state="accepted").items
+        )
+        self.assertEqual(
+            (FAMILY_ID,),
+            tuple(
+                item.family_id
+                for item in self.service.list_candidates(
+                    self.user, PRODUCT_ID, state="rejected"
+                ).items
+            ),
+        )
+        self.assertEqual(0, self.count_rows("web_publication_previews"))
 
 
 if __name__ == "__main__":

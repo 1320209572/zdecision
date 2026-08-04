@@ -11,6 +11,7 @@ import type {
   CandidateInbox,
   ReviewDraft,
   ReviewDraftItem,
+  ReviewSubmissionResult,
   RepositoryView,
 } from "../../api/types";
 import { useCandidateRefresh } from "../../features/candidate-refresh/useCandidateRefresh";
@@ -33,6 +34,17 @@ const candidateStates = new Set<CandidateStateFilter>([
   "published",
   "all",
 ]);
+
+function staleFamilyIds(error: ApiError): string[] {
+  if (typeof error.details !== "object" || error.details === null) return [];
+  if (!("family_ids" in error.details)) return [];
+  const values = error.details.family_ids;
+  if (!Array.isArray(values)) return [];
+  return values.filter(
+    (value): value is string =>
+      typeof value === "string" && /^cfm_[0-9a-f]{32}$/.test(value),
+  );
+}
 
 
 export function RepositoryEntryPage() {
@@ -104,20 +116,27 @@ export function CandidateReviewPage() {
     () => new Map<string, ReviewDraftItem>(),
   );
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [savedDraftSignature, setSavedDraftSignature] = useState("[]");
+  const [submitting, setSubmitting] = useState(false);
+  const [staleFamilies, setStaleFamilies] = useState(
+    () => new Set<string>(),
+  );
 
-  useEffect(() => {
-    let active = true;
-    setInbox(null);
-    setLoadFailed(false);
+  const candidatePath = useMemo(() => {
     const query = new URLSearchParams();
     query.set("search", routedSearch);
     if (routedRepository) query.set("repository_id", routedRepository);
     if (captureRequestId) query.set("capture_request_id", captureRequestId);
     query.set("state", routedState);
     const suffix = query.size ? `?${query.toString()}` : "";
-    api<CandidateInbox>(
-      `/api/v1/web/products/${productId}/candidates${suffix}`,
-    )
+    return `/api/v1/web/products/${productId}/candidates${suffix}`;
+  }, [captureRequestId, productId, routedRepository, routedSearch, routedState]);
+
+  useEffect(() => {
+    let active = true;
+    setInbox(null);
+    setLoadFailed(false);
+    api<CandidateInbox>(candidatePath)
       .then((value) => {
         if (!active) return;
         setInbox(value);
@@ -125,6 +144,8 @@ export function CandidateReviewPage() {
         setDraftByFamily(
           new Map(value.draft.items.map((item) => [item.family_id, item])),
         );
+        setSavedDraftSignature(JSON.stringify(value.draft.items));
+        setStaleFamilies(new Set());
         setSelectedRepository(
           routedRepository || value.repositories[0]?.repository_id || "",
         );
@@ -135,7 +156,7 @@ export function CandidateReviewPage() {
     return () => {
       active = false;
     };
-  }, [captureRequestId, productId, reload, routedRepository, routedSearch, routedState]);
+  }, [candidatePath, reload, routedRepository]);
 
   useEffect(() => {
     setFilterSearch(routedSearch);
@@ -152,6 +173,16 @@ export function CandidateReviewPage() {
   const draftItems = useMemo(
     () => Array.from(draftByFamily.values()),
     [draftByFamily],
+  );
+  const orderedClassifiedItems = useMemo(
+    () =>
+      inbox?.items
+        .map((item) => draftByFamily.get(item.family_id))
+        .filter((item): item is ReviewDraftItem => item !== undefined) ?? [],
+    [draftByFamily, inbox],
+  );
+  const previewEligible = orderedClassifiedItems.some(
+    (item) => item.action === "accept" || item.action === "edit_accept",
   );
 
   function updateLocalDraft(
@@ -184,6 +215,7 @@ export function CandidateReviewPage() {
       setDraftByFamily(
         new Map(saved.items.map((item) => [item.family_id, item])),
       );
+      setSavedDraftSignature(JSON.stringify(saved.items));
       setSaveMessage("审核草稿已保存");
     } catch (error) {
       if (
@@ -195,6 +227,131 @@ export function CandidateReviewPage() {
       } else {
         setSaveMessage("审核草稿保存失败");
       }
+    }
+  }
+
+  async function submitReview() {
+    if (orderedClassifiedItems.length === 0 || submitting) return;
+    setSaveMessage(null);
+    setSubmitting(true);
+    try {
+      let version = draftVersion;
+      let submittedItems = orderedClassifiedItems;
+      if (JSON.stringify(draftItems) !== savedDraftSignature) {
+        const saved = await api<ReviewDraft>(
+          `/api/v1/web/products/${productId}/review-draft`,
+          {
+            method: "PUT",
+            body: JSON.stringify({
+              expected_version: draftVersion,
+              items: draftItems,
+            }),
+          },
+        );
+        version = saved.version;
+        setDraftVersion(saved.version);
+        setSavedDraftSignature(JSON.stringify(saved.items));
+        const savedByFamily = new Map(
+          saved.items.map((item) => [item.family_id, item]),
+        );
+        submittedItems = orderedClassifiedItems
+          .map((item) => savedByFamily.get(item.family_id))
+          .filter((item): item is ReviewDraftItem => item !== undefined);
+      }
+      const result = await api<ReviewSubmissionResult>(
+        `/api/v1/web/products/${productId}/reviews`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            client_action_id: `web_action_${crypto.randomUUID()}`,
+            expected_draft_version: version,
+            items: submittedItems,
+          }),
+        },
+      );
+      const submittedFamilies = new Set(
+        submittedItems.map((item) => item.family_id),
+      );
+      const remaining = draftItems.filter(
+        (item) => !submittedFamilies.has(item.family_id),
+      );
+      setDraftVersion(result.draft_version);
+      setDraftByFamily(
+        new Map(remaining.map((item) => [item.family_id, item])),
+      );
+      setSavedDraftSignature(JSON.stringify(remaining));
+      setStaleFamilies(new Set());
+      setSaveMessage(
+        result.preview_eligible
+          ? "审核已提交，可生成发布预览"
+          : "审核结果已提交",
+      );
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        error.code === "review_stale"
+      ) {
+        setStaleFamilies(new Set(staleFamilyIds(error)));
+        setSaveMessage("候选版本已更新，请核对后载入最新版本");
+      } else if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        error.code === "review_draft_conflict"
+      ) {
+        setSaveMessage("审核草稿已在其他页面更新");
+      } else {
+        setSaveMessage("审核提交失败");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function loadLatestVersions() {
+    setSaveMessage(null);
+    try {
+      const latest = await api<CandidateInbox>(candidatePath);
+      const latestByFamily = new Map(
+        latest.items.map((item) => [item.family_id, item]),
+      );
+      setInbox({
+        ...latest,
+        items: latest.items.map((item) =>
+          staleFamilies.has(item.family_id)
+            ? { ...item, stale_draft: false }
+            : item,
+        ),
+      });
+      setDraftByFamily((current) => {
+        const replacement = new Map(current);
+        for (const familyId of staleFamilies) {
+          const candidate = latestByFamily.get(familyId);
+          const action = current.get(familyId);
+          if (!candidate || !action) continue;
+          replacement.set(familyId, {
+            ...action,
+            repository_id: candidate.repository_id,
+            revision_id: candidate.revision_id,
+            revision: candidate.revision,
+            content_digest: candidate.content_digest,
+            effective_content:
+              action.action === "edit_accept"
+                ? {
+                    ...(action.effective_content ?? candidate.content),
+                    product: candidate.content.product,
+                    repositories: candidate.content.repositories,
+                  }
+                : null,
+          });
+        }
+        return replacement;
+      });
+      setDraftVersion(latest.draft.version);
+      setStaleFamilies(new Set());
+      setSaveMessage("已载入最新候选版本，请重新提交审核");
+    } catch {
+      setSaveMessage("最新候选版本载入失败");
     }
   }
 
@@ -338,6 +495,14 @@ export function CandidateReviewPage() {
           >
             保存审核草稿
           </button>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={orderedClassifiedItems.length === 0 || submitting}
+            onClick={() => void submitReview()}
+          >
+            {previewEligible ? "生成发布预览" : "提交审核结果"}
+          </button>
         </div>
       </div>
 
@@ -357,6 +522,12 @@ export function CandidateReviewPage() {
               item={item}
               action={draftByFamily.get(item.family_id)}
               onChange={(value) => updateLocalDraft(item.family_id, value)}
+              stale={staleFamilies.has(item.family_id)}
+              onLoadLatest={
+                staleFamilies.has(item.family_id)
+                  ? () => void loadLatestVersions()
+                  : undefined
+              }
               key={`${item.family_id}:${item.revision_id}`}
             />
           ))}

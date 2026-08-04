@@ -10,6 +10,8 @@ interface ReviewEditorProps {
   item: CandidateInboxItem;
   action: ReviewDraftItem | undefined;
   onChange: (value: ReviewDraftItem | undefined) => void;
+  stale?: boolean;
+  onLoadLatest?: () => void;
 }
 
 const actionLabels: Record<ReviewAction, string> = {
@@ -35,7 +37,13 @@ function fromCandidate(
   };
 }
 
-export function ReviewEditor({ item, action, onChange }: ReviewEditorProps) {
+export function ReviewEditor({
+  item,
+  action,
+  onChange,
+  stale = false,
+  onLoadLatest,
+}: ReviewEditorProps) {
   const edited = action?.effective_content ?? item.content;
 
   function selectAction(value: string) {
@@ -59,8 +67,19 @@ export function ReviewEditor({ item, action, onChange }: ReviewEditorProps) {
       <div className="candidate-card__topline">
         <span className="candidate-card__revision">R{item.revision}</span>
         <code>{item.family_id}</code>
-        {item.stale_draft ? (
-          <span className="candidate-card__stale">已有新版本</span>
+        {item.stale_draft || stale ? (
+          <>
+            <span className="candidate-card__stale">已有新版本</span>
+            {onLoadLatest ? (
+              <button
+                className="quiet-button"
+                type="button"
+                onClick={onLoadLatest}
+              >
+                载入最新版本
+              </button>
+            ) : null}
+          </>
         ) : null}
       </div>
 

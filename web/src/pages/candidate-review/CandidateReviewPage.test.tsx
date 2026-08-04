@@ -13,6 +13,9 @@ const FAMILY_ID = "cfm_" + "a".repeat(32);
 const REVISION_ID = "crv_" + "b".repeat(32);
 const DIGEST = "c".repeat(64);
 const REQUEST_ID = "crq_" + "d".repeat(32);
+const FAMILY_B = "cfm_" + "e".repeat(32);
+const REVISION_B = "crv_" + "f".repeat(32);
+const DIGEST_B = "1".repeat(64);
 
 function draftItem(action: ReviewDraft["items"][number]["action"]) {
   return {
@@ -75,6 +78,32 @@ function inbox(options?: {
       updated_at: action ? "2026-08-04T08:00:00Z" : null,
     },
   };
+}
+
+function twoItemInbox(
+  firstAction: ReviewDraft["items"][number]["action"],
+  secondAction: ReviewDraft["items"][number]["action"],
+): CandidateInbox {
+  const view = inbox({ draftVersion: 1, action: firstAction });
+  const second = {
+    ...view.items[0],
+    family_id: FAMILY_B,
+    revision_id: REVISION_B,
+    content_digest: DIGEST_B,
+    content: {
+      ...view.items[0].content,
+      claim: "第二条候选用于部分审核。",
+    },
+    draft_action: secondAction,
+  };
+  view.items.push(second);
+  view.draft.items.push({
+    ...draftItem(secondAction),
+    family_id: FAMILY_B,
+    revision_id: REVISION_B,
+    content_digest: DIGEST_B,
+  });
+  return view;
 }
 
 function json(value: unknown, status = 200): Promise<Response> {
@@ -366,4 +395,145 @@ it("does not guess a product route for an unknown repository deep link", async (
 
   expect(await screen.findByText("仓库未登记或未启用")).toBeVisible();
   expect(fetcher).toHaveBeenCalledTimes(1);
+});
+
+it("submits an ordered partial accept and reject for preview eligibility", async () => {
+  const view = twoItemInbox("accept", "reject");
+  let reviewBody: unknown;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/candidates")) return json(view);
+      if (url.endsWith("/reviews") && init?.method === "POST") {
+        reviewBody = JSON.parse(String(init.body));
+        return json({
+          review_batch_id: "rvb_" + "2".repeat(32),
+          items: view.draft.items.map((item, index) => ({
+            review_id: "rvi_" + String(index + 1).repeat(32),
+            family_id: item.family_id,
+            publication_candidate_id:
+              "cand_" + item.family_id.slice(4) + "_01",
+            repository_id: item.repository_id,
+            revision_id: item.revision_id,
+            revision: item.revision,
+            content_digest: item.content_digest,
+            action: item.action,
+          })),
+          preview_eligible: true,
+          remaining_pending_count: 0,
+          draft_version: 2,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  await user.click(
+    await screen.findByRole("button", { name: "生成发布预览" }),
+  );
+
+  expect(reviewBody).toEqual({
+    client_action_id: expect.stringMatching(/^web_action_/),
+    expected_draft_version: 1,
+    items: view.draft.items,
+  });
+  expect(screen.getByText("审核已提交，可生成发布预览")).toBeVisible();
+});
+
+it("submits reject-only review without claiming a preview", async () => {
+  const view = inbox({ draftVersion: 1, action: "reject" });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/candidates")) return json(view);
+      if (url.endsWith("/reviews") && init?.method === "POST") {
+        return json({
+          review_batch_id: "rvb_" + "3".repeat(32),
+          items: [
+            {
+              review_id: "rvi_" + "3".repeat(32),
+              family_id: FAMILY_ID,
+              publication_candidate_id:
+                "cand_" + FAMILY_ID.slice(4) + "_01",
+              repository_id: REPOSITORY_ID,
+              revision_id: REVISION_ID,
+              revision: 1,
+              content_digest: DIGEST,
+              action: "reject",
+            },
+          ],
+          preview_eligible: false,
+          remaining_pending_count: 0,
+          draft_version: 2,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  await user.click(
+    await screen.findByRole("button", { name: "提交审核结果" }),
+  );
+
+  expect(screen.getByText("审核结果已提交")).toBeVisible();
+  expect(screen.getByRole("button", { name: "提交审核结果" })).toBeDisabled();
+});
+
+it("retains a stale selection and loads the latest revision without resubmitting", async () => {
+  const original = inbox({ draftVersion: 1, action: "accept" });
+  const latest = inbox({ draftVersion: 1, action: "accept" });
+  latest.items[0] = {
+    ...latest.items[0],
+    revision: 2,
+    revision_id: "crv_" + "9".repeat(32),
+    content_digest: "8".repeat(64),
+    content: { ...latest.items[0].content, claim: "最新候选版本" },
+  };
+  let candidateReads = 0;
+  let reviewWrites = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/candidates")) {
+        candidateReads += 1;
+        return json(candidateReads === 1 ? original : latest);
+      }
+      if (url.endsWith("/reviews") && init?.method === "POST") {
+        reviewWrites += 1;
+        return json(
+          { error: "review_stale", family_ids: [FAMILY_ID] },
+          409,
+        );
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  await user.click(
+    await screen.findByRole("button", { name: "生成发布预览" }),
+  );
+
+  expect(screen.getByDisplayValue("接受")).toBeVisible();
+  expect(screen.getByText("已有新版本")).toBeVisible();
+  expect(candidateReads).toBe(1);
+  expect(reviewWrites).toBe(1);
+
+  await user.click(screen.getByRole("button", { name: "载入最新版本" }));
+
+  expect(await screen.findByText("最新候选版本")).toBeVisible();
+  expect(screen.getByDisplayValue("接受")).toBeVisible();
+  expect(screen.queryByText("已有新版本")).not.toBeInTheDocument();
+  expect(reviewWrites).toBe(1);
 });

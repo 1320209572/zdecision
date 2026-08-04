@@ -14,6 +14,7 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
+    readonly details: unknown = null,
   ) {
     super(code);
     this.name = "ApiError";
@@ -26,6 +27,8 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
   const value: unknown = await response.json();
-  if (!response.ok) throw new ApiError(response.status, readErrorCode(value));
+  if (!response.ok) {
+    throw new ApiError(response.status, readErrorCode(value), value);
+  }
   return value as T;
 }
