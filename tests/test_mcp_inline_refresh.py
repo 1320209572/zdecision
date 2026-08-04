@@ -115,6 +115,16 @@ class RecordingCentralClient:
         return self.views_by_request[request_id]
 
 
+class RecordingBrowserLauncher:
+    def __init__(self, *, accepted: bool = True) -> None:
+        self.accepted = accepted
+        self.urls: list[str] = []
+
+    def open(self, url: str) -> bool:
+        self.urls.append(url)
+        return self.accepted
+
+
 class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -136,6 +146,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         )
         self.resolver = StaticRepositoryResolver()
         self.client = RecordingCentralClient()
+        self.browser_launcher = RecordingBrowserLauncher()
         self.action_ids = iter(
             ("codex_action_first", "codex_action_second")
         )
@@ -164,6 +175,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         *,
         now: datetime = NOW,
         client: RecordingCentralClient | None = None,
+        central_base_url: str = CENTRAL_BASE_URL,
         cwd: str | None = None,
     ) -> LocalMcpTools:
         required = {
@@ -172,6 +184,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             "central_base_url",
             "clock",
             "action_id_factory",
+            "browser_launcher",
             "repository_resolver",
         }
         parameters = set(inspect.signature(LocalMcpTools).parameters)
@@ -184,9 +197,10 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             cwd=self.cwd if cwd is None else cwd,
             binding_store=self.binding_store,
             central_client=self.client if client is None else client,
-            central_base_url=CENTRAL_BASE_URL,
+            central_base_url=central_base_url,
             clock=lambda: now,
             action_id_factory=lambda: next(self.action_ids),
+            browser_launcher=self.browser_launcher,
             repository_resolver=self.resolver,
         )
 
@@ -213,6 +227,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
                 "show_zdecision_update",
                 "start_zdecision_candidate_refresh",
                 "get_zdecision_candidate_refresh",
+                "open_zdecision_dashboard",
             },
             set(tools),
         )
@@ -239,8 +254,120 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status.annotations.destructiveHint)
         self.assertTrue(status.annotations.idempotentHint)
         self.assertFalse(status.annotations.openWorldHint)
+
+        open_dashboard = tools["open_zdecision_dashboard"]
+        self.assertEqual(["app"], open_dashboard.meta["ui"]["visibility"])
+        self.assertFalse(open_dashboard.annotations.readOnlyHint)
+        self.assertFalse(open_dashboard.annotations.destructiveHint)
+        self.assertFalse(open_dashboard.annotations.idempotentHint)
+        self.assertTrue(open_dashboard.annotations.openWorldHint)
         status_meta = tools["zdecision_status"].meta or {}
         self.assertNotIn("resourceUri", status_meta.get("ui", {}))
+
+    async def test_dashboard_launch_uses_only_bound_repository_url(
+        self,
+    ) -> None:
+        domain = self.domain()
+        domain.start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+
+        result = domain.open_zdecision_dashboard(CONTROL_ID)
+
+        expected = (
+            "http://127.0.0.1:8765/"
+            "?repository_id=repo_22222222222222222222222222222222"
+        )
+        self.assertEqual(
+            {"safe_state": "launch_requested", "dashboard_url": expected},
+            result,
+        )
+        self.assertEqual([expected], self.browser_launcher.urls)
+
+    async def test_dashboard_launch_rejects_unattached_or_invalid_controls(
+        self,
+    ) -> None:
+        domain = self.domain()
+
+        for control_id in (CONTROL_ID, "ctl_" + "9" * 32):
+            with self.subTest(control_id=control_id):
+                self.assertEqual(
+                    {"safe_state": "unavailable", "dashboard_url": None},
+                    domain.open_zdecision_dashboard(control_id),
+                )
+
+        self.assertEqual([], self.browser_launcher.urls)
+
+    async def test_dashboard_launch_rechecks_repository_mapping(self) -> None:
+        domain = self.domain()
+        domain.start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+        self.database.put_test_repository_mapping(
+            TestRepositoryMapping(
+                repository_id=REPOSITORY_ID,
+                product_id=PRODUCT_ID,
+                product_name="ZDecision",
+                enabled=False,
+            )
+        )
+
+        self.assertEqual(
+            {"safe_state": "unavailable", "dashboard_url": None},
+            domain.open_zdecision_dashboard(CONTROL_ID),
+        )
+        self.assertEqual([], self.browser_launcher.urls)
+
+    async def test_dashboard_launch_exposes_fallback_when_launcher_rejects(
+        self,
+    ) -> None:
+        self.browser_launcher.accepted = False
+        domain = self.domain()
+        domain.start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+
+        result = domain.open_zdecision_dashboard(CONTROL_ID)
+
+        self.assertEqual("unavailable", result["safe_state"])
+        self.assertEqual(
+            "http://127.0.0.1:8765/"
+            "?repository_id=repo_22222222222222222222222222222222",
+            result["dashboard_url"],
+        )
+        self.assertEqual(
+            [result["dashboard_url"]], self.browser_launcher.urls
+        )
+
+    async def test_dashboard_launch_derives_https_and_rejects_invalid_base(
+        self,
+    ) -> None:
+        domain = self.domain(
+            central_base_url="https://decisions.example.test"
+        )
+        domain.start_zdecision_candidate_refresh(
+            CONTROL_ID, "current_session"
+        )
+
+        result = domain.open_zdecision_dashboard(CONTROL_ID)
+
+        self.assertEqual(
+            "https://decisions.example.test/"
+            "?repository_id=repo_22222222222222222222222222222222",
+            result["dashboard_url"],
+        )
+        self.assertEqual(
+            [result["dashboard_url"]], self.browser_launcher.urls
+        )
+
+        invalid = self.domain(
+            central_base_url="https://user:pass@example.test"
+        )
+        self.assertEqual(
+            {"safe_state": "unavailable", "dashboard_url": None},
+            invalid.open_zdecision_dashboard(CONTROL_ID),
+        )
+        self.assertEqual(1, len(self.browser_launcher.urls))
 
     async def test_render_keeps_control_private_and_disabled_has_no_reason(
         self,

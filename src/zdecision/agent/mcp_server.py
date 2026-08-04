@@ -11,6 +11,10 @@ from uuid import uuid4
 
 from mcp.types import CallToolResult, TextContent
 
+from zdecision.agent.browser_launcher import (
+    BrowserLauncher,
+    SystemDefaultBrowserLauncher,
+)
 from zdecision.agent.central_client import CentralClient, CentralClientError
 from zdecision.agent.config_locator import load_agent_config_path
 from zdecision.agent.control_bindings import (
@@ -59,6 +63,7 @@ class LocalMcpTools:
         central_base_url: str | None = None,
         clock: Callable[[], datetime] | None = None,
         action_id_factory: Callable[[], str] | None = None,
+        browser_launcher: BrowserLauncher | None = None,
         repository_resolver: RepositoryResolver | None = None,
     ) -> None:
         self.database = database
@@ -70,6 +75,7 @@ class LocalMcpTools:
         self.action_id_factory = action_id_factory or (
             lambda: f"codex_action_{uuid4().hex}"
         )
+        self.browser_launcher = browser_launcher
         self.repository_resolver = repository_resolver or RepositoryResolver()
 
     def zdecision_status(self) -> dict[str, object]:
@@ -230,6 +236,33 @@ class LocalMcpTools:
             return _binding_output(binding, "failed")
         return _safe_output("unavailable")
 
+    def open_zdecision_dashboard(
+        self, control_id: str
+    ) -> dict[str, object]:
+        binding = self._valid_binding(control_id, require_current_cwd=False)
+        if (
+            binding is None
+            or binding.submission_state != "attached"
+            or binding.chosen_scope is None
+            or binding.central_request_id is None
+            or self.browser_launcher is None
+        ):
+            return _dashboard_output("unavailable")
+
+        dashboard_url = _dashboard_url(
+            self.central_base_url, binding.repository_id
+        )
+        if dashboard_url is None:
+            return _dashboard_output("unavailable")
+        try:
+            accepted = self.browser_launcher.open(dashboard_url)
+        except Exception:
+            accepted = False
+        return _dashboard_output(
+            "launch_requested" if accepted else "unavailable",
+            dashboard_url=dashboard_url,
+        )
+
     def _read_request(self, binding: ControlBinding) -> dict[str, object]:
         try:
             view = self.central_client.get_capture_request(
@@ -262,7 +295,7 @@ class LocalMcpTools:
         terminal_success = safe_state in ("empty", "succeeded")
         count = view.candidate_revision_count if terminal_success else None
         page_url = (
-            _candidate_page_url(self.central_base_url, binding.repository_id)
+            _dashboard_url(self.central_base_url, binding.repository_id)
             if terminal_success
             else None
         )
@@ -341,6 +374,12 @@ def create_mcp_server(tools: LocalMcpTools):
         idempotentHint=True,
         openWorldHint=False,
     )
+    browser_action = ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
 
     @server.resource(
         UPDATE_CANDIDATES_URI,
@@ -414,6 +453,15 @@ def create_mcp_server(tools: LocalMcpTools):
     ) -> dict[str, object]:
         return tools.get_zdecision_candidate_refresh(control_id)
 
+    @server.tool(
+        title="Open ZDecision dashboard",
+        description="Open the trusted product dashboard in the default browser.",
+        annotations=browser_action,
+        meta={"ui": {"visibility": ["app"]}},
+    )
+    def open_zdecision_dashboard(control_id: str) -> dict[str, object]:
+        return tools.open_zdecision_dashboard(control_id)
+
     return server
 
 
@@ -449,6 +497,7 @@ def run_mcp(
             binding_store=binding_store,
             central_client=client,
             central_base_url=central_base_url,
+            browser_launcher=SystemDefaultBrowserLauncher(),
         )
         create_mcp_server(tools).run(transport="stdio")
     finally:
@@ -523,6 +572,17 @@ def _binding_output(
     }
 
 
+def _dashboard_output(
+    safe_state: str,
+    *,
+    dashboard_url: str | None = None,
+) -> dict[str, object]:
+    return {
+        "safe_state": safe_state,
+        "dashboard_url": dashboard_url,
+    }
+
+
 def _validated_base_url(value: object) -> str | None:
     if not isinstance(value, str) or not 1 <= len(value) <= 2048:
         return None
@@ -542,7 +602,7 @@ def _validated_base_url(value: object) -> str | None:
     return value.rstrip("/")
 
 
-def _candidate_page_url(
+def _dashboard_url(
     central_base_url: object, repository_id: str
 ) -> str | None:
     base_url = _validated_base_url(central_base_url)
