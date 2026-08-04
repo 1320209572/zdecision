@@ -17,7 +17,7 @@
 - Product identity always uses `prod_<32-hex>`; human product names are display data and never filesystem path components.
 - One Review, preview, publication, and Git commit belongs to exactly one product.
 - Formal Decision files remain `zdecision-decision/v1`, `schema_version: 1`, `revision: 1`, and `lifecycle: active`.
-- Formal files remain under `decision-registry/products/<product_id>/...`; no formal Decision is stored in SQLite.
+- Formal files remain under `decision-registry/products/<product_id>/...`; no formal Decision is stored in SQLite. SQLite may retain canonical immutable **pre-publication Preview artifacts** solely for restart and crash recovery. A Preview is not a formal Decision; after publication, Git Registry is the sole formal source of the published Decision.
 - Candidate, Review, and Decision text is untrusted text and must never be rendered as HTML.
 - The browser cannot set organization, actor, authoritative product name, Registry path, commit message, or formal Decision bytes.
 - Publication starts only from an immutable preview and is successful only after the exact commit is proven on `origin/main`.

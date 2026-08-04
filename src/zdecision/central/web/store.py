@@ -89,6 +89,16 @@ def _read_record(
         raise WebRecordCorrupt(label) from None
 
 
+def _require_product_owned_preview_paths(record: PublicationRecord) -> None:
+    allowed_root = "decision-registry/registry.json"
+    product_prefix = f"decision-registry/products/{record.product_id}/"
+    paths = tuple(record.base_registry_digests) + tuple(
+        document.path for document in record.display_documents
+    ) + tuple(document.path for document in record.changed_files)
+    if any(path != allowed_root and not path.startswith(product_prefix) for path in paths):
+        raise ValueError("Preview Registry paths must belong to its product")
+
+
 class CentralWebStore:
     def __init__(self, connection: sqlite3.Connection) -> None:
         if not isinstance(connection, sqlite3.Connection):
@@ -313,11 +323,14 @@ class CentralWebStore:
     def put_preview(
         self, organization_id: str, product_id: str, record: PublicationRecord
     ) -> PublicationRecord:
+        """Persist one immutable pre-publication Preview artifact, never a Decision."""
+
         organization = require_id(organization_id, "organization_id")
         if not isinstance(record, PublicationRecord):
             raise TypeError("record must be a PublicationRecord")
         if record.product_id != product_id or record.state != "previewed":
             raise ValueError("preview product_id is invalid")
+        _require_product_owned_preview_paths(record)
         record_json, record_digest = _canonical_record(record.to_dict())
         with immediate(self.connection):
             review = self.get_review_batch(

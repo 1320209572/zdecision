@@ -15,6 +15,7 @@ from zdecision.ids import (
     candidate_revision_id,
     canonical_product_name,
     central_publication_id,
+    central_review_batch_id,
     product_id as derive_product_id,
     publication_candidate_id,
     review_item_id,
@@ -337,6 +338,30 @@ class CentralReviewBatch:
             for item in items
         ):
             raise ValueError("review_id is invalid")
+        identity_items = tuple(
+            {
+                "family_id": item.family_id,
+                "repository_id": item.repository_id,
+                "revision_id": item.revision_id,
+                "revision": item.revision,
+                "content_digest": item.content_digest,
+                "action": item.action,
+                "effective_content": (
+                    item.effective_content.to_dict()
+                    if item.action == "edit_accept" else None
+                ),
+                "note": item.note,
+            }
+            for item in items
+        )
+        if self.review_batch_id != central_review_batch_id(
+            self.organization_id,
+            self.actor_id,
+            self.product_id,
+            self.client_action_id,
+            identity_items,
+        ):
+            raise ValueError("review_batch_id is invalid")
         _timestamp(self.created_at, "created_at")
         object.__setattr__(self, "items", items)
 

@@ -343,6 +343,12 @@ decision-registry/
                 └── r0001.json
 ```
 
+SQLite may retain exact canonical bytes for an immutable **pre-publication
+Preview artifact** so restart and crash recovery can execute only the frozen
+preview. That artifact is not a formal Decision and never replaces Registry
+ownership: once publication completes, the corresponding formal Decision's
+sole formal source is its Git Registry file.
+
 Every new publication writes only its own product directory plus the root
 product index when needed. A Review or publication cannot contain Candidate
 items from two products. Product names never become filesystem directories.

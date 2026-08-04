@@ -94,7 +94,7 @@ class CentralWebStoreTest(unittest.TestCase):
             content_digest=DIGEST,
             action="edit_accept",
             effective_content=content(),
-            note=None,
+            note=source.note,
         )
         batch_id = central_review_batch_id(
             "org_demo", "user_demo", PRODUCT_ID, action_id, (source.to_dict(),)
@@ -121,15 +121,34 @@ class CentralWebStoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(batch, items=(replace(batch.items[0], review_id="rvi_" + "e" * 32),))
 
-    def preview(self, batch: CentralReviewBatch) -> PublicationRecord:
+    def test_review_batch_id_is_bound_to_its_ordered_item_projection(self) -> None:
+        batch = self.review_batch()
+        wrong_id = "rvb_" + "f" * 32
+        wrong_item = replace(
+            batch.items[0],
+            review_id=review_item_id(wrong_id, batch.items[0].publication_candidate_id),
+        )
+        with self.assertRaises(ValueError):
+            replace(batch, review_batch_id=wrong_id, items=(wrong_item,))
+
+    def preview(
+        self,
+        batch: CentralReviewBatch,
+        *,
+        document_path: str | None = None,
+        base_registry_path: str | None = None,
+    ) -> PublicationRecord:
         candidate_id = publication_candidate_id(FAMILY_ID)
         decision = decision_id(candidate_id, PRODUCT_ID)
         document = PublicationFile.from_bytes(
-            "decision-registry/products/zdecision/decisions/demo.md", b"# Demo\n"
+            document_path
+            or f"decision-registry/products/{PRODUCT_ID}/decisions/demo.md",
+            b"# Demo\n",
         )
+        registry_path = base_registry_path or document.path
         preview_id = publication_preview_id({
             "base_commit": "0" * 40,
-            "base_registry_digests": {document.path: "missing"},
+            "base_registry_digests": {registry_path: "missing"},
             "decision_ids": (decision,),
             "publisher_format": "zdecision-publisher/v1",
             "review_ids": (batch.items[0].review_id,),
@@ -148,7 +167,7 @@ class CentralWebStoreTest(unittest.TestCase):
             product_id=PRODUCT_ID,
             product_name="ZDecision",
             base_commit="0" * 40,
-            base_registry_digests={document.path: "missing"},
+            base_registry_digests={registry_path: "missing"},
             display_documents=(document,),
             changed_files=(document,),
             commit_message=(
@@ -156,6 +175,28 @@ class CentralWebStoreTest(unittest.TestCase):
                 f"ZDecision-Preview: {preview_id}\n"
             ),
         )
+
+    def test_preview_rejects_cross_product_registry_paths(self) -> None:
+        batch = self.review_batch()
+        self.web_store.put_review_batch(batch)
+        other_product = "prod_" + "2" * 32
+        invalid_document = self.preview(
+            batch,
+            document_path=(
+                f"decision-registry/products/{other_product}/decisions/demo.md"
+            ),
+        )
+        invalid_digest = self.preview(
+            batch,
+            base_registry_path=(
+                f"decision-registry/products/{other_product}/registry.json"
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            self.web_store.put_preview("org_demo", PRODUCT_ID, invalid_document)
+        with self.assertRaises(ValueError):
+            self.web_store.put_preview("org_demo", PRODUCT_ID, invalid_digest)
 
     def test_family_maps_deterministically_to_v1_candidate(self) -> None:
         self.assertEqual(
