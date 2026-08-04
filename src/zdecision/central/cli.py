@@ -24,6 +24,7 @@ from zdecision.central.web.store import CentralWebStore
 from zdecision.ids import canonical_product_name, product_id
 from zdecision.jsonio import atomic_create_json
 from zdecision.registry.git import GitRegistryAdapter
+from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.query import RegistryQuery
 from zdecision.sync.contracts import RepositoryView
 
@@ -194,6 +195,8 @@ def _run_server(arguments: argparse.Namespace) -> int:
         web_application = CentralWebApplication(
             store=CentralWebStore(store.connection),
             queries=CentralWebQueries(store.connection, registry_query),
+            catalog=RegistryCatalog(registry_root),
+            git=git,
         )
         app = create_app(
             CaptureRequestService(store),

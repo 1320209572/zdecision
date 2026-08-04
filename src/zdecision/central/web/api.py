@@ -56,6 +56,12 @@ class _SubmitReviewBody(_StrictBody):
     items: list[_DraftItemBody] = Field(min_length=1, max_length=20)
 
 
+class _ActionBody(_StrictBody):
+    client_action_id: str = Field(
+        pattern=r"^web_action_[A-Za-z0-9-]{1,96}$"
+    )
+
+
 router = APIRouter(prefix="/api/v1/web")
 
 
@@ -136,4 +142,27 @@ async def submit_review(
         body.expected_draft_version,
         tuple(item.to_contract() for item in body.items),
         request.app.state.current_time(),
+    ).to_dict()
+
+
+@router.post("/reviews/{review_batch_id}/previews")
+async def create_preview(
+    request: Request, review_batch_id: str, body: _ActionBody
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).create_preview(
+        identity_provider.browser_principal(),
+        review_batch_id,
+        body.client_action_id,
+        request.app.state.current_time(),
+    ).to_dict()
+
+
+@router.get("/publication-previews/{preview_id}")
+async def get_preview(
+    request: Request, preview_id: str
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).get_preview(
+        identity_provider.browser_principal(), preview_id
     ).to_dict()

@@ -20,7 +20,9 @@ from zdecision.central.web.store import CentralWebStore
 from zdecision.capture.models import CandidateContent
 from zdecision.ids import candidate_revision_id, product_id
 from zdecision.jsonio import canonical_json_bytes
-from zdecision.registry.models import ProductMetadata, ProductRegistry
+from zdecision.registry.catalog import RegistryCatalog
+from zdecision.registry.git import GitRegistryAdapter
+from zdecision.registry.models import ProductMetadata, ProductRegistry, RootRegistry
 from zdecision.registry.query import RegistrySnapshot
 from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
 
@@ -46,6 +48,42 @@ class CentralWebApiTest(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         root = Path(self.temporary_directory.name)
+        remote = root / "remote.git"
+        repository = root / "repository"
+        subprocess.run(
+            ("git", "init", "--bare", str(remote)),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ("git", "init", "-b", "main", str(repository)),
+            check=True,
+            capture_output=True,
+        )
+        for key, value in (
+            ("user.email", "tests@example.com"),
+            ("user.name", "ZDecision Tests"),
+        ):
+            subprocess.run(
+                ("git", "-C", str(repository), "config", key, value),
+                check=True,
+            )
+        registry = repository / "decision-registry"
+        registry.mkdir()
+        (registry / "registry.json").write_bytes(
+            canonical_json_bytes(RootRegistry({}).to_dict())
+        )
+        for command in (
+            ("add", "decision-registry"),
+            ("commit", "-m", "initial registry"),
+            ("remote", "add", "origin", str(remote.resolve())),
+            ("push", "-u", "origin", "main"),
+        ):
+            subprocess.run(
+                ("git", "-C", str(repository), *command),
+                check=True,
+                capture_output=True,
+            )
         self.store = CentralStore.open(root / "central.sqlite3")
         self.addCleanup(self.store.close)
         self.store.put_repository_mapping(
@@ -115,11 +153,16 @@ class CentralWebApiTest(unittest.TestCase):
             device_id="device_demo",
             device_token_sha256=hashlib.sha256(b"token").hexdigest(),
         )
+        git = GitRegistryAdapter(
+            repository, expected_origin=str(remote.resolve())
+        )
         web = CentralWebApplication(
             store=CentralWebStore(self.store.connection),
             queries=CentralWebQueries(
                 self.store.connection, _RegistryQuery()
             ),
+            catalog=RegistryCatalog(repository),
+            git=git,
         )
         self.client = TestClient(
             create_app(
@@ -302,6 +345,78 @@ class CentralWebApiTest(unittest.TestCase):
             0,
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM web_publication_previews"
+            ).fetchone()[0],
+        )
+
+    def test_preview_routes_return_exact_safe_artifact_and_replay(self) -> None:
+        draft = self.client.put(
+            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            json=self.draft_body(action="accept"),
+        ).json()
+        review = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            json={
+                "client_action_id": "web_action_api-preview-review",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        ).json()
+        body = {"client_action_id": "web_action_api-preview"}
+
+        created = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json=body,
+        )
+        replay = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json=body,
+        )
+        loaded = self.client.get(
+            f"/api/v1/web/publication-previews/{created.json()['preview_id']}"
+        )
+
+        self.assertEqual(200, created.status_code, created.text)
+        self.assertEqual(created.json(), replay.json())
+        self.assertEqual(created.json(), loaded.json())
+        payload = created.json()
+        self.assertEqual("publishable", payload["publishability"])
+        self.assertIsNone(payload["publication_id"])
+        self.assertEqual(COMMIT_SHA, _RegistryQuery().snapshot().commit_sha)
+        self.assertRegex(payload["base_commit"], r"^[0-9a-f]{40}$")
+        self.assertEqual(1, len(payload["decisions"]))
+        decision = payload["decisions"][0]
+        changed_decision = next(
+            file for file in payload["changed_files"]
+            if file["path"] == decision["path"]
+        )
+        self.assertEqual(self.revision.content.claim, decision["claim"])
+        self.assertEqual(decision["canonical_json"], changed_decision["content"])
+        self.assertNotIn("note", json.dumps(payload))
+        self.assertNotIn("session", json.dumps(payload).lower())
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM web_publications"
+            ).fetchone()[0],
+        )
+
+    def test_preview_routes_are_strict_and_do_not_create_publications(self) -> None:
+        malformed = self.client.post(
+            "/api/v1/web/reviews/rvb_" + "a" * 32 + "/previews",
+            json={"client_action_id": "not-an-action", "actor_id": "user_demo"},
+        )
+        missing = self.client.get(
+            "/api/v1/web/publication-previews/pub_" + "f" * 32
+        )
+
+        self.assertEqual(422, malformed.status_code)
+        self.assertEqual({"error": "invalid_request"}, malformed.json())
+        self.assertEqual(404, missing.status_code)
+        self.assertEqual({"error": "not_found"}, missing.json())
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM web_publications"
             ).fetchone()[0],
         )
 

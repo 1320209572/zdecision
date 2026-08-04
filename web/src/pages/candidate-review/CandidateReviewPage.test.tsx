@@ -400,6 +400,8 @@ it("does not guess a product route for an unknown repository deep link", async (
 it("submits an ordered partial accept and reject for preview eligibility", async () => {
   const view = twoItemInbox("accept", "reject");
   let reviewBody: unknown;
+  let previewBody: unknown;
+  const previewId = "pub_" + "4".repeat(32);
   vi.stubGlobal(
     "fetch",
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -425,6 +427,13 @@ it("submits an ordered partial accept and reject for preview eligibility", async
           draft_version: 2,
         });
       }
+      if (url.endsWith("/previews") && init?.method === "POST") {
+        previewBody = JSON.parse(String(init.body));
+        return json({ preview_id: previewId });
+      }
+      if (url.endsWith(`/publication-previews/${previewId}`)) {
+        return json({ error: "fixture_stops_after_navigation" }, 503);
+      }
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
@@ -441,7 +450,76 @@ it("submits an ordered partial accept and reject for preview eligibility", async
     expected_draft_version: 1,
     items: view.draft.items,
   });
-  expect(screen.getByText("审核已提交，可生成发布预览")).toBeVisible();
+  expect(previewBody).toEqual({
+    client_action_id: expect.stringMatching(/^web_action_/),
+  });
+  await waitFor(() =>
+    expect(router.state.location.pathname).toBe(
+      `/publication-previews/${previewId}`,
+    ),
+  );
+});
+
+it("retries a failed preview with the same durable action identity", async () => {
+  const view = inbox({ draftVersion: 1, action: "accept" });
+  const reviewBatchId = "rvb_" + "5".repeat(32);
+  const previewId = "pub_" + "6".repeat(32);
+  const previewBodies: Array<{ client_action_id: string }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/candidates")) return json(view);
+      if (url.endsWith("/reviews") && init?.method === "POST") {
+        return json({
+          review_batch_id: reviewBatchId,
+          items: [],
+          preview_eligible: true,
+          remaining_pending_count: 0,
+          draft_version: 2,
+        });
+      }
+      if (url.endsWith("/previews") && init?.method === "POST") {
+        previewBodies.push(JSON.parse(String(init.body)));
+        return previewBodies.length === 1
+          ? json({ error: "registry_unavailable" }, 503)
+          : json({ preview_id: previewId });
+      }
+      if (url.endsWith(`/publication-previews/${previewId}`)) {
+        return json({ error: "fixture_stops_after_navigation" }, 503);
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  await user.click(
+    await screen.findByRole("button", { name: "生成发布预览" }),
+  );
+
+  expect(await screen.findByText("审核已提交，但发布预览生成失败")).toBeVisible();
+  const pending = JSON.parse(
+    String(localStorage.getItem(`zdecision:preview:${PRODUCT_ID}`)),
+  );
+  expect(pending).toEqual({
+    review_batch_id: reviewBatchId,
+    client_action_id: expect.stringMatching(/^web_action_/),
+  });
+
+  await user.click(screen.getByRole("button", { name: "重试生成发布预览" }));
+
+  expect(previewBodies).toEqual([
+    { client_action_id: pending.client_action_id },
+    { client_action_id: pending.client_action_id },
+  ]);
+  await waitFor(() =>
+    expect(router.state.location.pathname).toBe(
+      `/publication-previews/${previewId}`,
+    ),
+  );
+  expect(localStorage.getItem(`zdecision:preview:${PRODUCT_ID}`)).toBeNull();
 });
 
 it("submits reject-only review without claiming a preview", async () => {

@@ -150,3 +150,67 @@ export interface ProgressEvent {
   code: string;
   occurred_at: string;
 }
+
+export type PreviewPublishability =
+  | "publishable"
+  | "stale"
+  | "registry_unavailable";
+
+export interface PublicationFile {
+  path: string;
+  content: string;
+  sha256: string;
+}
+
+export interface DecisionPreview {
+  path: string;
+  sha256: string;
+  canonical_json: string;
+  format: "zdecision-decision/v1";
+  schema_version: 1;
+  decision_id: string;
+  product_id: string;
+  product_name: string;
+  revision: 1;
+  lifecycle: "active";
+  claim: string;
+  future_action: string;
+  scope: {
+    summary: string;
+    repositories: string[];
+    paths: string[];
+  };
+  invalidation_conditions: string[];
+  supersedes: unknown[];
+  variant_of: unknown[];
+  source: { thread_id: string; turn_id: string };
+  review_approval: {
+    actor: string;
+    thread_id: string;
+    turn_id: string;
+    recorded_at: string;
+  };
+  publication_preview_id: string;
+}
+
+export interface PublicationPreview {
+  record_version: 1;
+  preview_id: string;
+  content_digest: string;
+  state: "previewed";
+  created_at: string;
+  review_batch_id: string;
+  review_ids: string[];
+  candidate_ids: string[];
+  decision_ids: string[];
+  product_id: string;
+  product_name: string;
+  base_commit: string;
+  base_registry_digests: Record<string, string>;
+  display_documents: PublicationFile[];
+  changed_files: PublicationFile[];
+  commit_message: string;
+  publishability: PreviewPublishability;
+  publication_id: string | null;
+  decisions: DecisionPreview[];
+}

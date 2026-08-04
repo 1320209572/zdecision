@@ -6,6 +6,7 @@ import {
   CandidateReviewPage,
   RepositoryEntryPage,
 } from "../pages/candidate-review/CandidateReviewPage";
+import { PublicationPreviewPage } from "../pages/publication-preview/PublicationPreviewPage";
 
 function DeferredSlicePage() {
   const location = useLocation();
@@ -45,7 +46,7 @@ export const router = createBrowserRouter([
         Component: DeferredSlicePage,
       },
       { path: "products/:productId/publications", Component: DeferredSlicePage },
-      { path: "publication-previews/:previewId", Component: DeferredSlicePage },
+      { path: "publication-previews/:previewId", Component: PublicationPreviewPage },
       { path: "publications/:publicationId", Component: DeferredSlicePage },
     ],
   },

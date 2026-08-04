@@ -330,6 +330,94 @@ class CentralWebStore:
             raise WebRecordCorrupt("review_batch")
         return batch
 
+    def get_review_batch_by_id(
+        self, organization_id: str, review_batch_id: str
+    ) -> CentralReviewBatch | None:
+        organization = require_id(organization_id, "organization_id")
+        row = self.connection.execute(
+            """
+            SELECT product_id, record_json, record_digest
+            FROM web_review_batches
+            WHERE organization_id = ? AND review_batch_id = ?
+            """,
+            (organization, review_batch_id),
+        ).fetchone()
+        if row is None:
+            return None
+        batch = _read_record(
+            row["record_json"], row["record_digest"],
+            CentralReviewBatch, "review_batch",
+        )
+        if (
+            batch.organization_id != organization
+            or batch.product_id != row["product_id"]
+            or batch.review_batch_id != review_batch_id
+        ):
+            raise WebRecordCorrupt("review_batch")
+        return batch
+
+    def latest_review_ids(
+        self,
+        organization_id: str,
+        product_id: str,
+        family_ids: Sequence[str],
+    ) -> dict[str, str]:
+        organization = require_id(organization_id, "organization_id")
+        families = tuple(family_ids)
+        if isinstance(family_ids, (str, bytes)) or not families:
+            raise ValueError("family_ids are invalid")
+        if len(set(families)) != len(families):
+            raise ValueError("family_ids contain duplicates")
+        for family_id in families:
+            publication_candidate_id(family_id)
+        latest: dict[str, str] = {}
+        for family_id in families:
+            row = self.connection.execute(
+                """
+                SELECT item.review_id
+                FROM web_review_items AS item
+                JOIN web_review_batches AS batch
+                  ON batch.organization_id = item.organization_id
+                 AND batch.product_id = item.product_id
+                 AND batch.review_batch_id = item.review_batch_id
+                WHERE item.organization_id = ? AND item.product_id = ?
+                  AND item.family_id = ?
+                ORDER BY batch.submission_order DESC, batch.rowid DESC,
+                         item.item_order DESC
+                LIMIT 1
+                """,
+                (organization, product_id, family_id),
+            ).fetchone()
+            if row is not None:
+                latest[family_id] = row["review_id"]
+        return latest
+
+    def published_families(
+        self,
+        organization_id: str,
+        product_id: str,
+        family_ids: Sequence[str],
+    ) -> frozenset[str]:
+        organization = require_id(organization_id, "organization_id")
+        families = tuple(family_ids)
+        if isinstance(family_ids, (str, bytes)) or not families:
+            raise ValueError("family_ids are invalid")
+        if len(set(families)) != len(families):
+            raise ValueError("family_ids contain duplicates")
+        published: set[str] = set()
+        for family_id in families:
+            publication_candidate_id(family_id)
+            row = self.connection.execute(
+                """
+                SELECT 1 FROM web_candidate_receipts
+                WHERE organization_id = ? AND product_id = ? AND family_id = ?
+                """,
+                (organization, product_id, family_id),
+            ).fetchone()
+            if row is not None:
+                published.add(family_id)
+        return frozenset(published)
+
     def put_review_submission_result(
         self, result: ReviewSubmissionSnapshot
     ) -> ReviewSubmissionSnapshot:

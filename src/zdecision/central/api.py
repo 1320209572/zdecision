@@ -32,6 +32,12 @@ from zdecision.central.web.reviews import (
     ProductOwnershipConflict,
     ReviewStale,
 )
+from zdecision.central.web.previews import (
+    NoAcceptedItems,
+    PreviewNotFound,
+    PreviewStale,
+    RegistryUnavailable,
+)
 from zdecision.central.web.store import DraftConflict, WebActionConflict
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_LEASE_SECONDS,
@@ -188,6 +194,30 @@ def create_app(
         return JSONResponse(
             status_code=409, content={"error": "web_action_conflict"}
         )
+
+    @app.exception_handler(PreviewNotFound)
+    async def preview_not_found_handler(
+        request: Request, error: PreviewNotFound
+    ) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"error": error.code})
+
+    @app.exception_handler(NoAcceptedItems)
+    async def no_accepted_items_handler(
+        request: Request, error: NoAcceptedItems
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"error": error.code})
+
+    @app.exception_handler(PreviewStale)
+    async def preview_stale_handler(
+        request: Request, error: PreviewStale
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"error": error.code})
+
+    @app.exception_handler(RegistryUnavailable)
+    async def preview_registry_unavailable_handler(
+        request: Request, error: RegistryUnavailable
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"error": error.code})
 
     @app.exception_handler(ValueError)
     async def value_error_handler(

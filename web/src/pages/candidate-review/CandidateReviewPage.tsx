@@ -46,6 +46,37 @@ function staleFamilyIds(error: ApiError): string[] {
   );
 }
 
+interface PendingPreviewAction {
+  review_batch_id: string;
+  client_action_id: string;
+}
+
+function pendingPreviewKey(productId: string) {
+  return `zdecision:preview:${productId}`;
+}
+
+function readPendingPreview(productId: string): PendingPreviewAction | null {
+  try {
+    const raw = localStorage.getItem(pendingPreviewKey(productId));
+    if (!raw) return null;
+    const value: unknown = JSON.parse(raw);
+    if (
+      typeof value !== "object" || value === null ||
+      !("review_batch_id" in value) || !("client_action_id" in value) ||
+      typeof value.review_batch_id !== "string" ||
+      typeof value.client_action_id !== "string" ||
+      !/^rvb_[0-9a-f]{32}$/.test(value.review_batch_id) ||
+      !/^web_action_[A-Za-z0-9-]{1,96}$/.test(value.client_action_id)
+    ) return null;
+    return {
+      review_batch_id: value.review_batch_id,
+      client_action_id: value.client_action_id,
+    };
+  } catch {
+    return null;
+  }
+}
+
 
 export function RepositoryEntryPage() {
   const location = useLocation();
@@ -89,6 +120,7 @@ export function RepositoryEntryPage() {
 
 export function CandidateReviewPage() {
   const { productId = "" } = useParams();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const routedRepository = searchParams.get("repository_id") ?? "";
   const captureRequestId = searchParams.get("capture_request_id") ?? "";
@@ -118,6 +150,9 @@ export function CandidateReviewPage() {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [savedDraftSignature, setSavedDraftSignature] = useState("[]");
   const [submitting, setSubmitting] = useState(false);
+  const [pendingPreview, setPendingPreview] = useState<PendingPreviewAction | null>(
+    () => readPendingPreview(productId),
+  );
   const [staleFamilies, setStaleFamilies] = useState(
     () => new Set<string>(),
   );
@@ -164,6 +199,10 @@ export function CandidateReviewPage() {
     setFilterCaptureRequest(captureRequestId);
     setFilterState(routedState);
   }, [captureRequestId, routedRepository, routedSearch, routedState]);
+
+  useEffect(() => {
+    setPendingPreview(readPendingPreview(productId));
+  }, [productId]);
 
   const refreshCompleted = useCallback(() => {
     setReload((value) => value + 1);
@@ -281,11 +320,17 @@ export function CandidateReviewPage() {
       );
       setSavedDraftSignature(JSON.stringify(remaining));
       setStaleFamilies(new Set());
-      setSaveMessage(
-        result.preview_eligible
-          ? "审核已提交，可生成发布预览"
-          : "审核结果已提交",
-      );
+      if (result.preview_eligible) {
+        const action = {
+          review_batch_id: result.review_batch_id,
+          client_action_id: `web_action_${crypto.randomUUID()}`,
+        };
+        localStorage.setItem(pendingPreviewKey(productId), JSON.stringify(action));
+        setPendingPreview(action);
+        await openPendingPreview(action);
+        return;
+      }
+      setSaveMessage("审核结果已提交");
     } catch (error) {
       if (
         error instanceof ApiError &&
@@ -303,6 +348,34 @@ export function CandidateReviewPage() {
       } else {
         setSaveMessage("审核提交失败");
       }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function openPendingPreview(action: PendingPreviewAction) {
+    try {
+      const preview = await api<{ preview_id: string }>(
+        `/api/v1/web/reviews/${action.review_batch_id}/previews`,
+        {
+          method: "POST",
+          body: JSON.stringify({ client_action_id: action.client_action_id }),
+        },
+      );
+      localStorage.removeItem(pendingPreviewKey(productId));
+      setPendingPreview(null);
+      void navigate(`/publication-previews/${preview.preview_id}`);
+    } catch {
+      setSaveMessage("审核已提交，但发布预览生成失败");
+    }
+  }
+
+  async function retryPendingPreview() {
+    if (!pendingPreview || submitting) return;
+    setSubmitting(true);
+    setSaveMessage(null);
+    try {
+      await openPendingPreview(pendingPreview);
     } finally {
       setSubmitting(false);
     }
@@ -500,6 +573,16 @@ export function CandidateReviewPage() {
           >
             保存审核草稿
           </button>
+          {pendingPreview ? (
+            <button
+              className="quiet-button"
+              type="button"
+              disabled={submitting}
+              onClick={() => void retryPendingPreview()}
+            >
+              重试生成发布预览
+            </button>
+          ) : null}
           <button
             className="primary-button"
             type="button"
