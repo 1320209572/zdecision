@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.capture.models import CandidateContent
 from zdecision.capture.reviews import ApprovalRef
@@ -297,6 +298,41 @@ class CentralPreviewServiceTest(unittest.TestCase):
                 ).fetchone()[0],
             ),
         )
+
+    def test_concurrent_action_replay_reports_current_stale_status(self) -> None:
+        first = self.service.create(
+            self.user, self.batch.review_batch_id, "web_action_preview-raced", NOW
+        )
+        original_action_result = self.store.action_result
+        calls = 0
+
+        def race_action_result(*args: object) -> object:
+            nonlocal calls
+            calls += 1
+            result = original_action_result(*args)
+            if calls == 1:
+                (self.repository / "decision-registry" / "README.md").write_text(
+                    "Registry base advanced during replay.\n", "utf-8"
+                )
+                self._git("add", "decision-registry/README.md")
+                self._git("commit", "-m", "advance registry during replay")
+                self._git("push", "origin", "main")
+                return None
+            return result
+
+        with patch.object(self.store, "action_result", side_effect=race_action_result):
+            raced = self.service.create(
+                self.user,
+                self.batch.review_batch_id,
+                "web_action_preview-raced",
+                LATER,
+            )
+        loaded = self.service.get(self.user, first.record.preview_id)
+
+        self.assertEqual(first.record, raced.record)
+        self.assertEqual("stale", raced.publishability)
+        self.assertIsNone(raced.publication_id)
+        self.assertEqual(loaded, raced)
 
     def test_base_change_before_atomic_freeze_writes_no_preview_or_action(
         self,

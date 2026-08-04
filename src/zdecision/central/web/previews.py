@@ -230,6 +230,8 @@ class CentralPreviewService:
                 f"ZDecision-Preview: {preview_id}\n"
             ),
         )
+        replayed_preview_id: str | None = None
+        stored: PublicationRecord | None = None
         with immediate(self.store.connection):
             replay = self.store.action_result(
                 principal.organization_id,
@@ -245,29 +247,34 @@ class CentralPreviewService:
                 )
                 if existing is None:
                     raise WebRecordCorrupt("preview_action_result")
-                return PublicationPreviewView(existing, "publishable", None)
-            self._require_latest_and_unpublished(principal, batch, accepted)
-            try:
-                self.git.fetch_and_require_exact_main(base_commit)
-            except GitRegistryError:
-                raise RegistryUnavailable("registry_unavailable") from None
-            existing = self.store.get_preview(
-                principal.organization_id, record.preview_id
-            )
-            if existing is not None:
-                record = replace(record, created_at=existing.created_at)
-            stored = self.store.put_preview(
-                principal.organization_id, batch.product_id, record
-            )
-            self.store.record_action(
-                principal.organization_id,
-                principal.actor_id,
-                "preview",
-                client_action_id,
-                request_digest,
-                stored.preview_id,
-                timestamp,
-            )
+                replayed_preview_id = existing.preview_id
+            else:
+                self._require_latest_and_unpublished(principal, batch, accepted)
+                try:
+                    self.git.fetch_and_require_exact_main(base_commit)
+                except GitRegistryError:
+                    raise RegistryUnavailable("registry_unavailable") from None
+                existing = self.store.get_preview(
+                    principal.organization_id, record.preview_id
+                )
+                if existing is not None:
+                    record = replace(record, created_at=existing.created_at)
+                stored = self.store.put_preview(
+                    principal.organization_id, batch.product_id, record
+                )
+                self.store.record_action(
+                    principal.organization_id,
+                    principal.actor_id,
+                    "preview",
+                    client_action_id,
+                    request_digest,
+                    stored.preview_id,
+                    timestamp,
+                )
+        if replayed_preview_id is not None:
+            return self.get(principal, replayed_preview_id)
+        if stored is None:
+            raise WebRecordCorrupt("preview_action_result")
         return PublicationPreviewView(stored, "publishable", None)
 
     def get(

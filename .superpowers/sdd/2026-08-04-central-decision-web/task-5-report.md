@@ -224,3 +224,38 @@ accepted, fixed, and covered before the final verification above:
 
 The reviewer reported no further architectural, security, or Task 5 scope
 concerns beyond those resolved findings.
+
+## Fix round 1/5: concurrent replay status
+
+An important follow-up review reproduced an action replay appearing between
+the initial lookup and the owning `BEGIN IMMEDIATE`. That branch returned the
+exact frozen record but incorrectly hard-coded `publishable` and omitted the
+trusted publication lookup, so an advanced Registry base disagreed with an
+immediate GET.
+
+The regression
+`test_concurrent_action_replay_reports_current_stale_status` hides an existing
+exact action on the first lookup, advances and pushes the Registry base, then
+reveals the action inside the transaction. Before the fix it failed with
+`'stale' != 'publishable'`.
+
+The replay branch now retains only the verified frozen Preview ID while the
+transaction is open, finishes that transaction, and resolves the response via
+the same `get()` path as ordinary reads. Thus freshness Git/network work and
+the trusted publication lookup occur after the transaction, while exact action
+digest conflict handling and immutable Preview bytes remain unchanged. No
+Preview or publication is created or replaced by the replay path.
+
+Fresh focused verification:
+
+```text
+.venv/bin/python -m unittest tests.test_central_web_preview \
+  tests.test_central_web_api.CentralWebApiTest.test_preview_routes_return_exact_safe_artifact_and_replay \
+  -v
+```
+
+Exit 0, 11/11 passed. Self-review confirmed the concurrent branch performs no
+Git/network work before leaving its transaction, returns the same frozen
+record as GET with current publishability/publication identity, and preserves
+the initial replay and request-digest conflict paths. No Task 6 behavior was
+added.
