@@ -16,6 +16,7 @@ from zdecision.central.web.contracts import (
     CentralReviewBatch,
     DraftItem,
     ReviewDraft,
+    ReviewSubmissionSnapshot,
 )
 from zdecision.ids import publication_candidate_id
 from zdecision.jsonio import canonical_json_bytes
@@ -256,18 +257,27 @@ class CentralWebStore:
                     if loaded == batch:
                         return loaded
                     raise WebRecordConflict("review_batch_conflict")
+            submission_order = self.connection.execute(
+                """
+                SELECT COALESCE(MAX(submission_order), 0) + 1
+                FROM web_review_batches
+                WHERE organization_id = ? AND product_id = ?
+                """,
+                (batch.organization_id, batch.product_id),
+            ).fetchone()[0]
             self.connection.execute(
                 """
                 INSERT INTO web_review_batches(
                     organization_id, product_id, review_batch_id, actor_id,
                     client_action_id, request_digest, record_json, record_digest,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, submission_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     batch.organization_id, batch.product_id, batch.review_batch_id,
                     batch.actor_id, batch.client_action_id, batch.request_digest,
                     record_json, record_digest, batch.created_at,
+                    submission_order,
                 ),
             )
             for order, item in enumerate(batch.items):
@@ -319,6 +329,96 @@ class CentralWebStore:
         ):
             raise WebRecordCorrupt("review_batch")
         return batch
+
+    def put_review_submission_result(
+        self, result: ReviewSubmissionSnapshot
+    ) -> ReviewSubmissionSnapshot:
+        if not isinstance(result, ReviewSubmissionSnapshot):
+            raise TypeError("result must be a ReviewSubmissionSnapshot")
+        record_json, record_digest = _canonical_record(result.to_dict())
+        with immediate(self.connection):
+            existing = self.connection.execute(
+                """
+                SELECT record_json, record_digest
+                FROM web_review_submission_results
+                WHERE organization_id = ? AND actor_id = ?
+                  AND review_batch_id = ?
+                """,
+                (
+                    result.organization_id,
+                    result.actor_id,
+                    result.review_batch_id,
+                ),
+            ).fetchone()
+            if existing is not None:
+                loaded = _read_record(
+                    existing["record_json"],
+                    existing["record_digest"],
+                    ReviewSubmissionSnapshot,
+                    "review_submission_result",
+                )
+                if loaded == result:
+                    return result
+                raise WebRecordConflict("review_submission_result_conflict")
+            batch = self.get_review_batch(
+                result.organization_id,
+                result.product_id,
+                result.review_batch_id,
+            )
+            if batch is None or batch.actor_id != result.actor_id:
+                raise WebRecordConflict("review_submission_result_conflict")
+            self.connection.execute(
+                """
+                INSERT INTO web_review_submission_results(
+                    organization_id, actor_id, product_id, review_batch_id,
+                    record_json, record_digest
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.organization_id,
+                    result.actor_id,
+                    result.product_id,
+                    result.review_batch_id,
+                    record_json,
+                    record_digest,
+                ),
+            )
+        return result
+
+    def get_review_submission_result(
+        self,
+        organization_id: str,
+        actor_id: str,
+        product_id: str,
+        review_batch_id: str,
+    ) -> ReviewSubmissionSnapshot | None:
+        organization = require_id(organization_id, "organization_id")
+        actor = require_id(actor_id, "actor_id")
+        row = self.connection.execute(
+            """
+            SELECT record_json, record_digest
+            FROM web_review_submission_results
+            WHERE organization_id = ? AND actor_id = ? AND product_id = ?
+              AND review_batch_id = ?
+            """,
+            (organization, actor, product_id, review_batch_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = _read_record(
+            row["record_json"],
+            row["record_digest"],
+            ReviewSubmissionSnapshot,
+            "review_submission_result",
+        )
+        if (
+            result.organization_id != organization
+            or result.actor_id != actor
+            or result.product_id != product_id
+            or result.review_batch_id != review_batch_id
+        ):
+            raise WebRecordCorrupt("review_submission_result")
+        return result
 
     def put_preview(
         self, organization_id: str, product_id: str, record: PublicationRecord

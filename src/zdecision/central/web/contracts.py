@@ -509,6 +509,76 @@ class CentralReviewBatch:
 
 
 @dataclass(frozen=True)
+class ReviewSubmissionSnapshot:
+    organization_id: str
+    actor_id: str
+    product_id: str
+    review_batch_id: str
+    preview_eligible: bool
+    remaining_pending: tuple[str, ...]
+    draft_version: int
+
+    def __post_init__(self) -> None:
+        require_id(self.organization_id, "organization_id")
+        require_id(self.actor_id, "actor_id")
+        _id(self.product_id, _PRODUCT_ID, "product_id")
+        _id(self.review_batch_id, _REVIEW_BATCH_ID, "review_batch_id")
+        if not isinstance(self.preview_eligible, bool):
+            raise ValueError("preview_eligible is invalid")
+        if not isinstance(self.remaining_pending, tuple):
+            raise ValueError("remaining_pending is invalid")
+        pending = tuple(
+            _id(value, _FAMILY_ID, "family_id")
+            for value in self.remaining_pending
+        )
+        if len(set(pending)) != len(pending):
+            raise ValueError("remaining_pending contains duplicates")
+        if (
+            not isinstance(self.draft_version, int)
+            or isinstance(self.draft_version, bool)
+            or self.draft_version < 1
+        ):
+            raise ValueError("draft_version is invalid")
+        object.__setattr__(self, "remaining_pending", pending)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "organization_id": self.organization_id,
+            "actor_id": self.actor_id,
+            "product_id": self.product_id,
+            "review_batch_id": self.review_batch_id,
+            "preview_eligible": self.preview_eligible,
+            "remaining_pending": list(self.remaining_pending),
+            "draft_version": self.draft_version,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, object]
+    ) -> "ReviewSubmissionSnapshot":
+        _require_fields(value, frozenset((
+            "organization_id", "actor_id", "product_id", "review_batch_id",
+            "preview_eligible", "remaining_pending", "draft_version",
+        )), "ReviewSubmissionSnapshot")
+        pending = value["remaining_pending"]
+        if not isinstance(pending, list):
+            raise ValueError("remaining_pending is invalid")
+        return cls(
+            organization_id=require_id(
+                value["organization_id"], "organization_id"
+            ),
+            actor_id=require_id(value["actor_id"], "actor_id"),
+            product_id=_id(value["product_id"], _PRODUCT_ID, "product_id"),
+            review_batch_id=_id(
+                value["review_batch_id"], _REVIEW_BATCH_ID, "review_batch_id"
+            ),
+            preview_eligible=value["preview_eligible"],
+            remaining_pending=tuple(pending),
+            draft_version=value["draft_version"],
+        )
+
+
+@dataclass(frozen=True)
 class CentralPublication:
     publication_id: str
     organization_id: str

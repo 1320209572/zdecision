@@ -493,7 +493,7 @@ class CentralWebQueries:
             WHERE item.organization_id = ? AND item.product_id = ?
               AND item.repository_id = ? AND item.family_id = ?
               AND item.revision_id = ?
-            ORDER BY batch.created_at DESC, batch.review_batch_id DESC,
+            ORDER BY batch.submission_order DESC, batch.rowid DESC,
                      item.item_order DESC
             LIMIT 1
             """,
@@ -626,8 +626,8 @@ class CentralWebQueries:
                   AND item.repository_id = head.repository_id
                   AND item.family_id = head.family_id
                   AND item.revision_id = head.revision_id
-                ORDER BY batch.created_at DESC,
-                         batch.review_batch_id DESC,
+                ORDER BY batch.submission_order DESC,
+                         batch.rowid DESC,
                          item.item_order DESC
                 LIMIT 1
               ), '') NOT IN ('accept', 'edit_accept', 'reject')

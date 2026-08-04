@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS web_review_batches (
   record_json TEXT NOT NULL,
   record_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  submission_order INTEGER CHECK(submission_order > 0),
   PRIMARY KEY(organization_id, product_id, review_batch_id),
   UNIQUE(organization_id, actor_id, client_action_id)
 );
@@ -65,6 +66,18 @@ CREATE TABLE IF NOT EXISTS web_review_items (
   note TEXT,
   PRIMARY KEY(organization_id, product_id, review_batch_id, item_order),
   UNIQUE(organization_id, product_id, review_id),
+  FOREIGN KEY(organization_id, product_id, review_batch_id)
+    REFERENCES web_review_batches(organization_id, product_id, review_batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS web_review_submission_results (
+  organization_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  review_batch_id TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  record_digest TEXT NOT NULL,
+  PRIMARY KEY(organization_id, actor_id, review_batch_id),
   FOREIGN KEY(organization_id, product_id, review_batch_id)
     REFERENCES web_review_batches(organization_id, product_id, review_batch_id)
 );
@@ -162,7 +175,56 @@ def initialize_web_schema(connection: sqlite3.Connection) -> None:
     """Create Web tables and recover their immutable Candidate associations."""
 
     connection.executescript(WEB_SCHEMA)
+    _ensure_review_submission_order(connection)
     _backfill_candidate_revision_batches(connection)
+
+
+def _ensure_review_submission_order(connection: sqlite3.Connection) -> None:
+    """Migrate and freeze one durable order for every immutable Review batch."""
+
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(web_review_batches)"
+        ).fetchall()
+    }
+    if "submission_order" not in columns:
+        connection.execute(
+            "ALTER TABLE web_review_batches ADD COLUMN submission_order INTEGER"
+        )
+    maxima = {
+        (row["organization_id"], row["product_id"]): int(row["maximum"])
+        for row in connection.execute(
+            """
+            SELECT organization_id, product_id,
+                   COALESCE(MAX(submission_order), 0) AS maximum
+            FROM web_review_batches
+            GROUP BY organization_id, product_id
+            """
+        ).fetchall()
+    }
+    rows = connection.execute(
+        """
+        SELECT rowid, organization_id, product_id
+        FROM web_review_batches
+        WHERE submission_order IS NULL
+        ORDER BY organization_id, product_id, rowid
+        """
+    ).fetchall()
+    for row in rows:
+        key = (row["organization_id"], row["product_id"])
+        order = maxima.get(key, 0) + 1
+        connection.execute(
+            "UPDATE web_review_batches SET submission_order = ? WHERE rowid = ?",
+            (order, row["rowid"]),
+        )
+        maxima[key] = order
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS web_review_batches_submission_order
+        ON web_review_batches(organization_id, product_id, submission_order)
+        """
+    )
 
 
 def record_candidate_revision_batch(

@@ -324,11 +324,15 @@ export function CandidateReviewPage() {
         ),
       });
       setDraftByFamily((current) => {
-        const replacement = new Map(current);
-        for (const familyId of staleFamilies) {
+        const replacement = new Map(
+          latest.draft.items.map((item) => [item.family_id, item]),
+        );
+        for (const [familyId, action] of current) {
           const candidate = latestByFamily.get(familyId);
-          const action = current.get(familyId);
-          if (!candidate || !action) continue;
+          if (!staleFamilies.has(familyId) || !candidate) {
+            replacement.set(familyId, action);
+            continue;
+          }
           replacement.set(familyId, {
             ...action,
             repository_id: candidate.repository_id,
@@ -348,6 +352,7 @@ export function CandidateReviewPage() {
         return replacement;
       });
       setDraftVersion(latest.draft.version);
+      setSavedDraftSignature(JSON.stringify(latest.draft.items));
       setStaleFamilies(new Set());
       setSaveMessage("已载入最新候选版本，请重新提交审核");
     } catch {

@@ -148,3 +148,94 @@ Additional verification:
   it does not affect results and dependency migration is outside Task 4.
 - No other known concern. Packaged SPA rebuild and complete suites remain later
   plan work; Task 5+ was not started.
+
+## Fix round 1/5
+
+### Findings fixed
+
+- Replaced timestamp/hash latest-Review tie-breaking with a durable per-product
+  `submission_order`. New batches allocate it inside the existing immediate
+  transaction; startup migrates historical rows once and freezes the resulting
+  order behind a unique index. Both latest-state consumers—the Candidate Inbox
+  and dashboard pending count—now use database submission order.
+- Added a strict canonical `ReviewSubmissionSnapshot` and immutable
+  `web_review_submission_results` record written in the same transaction as
+  batch, draft clearing, and action result. Identical replay now loads the
+  original eligibility, pending families, and draft version even after later
+  Reviews and a database reopen; changed request bytes still conflict.
+- Changed stale UI reconciliation to start from the latest durable server
+  draft, overlay retained local selections (including the reconciled current
+  head), preserve remote-only choices, and only then adopt the newer CAS
+  version. The next save includes both sides and stale handling never
+  resubmits Review automatically.
+
+### RED evidence
+
+The three backend regressions were run together before production changes:
+
+```text
+.venv/bin/python -m unittest \
+  tests.test_central_web_review.CentralWebReviewTest.test_later_same_timestamp_reject_is_the_latest_review_state \
+  tests.test_central_web_review.CentralWebReviewTest.test_replay_returns_original_result_after_later_review_state \
+  tests.test_central_web_queries.CentralWebQueriesTest.test_same_timestamp_dashboard_uses_database_submission_order -v
+```
+
+Result: exit 1. The later same-time reject was absent from rejected state; the
+replay returned an empty pending tuple instead of the original pending family;
+and the query fixture could not supply the missing `submission_order` column.
+
+Frontend command before the merge fix:
+
+```text
+cd web && npm test -- CandidateReviewPage.test.tsx
+```
+
+Result: exit 1, 1/12 failed. The saved merged body contained only the local
+family and erased the remote-only reject selection.
+
+### Final GREEN and compatibility evidence
+
+Fresh backend command:
+
+```text
+.venv/bin/python -m unittest tests.test_central_web_review tests.test_central_web_api tests.test_central_web_queries tests.test_central_web_store -v
+```
+
+Exit 0, 41/41 passed. This includes same-timestamp accept-then-reject state,
+same-timestamp dashboard accept-then-skip ordering, replay after a later Review
+and database reopen, action-byte conflicts, strict API behavior, schema/store
+contracts, and existing query compatibility.
+
+Fresh frontend command:
+
+```text
+cd web && npm run typecheck && npm test -- CandidateReviewPage.test.tsx
+```
+
+Exit 0. TypeScript passed and Candidate Review passed 12/12, including the
+cross-tab merge and no-automatic-resubmit assertion.
+
+Additional verification:
+
+- `.venv/bin/python -m compileall -q src tests`: exit 0.
+- `git diff --check`: exit 0.
+
+### Fix-round self-review
+
+- Audited every query that chooses the latest Review for Task 4 semantics;
+  only `_candidate_review_state` and `_pending_count` do so, and both now order
+  by the same durable `submission_order` contract.
+- Confirmed migration assigns each historical row once, new allocation is
+  serialized by `BEGIN IMMEDIATE`, and the unique product/order index detects
+  duplicate durable positions.
+- Confirmed the replay snapshot contains only IDs, boolean eligibility, pending
+  family IDs, and draft version—no Candidate/Review text or note—and is
+  canonically digest-checked on read.
+- Confirmed snapshot insertion precedes action-result insertion in the same
+  transaction, so no replayable action can commit without its exact response.
+- Confirmed remote-only draft items survive reconciliation, local selection
+  bytes win for retained families, the reconciled stale identity is saved
+  against the latest CAS version, and no Review POST follows automatically.
+- Confirmed no preview, publish, Registry, or Task 5+ behavior was introduced.
+
+The existing Starlette/httpx deprecation warning remains the only concern.

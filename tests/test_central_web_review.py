@@ -526,6 +526,91 @@ class CentralWebReviewTest(unittest.TestCase):
         )
         self.assertEqual(0, self.count_rows("web_publication_previews"))
 
+    def test_later_same_timestamp_reject_is_the_latest_review_state(
+        self,
+    ) -> None:
+        accepted = self.draft_item(self.current, REPOSITORY_ID)
+        self.service.save_draft(self.user, PRODUCT_ID, 0, (accepted,), NOW)
+        self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_same-time-accept",
+            1,
+            (accepted,),
+            NOW,
+        )
+        rejected = self.draft_item(
+            self.current, REPOSITORY_ID, action="reject"
+        )
+        self.service.save_draft(self.user, PRODUCT_ID, 2, (rejected,), NOW)
+        self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_same-time-reject",
+            3,
+            (rejected,),
+            NOW,
+        )
+
+        self.assertEqual(
+            (FAMILY_ID,),
+            tuple(
+                item.family_id
+                for item in self.service.list_candidates(
+                    self.user, PRODUCT_ID, state="rejected"
+                ).items
+            ),
+        )
+
+    def test_replay_returns_original_result_after_later_review_state(
+        self,
+    ) -> None:
+        family_b = self.add_current(FAMILY_B, "later review")
+        accepted = self.draft_item(self.current, REPOSITORY_ID)
+        self.service.save_draft(self.user, PRODUCT_ID, 0, (accepted,), NOW)
+        first = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_snapshot-first",
+            1,
+            (accepted,),
+            NOW,
+        )
+        rejected = self.draft_item(
+            family_b, REPOSITORY_ID, action="reject"
+        )
+        self.service.save_draft(self.user, PRODUCT_ID, 2, (rejected,), NOW)
+        self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_snapshot-later",
+            3,
+            (rejected,),
+            NOW,
+        )
+        database_path = self.store.path
+        self.store.close()
+        self.store = CentralStore.open(database_path)
+        self.addCleanup(self.store.close)
+        self.service = CentralReviewService(
+            store=CentralWebStore(self.store.connection),
+            queries=CentralWebQueries(
+                self.store.connection, _RegistryQuery()
+            ),
+        )
+
+        replay = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_snapshot-first",
+            1,
+            (accepted,),
+            NOW,
+        )
+
+        self.assertEqual((FAMILY_B,), first.remaining_pending)
+        self.assertEqual(first, replay)
+
 
 if __name__ == "__main__":
     unittest.main()

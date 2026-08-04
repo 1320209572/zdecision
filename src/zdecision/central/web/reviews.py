@@ -15,6 +15,7 @@ from zdecision.central.web.contracts import (
     CentralReviewItem,
     DraftItem,
     ReviewDraft,
+    ReviewSubmissionSnapshot,
 )
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import (
@@ -254,10 +255,19 @@ class CentralReviewService:
                 )
                 if batch is None:
                     raise WebRecordCorrupt("review_action_result")
-                return self._submission_result(
-                    principal,
-                    batch,
-                    draft_version=expected_draft_version + 1,
+                snapshot = self.store.get_review_submission_result(
+                    principal.organization_id,
+                    principal.actor_id,
+                    product_id,
+                    batch.review_batch_id,
+                )
+                if snapshot is None:
+                    raise WebRecordCorrupt("review_submission_result")
+                return ReviewSubmissionResult(
+                    batch=batch,
+                    preview_eligible=snapshot.preview_eligible,
+                    remaining_pending=snapshot.remaining_pending,
+                    draft_version=snapshot.draft_version,
                 )
 
             draft = self.store.get_draft(
@@ -331,6 +341,20 @@ class CentralReviewService:
             updated_draft = self.store.clear_submitted_draft_items(
                 draft, ordered, timestamp
             )
+            result = self._submission_result(
+                principal, batch, draft_version=updated_draft.version
+            )
+            self.store.put_review_submission_result(
+                ReviewSubmissionSnapshot(
+                    organization_id=principal.organization_id,
+                    actor_id=principal.actor_id,
+                    product_id=product_id,
+                    review_batch_id=batch.review_batch_id,
+                    preview_eligible=result.preview_eligible,
+                    remaining_pending=result.remaining_pending,
+                    draft_version=result.draft_version,
+                )
+            )
             self.store.record_action(
                 principal.organization_id,
                 principal.actor_id,
@@ -340,9 +364,7 @@ class CentralReviewService:
                 batch.review_batch_id,
                 timestamp,
             )
-            return self._submission_result(
-                principal, batch, draft_version=updated_draft.version
-            )
+            return result
 
     @staticmethod
     def _freeze_item(

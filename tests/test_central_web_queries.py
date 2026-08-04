@@ -320,16 +320,46 @@ class CentralWebQueriesTest(unittest.TestCase):
             1, self.queries.dashboard(self.user).metrics.pending_candidate_count
         )
 
-    def _insert_review(self, ordinal: str, action: str, created_at: str) -> None:
+    def test_same_timestamp_dashboard_uses_database_submission_order(
+        self,
+    ) -> None:
+        self._insert_review(
+            "1", "accept", "2026-08-04T01:00:00Z", submission_order=1
+        )
+        self._insert_review(
+            "f", "skip", "2026-08-04T01:00:00Z", submission_order=2
+        )
+
+        self.assertEqual(
+            1, self.queries.dashboard(self.user).metrics.pending_candidate_count
+        )
+
+    def _insert_review(
+        self,
+        ordinal: str,
+        action: str,
+        created_at: str,
+        *,
+        submission_order: int | None = None,
+    ) -> None:
         batch_id = "rvb_" + ordinal * 32
         with self.store.connection:
+            if submission_order is None:
+                submission_order = self.store.connection.execute(
+                    """
+                    SELECT COALESCE(MAX(submission_order), 0) + 1
+                    FROM web_review_batches
+                    WHERE organization_id = ? AND product_id = ?
+                    """,
+                    ("org_demo", PRODUCT_ID),
+                ).fetchone()[0]
             self.store.connection.execute(
                 """
                 INSERT INTO web_review_batches(
                     organization_id, product_id, review_batch_id, actor_id,
                     client_action_id, request_digest, record_json,
-                    record_digest, created_at
-                ) VALUES (?, ?, ?, 'user_demo', ?, ?, '{}', ?, ?)
+                    record_digest, created_at, submission_order
+                ) VALUES (?, ?, ?, 'user_demo', ?, ?, '{}', ?, ?, ?)
                 """,
                 (
                     "org_demo",
@@ -339,6 +369,7 @@ class CentralWebQueriesTest(unittest.TestCase):
                     ordinal * 64,
                     ordinal * 64,
                     created_at,
+                    submission_order,
                 ),
             )
             self.store.connection.execute(

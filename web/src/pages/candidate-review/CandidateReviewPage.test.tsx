@@ -537,3 +537,64 @@ it("retains a stale selection and loads the latest revision without resubmitting
   expect(screen.queryByText("已有新版本")).not.toBeInTheDocument();
   expect(reviewWrites).toBe(1);
 });
+
+it("merges remote-only draft choices before adopting a newer CAS version", async () => {
+  const original = inbox({ draftVersion: 1, action: "accept" });
+  const latest = twoItemInbox("accept", "reject");
+  latest.draft.version = 2;
+  latest.items[0] = {
+    ...latest.items[0],
+    revision: 2,
+    revision_id: "crv_" + "7".repeat(32),
+    content_digest: "6".repeat(64),
+  };
+  let candidateReads = 0;
+  let reviewWrites = 0;
+  let savedBody: {
+    expected_version: number;
+    items: ReviewDraft["items"];
+  } | null = null;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/candidates")) {
+        candidateReads += 1;
+        return json(candidateReads === 1 ? original : latest);
+      }
+      if (url.endsWith("/reviews") && init?.method === "POST") {
+        reviewWrites += 1;
+        return json(
+          { error: "review_stale", family_ids: [FAMILY_ID] },
+          409,
+        );
+      }
+      if (url.includes("/review-draft") && init?.method === "PUT") {
+        savedBody = JSON.parse(String(init.body));
+        return json({
+          ...latest.draft,
+          version: 3,
+          items: savedBody!.items,
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  await user.click(
+    await screen.findByRole("button", { name: "生成发布预览" }),
+  );
+  await user.click(screen.getByRole("button", { name: "载入最新版本" }));
+  await user.click(screen.getByRole("button", { name: "保存审核草稿" }));
+
+  expect(savedBody).not.toBeNull();
+  expect(savedBody!.expected_version).toBe(2);
+  expect(savedBody!.items.map((item) => [item.family_id, item.action])).toEqual([
+    [FAMILY_ID, "accept"],
+    [FAMILY_B, "reject"],
+  ]);
+  expect(reviewWrites).toBe(1);
+});
