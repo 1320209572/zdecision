@@ -8,8 +8,18 @@ from pathlib import Path
 from zdecision.central.auth import Principal
 from zdecision.central.store import CentralStore
 from zdecision.central.web.queries import CentralWebQueries
-from zdecision.ids import product_id
-from zdecision.registry.models import ProductMetadata, ProductRegistry
+from zdecision.capture.models import CandidateContent, SourceCheckpoint
+from zdecision.capture.reviews import ApprovalRef
+from zdecision.ids import decision_id, product_id
+from zdecision.registry.models import (
+    DecisionHead,
+    DecisionRevision,
+    DecisionSeed,
+    ProductMetadata,
+    ProductRegistry,
+    RootProductEntry,
+    RootRegistry,
+)
 from zdecision.registry.git import GitRegistryAdapter
 from zdecision.jsonio import atomic_write_json
 from zdecision.registry.query import (
@@ -53,7 +63,9 @@ class _RegistryQuery:
 
 
 class RegistryQueryTest(unittest.TestCase):
-    def test_uncommitted_canonical_registry_content_is_unavailable(self) -> None:
+    def test_snapshot_reads_commit_when_index_assumes_worktree_is_unchanged(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             remote = root / "remote.git"
@@ -78,14 +90,74 @@ class RegistryQueryTest(unittest.TestCase):
                 )
             registry = repository / "decision-registry"
             registry.mkdir()
+            candidate_id = "cand_" + "1" * 32 + "_01"
+            formal_decision_id = decision_id(candidate_id, PRODUCT_ID)
+            seed = DecisionSeed(
+                candidate_id=candidate_id,
+                decision_id=formal_decision_id,
+                product_id=PRODUCT_ID,
+                product_name=PRODUCT_NAME,
+                content=CandidateContent(
+                    product=PRODUCT_NAME,
+                    claim="committed formal decision",
+                    future_action="Read only the committed Registry bytes.",
+                    scope_summary="Commit-bound Registry query",
+                    repositories=("zdecision",),
+                    paths=("decision-registry/",),
+                    invalidation_conditions=("The formal Decision changes",),
+                ),
+                source=SourceCheckpoint("thread-source", "turn-source"),
+                review_approval=ApprovalRef(
+                    "user",
+                    "thread-review",
+                    "turn-review",
+                    "2026-08-04T00:00:00Z",
+                ),
+            )
+            revision = DecisionRevision.from_seed(
+                seed, "pub_" + "2" * 32
+            )
+            product_root = registry / "products" / PRODUCT_ID
+            decision_path = (
+                product_root
+                / "decisions"
+                / formal_decision_id
+                / "r0001.json"
+            )
+            decision_path.parent.mkdir(parents=True)
             atomic_write_json(
                 registry / "registry.json",
-                {
-                    "format": "zdecision-registry/v1",
-                    "schema_version": 1,
-                    "products": {},
-                },
+                RootRegistry(
+                    {
+                        PRODUCT_ID: RootProductEntry(
+                            PRODUCT_NAME,
+                            f"products/{PRODUCT_ID}/product.json",
+                            f"products/{PRODUCT_ID}/registry.json",
+                        )
+                    }
+                ).to_dict(),
             )
+            atomic_write_json(
+                product_root / "product.json",
+                ProductMetadata(PRODUCT_ID, PRODUCT_NAME).to_dict(),
+            )
+            atomic_write_json(
+                product_root / "registry.json",
+                ProductRegistry(
+                    PRODUCT_ID,
+                    {
+                        formal_decision_id: DecisionHead(
+                            1,
+                            "active",
+                            (
+                                f"decisions/{formal_decision_id}/"
+                                "r0001.json"
+                            ),
+                        )
+                    },
+                ).to_dict(),
+            )
+            atomic_write_json(decision_path, revision.to_dict())
             subprocess.run(
                 ("git", "-C", str(repository), "add", "decision-registry"),
                 check=True,
@@ -112,34 +184,20 @@ class RegistryQueryTest(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
-            product_root = registry / "products" / PRODUCT_ID
-            product_root.mkdir(parents=True)
-            atomic_write_json(
-                product_root / "product.json",
-                ProductMetadata(PRODUCT_ID, PRODUCT_NAME).to_dict(),
+            subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(repository),
+                    "update-index",
+                    "--assume-unchanged",
+                    str(decision_path.relative_to(repository)),
+                ),
+                check=True,
             )
-            atomic_write_json(
-                product_root / "registry.json",
-                ProductRegistry(PRODUCT_ID, {}).to_dict(),
-            )
-            atomic_write_json(
-                registry / "registry.json",
-                {
-                    "format": "zdecision-registry/v1",
-                    "schema_version": 1,
-                    "products": {
-                        PRODUCT_ID: {
-                            "name": PRODUCT_NAME,
-                            "product_path": (
-                                f"products/{PRODUCT_ID}/product.json"
-                            ),
-                            "registry_path": (
-                                f"products/{PRODUCT_ID}/registry.json"
-                            ),
-                        }
-                    },
-                },
-            )
+            changed = revision.to_dict()
+            changed["claim"] = "uncommitted canonical decision"
+            atomic_write_json(decision_path, changed)
             query = RegistryQuery(
                 repository,
                 GitRegistryAdapter(
@@ -147,8 +205,12 @@ class RegistryQueryTest(unittest.TestCase):
                 ),
             )
 
-            with self.assertRaises(RegistryQueryUnavailable):
-                query.snapshot()
+            snapshot = query.snapshot()
+
+            self.assertEqual(
+                "committed formal decision",
+                snapshot.decisions[(PRODUCT_ID, formal_decision_id)].claim,
+            )
 
 
 class CentralWebQueriesTest(unittest.TestCase):

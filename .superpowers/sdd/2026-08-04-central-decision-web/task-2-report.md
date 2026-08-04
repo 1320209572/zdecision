@@ -104,10 +104,19 @@ current head and that a later `skip` remains pending.
 Independent pre-commit review then reproduced a canonical uncommitted Registry
 change being returned under the synchronized commit SHA. A real local/bare Git
 fixture was added first and failed because `RegistryQueryUnavailable` was not
-raised. `RegistryQuery` now requires a clean Registry before and after reading
-and re-fetches/requires the same exact commit before returning; the reproducer
-then passed. The review also required a repository-local `node_modules/` ignore
-rule so package hygiene does not depend on a user-level Git configuration.
+raised. The initial defense required a clean Registry before and after reading
+and re-fetched/re-required the same exact commit before returning. The review
+also required a repository-local `node_modules/` ignore rule so package hygiene
+does not depend on a user-level Git configuration.
+
+Fix round 1 demonstrated that Git's `assume-unchanged` index bit bypassed that
+cleanliness defense: a tracked Decision could contain different canonical
+worktree bytes while status remained clean. The real Git regression failed with
+`'committed formal decision' != 'uncommitted canonical decision'`. The reader
+now resolves every root-declared document with `git ls-tree` at the proven
+commit, requires an exact regular blob entry, reads that object with
+`git cat-file`, and applies the existing canonical JSON and strict V1 ownership
+checks to those immutable bytes. The isolated regression then passed 1/1.
 
 ### Frontend RED
 
@@ -177,18 +186,20 @@ database/config paths.
   resolved. Missing Review and latest `skip` remain pending.
 - Confirmed Registry failures never become an available empty snapshot and that
   declared canonical paths and strict V1 ownership are checked before data is
-  exposed. A clean Registry is required on both sides of the read, and the
-  synchronized commit is revalidated before returning the snapshot.
+  exposed. Every document is read from a regular blob in the synchronized commit
+  object, and that synchronized commit is revalidated before returning the
+  snapshot; mutable worktree bytes and index cleanliness are not read inputs.
 - Confirmed existing Packet 1 API tests pass and the SPA catch-all explicitly
   refuses `/api` and `/api/...` paths.
 - Confirmed frontend source contains no representative hard-coded product
   catalog or Session identifier and later routes expose no working action.
 - `git diff --check` reports no whitespace errors.
-- Independent review reported no Critical findings. Its two Important findings
-  (mutable worktree Registry reads and repository-local `node_modules/` hygiene)
-  were addressed and verified before commit; it reported no other correctness,
-  isolation, SQL, SPA/API, CLI, frontend, or lockfile finding and no remaining
-  scope creep.
+- Independent review reported no Critical findings. Its package-hygiene finding
+  was addressed before the Task 2 commit. Its follow-up `assume-unchanged`
+  reproducer showed the first worktree defense was incomplete; fix round 1 now
+  removes the worktree from the read boundary entirely. The reviewer reported no
+  other correctness, isolation, SQL, SPA/API, CLI, frontend, or lockfile finding
+  and no remaining scope creep.
 
 ## Concerns
 

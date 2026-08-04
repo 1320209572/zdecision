@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
+import re
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,9 @@ from zdecision.registry.models import (
     ProductRegistry,
     RootRegistry,
 )
+
+
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
@@ -49,17 +53,22 @@ class RegistryQuery:
     def snapshot(self) -> RegistrySnapshot:
         try:
             commit_sha = self.git.fetch_and_require_exact_main()
-            self.git.require_clean_registry()
-            root = RootRegistry.from_dict(self._read(ROOT_PATH))
+            root = RootRegistry.from_dict(self._read(commit_sha, ROOT_PATH))
             products: dict[str, ProductMetadata] = {}
             registries: dict[str, ProductRegistry] = {}
             decisions: dict[tuple[str, str], DecisionRevision] = {}
             for product_id, entry in root.products.items():
                 metadata = ProductMetadata.from_dict(
-                    self._read(f"decision-registry/{entry.product_path}")
+                    self._read(
+                        commit_sha,
+                        f"decision-registry/{entry.product_path}",
+                    )
                 )
                 registry = ProductRegistry.from_dict(
-                    self._read(f"decision-registry/{entry.registry_path}")
+                    self._read(
+                        commit_sha,
+                        f"decision-registry/{entry.registry_path}",
+                    )
                 )
                 if (
                     metadata.product_id != product_id
@@ -74,7 +83,9 @@ class RegistryQuery:
                         f"decision-registry/products/{product_id}/"
                         f"{head.head_path}"
                     )
-                    revision = DecisionRevision.from_dict(self._read(relative))
+                    revision = DecisionRevision.from_dict(
+                        self._read(commit_sha, relative)
+                    )
                     if (
                         revision.product_id != product_id
                         or revision.product_name != metadata.name
@@ -84,7 +95,6 @@ class RegistryQuery:
                     ):
                         raise ValueError("Registry Decision ownership mismatch")
                     decisions[(product_id, decision_id)] = revision
-            self.git.require_clean_registry()
             if (
                 self.git.fetch_and_require_exact_main(
                     expected_base=commit_sha
@@ -100,7 +110,14 @@ class RegistryQuery:
         except (GitRegistryError, OSError, UnicodeError, TypeError, ValueError):
             raise RegistryQueryUnavailable("registry_unavailable") from None
 
-    def _read(self, relative_path: str) -> Mapping[str, object]:
+    def _read(
+        self, commit_sha: str, relative_path: str
+    ) -> Mapping[str, object]:
+        if (
+            not isinstance(commit_sha, str)
+            or _COMMIT.fullmatch(commit_sha) is None
+        ):
+            raise ValueError("Registry commit is invalid")
         pure = PurePosixPath(relative_path)
         if (
             pure.is_absolute()
@@ -109,19 +126,32 @@ class RegistryQuery:
             or any(part in ("", ".", "..") for part in pure.parts)
         ):
             raise ValueError("Registry path is invalid")
-        path = self.repository_root.joinpath(*pure.parts)
-        registry_root = self.repository_root / "decision-registry"
-        path.relative_to(registry_root)
-        current = registry_root
-        if current.is_symlink():
-            raise ValueError("Registry path contains a symlink")
-        for part in path.relative_to(registry_root).parts:
-            current = current / part
-            if os.path.lexists(current) and current.is_symlink():
-                raise ValueError("Registry path contains a symlink")
-        if not path.is_file():
-            raise OSError("Registry document is unavailable")
-        raw = path.read_bytes()
+        tree_entry = self._git(
+            "git",
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            commit_sha,
+            "--",
+            relative_path,
+        )
+        if tree_entry.count(b"\0") != 1 or not tree_entry.endswith(b"\0"):
+            raise ValueError("Registry document is unavailable")
+        try:
+            metadata, found_path = tree_entry[:-1].split(b"\t", 1)
+            mode, object_type, blob_sha = metadata.split(b" ")
+            decoded_path = found_path.decode("utf-8")
+            decoded_blob = blob_sha.decode("ascii")
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError("Registry Git entry is invalid") from None
+        if (
+            mode not in (b"100644", b"100755")
+            or object_type != b"blob"
+            or _COMMIT.fullmatch(decoded_blob) is None
+            or decoded_path != relative_path
+        ):
+            raise ValueError("Registry Git entry is invalid")
+        raw = self._git("git", "cat-file", "blob", decoded_blob)
         value = json.loads(
             raw.decode("utf-8"),
             parse_constant=lambda _: self._reject_constant(),
@@ -129,6 +159,22 @@ class RegistryQuery:
         if not isinstance(value, dict) or canonical_json_bytes(value) != raw:
             raise ValueError("Registry document is not canonical JSON")
         return value
+
+    def _git(self, *command: str) -> bytes:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.repository_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise OSError("Registry Git object is unavailable") from None
+        if result.returncode != 0:
+            raise OSError("Registry Git object is unavailable")
+        return result.stdout
 
     @staticmethod
     def _reject_constant() -> None:
