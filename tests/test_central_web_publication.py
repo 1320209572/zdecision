@@ -16,7 +16,7 @@ from zdecision.ids import candidate_revision_id, central_publication_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter, RegistryPushFailed
-from zdecision.sync.contracts import CandidateRevisionUpload
+from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
 
 
 class InjectedCrash(Exception):
@@ -158,6 +158,35 @@ class CentralPublicationServiceTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM web_publication_families"
             ).fetchone()[0],
         )
+        self.assertEqual(
+            0,
+            self.fixture.central.connection.execute(
+                "SELECT COUNT(*) FROM web_action_results WHERE action_kind = 'publish'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, self.commit_count())
+
+    def test_disabled_repository_makes_preview_stale_and_blocks_confirmation(
+        self,
+    ) -> None:
+        self.fixture.central.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                preview_fixtures.REPOSITORY_ID,
+                preview_fixtures.PRODUCT_ID,
+                preview_fixtures.PRODUCT_NAME,
+                False,
+            ),
+        )
+
+        view = self.fixture.service.get(
+            self.fixture.user, self.preview.preview_id
+        )
+
+        self.assertEqual("stale", view.publishability)
+        with self.assertRaises(PreviewStale):
+            self.confirm("web_action_publish-disabled-repository")
+        self.assertIsNone(self.stored())
         self.assertEqual(
             0,
             self.fixture.central.connection.execute(

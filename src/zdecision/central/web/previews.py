@@ -415,6 +415,15 @@ class CentralPreviewService:
         ):
             raise PreviewStale("preview_stale")
         for item in accepted:
+            mapping = self.queries.repository_mapping(
+                principal, item.repository_id
+            )
+            if mapping is None or (
+                not mapping.enabled
+                or mapping.product_id != batch.product_id
+                or mapping.product_name != batch.product_name
+            ):
+                raise PreviewStale("preview_stale")
             current = self.queries.current_candidate_revision(
                 principal, item.repository_id, item.family_id
             )

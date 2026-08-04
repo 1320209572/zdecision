@@ -16,6 +16,7 @@ from zdecision.central.web.contracts import CentralReviewBatch, CentralReviewIte
 from zdecision.central.web.previews import (
     CentralPreviewService,
     NoAcceptedItems,
+    PreviewStale,
     RegistryUnavailable,
 )
 from zdecision.central.web.queries import CentralWebQueries
@@ -249,6 +250,38 @@ class CentralPreviewServiceTest(unittest.TestCase):
         self.assertEqual(before, self._registry_tree_bytes())
         self.assertEqual("publishable", view.publishability)
         self.assertIsNone(view.publication_id)
+
+    def test_repository_remap_after_review_prevents_preview_creation(self) -> None:
+        remapped_name = "Other Product"
+        self.central.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                REPOSITORY_ID,
+                product_id(remapped_name),
+                remapped_name,
+                True,
+            ),
+        )
+
+        with self.assertRaises(PreviewStale):
+            self.service.create(
+                self.user,
+                self.batch.review_batch_id,
+                "web_action_preview-remapped",
+                NOW,
+            )
+
+        self.assertEqual(
+            (0, 0),
+            (
+                self.central.connection.execute(
+                    "SELECT COUNT(*) FROM web_publication_previews"
+                ).fetchone()[0],
+                self.central.connection.execute(
+                    "SELECT COUNT(*) FROM web_action_results WHERE action_kind='preview'"
+                ).fetchone()[0],
+            ),
+        )
 
     def test_preview_replay_is_exact_and_action_conflict_is_rejected(self) -> None:
         first = self.service.create(
