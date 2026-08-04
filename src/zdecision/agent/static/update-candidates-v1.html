@@ -177,7 +177,7 @@
           <p class="kicker">ZDecision / Refresh</p>
           <h1 id="title">更新候选决策</h1>
         </div>
-        <span class="index" aria-hidden="true">01—02</span>
+        <span id="card-state" class="index" aria-live="polite">当前卡片</span>
       </header>
 
       <div class="actions" aria-label="选择更新范围">
@@ -198,6 +198,7 @@
       const openPageButton = document.getElementById("open-page");
       const pageAddress = document.getElementById("page-address");
       const status = document.getElementById("status");
+      const cardState = document.getElementById("card-state");
       const pending = new Map();
       const activeStates = new Set([
         "creating", "queued", "capturing", "syncing", "retrying",
@@ -211,6 +212,7 @@
         retrying: "连接暂时中断，正在重试",
         busy: "已有更新正在进行",
         unavailable: "暂时无法更新",
+        expired: "此更新卡已失效",
         failed: "本次更新未完成",
         empty: "没有发现新的候选决策",
       };
@@ -289,6 +291,19 @@
             chosen_scope: null,
           };
         }
+        const isHistorical = value.safe_state === "unavailable"
+          && value.submission_state === undefined
+          && value.chosen_scope === undefined;
+        if (isHistorical) {
+          return {
+            valid: true,
+            safe_state: "expired",
+            candidate_revision_count: null,
+            candidate_page_url: null,
+            submission_state: null,
+            chosen_scope: null,
+          };
+        }
         const knownStates = new Set([
           "ready", "submitting", "queued", "capturing", "syncing", "retrying",
           "busy", "unavailable", "failed", "empty", "succeeded",
@@ -344,6 +359,9 @@
       function renderResult(value) {
         safeState = value.safe_state;
         pageUrl = value.candidate_page_url;
+        cardState.textContent = safeState === "expired"
+          ? "历史卡片"
+          : "当前卡片";
         if (safeState === "ready") {
           status.textContent = "";
         } else if (
@@ -456,6 +474,14 @@
           safeState = "unavailable";
           lockActions();
           status.textContent = labels.unavailable;
+          return;
+        }
+        if (value.safe_state === "expired") {
+          submissionState = null;
+          chosenScope = null;
+          selected = true;
+          renderResult(value);
+          lockActions();
           return;
         }
         submissionState = value.submission_state;

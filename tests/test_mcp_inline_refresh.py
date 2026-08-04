@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,7 +29,7 @@ REPOSITORY_ID = "repo_" + "2" * 32
 OTHER_REPOSITORY_ID = "repo_" + "8" * 32
 PRODUCT_ID = "prod_" + "3" * 32
 REQUEST_ID = "crq_" + "4" * 32
-WIDGET_URI = "ui://zdecision/update-candidates-v1.html"
+WIDGET_URI = "ui://zdecision/update-candidates-v2.html"
 WIDGET_MIME_TYPE = "text/html;profile=mcp-app"
 CENTRAL_BASE_URL = "http://127.0.0.1:8765"
 
@@ -776,7 +777,7 @@ class Element {{
   }}
 }}
 
-const elementIds = ["current", "all", "open-page", "status"];
+const elementIds = ["current", "all", "open-page", "status", "card-state"];
 const elements = Object.fromEntries(elementIds.map((id) => [id, new Element()]));
 const host = {{
   postMessage(message) {{ outbound.push(message); }},
@@ -1054,7 +1055,7 @@ async function mount() {
   }}
 
   const elements = Object.fromEntries(
-    ["current", "all", "open-page", "page-address", "status"].map(
+    ["current", "all", "open-page", "page-address", "status", "card-state"].map(
       (id) => [id, new Element()],
     ),
   );
@@ -1242,6 +1243,71 @@ __SCENARIO__
   process.stdout.write("omitted-ready-scope-ok");
 """,
             "omitted-ready-scope-ok",
+        )
+
+    async def test_widget_distinguishes_current_and_historical_cards(
+        self,
+    ) -> None:
+        self._run_widget_recovery_scenario(
+            """
+  const current = await mount();
+  const currentRestore = current.latestToolCall(
+    "get_zdecision_candidate_refresh",
+  );
+  await current.respond(currentRestore, state("ready", "ready"));
+  check(
+    current.elements["card-state"].textContent === "当前卡片",
+    "ready binding was not identified as the current card",
+  );
+  check(
+    !current.elements.current.disabled && !current.elements.all.disabled,
+    "current card actions were not enabled",
+  );
+
+  const historical = await mount();
+  const historicalRestore = historical.latestToolCall(
+    "get_zdecision_candidate_refresh",
+  );
+  await historical.respond(historicalRestore, {
+    content: [],
+    structuredContent: {
+      safe_state: "unavailable",
+      candidate_revision_count: null,
+      candidate_page_url: null,
+    },
+  });
+  check(
+    historical.elements["card-state"].textContent === "历史卡片",
+    "expired binding was not identified as a historical card",
+  );
+  check(
+    historical.elements.status.textContent === "此更新卡已失效",
+    "historical card used the generic failure message",
+  );
+  check(
+    historical.elements.current.disabled && historical.elements.all.disabled,
+    "historical card actions stayed enabled",
+  );
+
+  const currentFailure = await mount();
+  const failureRestore = currentFailure.latestToolCall(
+    "get_zdecision_candidate_refresh",
+  );
+  await currentFailure.respond(
+    failureRestore,
+    state("unavailable", "attached", "current_session"),
+  );
+  check(
+    currentFailure.elements["card-state"].textContent === "当前卡片",
+    "bound failure was incorrectly identified as historical",
+  );
+  check(
+    currentFailure.elements.status.textContent === "暂时无法更新",
+    "bound failure lost the current-card failure message",
+  );
+  process.stdout.write("card-freshness-ok");
+""",
+            "card-freshness-ok",
         )
 
     async def test_widget_same_mount_retries_durable_pending_submission(
@@ -1432,6 +1498,27 @@ __SCENARIO__
         self,
     ) -> None:
         html = mcp_server.UPDATE_CANDIDATES_PATH.read_text("utf-8")
+
+        class PageAddressMarkup(HTMLParser):
+            tag: str | None = None
+            attributes: dict[str, str | None] = {}
+
+            def handle_starttag(
+                self,
+                tag: str,
+                attrs: list[tuple[str, str | None]],
+            ) -> None:
+                attributes = dict(attrs)
+                if attributes.get("id") == "page-address":
+                    self.tag = tag
+                    self.attributes = attributes
+
+        markup = PageAddressMarkup()
+        markup.feed(html)
+        self.assertEqual("p", markup.tag)
+        self.assertNotIn("target", markup.attributes)
+        self.assertNotIn("rel", markup.attributes)
+
         script = html.split("<script>", 1)[1].split("</script>", 1)[0]
         harness = f"""
 const vm = require("node:vm");
@@ -1460,7 +1547,9 @@ class Element {{
   }}
 }}
 
-const elementIds = ["current", "all", "open-page", "page-address", "status"];
+const elementIds = [
+  "current", "all", "open-page", "page-address", "status", "card-state",
+];
 const elements = Object.fromEntries(elementIds.map((id) => [id, new Element()]));
 const host = {{
   postMessage(message) {{ outbound.push(message); }},
