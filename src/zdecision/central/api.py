@@ -27,6 +27,11 @@ from zdecision.central.service import (
     RequestNotFound,
 )
 from zdecision.central.web.application import CentralWebApplication
+from zdecision.central.web.reviews import (
+    ProductNotFound,
+    ProductOwnershipConflict,
+)
+from zdecision.central.web.store import DraftConflict
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_LEASE_SECONDS,
     CandidateBatchUpload,
@@ -99,6 +104,7 @@ def create_app(
     )
     app.state.web_application = web_application
     app.state.identity_provider = identity_provider
+    app.state.current_time = current_time
     if web_application is not None:
         from zdecision.central.web.api import router as web_router
 
@@ -143,6 +149,26 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content={"error": "invalid_request"},
+        )
+
+    @app.exception_handler(ProductNotFound)
+    async def product_not_found_handler(
+        request: Request, error: ProductNotFound
+    ) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"error": error.code})
+
+    @app.exception_handler(ProductOwnershipConflict)
+    async def product_ownership_handler(
+        request: Request, error: ProductOwnershipConflict
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"error": error.code})
+
+    @app.exception_handler(DraftConflict)
+    async def draft_conflict_handler(
+        request: Request, error: DraftConflict
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409, content={"error": "review_draft_conflict"}
         )
 
     @app.exception_handler(ValueError)
@@ -194,9 +220,8 @@ def create_app(
         body: _CaptureRequestBody,
     ) -> dict[str, object]:
         command = CaptureRequestCreate.from_dict(body.model_dump())
-        return service.create_request(
-            browser(), command, current_time()
-        ).to_dict()
+        result = service.create_request(browser(), command, current_time())
+        return {**result.to_dict(), "capture_scope": command.capture_scope}
 
     @app.get("/api/v1/capture-requests/{request_id}")
     async def get_capture_request(request_id: str) -> dict[str, object]:
@@ -208,9 +233,10 @@ def create_app(
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
         command = CaptureRequestCreate.from_dict(body.model_dump())
-        return service.create_request(
+        result = service.create_request(
             plugin(authorization), command, current_time()
-        ).to_dict()
+        )
+        return {**result.to_dict(), "capture_scope": command.capture_scope}
 
     @app.get("/api/v1/plugin/capture-requests/{request_id}")
     async def get_plugin_capture_request(

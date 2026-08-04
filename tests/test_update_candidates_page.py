@@ -56,57 +56,27 @@ class UpdateCandidatesPageTest(unittest.TestCase):
         if hasattr(self, "temporary_directory"):
             self.temporary_directory.cleanup()
 
-    def test_page_contains_one_action_and_cursor_reconnect(self) -> None:
-        response = self.client.get("/")
-        html = response.text
-        lowered = html.lower()
+    @staticmethod
+    def capture_body() -> dict[str, object]:
+        return {
+            "repository_id": "repo_" + "1" * 32,
+            "template_id": "business",
+            "capture_scope": "all_valid_sessions",
+            "client_action_id": "web_action_page-test",
+        }
 
-        self.assertEqual(200, response.status_code)
-        self.assertIn("更新候选决策", html)
-        self.assertIn("等待本地设备", html)
-        self.assertIn("after_sequence", html)
-        self.assertIn("localStorage", html)
-        self.assertIn("textContent", html)
-        self.assertNotIn("innerHTML", html)
-        self.assertNotIn("session_id", lowered)
-        self.assertNotIn("prompt", lowered)
-        self.assertNotIn("review", lowered)
-        self.assertNotIn("publish", lowered)
-
-    def test_page_posts_only_the_four_capture_request_fields(self) -> None:
+    def test_spa_build_and_capture_api_keep_the_explicit_boundary(self) -> None:
         html = self.client.get("/").text
 
-        self.assertRegex(
-            html,
-            r"JSON\.stringify\(\{\s*repository_id,\s*"
-            r"template_id:\s*['\"]business['\"],\s*"
-            r"capture_scope:\s*['\"]all_valid_sessions['\"],\s*"
-            r"client_action_id",
+        self.assertIn('<div id="root"></div>', html)
+        self.assertNotIn("session_id", html.lower())
+        response = self.client.post(
+            "/api/v1/capture-requests", json=self.capture_body()
         )
-
-    def test_terminal_request_refreshes_safe_candidate_fields(
-        self,
-    ) -> None:
-        html = self.client.get("/").text
-
-        self.assertIn("loadCandidates", html)
-        self.assertIn(
-            "/api/v1/repositories/${repositoryId}/candidates",
-            html,
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(
+            "all_valid_sessions", response.json()["capture_scope"]
         )
-        for field in (
-            "claim",
-            "future_action",
-            "scope_summary",
-            "invalidation_conditions",
-        ):
-            self.assertIn(field, html)
-        self.assertIn("candidateList.replaceChildren()", html)
-        self.assertIn("textContent", html)
-        self.assertNotIn("innerHTML", html)
-        self.assertNotIn("acceptCandidate", html)
-        self.assertNotIn("rejectCandidate", html)
-        self.assertNotIn("publishCandidate", html)
 
 
 if __name__ == "__main__":

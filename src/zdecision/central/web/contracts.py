@@ -20,9 +20,11 @@ from zdecision.ids import (
     publication_candidate_id,
     review_item_id,
 )
+from zdecision.sync.contracts import RepositoryView
 
 
 ReviewAction = Literal["accept", "edit_accept", "reject", "skip"]
+CandidateReviewState = Literal["pending", "accepted", "rejected", "published"]
 PublicationState = Literal["confirmed", "committed_pending_push", "completed"]
 ActionKind = Literal["review", "preview", "publish", "resume"]
 
@@ -44,6 +46,8 @@ _WEB_ACTION_ID = re.compile(r"^web_action_[A-Za-z0-9-]{1,96}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _RECOVERY_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_CAPTURE_REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
+_REVIEW_STATES = frozenset(("pending", "accepted", "rejected", "published"))
 
 
 def _require_fields(
@@ -227,6 +231,105 @@ class ReviewDraft:
                 if value["updated_at"] is not None else None
             ),
         )
+
+
+@dataclass(frozen=True)
+class CandidateInboxItem:
+    family_id: str
+    repository_id: str
+    capture_request_ids: tuple[str, ...]
+    revision_id: str
+    revision: int
+    content_digest: str
+    content: CandidateContent
+    review_state: CandidateReviewState
+    draft_action: ReviewAction | None
+    stale_draft: bool
+
+    def __post_init__(self) -> None:
+        _id(self.family_id, _FAMILY_ID, "family_id")
+        _id(self.repository_id, _REPOSITORY_ID, "repository_id")
+        if not isinstance(self.capture_request_ids, tuple):
+            raise ValueError("capture_request_ids are invalid")
+        capture_request_ids = tuple(
+            _id(value, _CAPTURE_REQUEST_ID, "capture_request_id")
+            for value in self.capture_request_ids
+        )
+        if len(set(capture_request_ids)) != len(capture_request_ids):
+            raise ValueError("capture_request_ids contain duplicates")
+        if (
+            not isinstance(self.revision, int)
+            or isinstance(self.revision, bool)
+            or self.revision < 1
+        ):
+            raise ValueError("revision is invalid")
+        _id(self.content_digest, _DIGEST, "content_digest")
+        if self.revision_id != candidate_revision_id(
+            self.family_id, self.revision, self.content_digest
+        ):
+            raise ValueError("revision_id is invalid")
+        _id(self.revision_id, _REVISION_ID, "revision_id")
+        object.__setattr__(self, "content", _content(self.content, "content"))
+        if self.review_state not in _REVIEW_STATES:
+            raise ValueError("review_state is invalid")
+        if self.draft_action is not None and self.draft_action not in _ACTIONS:
+            raise ValueError("draft_action is invalid")
+        if not isinstance(self.stale_draft, bool):
+            raise ValueError("stale_draft is invalid")
+        object.__setattr__(self, "capture_request_ids", capture_request_ids)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "family_id": self.family_id,
+            "repository_id": self.repository_id,
+            "capture_request_ids": list(self.capture_request_ids),
+            "revision_id": self.revision_id,
+            "revision": self.revision,
+            "content_digest": self.content_digest,
+            "content": self.content.to_dict(),
+            "review_state": self.review_state,
+            "draft_action": self.draft_action,
+            "stale_draft": self.stale_draft,
+        }
+
+
+@dataclass(frozen=True)
+class CandidateInboxView:
+    product_id: str
+    product_name: str
+    repositories: tuple[RepositoryView, ...]
+    items: tuple[CandidateInboxItem, ...]
+    draft: ReviewDraft
+
+    def __post_init__(self) -> None:
+        _id(self.product_id, _PRODUCT_ID, "product_id")
+        if canonical_product_name(self.product_name) != self.product_name:
+            raise ValueError("product_name is invalid")
+        if derive_product_id(self.product_name) != self.product_id:
+            raise ValueError("product identity is invalid")
+        if not isinstance(self.repositories, tuple) or any(
+            not isinstance(item, RepositoryView) for item in self.repositories
+        ):
+            raise ValueError("repositories are invalid")
+        if not isinstance(self.items, tuple) or any(
+            not isinstance(item, CandidateInboxItem) for item in self.items
+        ):
+            raise ValueError("items are invalid")
+        if not isinstance(self.draft, ReviewDraft):
+            raise ValueError("draft is invalid")
+        if self.draft.product_id != self.product_id:
+            raise ValueError("draft product is invalid")
+        if any(item.product_id != self.product_id for item in self.repositories):
+            raise ValueError("repository product is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "product_id": self.product_id,
+            "product_name": self.product_name,
+            "repositories": [item.to_dict() for item in self.repositories],
+            "items": [item.to_dict() for item in self.items],
+            "draft": self.draft.to_dict(),
+        }
 
 
 @dataclass(frozen=True)

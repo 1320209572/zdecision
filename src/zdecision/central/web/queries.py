@@ -7,15 +7,21 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Literal, cast
 
 from zdecision.central.auth import Principal
-from zdecision.central.web.contracts import CentralPublication
+from zdecision.central.web.contracts import (
+    CandidateInboxItem,
+    CandidateInboxView,
+    CandidateReviewState,
+    CentralPublication,
+    ReviewDraft,
+)
 from zdecision.central.web.store import WebRecordCorrupt
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.publication import PublicationRecord
 from zdecision.registry.query import RegistryQueryUnavailable, RegistrySnapshot
-from zdecision.sync.contracts import RepositoryView
+from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
 
 
 @dataclass(frozen=True)
@@ -142,6 +148,336 @@ class CentralWebQueries:
             row["product_id"],
             row["product_name"],
             bool(row["enabled"]),
+        )
+
+    def product_repositories(
+        self, principal: Principal, product_id: str
+    ) -> tuple[RepositoryView, ...]:
+        self._require_user(principal)
+        rows = self.connection.execute(
+            """
+            SELECT repository_id, product_id, product_name, enabled
+            FROM repository_mappings
+            WHERE organization_id = ? AND product_id = ? AND enabled = 1
+            ORDER BY repository_id
+            """,
+            (principal.organization_id, product_id),
+        ).fetchall()
+        return tuple(
+            RepositoryView(
+                row["repository_id"],
+                row["product_id"],
+                row["product_name"],
+                bool(row["enabled"]),
+            )
+            for row in rows
+        )
+
+    def repository_mapping(
+        self, principal: Principal, repository_id: str
+    ) -> RepositoryView | None:
+        self._require_user(principal)
+        row = self.connection.execute(
+            """
+            SELECT repository_id, product_id, product_name, enabled
+            FROM repository_mappings
+            WHERE organization_id = ? AND repository_id = ?
+            """,
+            (principal.organization_id, repository_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return RepositoryView(
+            row["repository_id"],
+            row["product_id"],
+            row["product_name"],
+            bool(row["enabled"]),
+        )
+
+    def capture_request_route(
+        self, principal: Principal, request_id: str
+    ) -> tuple[str, str] | None:
+        self._require_user(principal)
+        row = self.connection.execute(
+            """
+            SELECT repository_id, product_id
+            FROM capture_requests
+            WHERE organization_id = ? AND request_id = ?
+            """,
+            (principal.organization_id, request_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["repository_id"], row["product_id"]
+
+    def candidate_revision(
+        self,
+        principal: Principal,
+        repository_id: str,
+        family_id: str,
+        revision_id: str,
+    ) -> CandidateRevisionUpload | None:
+        self._require_user(principal)
+        row = self.connection.execute(
+            """
+            SELECT revision.family_id, revision.revision,
+                   revision.revision_id, revision.record_json,
+                   revision.record_digest
+            FROM candidate_revisions AS revision
+            WHERE revision.organization_id = ?
+              AND revision.repository_id = ?
+              AND revision.family_id = ?
+              AND revision.revision_id = ?
+            """,
+            (
+                principal.organization_id,
+                repository_id,
+                family_id,
+                revision_id,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        candidate = cast(
+            CandidateRevisionUpload,
+            self._read_record(
+                row["record_json"],
+                row["record_digest"],
+                CandidateRevisionUpload,
+                "candidate_revision",
+            ),
+        )
+        if (
+            candidate.family_id != row["family_id"]
+            or candidate.revision != row["revision"]
+            or candidate.revision_id != row["revision_id"]
+        ):
+            raise WebRecordCorrupt("candidate_revision")
+        return candidate
+
+    def candidate_inbox(
+        self,
+        principal: Principal,
+        product_id: str,
+        draft: ReviewDraft,
+        *,
+        search: str = "",
+        repository_id: str | None = None,
+        capture_request_id: str | None = None,
+        state: str = "pending",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> CandidateInboxView:
+        self._require_user(principal)
+        repositories = self.product_repositories(principal, product_id)
+        if not repositories:
+            raise ValueError("product is unavailable")
+        product_name = repositories[0].product_name
+        if any(item.product_name != product_name for item in repositories):
+            raise WebRecordCorrupt("repository_mapping")
+        if draft.product_id != product_id:
+            raise ValueError("draft product is invalid")
+
+        parameters: list[object] = [principal.organization_id, product_id]
+        conditions = [
+            "mapping.organization_id = ?",
+            "mapping.product_id = ?",
+            "mapping.enabled = 1",
+        ]
+        if repository_id is not None:
+            conditions.append("mapping.repository_id = ?")
+            parameters.append(repository_id)
+        if capture_request_id is not None:
+            conditions.append(
+                """EXISTS (
+                    SELECT 1
+                    FROM web_candidate_revision_batches AS association
+                    JOIN capture_requests AS request
+                      ON request.request_id = association.request_id
+                     AND request.organization_id = association.organization_id
+                     AND request.repository_id = association.repository_id
+                    WHERE association.organization_id = head.organization_id
+                      AND association.repository_id = head.repository_id
+                      AND association.family_id = head.family_id
+                      AND association.revision_id = head.revision_id
+                      AND association.request_id = ?
+                      AND request.product_id = mapping.product_id
+                )"""
+            )
+            parameters.append(capture_request_id)
+        rows = self.connection.execute(
+            f"""
+            SELECT mapping.repository_id,
+                   head.family_id, head.revision, head.revision_id,
+                   revision.record_json, revision.record_digest
+            FROM repository_mappings AS mapping
+            JOIN candidate_family_heads AS head
+              ON head.organization_id = mapping.organization_id
+             AND head.repository_id = mapping.repository_id
+            JOIN candidate_revisions AS revision
+              ON revision.organization_id = head.organization_id
+             AND revision.repository_id = head.repository_id
+             AND revision.family_id = head.family_id
+             AND revision.revision = head.revision
+             AND revision.revision_id = head.revision_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY head.family_id, mapping.repository_id
+            """,
+            tuple(parameters),
+        ).fetchall()
+
+        draft_by_family = {item.family_id: item for item in draft.items}
+        selected: list[CandidateInboxItem] = []
+        normalized_search = search.casefold()
+        for row in rows:
+            candidate = cast(
+                CandidateRevisionUpload,
+                self._read_record(
+                    row["record_json"],
+                    row["record_digest"],
+                    CandidateRevisionUpload,
+                    "candidate_revision",
+                ),
+            )
+            if (
+                candidate.family_id != row["family_id"]
+                or candidate.revision != row["revision"]
+                or candidate.revision_id != row["revision_id"]
+            ):
+                raise WebRecordCorrupt("candidate_revision")
+            if normalized_search and normalized_search not in self._candidate_text(
+                candidate
+            ).casefold():
+                continue
+            review_state = self._candidate_review_state(
+                principal.organization_id,
+                product_id,
+                row["repository_id"],
+                candidate,
+            )
+            if state != "all" and review_state != state:
+                continue
+            draft_item = draft_by_family.get(candidate.family_id)
+            selected.append(
+                CandidateInboxItem(
+                    family_id=candidate.family_id,
+                    repository_id=row["repository_id"],
+                    capture_request_ids=self._capture_request_ids(
+                        principal.organization_id,
+                        product_id,
+                        row["repository_id"],
+                        candidate,
+                    ),
+                    revision_id=candidate.revision_id,
+                    revision=candidate.revision,
+                    content_digest=candidate.content_digest,
+                    content=candidate.content,
+                    review_state=review_state,
+                    draft_action=(draft_item.action if draft_item else None),
+                    stale_draft=(
+                        draft_item is not None
+                        and draft_item.revision_id != candidate.revision_id
+                    ),
+                )
+            )
+        return CandidateInboxView(
+            product_id,
+            product_name,
+            repositories,
+            tuple(selected[offset : offset + limit]),
+            draft,
+        )
+
+    def _capture_request_ids(
+        self,
+        organization_id: str,
+        product_id: str,
+        repository_id: str,
+        candidate: CandidateRevisionUpload,
+    ) -> tuple[str, ...]:
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT association.request_id
+            FROM web_candidate_revision_batches AS association
+            JOIN capture_requests AS request
+              ON request.request_id = association.request_id
+             AND request.organization_id = association.organization_id
+             AND request.repository_id = association.repository_id
+            WHERE association.organization_id = ?
+              AND association.repository_id = ?
+              AND association.family_id = ?
+              AND association.revision_id = ?
+              AND request.product_id = ?
+            ORDER BY association.request_id
+            """,
+            (
+                organization_id,
+                repository_id,
+                candidate.family_id,
+                candidate.revision_id,
+                product_id,
+            ),
+        ).fetchall()
+        return tuple(row["request_id"] for row in rows)
+
+    def _candidate_review_state(
+        self,
+        organization_id: str,
+        product_id: str,
+        repository_id: str,
+        candidate: CandidateRevisionUpload,
+    ) -> CandidateReviewState:
+        receipt = self.connection.execute(
+            """
+            SELECT 1 FROM web_candidate_receipts
+            WHERE organization_id = ? AND product_id = ? AND family_id = ?
+            """,
+            (organization_id, product_id, candidate.family_id),
+        ).fetchone()
+        if receipt is not None:
+            return "published"
+        row = self.connection.execute(
+            """
+            SELECT item.action
+            FROM web_review_items AS item
+            JOIN web_review_batches AS batch
+              ON batch.organization_id = item.organization_id
+             AND batch.product_id = item.product_id
+             AND batch.review_batch_id = item.review_batch_id
+            WHERE item.organization_id = ? AND item.product_id = ?
+              AND item.repository_id = ? AND item.family_id = ?
+              AND item.revision_id = ?
+            ORDER BY batch.created_at DESC, batch.review_batch_id DESC,
+                     item.item_order DESC
+            LIMIT 1
+            """,
+            (
+                organization_id,
+                product_id,
+                repository_id,
+                candidate.family_id,
+                candidate.revision_id,
+            ),
+        ).fetchone()
+        if row is None or row["action"] == "skip":
+            return "pending"
+        if row["action"] == "reject":
+            return "rejected"
+        return "accepted"
+
+    @staticmethod
+    def _candidate_text(candidate: CandidateRevisionUpload) -> str:
+        content = candidate.content
+        return "\n".join(
+            (
+                content.product,
+                content.claim,
+                content.future_action,
+                content.scope_summary,
+                *content.repositories,
+                *content.paths,
+                *content.invalidation_conditions,
+            )
         )
 
     def dashboard(self, principal: Principal) -> DashboardView:

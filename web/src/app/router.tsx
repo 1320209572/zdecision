@@ -1,8 +1,11 @@
 import { createBrowserRouter, useLocation } from "react-router-dom";
 
 import { AppShell } from "./AppShell";
-import { CompanyOverviewPage } from "../pages/company-overview/CompanyOverviewPage";
 import { ReviewIndexPage } from "../pages/review-index/ReviewIndexPage";
+import {
+  CandidateReviewPage,
+  RepositoryEntryPage,
+} from "../pages/candidate-review/CandidateReviewPage";
 
 function DeferredSlicePage() {
   const location = useLocation();
@@ -31,11 +34,11 @@ export const router = createBrowserRouter([
     path: "/",
     Component: AppShell,
     children: [
-      { index: true, Component: CompanyOverviewPage },
+      { index: true, Component: RepositoryEntryPage },
       { path: "reviews", Component: ReviewIndexPage },
       { path: "decisions", Component: DeferredSlicePage },
       { path: "publications", Component: DeferredSlicePage },
-      { path: "products/:productId/candidates", Component: DeferredSlicePage },
+      { path: "products/:productId/candidates", Component: CandidateReviewPage },
       { path: "products/:productId/decisions", Component: DeferredSlicePage },
       {
         path: "products/:productId/decisions/:decisionId",

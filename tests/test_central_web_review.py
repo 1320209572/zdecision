@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+
+from zdecision.capture.models import CandidateContent
+from zdecision.central.auth import Principal
+from zdecision.central.store import CentralStore
+from zdecision.central.web.contracts import DraftItem
+from zdecision.central.web.queries import CentralWebQueries
+from zdecision.central.web.reviews import (
+    CentralReviewService,
+    ProductNotFound,
+    ProductOwnershipConflict,
+)
+from zdecision.central.web.store import (
+    CentralWebStore,
+    DraftConflict,
+    WebRecordCorrupt,
+)
+from zdecision.ids import candidate_revision_id, product_id
+from zdecision.jsonio import canonical_json_bytes
+from zdecision.registry.models import ProductMetadata, ProductRegistry
+from zdecision.registry.query import RegistrySnapshot
+from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+
+
+NOW = "2026-08-04T08:00:00Z"
+PRODUCT_NAME = "ZDecision"
+PRODUCT_ID = product_id(PRODUCT_NAME)
+REPOSITORY_ID = "repo_" + "1" * 32
+FAMILY_ID = "cfm_" + "a" * 32
+CAPTURE_REQUEST_ID = "crq_" + "3" * 32
+OTHER_PRODUCT_NAME = "Other Product"
+OTHER_PRODUCT_ID = product_id(OTHER_PRODUCT_NAME)
+OTHER_REPOSITORY_ID = "repo_" + "2" * 32
+OTHER_FAMILY_ID = "cfm_" + "b" * 32
+
+
+class _RegistryQuery:
+    def snapshot(self) -> RegistrySnapshot:
+        return RegistrySnapshot(
+            "c" * 40,
+            {PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME)},
+            {PRODUCT_ID: ProductRegistry(PRODUCT_ID, {})},
+            {},
+        )
+
+
+def candidate_content(
+    *, claim: str = "Keep product decisions explicit."
+) -> CandidateContent:
+    return CandidateContent(
+        product=PRODUCT_NAME,
+        claim=claim,
+        future_action="Read the formal decision before changing this area.",
+        scope_summary="Central product review",
+        repositories=("zdecision",),
+        paths=("src/zdecision/central/",),
+        invalidation_conditions=("The product workflow changes.",),
+    )
+
+
+def revision(
+    family_id: str,
+    number: int,
+    content: CandidateContent,
+) -> CandidateRevisionUpload:
+    digest = hashlib.sha256(canonical_json_bytes(content.to_dict())).hexdigest()
+    return CandidateRevisionUpload(
+        family_id=family_id,
+        revision_id=candidate_revision_id(family_id, number, digest),
+        revision=number,
+        content=content,
+        content_digest=digest,
+        evidence_digest="e" * 64,
+    )
+
+
+class CentralWebReviewTest(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = CentralStore.open(Path(directory.name) / "central.sqlite3")
+        self.addCleanup(self.store.close)
+        self.user = Principal("user", "org_demo", "user_demo", None)
+        self.store.put_repository_mapping(
+            "org_demo",
+            RepositoryView(REPOSITORY_ID, PRODUCT_ID, PRODUCT_NAME, True),
+        )
+        self.store.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                OTHER_REPOSITORY_ID,
+                OTHER_PRODUCT_ID,
+                OTHER_PRODUCT_NAME,
+                True,
+            ),
+        )
+        self.current = revision(FAMILY_ID, 2, candidate_content(claim="current"))
+        self.older = revision(FAMILY_ID, 1, candidate_content(claim="older"))
+        self.other = revision(
+            OTHER_FAMILY_ID,
+            1,
+            replace(candidate_content(), product=OTHER_PRODUCT_NAME),
+        )
+        with self.store.connection:
+            self._insert_request(CAPTURE_REQUEST_ID, REPOSITORY_ID, PRODUCT_ID)
+            self._insert_revision("org_demo", REPOSITORY_ID, self.older, False)
+            self._insert_revision("org_demo", REPOSITORY_ID, self.current, True)
+            self._insert_revision(
+                "org_demo", OTHER_REPOSITORY_ID, self.other, True
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO web_candidate_revision_batches(
+                    organization_id, repository_id, family_id, revision_id,
+                    request_id, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "org_demo",
+                    REPOSITORY_ID,
+                    FAMILY_ID,
+                    self.current.revision_id,
+                    CAPTURE_REQUEST_ID,
+                    NOW,
+                ),
+            )
+        queries = CentralWebQueries(self.store.connection, _RegistryQuery())
+        self.service = CentralReviewService(
+            store=CentralWebStore(self.store.connection), queries=queries
+        )
+
+    def _insert_request(
+        self, request_id: str, repository_id: str, routed_product_id: str
+    ) -> None:
+        product_name = (
+            PRODUCT_NAME if routed_product_id == PRODUCT_ID else OTHER_PRODUCT_NAME
+        )
+        self.store.connection.execute(
+            """
+            INSERT INTO capture_requests(
+                request_id, organization_id, actor_id, repository_id,
+                product_id, product_name, template_id, capture_scope,
+                client_action_id, state, attempt_count, last_sequence,
+                created_at, updated_at
+            ) VALUES (?, 'org_demo', 'user_demo', ?, ?, ?, 'business',
+                      'all_valid_sessions', 'web_action_fixture', 'succeeded',
+                      1, 1, ?, ?)
+            """,
+            (request_id, repository_id, routed_product_id, product_name, NOW, NOW),
+        )
+
+    def _insert_revision(
+        self,
+        organization_id: str,
+        repository_id: str,
+        item: CandidateRevisionUpload,
+        is_head: bool,
+    ) -> None:
+        payload = canonical_json_bytes(item.to_dict())
+        self.store.connection.execute(
+            """
+            INSERT INTO candidate_revisions(
+                organization_id, repository_id, family_id, revision,
+                revision_id, record_json, record_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                organization_id,
+                repository_id,
+                item.family_id,
+                item.revision,
+                item.revision_id,
+                payload.decode("utf-8"),
+                hashlib.sha256(payload).hexdigest(),
+            ),
+        )
+        if is_head:
+            self.store.connection.execute(
+                """
+                INSERT INTO candidate_family_heads(
+                    organization_id, repository_id, family_id, revision,
+                    revision_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    organization_id,
+                    repository_id,
+                    item.family_id,
+                    item.revision,
+                    item.revision_id,
+                ),
+            )
+
+    @staticmethod
+    def draft_item(
+        item: CandidateRevisionUpload,
+        repository_id: str,
+        action: str = "accept",
+        *,
+        effective_content: CandidateContent | None = None,
+        note: str | None = None,
+    ) -> DraftItem:
+        return DraftItem(
+            family_id=item.family_id,
+            repository_id=repository_id,
+            revision_id=item.revision_id,
+            revision=item.revision,
+            content_digest=item.content_digest,
+            action=action,
+            effective_content=effective_content,
+            note=note,
+        )
+
+    def test_inbox_contains_only_current_heads_for_route_product(self) -> None:
+        view = self.service.list_candidates(self.user, PRODUCT_ID)
+
+        self.assertEqual((FAMILY_ID,), tuple(item.family_id for item in view.items))
+        self.assertEqual(self.current.revision_id, view.items[0].revision_id)
+        self.assertNotIn("session", json.dumps(view.to_dict()).lower())
+
+    def test_save_draft_rejects_wrong_version_without_losing_existing_actions(
+        self,
+    ) -> None:
+        accepted = self.draft_item(self.current, REPOSITORY_ID)
+        rejected = self.draft_item(
+            self.current, REPOSITORY_ID, action="reject"
+        )
+
+        first = self.service.save_draft(
+            self.user, PRODUCT_ID, 0, (accepted,), NOW
+        )
+        with self.assertRaises(DraftConflict):
+            self.service.save_draft(
+                self.user, PRODUCT_ID, 0, (rejected,), NOW
+            )
+
+        self.assertEqual(first, self.service.get_draft(self.user, PRODUCT_ID))
+
+    def test_draft_cannot_reference_candidate_from_another_product(self) -> None:
+        with self.assertRaises(ProductOwnershipConflict):
+            self.service.save_draft(
+                self.user,
+                PRODUCT_ID,
+                0,
+                (self.draft_item(self.other, OTHER_REPOSITORY_ID),),
+                NOW,
+            )
+
+    def test_capture_batch_filter_uses_safe_request_association(self) -> None:
+        view = self.service.list_candidates(
+            self.user,
+            PRODUCT_ID,
+            capture_request_id=CAPTURE_REQUEST_ID,
+        )
+
+        self.assertEqual((FAMILY_ID,), tuple(item.family_id for item in view.items))
+        self.assertEqual((CAPTURE_REQUEST_ID,), view.items[0].capture_request_ids)
+
+    def test_stale_saved_draft_is_returned_against_the_new_head(self) -> None:
+        stale = self.draft_item(self.older, REPOSITORY_ID)
+        self.service.save_draft(self.user, PRODUCT_ID, 0, (stale,), NOW)
+
+        item = self.service.list_candidates(self.user, PRODUCT_ID).items[0]
+
+        self.assertEqual(self.current.revision_id, item.revision_id)
+        self.assertEqual("accept", item.draft_action)
+        self.assertTrue(item.stale_draft)
+
+    def test_edit_accept_locks_product_and_repository_content(self) -> None:
+        edited = replace(self.current.content, product="Untrusted Product")
+
+        with self.assertRaises(ValueError):
+            self.service.save_draft(
+                self.user,
+                PRODUCT_ID,
+                0,
+                (
+                    self.draft_item(
+                        self.current,
+                        REPOSITORY_ID,
+                        action="edit_accept",
+                        effective_content=edited,
+                    ),
+                ),
+                NOW,
+            )
+
+    def test_search_and_repository_filters_are_bounded_and_owned(self) -> None:
+        self.assertEqual(
+            (FAMILY_ID,),
+            tuple(
+                item.family_id
+                for item in self.service.list_candidates(
+                    self.user, PRODUCT_ID, search="current"
+                ).items
+            ),
+        )
+        self.assertEqual(
+            (),
+            self.service.list_candidates(
+                self.user, PRODUCT_ID, search="not present"
+            ).items,
+        )
+        with self.assertRaises(ProductOwnershipConflict):
+            self.service.list_candidates(
+                self.user, PRODUCT_ID, repository_id=OTHER_REPOSITORY_ID
+            )
+        with self.assertRaises(ValueError):
+            self.service.list_candidates(self.user, PRODUCT_ID, search="界" * 67)
+
+    def test_unknown_product_is_not_treated_as_an_empty_inbox(self) -> None:
+        with self.assertRaises(ProductNotFound):
+            self.service.get_draft(self.user, "prod_" + "f" * 32)
+
+    def test_draft_rejects_canonical_payload_with_mismatched_storage_identity(
+        self,
+    ) -> None:
+        mismatched = revision(
+            "cfm_" + "c" * 32,
+            self.current.revision,
+            self.current.content,
+        )
+        payload = canonical_json_bytes(mismatched.to_dict())
+        with self.store.connection:
+            self.store.connection.execute(
+                """
+                UPDATE candidate_revisions
+                SET record_json = ?, record_digest = ?
+                WHERE organization_id = 'org_demo'
+                  AND repository_id = ? AND family_id = ?
+                  AND revision_id = ?
+                """,
+                (
+                    payload.decode("utf-8"),
+                    hashlib.sha256(payload).hexdigest(),
+                    REPOSITORY_ID,
+                    FAMILY_ID,
+                    self.current.revision_id,
+                ),
+            )
+
+        with self.assertRaises(WebRecordCorrupt):
+            self.service.save_draft(
+                self.user,
+                PRODUCT_ID,
+                0,
+                (self.draft_item(self.current, REPOSITORY_ID),),
+                NOW,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
