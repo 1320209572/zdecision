@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -355,12 +356,51 @@ class CentralWebVerticalTest(unittest.TestCase):
             ).fetchone()[0]
         )
 
-    def remote_contains(self, commit_sha: str) -> bool:
+    def remote_main_contains(self, commit_sha: str) -> bool:
+        main_ref = "refs/heads/main"
+        verified = subprocess.run(
+            ("git", "-C", str(self.remote), "rev-parse", "--verify", main_ref),
+            capture_output=True,
+        )
+        if verified.returncode != 0:
+            return False
         result = subprocess.run(
-            ("git", "-C", str(self.remote), "cat-file", "-e", f"{commit_sha}^{{commit}}"),
+            (
+                "git",
+                "-C",
+                str(self.remote),
+                "merge-base",
+                "--is-ancestor",
+                commit_sha,
+                main_ref,
+            ),
             capture_output=True,
         )
         return result.returncode == 0
+
+    def create_unreferenced_remote_commit(self) -> str:
+        environment = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "ZDecision Vertical Test",
+            "GIT_AUTHOR_EMAIL": "vertical@example.com",
+            "GIT_COMMITTER_NAME": "ZDecision Vertical Test",
+            "GIT_COMMITTER_EMAIL": "vertical@example.com",
+        }
+        return subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.remote),
+                "commit-tree",
+                "refs/heads/main^{tree}",
+                "-p",
+                "refs/heads/main",
+            ),
+            check=True,
+            input=b"unreferenced remote commit\n",
+            capture_output=True,
+            env=environment,
+        ).stdout.decode("ascii").strip()
 
     def all_git_blob_bytes(self) -> bytes:
         object_lines = self._git("rev-list", "--objects", "--all").splitlines()
@@ -503,7 +543,50 @@ class CentralWebVerticalTest(unittest.TestCase):
         )
         self.assertEqual(200, detail.status_code, detail.text)
         self.assertEqual(PRODUCT_ID, detail.json()["product_id"])
-        self.assertTrue(self.remote_contains(published["commit_sha"]))
+        unreferenced_commit = self.create_unreferenced_remote_commit()
+        self.assertTrue(
+            subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(self.remote),
+                    "cat-file",
+                    "-e",
+                    f"{unreferenced_commit}^{{commit}}",
+                ),
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+        self.assertFalse(self.remote_main_contains(unreferenced_commit))
+        self.assertTrue(self.remote_main_contains(published["commit_sha"]))
+        self.assertEqual(
+            published["commit_sha"],
+            self._git(
+                "rev-parse", "--verify", "refs/heads/main", repository=self.remote
+            )
+            .decode("ascii")
+            .strip(),
+        )
+        product_path = (
+            self.repository
+            / "decision-registry"
+            / "products"
+            / PRODUCT_ID
+            / "product.json"
+        )
+        self.assertTrue(product_path.is_file())
+        self.assertEqual(
+            canonical_json_bytes(
+                {
+                    "format": "zdecision-product/v1",
+                    "schema_version": 1,
+                    "product_id": PRODUCT_ID,
+                    "name": PRODUCT_NAME,
+                }
+            ),
+            product_path.read_bytes(),
+        )
         registry_path = (
             self.repository
             / "decision-registry"

@@ -26,9 +26,10 @@ FastAPI transport. It created and completed Capture through the agent HTTP
 routes, saved a partial accept/reject/skip draft, restarted and restored it,
 submitted Review, froze Preview, restarted again, injected a crash after the
 Git commit, restarted, and completed the same publication. The temporary bare
-remote contained the exact commit, the product Decision file existed, the
-Decision detail and publication history resolved over HTTP, one preview commit
-existed, and one accepted-family receipt existed.
+remote `refs/heads/main` had the published commit as its exact tip and contained
+it by ancestry; the canonical product metadata and product Decision files
+existed; the Decision detail and publication history resolved over HTTP, one
+preview commit existed, and one accepted-family receipt existed.
 
 ## Privacy and negative-boundary evidence
 
@@ -46,18 +47,20 @@ every Git blob.
 
 ## Verification evidence
 
-- Focused vertical: `python -m unittest tests.integration.test_central_web_vertical -v` — 1/1 passed.
+- Focused vertical: `.venv/bin/python -m unittest tests.integration.test_central_web_vertical -v` — 1/1 passed.
 - Browser/API compatibility: 15/15 passed across
   `tests.test_update_candidates_page` and `tests.test_central_web_api`.
 - Complete backend discovery: 605 tests discovered and the fresh complete run
   exited 0; 2 existing live-environment tests skipped, 0 failures/errors.
 - Frontend: TypeScript passed; Vitest 6/6 files and 27/27 tests passed.
+- Correction round: Candidate/Preview/Decision Vitest targets passed 22/22;
+  focused route/API compatibility remained 15/15.
 - Unsafe-code scan for `dangerouslySetInnerHTML`, `innerHTML`, `eval(`, and
   `new Function` under `web/src` returned no matches.
 - Production build: Vite transformed 40 modules and generated
-  `index-CuOAgVv1.css` (32.83 kB, 7.40 kB gzip),
-  `index-CUym1esE.js` (333.24 kB, 102.18 kB gzip), and `index.html`
-  (0.45 kB, 0.29 kB gzip).
+  `index-CgRp9G-8.css` (32.80 kB, 7.39 kB gzip),
+  `index-Cpxw0SAg.js` (333.24 kB, 102.18 kB gzip), and `index.html`
+  (0.45 kB, 0.30 kB gzip).
 - `git diff --check` returned no output.
 
 ## Visual and route status
@@ -69,18 +72,29 @@ Publication fixtures was inspected in the in-app browser at 1440×1000 and
 `/publications`, and Publication detail. Desktop layouts had no horizontal
 overflow. The narrow pass found and bounded three concrete defects: decorative
 horizontal overflow, missing owning-navigation selection on nested routes, and
-one-character Preview metadata wrapping. The fixes clip only decorative
-overflow, select the owning navigation section, collapse Preview metadata at
-the existing mobile breakpoint, and correct the visible ZStack wordmark from
-`ZETACK` to `ZSTACK`. Focus styling remains the global `:focus-visible`
-contract. The temporary browser tab, viewport override, HTTP server, working
+one-character Preview metadata wrapping. The fixes clip only decorative rail
+pseudo-elements through their local positioned/overflow-hidden ancestor, leave
+document overflow observable, select the owning navigation section, collapse
+Preview metadata at the existing mobile breakpoint, and correct the visible
+ZStack wordmark from `ZETACK` to `ZSTACK`. Focus styling remains the global
+`:focus-visible` contract. The temporary browser tab, viewport override, HTTP server, working
 repository, bare origin, database, and published Registry were all cleaned up.
+
+The correction-round narrow recheck repeated all eight routes at 390×844 after
+removing the document-level clip. Every route reported `innerWidth=390`,
+`documentElement.scrollWidth=390`, and `body.scrollWidth=390` (8/8). The
+disposable loopback fixture was then stopped.
 
 ## Files and concrete Gate fixes
 
 - Added the vertical fixture and exact operator runbook:
   `tests/integration/test_central_web_vertical.py`,
   `docs/demo-central-web.md`.
+- The correction round proves a commit object that is present but unreachable
+  from remote `main` is rejected, checks the exact remote `main` tip, and checks
+  canonical `product.json` content at the expected product path.
+- The runbook now names the repository-local virtual environment prerequisite
+  and invokes its executable interpreter; bare `python` is not required.
 - Tightened route/security evidence:
   `tests/test_central_web_api.py` and Candidate/Preview/Decision frontend tests.
 - Fixed observed transport contract failures: underscore-compatible documented
@@ -99,10 +113,11 @@ opening without a Session ID, restart restoration, one confirmation click, and
 the final Decision/history links. It must not be represented as complete until
 those IDs are recorded.
 
-The instructed local base `b0eb23e` is currently behind the checkout's
-`origin/main`; therefore the runbook's exact synchronized-main prerequisite is
-not currently met and must be resolved by the user/main coordinator before the
-live Gate 7 flow. The full suite also emits an existing FastAPI TestClient
+Before this correction commit, `git rev-list --left-right --count
+HEAD...origin/main` returned `19 0`: local `HEAD` was ahead by 19 and behind by
+0. Exact-main is nevertheless unmet because `HEAD != origin/main`, so the user
+or main coordinator must resolve that mismatch before the live Gate 7 flow.
+The full suite also emits an existing FastAPI TestClient
 deprecation warning, and one run emitted an existing SQLite `ResourceWarning`;
 neither caused a failure. SSO, Git-role authorization, Decision updates, and
 automatic recall remain expressly outside this Demo.

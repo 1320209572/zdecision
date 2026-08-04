@@ -11,7 +11,9 @@ The repository must be on a clean, synchronized `main` branch with its expected
 `origin`. The directory `/Users/zhaohuiying/.zdecision/demo` must already contain
 the matching `central.json` and local Agent configuration created by
 `zdecision.central.cli demo-config init`. Never recreate that directory over
-existing Demo data.
+existing Demo data. The repository-local virtual environment must already exist
+at `/Users/zhaohuiying/Desktop/Zstack-repos/zdecision/.venv` with ZDecision and
+its runtime dependencies installed.
 
 ## Start the loopback service
 
@@ -21,7 +23,7 @@ Run this block exactly in a terminal and leave it running:
 export ZDECISION_REPO=/Users/zhaohuiying/Desktop/Zstack-repos/zdecision
 export ZDECISION_DEMO_DIR=/Users/zhaohuiying/.zdecision/demo
 cd "$ZDECISION_REPO"
-python -m zdecision.central.cli run \
+"$ZDECISION_REPO/.venv/bin/python" -m zdecision.central.cli run \
   --database "$ZDECISION_DEMO_DIR/central.sqlite3" \
   --config "$ZDECISION_DEMO_DIR/central.json" \
   --registry-repository-root "$ZDECISION_REPO" \
