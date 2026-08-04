@@ -50,8 +50,9 @@ every Git blob.
 - Focused vertical: `.venv/bin/python -m unittest tests.integration.test_central_web_vertical -v` — 1/1 passed.
 - Browser/API compatibility: 15/15 passed across
   `tests.test_update_candidates_page` and `tests.test_central_web_api`.
-- Complete backend discovery: 605 tests discovered and the fresh complete run
-  exited 0; 2 existing live-environment tests skipped, 0 failures/errors.
+- Complete backend discovery after the final product-routing fix: 607 tests
+  ran in 61.635 seconds and exited 0; 2 existing live-environment tests
+  skipped, 0 failures/errors.
 - Frontend: TypeScript passed; Vitest 6/6 files and 27/27 tests passed.
 - Correction round: Candidate/Preview/Decision Vitest targets passed 22/22;
   focused route/API compatibility remained 15/15.
@@ -93,6 +94,9 @@ disposable loopback fixture was then stopped.
 - The correction round proves a commit object that is present but unreachable
   from remote `main` is rejected, checks the exact remote `main` tip, and checks
   canonical `product.json` content at the expected product path.
+- The final cross-task review found and closed one product-isolation gap:
+  remapped or disabled repositories now make old Reviews ineligible for Preview
+  creation and existing Previews stale at both display and confirmation time.
 - The runbook now names the repository-local virtual environment prerequisite
   and invokes its executable interpreter; bare `python` is not required.
 - Tightened route/security evidence:
@@ -113,10 +117,10 @@ opening without a Session ID, restart restoration, one confirmation click, and
 the final Decision/history links. It must not be represented as complete until
 those IDs are recorded.
 
-Before this correction commit, `git rev-list --left-right --count
-HEAD...origin/main` returned `19 0`: local `HEAD` was ahead by 19 and behind by
-0. Exact-main is nevertheless unmet because `HEAD != origin/main`, so the user
-or main coordinator must resolve that mismatch before the live Gate 7 flow.
+At the final verification point, `git rev-list --left-right --count
+origin/main...HEAD` returned `0 21`: local `HEAD` was ahead by 21 and behind by
+0. Exact-main is therefore unmet because `HEAD != origin/main`, so the user or
+main coordinator must resolve that mismatch before the live Gate 7 flow.
 The full suite also emits an existing FastAPI TestClient
 deprecation warning, and one run emitted an existing SQLite `ResourceWarning`;
 neither caused a failure. SSO, Git-role authorization, Decision updates, and
