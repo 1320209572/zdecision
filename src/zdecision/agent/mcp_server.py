@@ -33,7 +33,7 @@ from zdecision.sync.contracts import (
 )
 
 
-UPDATE_CANDIDATES_URI = "ui://zdecision/update-candidates-v2.html"
+UPDATE_CANDIDATES_URI = "ui://zdecision/update-candidates-v3.html"
 UPDATE_CANDIDATES_MIME_TYPE = "text/html;profile=mcp-app"
 UPDATE_CANDIDATES_PATH = (
     Path(__file__).resolve().parent / "static" / "update-candidates-v1.html"

@@ -6,7 +6,6 @@ import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
-from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -29,7 +28,7 @@ REPOSITORY_ID = "repo_" + "2" * 32
 OTHER_REPOSITORY_ID = "repo_" + "8" * 32
 PRODUCT_ID = "prod_" + "3" * 32
 REQUEST_ID = "crq_" + "4" * 32
-WIDGET_URI = "ui://zdecision/update-candidates-v2.html"
+WIDGET_URI = "ui://zdecision/update-candidates-v3.html"
 WIDGET_MIME_TYPE = "text/html;profile=mcp-app"
 CENTRAL_BASE_URL = "http://127.0.0.1:8765"
 
@@ -823,8 +822,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             '"tools/call"',
             '"start_zdecision_candidate_refresh"',
             '"get_zdecision_candidate_refresh"',
-            '"ui/open-link"',
-            "hostCapabilities?.openLinks",
+            'name: "open_zdecision_dashboard"',
             "setTimeout(poll, 1500)",
             "正在创建更新请求",
             "等待本地设备",
@@ -834,7 +832,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             "暂时无法更新",
             "本次更新未完成",
             "没有发现新的候选决策",
-            "打开候选决策页面",
+            "打开决策中心",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, html)
@@ -842,6 +840,10 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         lowered = html.lower()
         for forbidden in (
             "window.openai",
+            "window.open(",
+            '"ui/open-link"',
+            'target="_blank"',
+            'rel="noopener noreferrer"',
             "acknowledge_zdecision_update",
             "ui_probe_v1",
             "能力探针",
@@ -1621,30 +1623,17 @@ __SCENARIO__
             "terminal-remounts-closed-ok",
         )
 
-    async def test_widget_only_requests_https_page_and_never_claims_navigation(
+    async def test_widget_requests_trusted_dashboard_launch_and_handles_uncertainty(
         self,
     ) -> None:
         html = mcp_server.UPDATE_CANDIDATES_PATH.read_text("utf-8")
-
-        class PageAddressMarkup(HTMLParser):
-            tag: str | None = None
-            attributes: dict[str, str | None] = {}
-
-            def handle_starttag(
-                self,
-                tag: str,
-                attrs: list[tuple[str, str | None]],
-            ) -> None:
-                attributes = dict(attrs)
-                if attributes.get("id") == "page-address":
-                    self.tag = tag
-                    self.attributes = attributes
-
-        markup = PageAddressMarkup()
-        markup.feed(html)
-        self.assertEqual("p", markup.tag)
-        self.assertNotIn("target", markup.attributes)
-        self.assertNotIn("rel", markup.attributes)
+        self.assertNotIn('target="_blank"', html)
+        self.assertNotIn('rel="noopener noreferrer"', html)
+        self.assertNotIn('"ui/open-link"', html)
+        self.assertNotIn("window.open(", html)
+        self.assertIn('id="page-address"', html)
+        self.assertIn("打开决策中心", html)
+        self.assertIn('name: "open_zdecision_dashboard"', html)
 
         script = html.split("<script>", 1)[1].split("</script>", 1)[0]
         harness = f"""
@@ -1778,55 +1767,93 @@ vm.runInThisContext(shippedScript);
   check(!elements["open-page"].hidden, "terminal success did not show open action");
 
   const successfulClick = elements["open-page"].dispatch("click");
-  const successfulOpen = latestCall("ui/open-link");
-  check(successfulOpen.params.url === candidateUrl, "open action changed the safe page URL");
-  check(elements.status.textContent === "正在打开候选决策页面", "open action had no immediate feedback");
-  check(elements["open-page"].disabled, "open action allowed a duplicate request");
-  deliver({{ jsonrpc: "2.0", id: successfulOpen.id, result: {{ isError: false }} }});
+  const successfulOpen = latestCall("tools/call");
+  check(
+    successfulOpen.params.name === "open_zdecision_dashboard",
+    "open action called the wrong tool",
+  );
+  check(
+    JSON.stringify(successfulOpen.params.arguments)
+      === JSON.stringify({{ control_id: trustedControl }}),
+    "open action sent anything other than the trusted control",
+  );
+  check(elements.status.textContent === "正在请求默认浏览器", "open action had no immediate feedback");
+  check(elements["open-page"].disabled, "open action allowed a duplicate call");
+  deliver({{
+    jsonrpc: "2.0",
+    id: successfulOpen.id,
+    result: {{
+      structuredContent: {{
+        safe_state: "launch_requested",
+        dashboard_url: candidateUrl,
+      }},
+    }},
+  }});
   await successfulClick;
   check(
-    elements.status.textContent === "已提交浏览器打开请求；未打开请使用下方地址",
-    "host acknowledgement was reported as confirmed navigation",
+    elements.status.textContent === "已请求使用默认浏览器打开决策中心",
+    "accepted launch used false navigation copy",
   );
-  check(!elements["open-page"].disabled, "successful open was not retryable");
-  check(!elements["page-address"].hidden, "host acknowledgement hid the fallback address");
-  check(elements["page-address"].textContent === candidateUrl, "acknowledged open lost the exact address");
+  check(!elements["open-page"].disabled, "accepted launch was not retryable");
 
-  const deniedClick = elements["open-page"].dispatch("click");
-  const deniedOpen = latestCall("ui/open-link");
-  deliver({{ jsonrpc: "2.0", id: deniedOpen.id, result: {{ isError: true }} }});
-  await deniedClick;
-  check(elements.status.textContent === "页面未打开，请重试", "host denial was silent");
-  check(!elements["open-page"].disabled, "host denial prevented retry");
-  check(!elements["page-address"].hidden, "host denial hid the fallback address");
-  check(elements["page-address"].textContent === candidateUrl, "fallback address was not exact");
+  const rejectedClick = elements["open-page"].dispatch("click");
+  const rejectedOpen = latestCall("tools/call");
+  deliver({{
+    jsonrpc: "2.0",
+    id: rejectedOpen.id,
+    result: {{
+      structuredContent: {{
+        safe_state: "unavailable",
+        dashboard_url: candidateUrl,
+      }},
+    }},
+  }});
+  await rejectedClick;
+  check(
+    elements.status.textContent === "无法自动打开，请使用下方地址",
+    "rejected launch hid the fallback state",
+  );
+  check(!elements["open-page"].disabled, "rejected launch prevented retry");
+  check(!elements["page-address"].hidden, "fallback address stayed hidden");
+  check(elements["page-address"].textContent === candidateUrl, "fallback address changed");
 
-  const timeoutClick = elements["open-page"].dispatch("click");
-  const timedOutOpen = latestCall("ui/open-link");
+  const callCount = outbound.filter(
+    (message) => message.method === "tools/call"
+      && message.params?.name === "open_zdecision_dashboard",
+  ).length;
+  const timedOutClick = elements["open-page"].dispatch("click");
+  const timedOutOpen = latestCall("tools/call");
   takeTimer(5000)();
-  await timeoutClick;
-  check(elements.status.textContent === "页面未打开，请重试", "open timeout was silent");
-  check(!elements["open-page"].disabled, "open timeout prevented retry");
-  deliver({{ jsonrpc: "2.0", id: timedOutOpen.id, result: {{ isError: false }} }});
-  check(elements.status.textContent === "页面未打开，请重试", "late response changed timeout state");
-
-  const localCandidateUrl = "http://127.0.0.1:8765/?repository_id=repo_22222222222222222222222222222222";
-  vm.runInThisContext(`pageUrl = ${{JSON.stringify(localCandidateUrl)}}`);
-  const openCallCount = outbound.filter((message) => message.method === "ui/open-link").length;
-  const localClick = elements["open-page"].dispatch("click");
-  await Promise.resolve();
+  await timedOutClick;
   check(
-    outbound.filter((message) => message.method === "ui/open-link").length === openCallCount,
-    "local HTTP page was sent to a host that silently rejects it",
+    elements.status.textContent === "无法确认是否已打开；如未出现请重试",
+    "lost response claimed a definite result",
   );
-  await localClick;
+  check(!elements["open-page"].disabled, "lost response prevented retry");
+  check(!elements["page-address"].hidden, "lost response hid the fallback address");
+  check(elements["page-address"].textContent === candidateUrl, "lost response changed the fallback address");
   check(
-    elements.status.textContent === "当前本地页面无法自动打开，请使用下方地址",
-    "local HTTP limitation was not reported",
+    outbound.filter(
+      (message) => message.method === "tools/call"
+        && message.params?.name === "open_zdecision_dashboard",
+    ).length === callCount + 1,
+    "lost response triggered an automatic second launch",
   );
-  check(!elements["page-address"].hidden, "local HTTP page address stayed hidden");
-  check(elements["page-address"].textContent === localCandidateUrl, "local HTTP fallback address was not exact");
-  process.stdout.write("open-page-regression-ok");
+  deliver({{
+    jsonrpc: "2.0",
+    id: timedOutOpen.id,
+    result: {{
+      structuredContent: {{
+        safe_state: "launch_requested",
+        dashboard_url: candidateUrl,
+      }},
+    }},
+  }});
+  check(
+    elements.status.textContent === "无法确认是否已打开；如未出现请重试",
+    "late response changed the uncertain result",
+  );
+  process.stdout.write("default-browser-launch-ok");
 }})().catch((error) => {{
   process.stderr.write(error.stack || String(error));
   process.exitCode = 1;
@@ -1846,7 +1873,7 @@ vm.runInThisContext(shippedScript);
             completed.returncode,
             completed.stderr or completed.stdout,
         )
-        self.assertEqual("open-page-regression-ok", completed.stdout)
+        self.assertEqual("default-browser-launch-ok", completed.stdout)
 
     async def test_run_mcp_starts_with_disabled_card_when_locator_unavailable(
         self,

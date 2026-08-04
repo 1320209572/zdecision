@@ -187,8 +187,8 @@
 
       <footer>
         <p id="status" role="status" aria-live="polite"></p>
-        <button id="open-page" type="button" hidden>打开候选决策页面</button>
-        <p id="page-address" aria-label="候选决策页面地址" hidden></p>
+        <button id="open-page" type="button" hidden>打开决策中心</button>
+        <p id="page-address" aria-label="决策中心地址" hidden></p>
       </footer>
     </main>
 
@@ -227,7 +227,6 @@
       let controlId = null;
       let safeState = "disabled";
       let pageUrl = null;
-      let hostCapabilities = {};
 
       function request(method, params, timeoutMs = null) {
         const id = nextRequestId++;
@@ -353,6 +352,23 @@
           candidate_page_url: candidatePageUrl,
           submission_state: stateIsConsistent ? value.submission_state : null,
           chosen_scope: hasPersistedScope ? persistedScope : null,
+        };
+      }
+
+      function boundedLaunchResult(result) {
+        const toolResult = result?.structuredContent
+          ? result
+          : result?.toolResult;
+        const value = toolResult?.structuredContent;
+        const safeState = value?.safe_state;
+        return {
+          valid: toolResult?.isError !== true
+            && (safeState === "launch_requested"
+              || safeState === "unavailable"),
+          safe_state: safeState,
+          dashboard_url: typeof value?.dashboard_url === "string"
+            ? value.dashboard_url
+            : null,
         };
       }
 
@@ -537,33 +553,38 @@
       currentButton.addEventListener("click", () => start("current_session"));
       allButton.addEventListener("click", () => start("all_valid_sessions"));
       openPageButton.addEventListener("click", async () => {
-        if (typeof pageUrl !== "string") return;
-        const targetUrl = pageUrl;
-        let targetProtocol = null;
-        try {
-          targetProtocol = new URL(targetUrl).protocol;
-        } catch {
-          targetProtocol = null;
-        }
-        pageAddress.textContent = targetUrl;
-        pageAddress.hidden = false;
-        if (!hostCapabilities?.openLinks || targetProtocol !== "https:") {
-          status.textContent = targetProtocol === "http:"
-            ? "当前本地页面无法自动打开，请使用下方地址"
-            : "当前页面无法自动打开，请使用下方地址";
-          openPageButton.textContent = "再次显示候选决策页面地址";
-          return;
-        }
+        if (typeof controlId !== "string") return;
         openPageButton.disabled = true;
-        status.textContent = "正在打开候选决策页面";
+        pageAddress.hidden = true;
+        status.textContent = "正在请求默认浏览器";
         try {
-          const result = await request("ui/open-link", { url: targetUrl }, 5000);
-          if (result?.isError === true) throw new Error("open_link_rejected");
-          status.textContent = "已提交浏览器打开请求；未打开请使用下方地址";
-          openPageButton.textContent = "再次打开候选决策页面";
+          const result = await request("tools/call", {
+            name: "open_zdecision_dashboard",
+            arguments: { control_id: controlId },
+          }, 5000);
+          const launch = boundedLaunchResult(result);
+          if (!launch.valid) {
+            throw new Error("invalid_dashboard_launch_result");
+          }
+          const fallbackUrl = launch.dashboard_url || pageUrl;
+          if (launch.safe_state === "launch_requested") {
+            status.textContent = "已请求使用默认浏览器打开决策中心";
+            openPageButton.textContent = "再次打开决策中心";
+          } else {
+            status.textContent = "无法自动打开，请使用下方地址";
+            openPageButton.textContent = "重试打开决策中心";
+            if (typeof fallbackUrl === "string") {
+              pageAddress.textContent = fallbackUrl;
+              pageAddress.hidden = false;
+            }
+          }
         } catch {
-          status.textContent = "页面未打开，请重试";
-          openPageButton.textContent = "重试打开候选决策页面";
+          status.textContent = "无法确认是否已打开；如未出现请重试";
+          openPageButton.textContent = "重试打开决策中心";
+          if (typeof pageUrl === "string") {
+            pageAddress.textContent = pageUrl;
+            pageAddress.hidden = false;
+          }
         } finally {
           openPageButton.disabled = false;
         }
@@ -575,7 +596,6 @@
         protocolVersion: "2026-01-26",
       })
         .then((result) => {
-          hostCapabilities = result?.hostCapabilities || {};
           initialized = true;
           notify("ui/notifications/initialized", {});
           restoreInitialBinding();
