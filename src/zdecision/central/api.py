@@ -39,6 +39,11 @@ from zdecision.central.web.previews import (
     RegistryUnavailable,
 )
 from zdecision.central.web.store import DraftConflict, WebActionConflict
+from zdecision.central.web.publications import (
+    CandidateAlreadyPublishing,
+    PublicationAmbiguous,
+    PublicationNotFound,
+)
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_LEASE_SECONDS,
     CandidateBatchUpload,
@@ -218,6 +223,24 @@ def create_app(
         request: Request, error: RegistryUnavailable
     ) -> JSONResponse:
         return JSONResponse(status_code=503, content={"error": error.code})
+
+    @app.exception_handler(PublicationNotFound)
+    async def publication_not_found_handler(
+        request: Request, error: PublicationNotFound
+    ) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"error": error.code})
+
+    @app.exception_handler(CandidateAlreadyPublishing)
+    async def publication_family_handler(
+        request: Request, error: CandidateAlreadyPublishing
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"error": error.code})
+
+    @app.exception_handler(PublicationAmbiguous)
+    async def publication_ambiguous_handler(
+        request: Request, error: PublicationAmbiguous
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"error": error.code})
 
     @app.exception_handler(ValueError)
     async def value_error_handler(

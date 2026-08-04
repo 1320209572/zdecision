@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.capture.models import CandidateContent, SourceCheckpoint
 from zdecision.capture.reviews import ApprovalRef
@@ -259,6 +260,41 @@ class GitRegistryAdapterTests(unittest.TestCase):
         )
         self.assertEqual(ReconciledCommit(commit_sha, True), remote)
         self.adapter.push_exact(commit_sha, base)
+
+    def test_exact_commit_ignores_inherited_alternate_index(self) -> None:
+        base = self.adapter.fetch_and_require_exact_main()
+        catalog, _, draft = self.draft()
+        catalog.write_exact(draft.changed_files)
+        alternate_index = self.root / "attacker.index"
+
+        with patch.dict(
+            "os.environ", {"GIT_INDEX_FILE": str(alternate_index)}, clear=False
+        ):
+            commit_sha = self.adapter.commit_exact(
+                base, self.publication_message(), draft.changed_files
+            )
+
+        self.assertEqual(commit_sha, self.head())
+        self.assertFalse(alternate_index.exists())
+
+    def test_reconcile_ignores_replace_refs_when_proving_exact_commit(self) -> None:
+        base = self.adapter.fetch_and_require_exact_main()
+        catalog, _, draft = self.draft()
+        catalog.write_exact(draft.changed_files)
+        commit_sha = self.adapter.commit_exact(
+            base, self.publication_message(), draft.changed_files
+        )
+        wrong = self.git(
+            "git", "commit-tree", f"{base}^{{tree}}", "-p", base,
+            cwd=self.local, input_bytes=b"wrong\n",
+        ).stdout.decode("ascii").strip()
+        self.git("git", "replace", commit_sha, wrong, cwd=self.local)
+
+        result = self.adapter.reconcile_exact_commit(
+            base, self.publication_message(), draft.changed_files
+        )
+
+        self.assertEqual(ReconciledCommit(commit_sha, False), result)
 
     def test_reconcile_rejects_wrong_message_without_replacing_commit(self) -> None:
         base = self.adapter.fetch_and_require_exact_main()

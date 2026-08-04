@@ -2,7 +2,8 @@ export type RegistryState = "available" | "unavailable";
 export type PublicationState =
   | "confirmed"
   | "committed_pending_push"
-  | "completed";
+  | "completed"
+  | "ambiguous";
 
 export interface DashboardMetrics {
   product_count: number;
@@ -36,6 +37,17 @@ export interface PublicationSummary {
   state: PublicationState;
   recovery_code: string | null;
   commit_sha: string | null;
+}
+
+export interface PublicationDetail extends PublicationSummary {
+  decision_ids: string[];
+}
+
+export interface PublicationHistory {
+  items: PublicationDetail[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface Dashboard {

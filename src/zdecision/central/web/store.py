@@ -637,6 +637,100 @@ class CentralWebStore:
             row["record_json"], row["record_digest"], CentralPublication, "publication"
         )
 
+    def get_publication(
+        self, organization_id: str, publication_id: str
+    ) -> CentralPublication | None:
+        organization = require_id(organization_id, "organization_id")
+        row = self.connection.execute(
+            """
+            SELECT product_id, preview_id, record_json, record_digest
+            FROM web_publications
+            WHERE organization_id = ? AND publication_id = ?
+            """,
+            (organization, publication_id),
+        ).fetchone()
+        if row is None:
+            return None
+        publication = _read_record(
+            row["record_json"], row["record_digest"], CentralPublication,
+            "publication",
+        )
+        if (
+            publication.organization_id != organization
+            or publication.publication_id != publication_id
+            or publication.product_id != row["product_id"]
+            or publication.preview_id != row["preview_id"]
+        ):
+            raise WebRecordCorrupt("publication")
+        return publication
+
+    def list_publications(
+        self,
+        organization_id: str,
+        *,
+        product_id: str | None,
+        state: str | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[tuple[CentralPublication, ...], int]:
+        organization = require_id(organization_id, "organization_id")
+        if state not in (
+            None, "confirmed", "committed_pending_push", "completed",
+            "ambiguous",
+        ):
+            raise ValueError("publication state is invalid")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("publication limit is invalid")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("publication offset is invalid")
+        clauses = [
+            "publication.organization_id = ?",
+            """EXISTS (
+                SELECT 1 FROM repository_mappings AS mapping
+                WHERE mapping.organization_id = publication.organization_id
+                  AND mapping.product_id = publication.product_id
+                  AND mapping.enabled = 1
+            )""",
+        ]
+        values: list[object] = [organization]
+        if product_id is not None:
+            clauses.append("publication.product_id = ?")
+            values.append(product_id)
+        if state == "ambiguous":
+            clauses.append("publication.recovery_code = 'ambiguous'")
+        elif state is not None:
+            clauses.append("publication.state = ?")
+            clauses.append("publication.recovery_code IS NULL")
+            values.append(state)
+        where = " AND ".join(clauses)
+        total = int(self.connection.execute(
+            f"SELECT COUNT(*) FROM web_publications AS publication WHERE {where}",
+            values,
+        ).fetchone()[0])
+        rows = self.connection.execute(
+            f"""
+            SELECT publication_id, record_json, record_digest
+            FROM web_publications AS publication
+            WHERE {where}
+            ORDER BY updated_at DESC, publication_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*values, limit, offset),
+        ).fetchall()
+        publications: list[CentralPublication] = []
+        for row in rows:
+            publication = _read_record(
+                row["record_json"], row["record_digest"], CentralPublication,
+                "publication",
+            )
+            if (
+                publication.organization_id != organization
+                or publication.publication_id != row["publication_id"]
+            ):
+                raise WebRecordCorrupt("publication")
+            publications.append(publication)
+        return tuple(publications), total
+
     def claim_publication_families(
         self, publication: CentralPublication, family_ids: Collection[str]
     ) -> None:
@@ -693,11 +787,28 @@ class CentralWebStore:
             != {key: value for key, value in replacement.to_dict().items() if key not in mutable}
         ):
             raise WebRecordConflict("publication_immutable_fields")
-        if not exact_replay and (expected.state, replacement.state) not in {
+        ambiguity_latch = (
+            expected.state in ("confirmed", "committed_pending_push")
+            and expected.state == replacement.state
+            and expected.commit_sha == replacement.commit_sha
+            and expected.recovery_code is None
+            and replacement.recovery_code == "ambiguous"
+        )
+        if not exact_replay and not ambiguity_latch and (
+            expected.state, replacement.state
+        ) not in {
             ("confirmed", "committed_pending_push"),
             ("committed_pending_push", "completed"),
         }:
             raise WebRecordConflict("publication_state_conflict")
+        if not exact_replay and not ambiguity_latch:
+            if expected.recovery_code is not None or replacement.recovery_code is not None:
+                raise WebRecordConflict("publication_recovery_conflict")
+            if (
+                expected.state == "committed_pending_push"
+                and expected.commit_sha != replacement.commit_sha
+            ):
+                raise WebRecordConflict("publication_commit_conflict")
         record_json, record_digest = _canonical_record(replacement.to_dict())
         with immediate(self.connection):
             row = self.connection.execute(

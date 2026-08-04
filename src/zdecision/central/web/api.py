@@ -166,3 +166,59 @@ async def get_preview(
     return _application(request).get_preview(
         identity_provider.browser_principal(), preview_id
     ).to_dict()
+
+
+@router.post("/publication-previews/{preview_id}/publish")
+async def publish(
+    request: Request, preview_id: str, body: _ActionBody
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).publish(
+        identity_provider.browser_principal(),
+        preview_id,
+        body.client_action_id,
+        request.app.state.current_time(),
+    ).to_dict()
+
+
+@router.post("/publications/{publication_id}/resume")
+async def resume_publication(
+    request: Request, publication_id: str, body: _ActionBody
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).resume_publication(
+        identity_provider.browser_principal(),
+        publication_id,
+        body.client_action_id,
+        request.app.state.current_time(),
+    ).to_dict()
+
+
+@router.get("/publications")
+async def publications(
+    request: Request,
+    product_id: str | None = None,
+    state: Literal[
+        "confirmed", "committed_pending_push", "completed", "ambiguous"
+    ] | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).list_publications(
+        identity_provider.browser_principal(),
+        product_id=product_id,
+        state=state,
+        limit=limit,
+        offset=offset,
+    ).to_dict()
+
+
+@router.get("/publications/{publication_id}")
+async def publication_detail(
+    request: Request, publication_id: str
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).get_publication(
+        identity_provider.browser_principal(), publication_id
+    ).to_dict()

@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -468,6 +469,128 @@ class CentralWebApiTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM web_review_batches"
             ).fetchone()[0],
         )
+
+    def test_publication_routes_require_one_explicit_action_and_return_safe_history(
+        self,
+    ) -> None:
+        draft = self.client.put(
+            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            json=self.draft_body(action="accept"),
+        ).json()
+        review = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            json={
+                "client_action_id": "web_action_api-publish-review",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        ).json()
+        preview = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json={"client_action_id": "web_action_api-publish-preview"},
+        ).json()
+        before = self.store.connection.execute(
+            "SELECT COUNT(*) FROM web_publications"
+        ).fetchone()[0]
+
+        malformed = self.client.post(
+            f"/api/v1/web/publication-previews/{preview['preview_id']}/publish",
+            json={
+                "client_action_id": "web_action_api-publish",
+                "actor_id": "browser_claimed_authority",
+            },
+        )
+        published = self.client.post(
+            f"/api/v1/web/publication-previews/{preview['preview_id']}/publish",
+            json={"client_action_id": "web_action_api-publish"},
+        )
+        publication_id = published.json()["publication_id"]
+        replay = self.client.post(
+            f"/api/v1/web/publication-previews/{preview['preview_id']}/publish",
+            json={"client_action_id": "web_action_api-publish"},
+        )
+        resumed = self.client.post(
+            f"/api/v1/web/publications/{publication_id}/resume",
+            json={"client_action_id": "web_action_api-resume"},
+        )
+        history = self.client.get("/api/v1/web/publications")
+        product_history = self.client.get(
+            "/api/v1/web/publications", params={"product_id": PRODUCT_ID}
+        )
+        detail = self.client.get(
+            f"/api/v1/web/publications/{publication_id}"
+        )
+
+        self.assertEqual(0, before)
+        self.assertEqual(422, malformed.status_code)
+        self.assertEqual({"error": "invalid_request"}, malformed.json())
+        self.assertEqual(200, published.status_code, published.text)
+        self.assertEqual("completed", published.json()["state"])
+        self.assertEqual(published.json(), replay.json())
+        self.assertEqual(published.json(), resumed.json())
+        self.assertEqual(200, history.status_code, history.text)
+        self.assertEqual(history.json(), product_history.json())
+        self.assertEqual(1, history.json()["total"])
+        row = history.json()["items"][0]
+        self.assertEqual(PRODUCT_NAME, row["product_name"])
+        self.assertEqual("user_demo", row["actor_id"])
+        self.assertEqual("completed", row["state"])
+        self.assertEqual([self.revision.family_id], [self.revision.family_id])
+        self.assertEqual(row, {
+            key: detail.json()[key] for key in row
+        })
+        encoded = json.dumps(history.json())
+        self.assertNotIn("note", encoded)
+        self.assertNotIn(self.revision.content.claim, encoded)
+        self.assertEqual(1, len(detail.json()["decision_ids"]))
+
+    def test_ambiguous_publication_resume_is_a_stable_409(self) -> None:
+        draft = self.client.put(
+            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            json=self.draft_body(action="accept"),
+        ).json()
+        review = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            json={
+                "client_action_id": "web_action_api-ambiguous-review",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        ).json()
+        preview = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json={"client_action_id": "web_action_api-ambiguous-preview"},
+        ).json()
+
+        class InjectedCrash(Exception):
+            pass
+
+        publications = self.client.app.state.web_application.publications
+        publications.checkpoint = lambda name: (
+            (_ for _ in ()).throw(InjectedCrash())
+            if name == "after_confirmation" else None
+        )
+        with self.assertRaises(InjectedCrash):
+            self.client.post(
+                f"/api/v1/web/publication-previews/{preview['preview_id']}/publish",
+                json={"client_action_id": "web_action_api-ambiguous-publish"},
+            )
+        publications.checkpoint = lambda _: None
+        web_store = CentralWebStore(self.store.connection)
+        confirmed = web_store.get_publication_by_preview(
+            "org_demo", preview["preview_id"]
+        )
+        web_store.replace_publication(
+            confirmed, replace(confirmed, recovery_code="ambiguous")
+        )
+
+        response = self.client.post(
+            f"/api/v1/web/publications/{confirmed.publication_id}/resume",
+            json={"client_action_id": "web_action_api-ambiguous-resume"},
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual({"error": "publication_ambiguous"}, response.json())
 
 
 class CentralWebCliCompositionTest(unittest.TestCase):

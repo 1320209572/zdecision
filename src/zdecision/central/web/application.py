@@ -6,11 +6,22 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from zdecision.central.auth import Principal
-from zdecision.central.web.contracts import CandidateInboxView, DraftItem, ReviewDraft
+from zdecision.central.web.contracts import (
+    CandidateInboxView,
+    CentralPublication,
+    DraftItem,
+    ReviewDraft,
+)
 from zdecision.central.web.queries import CentralWebQueries, DashboardView
 from zdecision.central.web.previews import (
     CentralPreviewService,
     PublicationPreviewView,
+)
+from zdecision.central.web.publications import (
+    CentralPublicationService,
+    PublicationHistory,
+    PublicationView,
+    PublicHistoryState,
 )
 from zdecision.central.web.reviews import (
     CentralReviewService,
@@ -44,6 +55,16 @@ class CentralWebApplication:
                 store=store, queries=queries, catalog=catalog, git=git
             )
             if catalog is not None and git is not None
+            else None
+        )
+        self.publications = (
+            CentralPublicationService(
+                store=store,
+                previews=self.previews,
+                catalog=catalog,
+                git=git,
+            )
+            if self.previews is not None and catalog is not None and git is not None
             else None
         )
 
@@ -124,7 +145,56 @@ class CentralWebApplication:
     ) -> PublicationPreviewView:
         return self._preview_service().get(principal, preview_id)
 
+    def publish(
+        self,
+        principal: Principal,
+        preview_id: str,
+        client_action_id: str,
+        now: str | datetime,
+    ) -> CentralPublication:
+        return self._publication_service().confirm(
+            principal, preview_id, client_action_id, now
+        )
+
+    def resume_publication(
+        self,
+        principal: Principal,
+        publication_id: str,
+        client_action_id: str,
+        now: str | datetime,
+    ) -> CentralPublication:
+        return self._publication_service().resume(
+            principal, publication_id, client_action_id, now
+        )
+
+    def get_publication(
+        self, principal: Principal, publication_id: str
+    ) -> PublicationView:
+        return self._publication_service().get(principal, publication_id)
+
+    def list_publications(
+        self,
+        principal: Principal,
+        *,
+        product_id: str | None,
+        state: PublicHistoryState | None,
+        limit: int,
+        offset: int,
+    ) -> PublicationHistory:
+        return self._publication_service().list(
+            principal,
+            product_id=product_id,
+            state=state,
+            limit=limit,
+            offset=offset,
+        )
+
     def _preview_service(self) -> CentralPreviewService:
         if self.previews is None:
             raise RuntimeError("Central Preview service is not configured")
         return self.previews
+
+    def _publication_service(self) -> CentralPublicationService:
+        if self.publications is None:
+            raise RuntimeError("Central Publication service is not configured")
+        return self.publications

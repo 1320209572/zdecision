@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { RouterProvider } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -156,4 +157,45 @@ it.each([
   });
   expect(publish).toBeDisabled();
   expect(screen.getAllByRole("button")).toEqual([publish]);
+});
+
+it("publishes once and shows pending push without claiming success", async () => {
+  const value = preview();
+  const publication = {
+    publication_id: "plb_" + "a".repeat(32),
+    preview_id: PREVIEW_ID,
+    product_id: PRODUCT_ID,
+    product_name: "ZDecision",
+    decision_count: 1,
+    decision_ids: [DECISION_ID],
+    actor_id: "user_demo",
+    approved_at: "2026-08-04T08:02:00Z",
+    state: "committed_pending_push",
+    recovery_code: null,
+    commit_sha: "e".repeat(40),
+  };
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const path = String(input);
+    const body = path.includes("publication-previews") && !path.endsWith("/publish")
+      ? value
+      : publication;
+    return Promise.resolve(new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  await router.navigate(`/publication-previews/${PREVIEW_ID}`);
+  render(<RouterProvider router={router} />);
+
+  await userEvent.click(await screen.findByRole("button", {
+    name: "确认发布 1 条决策",
+  }));
+
+  expect(await screen.findByText("已提交，等待推送")).toBeVisible();
+  expect(screen.queryByText("发布完成")).not.toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledWith(
+    `/api/v1/web/publication-previews/${PREVIEW_ID}/publish`,
+    expect.objectContaining({ method: "POST" }),
+  );
 });

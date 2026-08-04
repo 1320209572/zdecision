@@ -394,10 +394,24 @@ class GitRegistryAdapter:
         check: bool = True,
         error_type: type[GitRegistryError] = RegistryGitConflict,
     ) -> subprocess.CompletedProcess[bytes]:
+        if not command or command[0] != "git":
+            raise error_type("Git operation is invalid")
+        safe_command = ("git", "--no-replace-objects", *command[1:])
+        environment = os.environ.copy()
+        for name in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_REPLACE_REF_BASE",
+        ):
+            environment.pop(name, None)
         try:
             result = subprocess.run(
-                command,
+                safe_command,
                 cwd=self.repository_root,
+                env=environment,
                 input=input_bytes,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

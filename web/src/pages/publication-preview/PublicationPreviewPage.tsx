@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { api } from "../../api/client";
 import type {
@@ -83,8 +83,11 @@ function DecisionPanel({ decision, index }: {
 
 export function PublicationPreviewPage() {
   const { previewId = "" } = useParams();
+  const navigate = useNavigate();
   const [preview, setPreview] = useState<PublicationPreview | null>(null);
   const [failed, setFailed] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [publishFailed, setPublishFailed] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -116,6 +119,26 @@ export function PublicationPreviewPage() {
   const statusTone = isPublishable
     ? "success"
     : preview.publishability === "stale" ? "danger" : "warning";
+
+  async function publish() {
+    if (!isPublishable || publishing) return;
+    setPublishing(true);
+    setPublishFailed(false);
+    const clientActionId = `web_action_publish-${Date.now().toString(36)}`;
+    try {
+      const result = await api<{ publication_id: string }>(
+        `/api/v1/web/publication-previews/${previewId}/publish`,
+        {
+          method: "POST",
+          body: JSON.stringify({ client_action_id: clientActionId }),
+        },
+      );
+      await navigate(`/publications/${result.publication_id}`);
+    } catch {
+      setPublishFailed(true);
+      setPublishing(false);
+    }
+  }
 
   return (
     <div className="page preview-page">
@@ -213,13 +236,18 @@ export function PublicationPreviewPage() {
           ← 返回修改审核
         </Link>
         <div>
-          <span>发布写入将在后续步骤启用</span>
+          <span aria-live="polite">
+            {publishFailed
+              ? "发布状态未能确认，请从发布历史检查。"
+              : "仅本次明确确认会启动精确写入"}
+          </span>
           <button
             className="primary-button preview-publish"
             type="button"
-            disabled={!isPublishable}
+            disabled={!isPublishable || publishing}
+            onClick={publish}
           >
-            确认发布 {preview.decisions.length} 条决策
+            {publishing ? "正在证明提交…" : `确认发布 ${preview.decisions.length} 条决策`}
           </button>
         </div>
       </footer>

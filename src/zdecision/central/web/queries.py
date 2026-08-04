@@ -78,7 +78,9 @@ class PublicationSummary:
     decision_count: int
     actor_id: str
     approved_at: str
-    state: Literal["confirmed", "committed_pending_push", "completed"]
+    state: Literal[
+        "confirmed", "committed_pending_push", "completed", "ambiguous"
+    ]
     recovery_code: str | None
     commit_sha: str | None
 
@@ -729,7 +731,11 @@ class CentralWebQueries:
                     decision_count=len(preview.decision_ids),
                     actor_id=publication.actor_id,
                     approved_at=publication.approval.recorded_at,
-                    state=publication.state,
+                    state=(
+                        "ambiguous"
+                        if publication.recovery_code == "ambiguous"
+                        else publication.state
+                    ),
                     recovery_code=publication.recovery_code,
                     commit_sha=publication.commit_sha,
                 )
