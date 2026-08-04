@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,8 +21,15 @@ from zdecision.central.web.contracts import (
 from zdecision.central.web.store import WebRecordCorrupt
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.publication import PublicationRecord
+from zdecision.registry.models import DecisionRevision
 from zdecision.registry.query import RegistryQueryUnavailable, RegistrySnapshot
 from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+
+
+_RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,101 @@ class DashboardView:
         }
 
 
+class DecisionReadError(Exception):
+    code = "decision_read_error"
+
+
+class DecisionNotFound(DecisionReadError):
+    code = "not_found"
+
+
+class DecisionRegistryUnavailable(DecisionReadError):
+    code = "registry_unavailable"
+
+
+@dataclass(frozen=True)
+class DecisionListItem:
+    product_id: str
+    product_name: str
+    decision_id: str
+    revision: int
+    lifecycle: str
+    claim: str
+    future_action: str
+    scope_summary: str
+    repositories: tuple[str, ...]
+    paths: tuple[str, ...]
+    published_at: str | None
+    publication_id: str | None
+    commit_sha: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "product_id": self.product_id,
+            "product_name": self.product_name,
+            "decision_id": self.decision_id,
+            "revision": self.revision,
+            "lifecycle": self.lifecycle,
+            "claim": self.claim,
+            "future_action": self.future_action,
+            "scope_summary": self.scope_summary,
+            "repositories": list(self.repositories),
+            "paths": list(self.paths),
+            "published_at": self.published_at,
+            "publication_id": self.publication_id,
+            "commit_sha": self.commit_sha,
+        }
+
+
+@dataclass(frozen=True)
+class DecisionListView:
+    registry_state: Literal["available", "unavailable"]
+    registry_commit: str | None
+    items: tuple[DecisionListItem, ...] | None
+    total: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "registry_state": self.registry_state,
+            "registry_commit": self.registry_commit,
+            "items": (
+                [item.to_dict() for item in self.items]
+                if self.items is not None
+                else None
+            ),
+            "total": self.total,
+        }
+
+
+@dataclass(frozen=True)
+class DecisionDetailView:
+    registry_commit: str
+    decision: DecisionRevision
+    publication_id: str | None
+    published_at: str | None
+    commit_sha: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        canonical = canonical_json_bytes(self.decision.to_dict()).decode(
+            "utf-8"
+        )
+        return {
+            **self.decision.to_dict(),
+            "canonical_json": canonical,
+            "registry_commit": self.registry_commit,
+            "publication_id": self.publication_id,
+            "published_at": self.published_at,
+            "commit_sha": self.commit_sha,
+        }
+
+
+@dataclass(frozen=True)
+class _DecisionPublication:
+    publication_id: str
+    published_at: str
+    commit_sha: str
+
+
 class CentralWebQueries:
     def __init__(self, connection: sqlite3.Connection, registry_query: object) -> None:
         if not isinstance(connection, sqlite3.Connection):
@@ -130,6 +233,117 @@ class CentralWebQueries:
         self._require_user(principal)
         snapshot = self._registry_snapshot()
         return self._list_products(principal, snapshot)
+
+    def list_decisions(
+        self,
+        principal: Principal,
+        *,
+        product_id: str | None = None,
+        search: str = "",
+        repository: str = "",
+        published_after: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> DecisionListView:
+        self._require_user(principal)
+        self._validate_decision_filters(
+            search, repository, published_after, limit, offset
+        )
+        products = self._owned_products(principal)
+        if product_id is not None and product_id not in products:
+            raise DecisionNotFound("not_found")
+        snapshot = self._registry_snapshot()
+        if snapshot is None:
+            return DecisionListView("unavailable", None, None, None)
+
+        selected_products = (
+            {product_id: products[product_id]}
+            if product_id is not None
+            else products
+        )
+        publications = self._decision_publications(
+            principal, frozenset(selected_products)
+        )
+        threshold = (
+            self._rfc3339(published_after)
+            if published_after is not None
+            else None
+        )
+        folded_search = search.casefold()
+        items: list[DecisionListItem] = []
+        for revision in snapshot.active_decisions(product_id):
+            mapped = selected_products.get(revision.product_id)
+            if mapped is None or mapped[0] != revision.product_name:
+                continue
+            if folded_search and folded_search not in "\n".join(
+                (
+                    revision.claim,
+                    revision.future_action,
+                    revision.scope_summary,
+                )
+            ).casefold():
+                continue
+            if repository and repository not in revision.repositories:
+                continue
+            publication = publications.get(
+                (revision.product_id, revision.decision_id)
+            )
+            if threshold is not None and (
+                publication is None
+                or self._rfc3339(publication.published_at) < threshold
+            ):
+                continue
+            items.append(
+                self._decision_list_item(revision, publication)
+            )
+        items.sort(
+            key=lambda item: (
+                item.product_name.casefold(),
+                item.decision_id,
+            )
+        )
+        items.sort(key=lambda item: item.published_at or "", reverse=True)
+        total = len(items)
+        return DecisionListView(
+            "available",
+            snapshot.commit_sha,
+            tuple(items[offset : offset + limit]),
+            total,
+        )
+
+    def get_decision(
+        self, principal: Principal, product_id: str, decision_id: str
+    ) -> DecisionDetailView:
+        self._require_user(principal)
+        products = self._owned_products(principal)
+        if product_id not in products:
+            raise DecisionNotFound("not_found")
+        snapshot = self._registry_snapshot()
+        if snapshot is None:
+            raise DecisionRegistryUnavailable("registry_unavailable")
+        revision = snapshot.decisions.get((product_id, decision_id))
+        if (
+            revision is None
+            or revision.lifecycle != "active"
+            or revision.product_name != products[product_id][0]
+        ):
+            raise DecisionNotFound("not_found")
+        publication = self._decision_publications(
+            principal, frozenset((product_id,))
+        ).get((product_id, decision_id))
+        return DecisionDetailView(
+            registry_commit=snapshot.commit_sha,
+            decision=revision,
+            publication_id=(
+                publication.publication_id if publication is not None else None
+            ),
+            published_at=(
+                publication.published_at if publication is not None else None
+            ),
+            commit_sha=(
+                publication.commit_sha if publication is not None else None
+            ),
+        )
 
     def resolve_repository(
         self, principal: Principal, repository_id: str
@@ -556,9 +770,9 @@ class CentralWebQueries:
             publications,
         )
 
-    def _list_products(
-        self, principal: Principal, snapshot: RegistrySnapshot | None
-    ) -> tuple[ProductSummary, ...]:
+    def _owned_products(
+        self, principal: Principal
+    ) -> dict[str, tuple[str, tuple[str, ...]]]:
         rows = self.connection.execute(
             """
             SELECT product_id, product_name, repository_id
@@ -568,30 +782,178 @@ class CentralWebQueries:
             """,
             (principal.organization_id,),
         ).fetchall()
-        grouped: dict[tuple[str, str], list[str]] = {}
+        grouped: dict[str, tuple[str, list[str]]] = {}
         for row in rows:
-            grouped.setdefault(
-                (row["product_id"], row["product_name"]), []
-            ).append(row["repository_id"])
-        products: list[ProductSummary] = []
-        for (product_id, product_name), repository_ids in grouped.items():
-            registry = (
-                snapshot.registries.get(product_id)
-                if snapshot is not None
-                else None
+            product_id = row["product_id"]
+            product_name = row["product_name"]
+            current = grouped.get(product_id)
+            if current is None:
+                grouped[product_id] = (product_name, [row["repository_id"]])
+            elif current[0] != product_name:
+                raise WebRecordCorrupt("repository_mapping")
+            else:
+                current[1].append(row["repository_id"])
+        return {
+            product_id: (name, tuple(repositories))
+            for product_id, (name, repositories) in grouped.items()
+        }
+
+    def _decision_publications(
+        self, principal: Principal, product_ids: frozenset[str]
+    ) -> dict[tuple[str, str], _DecisionPublication]:
+        if not product_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in product_ids)
+        rows = self.connection.execute(
+            f"""
+            SELECT publication.product_id, publication.publication_id,
+                   publication.preview_id, publication.commit_sha,
+                   publication.updated_at, publication.record_json,
+                   publication.record_digest, receipt.decision_id,
+                   receipt.preview_id AS receipt_preview_id,
+                   receipt.commit_sha AS receipt_commit_sha
+            FROM web_publications AS publication
+            JOIN web_candidate_receipts AS receipt
+              ON receipt.organization_id = publication.organization_id
+             AND receipt.product_id = publication.product_id
+             AND receipt.preview_id = publication.preview_id
+             AND receipt.commit_sha = publication.commit_sha
+            WHERE publication.organization_id = ?
+              AND publication.state = 'completed'
+              AND publication.product_id IN ({placeholders})
+            ORDER BY publication.updated_at DESC,
+                     publication.publication_id DESC,
+                     receipt.decision_id
+            """,
+            (principal.organization_id, *sorted(product_ids)),
+        ).fetchall()
+        joined: dict[tuple[str, str], _DecisionPublication] = {}
+        for row in rows:
+            publication = cast(
+                CentralPublication,
+                self._read_record(
+                    row["record_json"],
+                    row["record_digest"],
+                    CentralPublication,
+                    "publication",
+                ),
             )
+            if (
+                publication.organization_id != principal.organization_id
+                or publication.product_id != row["product_id"]
+                or publication.publication_id != row["publication_id"]
+                or publication.preview_id != row["preview_id"]
+                or publication.preview_id != row["receipt_preview_id"]
+                or publication.state != "completed"
+                or publication.commit_sha != row["commit_sha"]
+                or publication.commit_sha != row["receipt_commit_sha"]
+                or publication.updated_at != row["updated_at"]
+                or publication.commit_sha is None
+            ):
+                raise WebRecordCorrupt("publication")
+            key = (publication.product_id, row["decision_id"])
+            if key in joined:
+                raise WebRecordCorrupt("candidate_receipt")
+            joined[key] = _DecisionPublication(
+                publication.publication_id,
+                publication.updated_at,
+                publication.commit_sha,
+            )
+        return joined
+
+    @staticmethod
+    def _decision_list_item(
+        revision: DecisionRevision,
+        publication: _DecisionPublication | None,
+    ) -> DecisionListItem:
+        return DecisionListItem(
+            product_id=revision.product_id,
+            product_name=revision.product_name,
+            decision_id=revision.decision_id,
+            revision=revision.revision,
+            lifecycle=revision.lifecycle,
+            claim=revision.claim,
+            future_action=revision.future_action,
+            scope_summary=revision.scope_summary,
+            repositories=revision.repositories,
+            paths=revision.paths,
+            published_at=(
+                publication.published_at if publication is not None else None
+            ),
+            publication_id=(
+                publication.publication_id if publication is not None else None
+            ),
+            commit_sha=(
+                publication.commit_sha if publication is not None else None
+            ),
+        )
+
+    @classmethod
+    def _validate_decision_filters(
+        cls,
+        search: str,
+        repository: str,
+        published_after: str | None,
+        limit: int,
+        offset: int,
+    ) -> None:
+        for value, name in (
+            (search, "search"),
+            (repository, "repository"),
+        ):
+            try:
+                encoded = value.encode("utf-8")
+            except (AttributeError, UnicodeError):
+                raise ValueError(f"{name} is invalid") from None
+            if len(encoded) > 200:
+                raise ValueError(f"{name} is too long")
+        if published_after is not None:
+            cls._rfc3339(published_after)
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 100
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+        ):
+            raise ValueError("Decision pagination is invalid")
+
+    @staticmethod
+    def _rfc3339(value: str) -> datetime:
+        if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
+            raise ValueError("published_after is invalid")
+        try:
+            parsed = datetime.fromisoformat(
+                value.removesuffix("Z")
+                + ("+00:00" if value.endswith("Z") else "")
+            )
+        except ValueError:
+            raise ValueError("published_after is invalid") from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("published_after is invalid")
+        return parsed.astimezone(UTC)
+
+    def _list_products(
+        self, principal: Principal, snapshot: RegistrySnapshot | None
+    ) -> tuple[ProductSummary, ...]:
+        products: list[ProductSummary] = []
+        for product_id, (
+            product_name,
+            repository_ids,
+        ) in self._owned_products(principal).items():
             products.append(
                 ProductSummary(
                     product_id=product_id,
                     product_name=product_name,
-                    repository_ids=tuple(repository_ids),
+                    repository_ids=repository_ids,
                     pending_candidate_count=self._pending_count(
                         principal.organization_id, product_id
                     ),
                     active_decision_count=(
-                        len(registry.decisions)
-                        if snapshot is not None and registry is not None
-                        else (0 if snapshot is not None else None)
+                        len(snapshot.active_decisions(product_id))
+                        if snapshot is not None
+                        else None
                     ),
                     last_activity_at=self._last_activity(
                         principal.organization_id, product_id

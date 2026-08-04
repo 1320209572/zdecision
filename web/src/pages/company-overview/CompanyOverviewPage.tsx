@@ -98,9 +98,8 @@ export function CompanyOverviewPage() {
         ) : (
           <div className="product-list">
             {dashboard.products.map((product, index) => (
-              <Link
+              <article
                 className="product-row"
-                to={`/products/${product.product_id}/candidates`}
                 key={product.product_id}
                 style={{ "--delay": `${220 + index * 55}ms` } as React.CSSProperties}
               >
@@ -109,19 +108,23 @@ export function CompanyOverviewPage() {
                   <strong>{product.product_name}</strong>
                   <small>{product.repository_ids.length} 个已启用仓库</small>
                 </span>
-                <span className="product-row__stat">
-                  <strong>{product.pending_candidate_count}</strong>
-                  <small>待审核</small>
-                </span>
-                <span className="product-row__stat">
-                  <strong>{product.active_decision_count ?? "—"}</strong>
-                  <small>生效决策</small>
-                </span>
+                <span className="product-row__stat"><strong>{product.pending_candidate_count}</strong><small>待审核</small></span>
+                <span className="product-row__stat"><strong>{product.active_decision_count ?? "—"}</strong><small>生效决策</small></span>
                 <span className="product-row__activity">
                   {formatDate(product.last_activity_at)}
                 </span>
-                <span className="product-row__arrow" aria-hidden="true">↗</span>
-              </Link>
+                <span className="product-row__actions">
+                  <Link
+                    aria-label={`候选 ${product.pending_candidate_count}`}
+                    to={`/products/${product.product_id}/candidates`}
+                  >候选</Link>
+                  <Link
+                    aria-label={`决策 ${product.active_decision_count ?? "未知"}`}
+                    to={`/products/${product.product_id}/decisions`}
+                  >决策</Link>
+                  <Link to={`/products/${product.product_id}/publications`}>发布</Link>
+                </span>
+              </article>
             ))}
           </div>
         )}

@@ -27,6 +27,10 @@ from zdecision.central.service import (
     RequestNotFound,
 )
 from zdecision.central.web.application import CentralWebApplication
+from zdecision.central.web.queries import (
+    DecisionNotFound,
+    DecisionRegistryUnavailable,
+)
 from zdecision.central.web.reviews import (
     ProductNotFound,
     ProductOwnershipConflict,
@@ -229,6 +233,18 @@ def create_app(
         request: Request, error: PublicationNotFound
     ) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": error.code})
+
+    @app.exception_handler(DecisionNotFound)
+    async def decision_not_found_handler(
+        request: Request, error: DecisionNotFound
+    ) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"error": error.code})
+
+    @app.exception_handler(DecisionRegistryUnavailable)
+    async def decision_registry_unavailable_handler(
+        request: Request, error: DecisionRegistryUnavailable
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"error": error.code})
 
     @app.exception_handler(CandidateAlreadyPublishing)
     async def publication_family_handler(

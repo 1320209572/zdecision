@@ -12,7 +12,13 @@ from zdecision.central.web.contracts import (
     DraftItem,
     ReviewDraft,
 )
-from zdecision.central.web.queries import CentralWebQueries, DashboardView
+from zdecision.central.web.queries import (
+    CentralWebQueries,
+    DashboardView,
+    DecisionDetailView,
+    DecisionListView,
+    DecisionRegistryUnavailable,
+)
 from zdecision.central.web.previews import (
     CentralPreviewService,
     PublicationPreviewView,
@@ -70,6 +76,35 @@ class CentralWebApplication:
 
     def dashboard(self, principal: Principal) -> DashboardView:
         return self.queries.dashboard(principal)
+
+    def list_decisions(
+        self,
+        principal: Principal,
+        *,
+        product_id: str | None = None,
+        search: str = "",
+        repository: str = "",
+        published_after: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> DecisionListView:
+        view = self.queries.list_decisions(
+            principal,
+            product_id=product_id,
+            search=search,
+            repository=repository,
+            published_after=published_after,
+            limit=limit,
+            offset=offset,
+        )
+        if view.registry_state == "unavailable":
+            raise DecisionRegistryUnavailable("registry_unavailable")
+        return view
+
+    def get_decision(
+        self, principal: Principal, product_id: str, decision_id: str
+    ) -> DecisionDetailView:
+        return self.queries.get_decision(principal, product_id, decision_id)
 
     def list_candidates(
         self,

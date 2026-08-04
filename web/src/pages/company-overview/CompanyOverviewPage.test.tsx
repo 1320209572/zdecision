@@ -51,5 +51,17 @@ it("renders server products and routes without hard-coded product pages", async 
     "href",
     "/reviews",
   );
+  expect(screen.getByRole("link", { name: "候选 12" })).toHaveAttribute(
+    "href",
+    `/products/${PRODUCT_ID}/candidates`,
+  );
+  expect(screen.getByRole("link", { name: "决策 14" })).toHaveAttribute(
+    "href",
+    `/products/${PRODUCT_ID}/decisions`,
+  );
+  expect(screen.getByRole("link", { name: "发布" })).toHaveAttribute(
+    "href",
+    `/products/${PRODUCT_ID}/publications`,
+  );
   expect(screen.queryByText(/session_id/i)).not.toBeInTheDocument();
 });

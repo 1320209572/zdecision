@@ -57,6 +57,62 @@ export interface Dashboard {
   recent_publications: PublicationSummary[];
 }
 
+export interface DecisionListItem {
+  product_id: string;
+  product_name: string;
+  decision_id: string;
+  revision: number;
+  lifecycle: "active";
+  claim: string;
+  future_action: string;
+  scope_summary: string;
+  repositories: string[];
+  paths: string[];
+  published_at: string | null;
+  publication_id: string | null;
+  commit_sha: string | null;
+}
+
+export interface DecisionListView {
+  registry_state: RegistryState;
+  registry_commit: string | null;
+  items: DecisionListItem[] | null;
+  total: number | null;
+}
+
+export interface DecisionDetail {
+  format: "zdecision-decision/v1";
+  schema_version: 1;
+  decision_id: string;
+  product_id: string;
+  product_name: string;
+  revision: 1;
+  lifecycle: "active";
+  claim: string;
+  future_action: string;
+  scope: {
+    summary: string;
+    repositories: string[];
+    paths: string[];
+  };
+  invalidation_conditions: string[];
+  supersedes: unknown[];
+  variant_of: unknown[];
+  source: { thread_id: string; turn_id: string };
+  review_approval: {
+    actor: "user";
+    thread_id: string;
+    turn_id: string;
+    recorded_at: string;
+  };
+  publication_preview_id: string;
+  canonical_json: string;
+  registry_commit: string;
+  publication_id: string | null;
+  published_at: string | null;
+  commit_sha: string | null;
+}
+
 export type ReviewAction = "accept" | "edit_accept" | "reject" | "skip";
 export type CandidateReviewState =
   | "pending"

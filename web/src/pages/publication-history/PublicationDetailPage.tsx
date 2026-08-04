@@ -109,6 +109,11 @@ export function PublicationDetailPage() {
         <div><span>RECOVERY</span><code>{publication.recovery_code ?? "none"}</code></div>
       </section>
 
+      <nav className="publication-detail__product-nav" aria-label="产品发布上下文">
+        <Link to={`/products/${publication.product_id}/decisions`}>产品决策目录</Link>
+        <Link to={`/products/${publication.product_id}/publications`}>产品发布历史</Link>
+      </nav>
+
       <section className="publication-detail__decisions">
         <header><p className="eyebrow">FORMAL OUTPUT</p><h2>精确 Decision</h2></header>
         <div>

@@ -40,6 +40,24 @@ class RegistrySnapshot:
             self, "decisions", MappingProxyType(dict(self.decisions))
         )
 
+    def active_decisions(
+        self, product_id: str | None = None
+    ) -> tuple[DecisionRevision, ...]:
+        """Return a stable product-owned view of active V1 heads."""
+
+        if product_id is not None and (
+            not isinstance(product_id, str) or not product_id
+        ):
+            raise ValueError("product_id is invalid")
+        return tuple(
+            revision
+            for (owned_product_id, _), revision in sorted(
+                self.decisions.items()
+            )
+            if revision.lifecycle == "active"
+            and (product_id is None or owned_product_id == product_id)
+        )
+
 
 class RegistryQueryUnavailable(Exception):
     code = "registry_unavailable"

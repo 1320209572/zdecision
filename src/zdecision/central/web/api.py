@@ -80,6 +80,38 @@ async def dashboard(request: Request) -> dict[str, object]:
     ).to_dict()
 
 
+@router.get("/decisions")
+async def decisions(
+    request: Request,
+    product_id: str | None = None,
+    search: str = Query(default="", max_length=200),
+    repository: str = Query(default="", max_length=200),
+    published_after: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).list_decisions(
+        identity_provider.browser_principal(),
+        product_id=product_id,
+        search=search,
+        repository=repository,
+        published_after=published_after,
+        limit=limit,
+        offset=offset,
+    ).to_dict()
+
+
+@router.get("/products/{product_id}/decisions/{decision_id}")
+async def decision_detail(
+    request: Request, product_id: str, decision_id: str
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).get_decision(
+        identity_provider.browser_principal(), product_id, decision_id
+    ).to_dict()
+
+
 @router.get("/products/{product_id}/candidates")
 async def candidates(
     request: Request,

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import tempfile
+import hashlib
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 from zdecision.central.auth import Principal
 from zdecision.central.store import CentralStore
-from zdecision.central.web.queries import CentralWebQueries
+from zdecision.central.web.contracts import CentralPublication
+from zdecision.central.web.queries import CentralWebQueries, DecisionNotFound
 from zdecision.capture.models import CandidateContent, SourceCheckpoint
 from zdecision.capture.reviews import ApprovalRef
-from zdecision.ids import decision_id, product_id
+from zdecision.ids import central_publication_id, decision_id, product_id
 from zdecision.registry.models import (
     DecisionHead,
     DecisionRevision,
@@ -37,15 +39,72 @@ OTHER_PRODUCT_NAME = "Other Product"
 OTHER_PRODUCT_ID = product_id(OTHER_PRODUCT_NAME)
 OTHER_REPOSITORY_ID = "repo_" + "2" * 32
 COMMIT_SHA = "a" * 40
+PUBLICATION_COMMIT = "b" * 40
+
+
+def _decision(
+    *,
+    product_name: str = PRODUCT_NAME,
+    candidate_ordinal: str = "3",
+    claim: str = "隔离正式决策读取",
+    repository: str = "zdecision",
+) -> DecisionRevision:
+    owned_product_id = product_id(product_name)
+    candidate_id = "cand_" + candidate_ordinal * 32 + "_01"
+    seed = DecisionSeed(
+        candidate_id=candidate_id,
+        decision_id=decision_id(candidate_id, owned_product_id),
+        product_id=owned_product_id,
+        product_name=product_name,
+        content=CandidateContent(
+            product=product_name,
+            claim=claim,
+            future_action="Keep the catalog commit-bound.",
+            scope_summary="Registry isolation",
+            repositories=(repository,),
+            paths=("decision-registry/",),
+            invalidation_conditions=("Registry ownership changes.",),
+        ),
+        source=SourceCheckpoint("opaque-thread", "opaque-turn"),
+        review_approval=ApprovalRef(
+            "user",
+            "approval-thread",
+            "approval-turn",
+            "2026-08-03T10:00:00Z",
+        ),
+    )
+    return DecisionRevision.from_seed(seed, "pub_" + candidate_ordinal * 32)
 
 
 class _RegistryQuery:
-    def __init__(self, *, unavailable: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        unavailable: bool = False,
+        decisions: tuple[DecisionRevision, ...] = (),
+    ) -> None:
         self.unavailable = unavailable
+        self.decisions = decisions
+        self.snapshot_count = 0
 
     def snapshot(self) -> RegistrySnapshot:
+        self.snapshot_count += 1
         if self.unavailable:
             raise RegistryQueryUnavailable("registry_unavailable")
+        product_decisions: dict[str, dict[str, DecisionHead]] = {
+            PRODUCT_ID: {},
+            OTHER_PRODUCT_ID: {},
+        }
+        indexed: dict[tuple[str, str], DecisionRevision] = {}
+        for revision in self.decisions:
+            indexed[(revision.product_id, revision.decision_id)] = revision
+            product_decisions[revision.product_id][revision.decision_id] = (
+                DecisionHead(
+                    revision.revision,
+                    revision.lifecycle,
+                    f"decisions/{revision.decision_id}/r0001.json",
+                )
+            )
         return RegistrySnapshot(
             commit_sha=COMMIT_SHA,
             products={
@@ -55,10 +114,14 @@ class _RegistryQuery:
                 ),
             },
             registries={
-                PRODUCT_ID: ProductRegistry(PRODUCT_ID, {}),
-                OTHER_PRODUCT_ID: ProductRegistry(OTHER_PRODUCT_ID, {}),
+                PRODUCT_ID: ProductRegistry(
+                    PRODUCT_ID, product_decisions[PRODUCT_ID]
+                ),
+                OTHER_PRODUCT_ID: ProductRegistry(
+                    OTHER_PRODUCT_ID, product_decisions[OTHER_PRODUCT_ID]
+                ),
             },
-            decisions={},
+            decisions=indexed,
         )
 
 
@@ -210,6 +273,14 @@ class RegistryQueryTest(unittest.TestCase):
 
         self._assert_committed_claim()
 
+    def test_snapshot_selects_active_revisions_by_product_ownership(self) -> None:
+        snapshot = self.query.snapshot()
+
+        self.assertEqual(
+            (self.revision,), snapshot.active_decisions(PRODUCT_ID)
+        )
+        self.assertEqual((), snapshot.active_decisions(OTHER_PRODUCT_ID))
+
 
 class CentralWebQueriesTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -264,6 +335,158 @@ class CentralWebQueriesTest(unittest.TestCase):
         self.queries = CentralWebQueries(
             self.store.connection, _RegistryQuery()
         )
+
+    def test_global_and_product_catalog_return_same_owned_revision(self) -> None:
+        revision = _decision()
+        registry = _RegistryQuery(decisions=(revision,))
+        queries = CentralWebQueries(self.store.connection, registry)
+
+        global_items = queries.list_decisions(
+            self.user, product_id=None, search="隔离"
+        )
+        product_items = queries.list_decisions(
+            self.user, product_id=PRODUCT_ID, search="隔离"
+        )
+
+        self.assertEqual(global_items.items, product_items.items)
+        self.assertEqual(PRODUCT_ID, global_items.items[0].product_id)
+        self.assertEqual(2, registry.snapshot_count)
+
+    def test_product_detail_rejects_decision_owned_by_another_product(self) -> None:
+        revision = _decision()
+        self.store.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                OTHER_REPOSITORY_ID,
+                OTHER_PRODUCT_ID,
+                OTHER_PRODUCT_NAME,
+                True,
+            ),
+        )
+        queries = CentralWebQueries(
+            self.store.connection, _RegistryQuery(decisions=(revision,))
+        )
+
+        with self.assertRaises(DecisionNotFound) as raised:
+            queries.get_decision(
+                self.user, OTHER_PRODUCT_ID, revision.decision_id
+            )
+        self.assertEqual("not_found", getattr(raised.exception, "code", None))
+
+    def test_invalid_registry_is_unavailable_not_empty(self) -> None:
+        result = CentralWebQueries(
+            self.store.connection, _RegistryQuery(unavailable=True)
+        ).list_decisions(self.user)
+
+        self.assertEqual("unavailable", result.registry_state)
+        self.assertIsNone(result.items)
+        self.assertIsNone(result.total)
+
+    def test_catalog_filters_are_bounded_and_join_completed_publication(self) -> None:
+        revision = _decision(repository="ZDecision")
+        publication_id = central_publication_id(
+            revision.publication_preview_id
+        )
+        publication = CentralPublication(
+            publication_id=publication_id,
+            organization_id="org_demo",
+            actor_id="user_demo",
+            product_id=PRODUCT_ID,
+            preview_id=revision.publication_preview_id,
+            confirm_action_id="web_action_catalog-fixture",
+            confirm_request_digest="d" * 64,
+            state="completed",
+            approval=ApprovalRef(
+                "user",
+                "publish-thread",
+                "publish-turn",
+                "2026-08-03T11:00:00Z",
+            ),
+            commit_sha=PUBLICATION_COMMIT,
+            recovery_code=None,
+            created_at="2026-08-03T11:00:00Z",
+            updated_at="2026-08-04T12:30:00Z",
+        )
+        encoded = canonical_json_bytes(publication.to_dict())
+        self.store.connection.execute("PRAGMA foreign_keys = OFF")
+        with self.store.connection:
+            self.store.connection.execute(
+                """
+                INSERT INTO web_publications(
+                    organization_id, product_id, publication_id, preview_id,
+                    actor_id, state, recovery_code, commit_sha, record_json,
+                    record_digest, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    publication.organization_id,
+                    publication.product_id,
+                    publication.publication_id,
+                    publication.preview_id,
+                    publication.actor_id,
+                    publication.state,
+                    publication.recovery_code,
+                    publication.commit_sha,
+                    encoded.decode("utf-8"),
+                    hashlib.sha256(encoded).hexdigest(),
+                    publication.created_at,
+                    publication.updated_at,
+                ),
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO web_candidate_receipts(
+                    organization_id, product_id, family_id,
+                    publication_candidate_id, decision_id, preview_id,
+                    commit_sha, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "org_demo",
+                    PRODUCT_ID,
+                    "cfm_" + "3" * 32,
+                    "cand_" + "3" * 32 + "_01",
+                    revision.decision_id,
+                    revision.publication_preview_id,
+                    PUBLICATION_COMMIT,
+                    publication.created_at,
+                ),
+            )
+        self.store.connection.execute("PRAGMA foreign_keys = ON")
+        registry = _RegistryQuery(decisions=(revision,))
+        queries = CentralWebQueries(self.store.connection, registry)
+
+        result = queries.list_decisions(
+            self.user,
+            repository="ZDecision",
+            published_after="2026-08-04T00:00:00Z",
+        )
+        detail = queries.get_decision(
+            self.user, PRODUCT_ID, revision.decision_id
+        )
+
+        self.assertEqual(1, result.total)
+        self.assertEqual(publication_id, result.items[0].publication_id)
+        self.assertEqual("2026-08-04T12:30:00Z", result.items[0].published_at)
+        self.assertEqual(PUBLICATION_COMMIT, result.items[0].commit_sha)
+        self.assertEqual(publication_id, detail.publication_id)
+        self.assertEqual(
+            canonical_json_bytes(revision.to_dict()).decode("utf-8"),
+            detail.to_dict()["canonical_json"],
+        )
+        self.assertEqual(2, registry.snapshot_count)
+
+        invalid_arguments = (
+            {"search": "界" * 67},
+            {"repository": "r" * 201},
+            {"published_after": "yesterday"},
+            {"limit": 0},
+            {"limit": 101},
+            {"offset": -1},
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                queries.list_decisions(self.user, **arguments)
 
     def test_dashboard_derives_products_and_counts_from_owned_sources(
         self,

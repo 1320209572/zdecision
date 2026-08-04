@@ -18,13 +18,24 @@ from zdecision.central.store import CentralStore
 from zdecision.central.web.application import CentralWebApplication
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import CentralWebStore
-from zdecision.capture.models import CandidateContent
-from zdecision.ids import candidate_revision_id, product_id
+from zdecision.capture.models import CandidateContent, SourceCheckpoint
+from zdecision.capture.reviews import ApprovalRef
+from zdecision.ids import candidate_revision_id, decision_id, product_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter
-from zdecision.registry.models import ProductMetadata, ProductRegistry, RootRegistry
-from zdecision.registry.query import RegistrySnapshot
+from zdecision.registry.models import (
+    DecisionHead,
+    DecisionRevision,
+    DecisionSeed,
+    ProductMetadata,
+    ProductRegistry,
+    RootRegistry,
+)
+from zdecision.registry.query import (
+    RegistryQueryUnavailable,
+    RegistrySnapshot,
+)
 from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
 
 
@@ -35,12 +46,32 @@ COMMIT_SHA = "b" * 40
 
 
 class _RegistryQuery:
+    def __init__(self, decision: DecisionRevision) -> None:
+        self.decision = decision
+        self.unavailable = False
+
     def snapshot(self) -> RegistrySnapshot:
+        if self.unavailable:
+            raise RegistryQueryUnavailable("registry_unavailable")
         return RegistrySnapshot(
             COMMIT_SHA,
             {PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME)},
-            {PRODUCT_ID: ProductRegistry(PRODUCT_ID, {})},
-            {},
+            {
+                PRODUCT_ID: ProductRegistry(
+                    PRODUCT_ID,
+                    {
+                        self.decision.decision_id: DecisionHead(
+                            1,
+                            "active",
+                            (
+                                f"decisions/{self.decision.decision_id}/"
+                                "r0001.json"
+                            ),
+                        )
+                    },
+                )
+            },
+            {(PRODUCT_ID, self.decision.decision_id): self.decision},
         )
 
 
@@ -105,6 +136,24 @@ class CentralWebApiTest(unittest.TestCase):
         content_digest = hashlib.sha256(
             canonical_json_bytes(content.to_dict())
         ).hexdigest()
+        formal_candidate_id = "cand_" + "4" * 32 + "_01"
+        self.formal_decision = DecisionRevision.from_seed(
+            DecisionSeed(
+                candidate_id=formal_candidate_id,
+                decision_id=decision_id(formal_candidate_id, PRODUCT_ID),
+                product_id=PRODUCT_ID,
+                product_name=PRODUCT_NAME,
+                content=content,
+                source=SourceCheckpoint("opaque-source", "opaque-checkpoint"),
+                review_approval=ApprovalRef(
+                    "user",
+                    "review-thread",
+                    "review-turn",
+                    "2026-08-03T09:00:00Z",
+                ),
+            ),
+            "pub_" + "4" * 32,
+        )
         family_id = "cfm_" + "a" * 32
         self.revision = CandidateRevisionUpload(
             family_id=family_id,
@@ -157,10 +206,11 @@ class CentralWebApiTest(unittest.TestCase):
         git = GitRegistryAdapter(
             repository, expected_origin=str(remote.resolve())
         )
+        self.registry_query = _RegistryQuery(self.formal_decision)
         web = CentralWebApplication(
             store=CentralWebStore(self.store.connection),
             queries=CentralWebQueries(
-                self.store.connection, _RegistryQuery()
+                self.store.connection, self.registry_query
             ),
             catalog=RegistryCatalog(repository),
             git=git,
@@ -184,7 +234,7 @@ class CentralWebApiTest(unittest.TestCase):
                 "metrics": {
                     "product_count": 1,
                     "pending_candidate_count": 1,
-                    "active_decision_count": 0,
+                    "active_decision_count": 1,
                     "completed_this_week": 0,
                 },
                 "registry": {
@@ -197,7 +247,7 @@ class CentralWebApiTest(unittest.TestCase):
                         "product_name": PRODUCT_NAME,
                         "repository_ids": [REPOSITORY_ID],
                         "pending_candidate_count": 1,
-                        "active_decision_count": 0,
+                        "active_decision_count": 1,
                         "last_activity_at": None,
                     }
                 ],
@@ -205,6 +255,64 @@ class CentralWebApiTest(unittest.TestCase):
             },
             response.json(),
         )
+
+    def test_decision_catalog_and_detail_are_complete_read_only_views(self) -> None:
+        catalog = self.client.get(
+            "/api/v1/web/decisions", params={"search": "explicit Review"}
+        )
+        detail = self.client.get(
+            f"/api/v1/web/products/{PRODUCT_ID}/decisions/"
+            f"{self.formal_decision.decision_id}"
+        )
+
+        self.assertEqual(200, catalog.status_code, catalog.text)
+        self.assertEqual(COMMIT_SHA, catalog.json()["registry_commit"])
+        self.assertEqual(1, catalog.json()["total"])
+        self.assertEqual(
+            self.formal_decision.decision_id,
+            catalog.json()["items"][0]["decision_id"],
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        payload = detail.json()
+        self.assertEqual(self.formal_decision.to_dict()["source"], payload["source"])
+        self.assertEqual(
+            self.formal_decision.to_dict(), json.loads(payload["canonical_json"])
+        )
+        self.assertEqual(COMMIT_SHA, payload["registry_commit"])
+        self.assertTrue(
+            {"publication_id", "published_at", "commit_sha"}.issubset(payload)
+        )
+        self.assertTrue(
+            {"update", "delete", "supersede", "retire"}.isdisjoint(payload)
+        )
+
+    def test_decision_routes_distinguish_mismatch_unavailable_and_invalid_filters(
+        self,
+    ) -> None:
+        other_name = "Other Product"
+        other_id = product_id(other_name)
+        self.store.put_repository_mapping(
+            "org_demo",
+            RepositoryView(
+                "repo_" + "9" * 32, other_id, other_name, True
+            ),
+        )
+        mismatch = self.client.get(
+            f"/api/v1/web/products/{other_id}/decisions/"
+            f"{self.formal_decision.decision_id}"
+        )
+        invalid = self.client.get(
+            "/api/v1/web/decisions", params={"search": "界" * 67}
+        )
+        self.registry_query.unavailable = True
+        unavailable = self.client.get("/api/v1/web/decisions")
+
+        self.assertEqual(404, mismatch.status_code)
+        self.assertEqual({"error": "not_found"}, mismatch.json())
+        self.assertEqual(422, invalid.status_code)
+        self.assertEqual({"error": "invalid_request"}, invalid.json())
+        self.assertEqual(503, unavailable.status_code)
+        self.assertEqual({"error": "registry_unavailable"}, unavailable.json())
 
     def test_spa_fallback_serves_browser_routes_but_never_api_misses(
         self,
@@ -382,7 +490,7 @@ class CentralWebApiTest(unittest.TestCase):
         payload = created.json()
         self.assertEqual("publishable", payload["publishability"])
         self.assertIsNone(payload["publication_id"])
-        self.assertEqual(COMMIT_SHA, _RegistryQuery().snapshot().commit_sha)
+        self.assertEqual(COMMIT_SHA, self.registry_query.snapshot().commit_sha)
         self.assertRegex(payload["base_commit"], r"^[0-9a-f]{40}$")
         self.assertEqual(1, len(payload["decisions"]))
         decision = payload["decisions"][0]

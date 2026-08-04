@@ -65,6 +65,10 @@ it("shows safe resume only for pending push and never for ambiguity", async () =
 
   expect(await screen.findByText("已提交，等待推送")).toBeVisible();
   expect(screen.getByRole("button", { name: "继续安全推送" })).toBeVisible();
+  expect(screen.getByRole("link", { name: "产品决策目录" })).toHaveAttribute(
+    "href",
+    `/products/${CLOUD_ID}/decisions`,
+  );
 
   view.unmount();
   const ambiguous = {
