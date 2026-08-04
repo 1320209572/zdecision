@@ -1,0 +1,26 @@
+:root {
+  --rail: #0b1d36;
+  --primary: #1769e0;
+  --surface: #ffffff;
+  --canvas: #f4f7fb;
+  --danger: #c83f32;
+  --ink: #10233f;
+  --muted: #66758a;
+  --line: #dce4ef;
+  --success: #168564;
+  --warning: #a96b12;
+  --rail-muted: #8fa1b9;
+  --rail-line: rgba(255, 255, 255, 0.11);
+  font-family: "Avenir Next", "Source Han Sans SC", "PingFang SC", sans-serif;
+  color: var(--ink);
+  background: var(--canvas);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; min-height: 100%; background: var(--canvas); }
+body { min-width: 320px; min-height: 100vh; margin: 0; background: var(--canvas); }
+button, input, textarea, select { font: inherit; }
+a { color: inherit; text-decoration: none; }
+:focus-visible { outline: 3px solid rgba(23, 105, 224, 0.42); outline-offset: 3px; }

@@ -140,6 +140,8 @@ class DemoConfigTest(unittest.TestCase):
                     str(self.root / "missing.sqlite3"),
                     "--config",
                     str(self.root / "missing.json"),
+                    "--registry-repository-root",
+                    str(self.repository),
                     "--host",
                     "0.0.0.0",
                 ]

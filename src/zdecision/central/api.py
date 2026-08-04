@@ -10,6 +10,7 @@ from typing import Annotated
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from zdecision.central.auth import (
@@ -25,6 +26,7 @@ from zdecision.central.service import (
     RepositoryUnavailable,
     RequestNotFound,
 )
+from zdecision.central.web.application import CentralWebApplication
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_LEASE_SECONDS,
     CandidateBatchUpload,
@@ -72,18 +74,38 @@ def create_app(
     identity_provider: DemoIdentityProvider,
     *,
     clock: Callable[[], datetime] | None = None,
+    web_application: CentralWebApplication | None = None,
+    static_root: Path | None = None,
 ) -> FastAPI:
     if not isinstance(service, CaptureRequestService):
         raise TypeError("service must be a CaptureRequestService")
     if not isinstance(identity_provider, DemoIdentityProvider):
         raise TypeError("identity_provider must be a DemoIdentityProvider")
+    if web_application is not None and not isinstance(
+        web_application, CentralWebApplication
+    ):
+        raise TypeError("web_application must be a CentralWebApplication")
     current_time = clock or (lambda: datetime.now(UTC))
+    selected_static_root = (
+        Path(static_root)
+        if static_root is not None
+        else Path(__file__).with_name("static")
+    )
     app = FastAPI(
         title="ZDecision Central",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
     )
+    app.state.web_application = web_application
+    app.state.identity_provider = identity_provider
+    if web_application is not None:
+        from zdecision.central.web.api import router as web_router
+
+        app.include_router(web_router)
+        assets = selected_static_root / "assets"
+        if assets.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
     @app.exception_handler(InvalidCredentials)
     async def invalid_credentials_handler(
@@ -143,7 +165,7 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
-        path = Path(__file__).with_name("static") / "index.html"
+        path = selected_static_root / "index.html"
         return HTMLResponse(path.read_text("utf-8"))
 
     @app.get("/api/v1/repositories")
@@ -313,5 +335,16 @@ def create_app(
             body.retryable,
             current_time(),
         ).to_dict()
+
+    if web_application is not None:
+
+        @app.get("/{browser_path:path}", response_class=HTMLResponse)
+        async def spa_fallback(browser_path: str) -> Response:
+            if browser_path == "api" or browser_path.startswith("api/"):
+                return JSONResponse(
+                    status_code=404, content={"detail": "Not Found"}
+                )
+            path = selected_static_root / "index.html"
+            return HTMLResponse(path.read_text("utf-8"))
 
     return app

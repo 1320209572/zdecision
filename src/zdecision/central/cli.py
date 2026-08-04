@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -17,8 +18,13 @@ from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.auth import DemoIdentityProvider, require_id, require_sha256
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
+from zdecision.central.web.application import CentralWebApplication
+from zdecision.central.web.queries import CentralWebQueries
+from zdecision.central.web.store import CentralWebStore
 from zdecision.ids import canonical_product_name, product_id
 from zdecision.jsonio import atomic_create_json
+from zdecision.registry.git import GitRegistryAdapter
+from zdecision.registry.query import RegistryQuery
 from zdecision.sync.contracts import RepositoryView
 
 
@@ -51,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run the loopback central service")
     run.add_argument("--database", required=True)
     run.add_argument("--config", required=True)
+    run.add_argument("--registry-repository-root", required=True)
     run.add_argument("--host", default="127.0.0.1")
     run.add_argument("--port", type=int, default=8765)
     return parser
@@ -162,6 +169,9 @@ def _run_server(arguments: argparse.Namespace) -> int:
     database_path = Path(arguments.database).expanduser()
     if not config_path.is_absolute() or not database_path.is_absolute():
         raise CentralCliError("server_path_not_absolute")
+    registry_root = _registry_repository_root(
+        arguments.registry_repository_root
+    )
     config = _load_central_config(config_path)
 
     from zdecision.central.api import create_app
@@ -179,7 +189,17 @@ def _run_server(arguments: argparse.Namespace) -> int:
             device_id=config["device_id"],
             device_token_sha256=config["device_token_sha256"],
         )
-        app = create_app(CaptureRequestService(store), provider)
+        git = GitRegistryAdapter(registry_root)
+        registry_query = RegistryQuery(registry_root, git)
+        web_application = CentralWebApplication(
+            store=CentralWebStore(store.connection),
+            queries=CentralWebQueries(store.connection, registry_query),
+        )
+        app = create_app(
+            CaptureRequestService(store),
+            provider,
+            web_application=web_application,
+        )
         import uvicorn
 
         uvicorn.run(
@@ -191,6 +211,34 @@ def _run_server(arguments: argparse.Namespace) -> int:
     finally:
         store.close()
     return 0
+
+
+def _registry_repository_root(value: str) -> Path:
+    root = Path(value).expanduser()
+    if not root.is_absolute():
+        raise CentralCliError("registry_repository_root_not_absolute")
+    if not root.is_dir():
+        raise CentralCliError("registry_repository_root_invalid")
+    resolved = root.resolve()
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(resolved), "rev-parse", "--show-toplevel"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise CentralCliError("registry_repository_root_not_git") from None
+    if result.returncode != 0:
+        raise CentralCliError("registry_repository_root_not_git")
+    try:
+        top_level = Path(result.stdout.strip()).resolve()
+    except (OSError, ValueError):
+        raise CentralCliError("registry_repository_root_not_git") from None
+    if top_level != resolved:
+        raise CentralCliError("registry_repository_root_not_git")
+    return resolved
 
 
 def _load_central_config(path: Path) -> dict[str, object]:
