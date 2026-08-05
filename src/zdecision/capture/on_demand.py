@@ -36,9 +36,12 @@ ArchiveState = Literal["not_applicable", "pending", "archived"]
 _CAPTURE_ID = re.compile(r"^cap_[0-9a-f]{32}$")
 _REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
+_DECISION_SPACE_ID = re.compile(r"^dsp_[0-9a-f]{32}$")
+_ROUTE_ID = re.compile(r"^drr_[0-9a-f]{32}$")
+_PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _MODEL_PROFILE_ID = re.compile(r"^fmp_[0-9a-f]{32}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-_FROZEN_FIELDS = frozenset(
+_FROZEN_V3_FIELDS = frozenset(
     (
         "record_version",
         "protocol_revision",
@@ -61,6 +64,7 @@ _FROZEN_FIELDS = frozenset(
         "model_discovered_at",
     )
 )
+_FROZEN_V4_FIELDS = _FROZEN_V3_FIELDS | frozenset(("route_context",))
 _RESULT_FIELDS = frozenset(
     (
         "operation_id",
@@ -128,8 +132,69 @@ def _candidate_as_extraction_item(candidate: Candidate) -> dict[str, object]:
 
 
 @dataclass(frozen=True)
+class FrozenCaptureRouteContext:
+    decision_space_id: str
+    decision_space_kind: Literal["product", "shared_unit"]
+    decision_space_name: str
+    route_id: str
+    route_configuration_version: int
+    compatibility_product_id: str
+    matched_path_digest: str
+
+    def __post_init__(self) -> None:
+        if _DECISION_SPACE_ID.fullmatch(self.decision_space_id) is None:
+            raise ValueError("decision_space_id is invalid")
+        if self.decision_space_kind not in ("product", "shared_unit"):
+            raise ValueError("decision_space_kind is invalid")
+        _nonempty(self.decision_space_name, "decision_space_name")
+        if _ROUTE_ID.fullmatch(self.route_id) is None:
+            raise ValueError("route_id is invalid")
+        if (
+            not isinstance(self.route_configuration_version, int)
+            or isinstance(self.route_configuration_version, bool)
+            or self.route_configuration_version < 1
+        ):
+            raise ValueError("route_configuration_version is invalid")
+        if _PRODUCT_ID.fullmatch(self.compatibility_product_id) is None:
+            raise ValueError("compatibility_product_id is invalid")
+        _digest(self.matched_path_digest, "matched_path_digest")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "decision_space_id": self.decision_space_id,
+            "decision_space_kind": self.decision_space_kind,
+            "decision_space_name": self.decision_space_name,
+            "route_id": self.route_id,
+            "route_configuration_version": self.route_configuration_version,
+            "compatibility_product_id": self.compatibility_product_id,
+            "matched_path_digest": self.matched_path_digest,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, object]
+    ) -> "FrozenCaptureRouteContext":
+        _require_exact_fields(
+            value,
+            frozenset(
+                (
+                    "decision_space_id",
+                    "decision_space_kind",
+                    "decision_space_name",
+                    "route_id",
+                    "route_configuration_version",
+                    "compatibility_product_id",
+                    "matched_path_digest",
+                )
+            ),
+            "FrozenCaptureRouteContext",
+        )
+        return cls(**value)
+
+
+@dataclass(frozen=True)
 class FrozenCaptureInput:
-    record_version: Literal[3]
+    record_version: Literal[3, 4]
     protocol_revision: str
     operation_id: str
     request_id: str
@@ -148,10 +213,13 @@ class FrozenCaptureInput:
     reasoning_effort: str
     model_discovery_digest: str
     model_discovered_at: str
+    route_context: FrozenCaptureRouteContext | None
 
     def __post_init__(self) -> None:
-        if self.record_version != 3 or isinstance(self.record_version, bool):
-            raise ValueError("FrozenCaptureInput record_version must be 3")
+        if self.record_version not in (3, 4) or isinstance(
+            self.record_version, bool
+        ):
+            raise ValueError("FrozenCaptureInput record_version is invalid")
         if _CAPTURE_ID.fullmatch(self.operation_id) is None:
             raise ValueError("FrozenCaptureInput operation_id is invalid")
         if _REQUEST_ID.fullmatch(self.request_id) is None:
@@ -172,7 +240,16 @@ class FrozenCaptureInput:
             "model_discovered_at",
         ):
             _nonempty(getattr(self, field_name), field_name)
-        if not self.protocol_revision.startswith("extractor-v3"):
+        if self.record_version == 3:
+            if (
+                not self.protocol_revision.startswith("extractor-v3")
+                or self.route_context is not None
+            ):
+                raise ValueError("FrozenCaptureInput v3 fields are invalid")
+        elif (
+            not self.protocol_revision.startswith("extractor-v4")
+            or not isinstance(self.route_context, FrozenCaptureRouteContext)
+        ):
             raise ValueError("FrozenCaptureInput protocol_revision is invalid")
         if not Path(self.cwd).is_absolute():
             raise ValueError("FrozenCaptureInput cwd must be absolute")
@@ -210,6 +287,7 @@ class FrozenCaptureInput:
         reasoning_effort: str,
         model_discovery_digest: str,
         model_discovered_at: str,
+        route_context: FrozenCaptureRouteContext,
         protocol_revision: str = ON_DEMAND_CAPTURE_PROTOCOL,
     ) -> "FrozenCaptureInput":
         identity = {
@@ -230,9 +308,10 @@ class FrozenCaptureInput:
             "reasoning_effort": reasoning_effort,
             "model_discovery_digest": model_discovery_digest,
             "model_discovered_at": model_discovered_at,
+            "route_context": route_context.to_dict(),
         }
         return cls(
-            record_version=3,
+            record_version=4,
             operation_id=on_demand_capture_operation_id(identity),
             protocol_revision=protocol_revision,
             request_id=request_id,
@@ -251,6 +330,7 @@ class FrozenCaptureInput:
             reasoning_effort=reasoning_effort,
             model_discovery_digest=model_discovery_digest,
             model_discovered_at=model_discovered_at,
+            route_context=route_context,
         )
 
     def _identity_payload(self) -> dict[str, object]:
@@ -272,6 +352,11 @@ class FrozenCaptureInput:
             "reasoning_effort": self.reasoning_effort,
             "model_discovery_digest": self.model_discovery_digest,
             "model_discovered_at": self.model_discovered_at,
+            **(
+                {}
+                if self.route_context is None
+                else {"route_context": self.route_context.to_dict()}
+            ),
         }
 
     @property
@@ -299,16 +384,26 @@ class FrozenCaptureInput:
             "reasoning_effort": self.reasoning_effort,
             "model_discovery_digest": self.model_discovery_digest,
             "model_discovered_at": self.model_discovered_at,
+            **(
+                {}
+                if self.route_context is None
+                else {"route_context": self.route_context.to_dict()}
+            ),
         }
 
     @classmethod
     def from_dict(
         cls, value: Mapping[str, object]
     ) -> "FrozenCaptureInput":
-        _require_exact_fields(value, _FROZEN_FIELDS, "FrozenCaptureInput")
+        version = value.get("record_version")
+        expected = _FROZEN_V3_FIELDS if version == 3 else _FROZEN_V4_FIELDS
+        _require_exact_fields(value, expected, "FrozenCaptureInput")
         template = value["template"]
         if not isinstance(template, Mapping):
             raise ValueError("FrozenCaptureInput template must be an object")
+        raw_context = value.get("route_context")
+        if raw_context is not None and not isinstance(raw_context, Mapping):
+            raise ValueError("FrozenCaptureInput route_context is invalid")
         return cls(
             record_version=value["record_version"],
             protocol_revision=value["protocol_revision"],
@@ -329,6 +424,11 @@ class FrozenCaptureInput:
             reasoning_effort=value["reasoning_effort"],
             model_discovery_digest=value["model_discovery_digest"],
             model_discovered_at=value["model_discovered_at"],
+            route_context=(
+                None
+                if raw_context is None
+                else FrozenCaptureRouteContext.from_dict(raw_context)
+            ),
         )
 
 

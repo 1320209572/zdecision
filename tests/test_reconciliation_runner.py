@@ -19,6 +19,8 @@ from zdecision.ids import candidate_family_id
 
 REQUEST_ID = "crq_11111111111111111111111111111111"
 REPOSITORY_ID = "repo_22222222222222222222222222222222"
+SLICE_ID = "csl_55555555555555555555555555555555"
+DECISION_SPACE_ID = "dsp_66666666666666666666666666666666"
 SOURCE_THREAD = "source-thread-must-not-leak"
 SOURCE_TURN = "source-turn-must-not-leak"
 
@@ -65,7 +67,9 @@ class FakeGateway:
                     "observation_id": observation.candidate_id,
                     "relation": "unrelated",
                     "family_id": candidate_family_id(
-                        REPOSITORY_ID, observation.candidate_id
+                        REPOSITORY_ID,
+                        DECISION_SPACE_ID,
+                        observation.candidate_id,
                     ),
                     "effective_content": None,
                 }
@@ -155,7 +159,9 @@ class ReconciliationRunnerTest(unittest.TestCase):
     def _run(self, observations: tuple[Candidate, ...] | None = None):
         return self.runner.run(
             request_id=REQUEST_ID,
+            slice_id=SLICE_ID,
             repository_id=REPOSITORY_ID,
+            decision_space_id=DECISION_SPACE_ID,
             cwd=str(self.root),
             observations=(
                 (self.observation,)
@@ -187,7 +193,9 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertEqual(
             [
                 candidate_family_id(
-                    REPOSITORY_ID, self.observation.candidate_id
+                    REPOSITORY_ID,
+                    DECISION_SPACE_ID,
+                    self.observation.candidate_id,
                 )
             ],
             family_options[0]["enum"],
@@ -206,7 +214,9 @@ class ReconciliationRunnerTest(unittest.TestCase):
 
         self.runner.run(
             request_id=REQUEST_ID,
+            slice_id=SLICE_ID,
             repository_id=REPOSITORY_ID,
+            decision_space_id=DECISION_SPACE_ID,
             cwd=str(self.root),
             observations=(self.observation,),
             current=(),

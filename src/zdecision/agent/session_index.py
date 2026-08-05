@@ -33,6 +33,8 @@ class FrozenSessionSource:
     previous_handled_turn_id: str | None
     upper_turn_id: str
     source_fingerprint: str
+    previous_handled_head_commit: str | None = None
+    upper_head_commit: str | None = None
 
 
 class RequestModelProfileConflict(Exception):
@@ -74,6 +76,8 @@ class SessionIndex:
                     latest_source_fingerprint TEXT NOT NULL,
                     handled_turn_id TEXT,
                     handled_source_fingerprint TEXT,
+                    latest_head_commit TEXT,
+                    handled_head_commit TEXT,
                     excluded_reason TEXT,
                     UNIQUE(repository_id, session_id, lineage)
                 );
@@ -103,6 +107,8 @@ class SessionIndex:
                     previous_handled_turn_id TEXT,
                     upper_turn_id TEXT NOT NULL,
                     source_fingerprint TEXT NOT NULL,
+                    previous_handled_head_commit TEXT,
+                    upper_head_commit TEXT,
                     state TEXT NOT NULL CHECK(
                         state IN ('frozen','excluded','acknowledged')
                     ),
@@ -141,6 +147,38 @@ class SessionIndex:
                 connection.execute(
                     "ALTER TABLE capture_request_freezes ADD COLUMN "
                     "model_profile_json TEXT"
+                )
+            checkpoint_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(session_checkpoints)"
+                ).fetchall()
+            }
+            if "latest_head_commit" not in checkpoint_columns:
+                connection.execute(
+                    "ALTER TABLE session_checkpoints ADD COLUMN "
+                    "latest_head_commit TEXT"
+                )
+            if "handled_head_commit" not in checkpoint_columns:
+                connection.execute(
+                    "ALTER TABLE session_checkpoints ADD COLUMN "
+                    "handled_head_commit TEXT"
+                )
+            source_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(capture_request_sources)"
+                ).fetchall()
+            }
+            if "previous_handled_head_commit" not in source_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_sources ADD COLUMN "
+                    "previous_handled_head_commit TEXT"
+                )
+            if "upper_head_commit" not in source_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_sources ADD COLUMN "
+                    "upper_head_commit TEXT"
                 )
         return cls(database_path, connection)
 
@@ -236,7 +274,8 @@ class SessionIndex:
                         latest_turn_id = ?,
                         latest_event_id = ?,
                         latest_observed_at = ?,
-                        latest_source_fingerprint = ?
+                        latest_source_fingerprint = ?,
+                        latest_head_commit = ?
                     WHERE source_key = ?
                     """,
                     (
@@ -245,6 +284,7 @@ class SessionIndex:
                         event.event_id,
                         observed_at,
                         source_fingerprint,
+                        invocation.head_commit,
                         source_key,
                     ),
                 )
@@ -255,8 +295,10 @@ class SessionIndex:
                         source_key, repository_id, session_id, cwd, lineage,
                         latest_turn_id, latest_event_id, latest_observed_at,
                         latest_source_fingerprint, handled_turn_id,
-                        handled_source_fingerprint, excluded_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                        handled_source_fingerprint, latest_head_commit,
+                        handled_head_commit, excluded_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL,
+                              NULL)
                     """,
                     (
                         source_key,
@@ -268,6 +310,7 @@ class SessionIndex:
                         event.event_id,
                         observed_at,
                         source_fingerprint,
+                        invocation.head_commit,
                     ),
                 )
             self._connection.commit()
@@ -353,7 +396,8 @@ class SessionIndex:
                     f"""
                     SELECT source_key, repository_id, session_id, cwd, lineage,
                            handled_turn_id, latest_turn_id,
-                           latest_source_fingerprint
+                           latest_source_fingerprint, handled_head_commit,
+                           latest_head_commit
                     FROM session_checkpoints
                     WHERE repository_id = ?
                       AND session_id = ?
@@ -368,7 +412,8 @@ class SessionIndex:
                     f"""
                     SELECT source_key, repository_id, session_id, cwd, lineage,
                            handled_turn_id, latest_turn_id,
-                           latest_source_fingerprint
+                           latest_source_fingerprint, handled_head_commit,
+                           latest_head_commit
                     FROM session_checkpoints
                     WHERE repository_id = ?
                       AND {changed_clause}
@@ -382,10 +427,11 @@ class SessionIndex:
                     INSERT INTO capture_request_sources(
                         request_id, source_key, repository_id, session_id,
                         cwd, lineage, previous_handled_turn_id, upper_turn_id,
-                        source_fingerprint, state, excluded_reason, frozen_at,
+                        source_fingerprint, previous_handled_head_commit,
+                        upper_head_commit, state, excluded_reason, frozen_at,
                         acknowledged_at, acknowledgement_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'frozen', NULL, ?,
-                              NULL, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'frozen', NULL,
+                              ?, NULL, NULL)
                     """,
                     (
                         request_id,
@@ -397,6 +443,8 @@ class SessionIndex:
                         checkpoint["handled_turn_id"],
                         checkpoint["latest_turn_id"],
                         checkpoint["latest_source_fingerprint"],
+                        checkpoint["handled_head_commit"],
+                        checkpoint["latest_head_commit"],
                         timestamp,
                     ),
                 )
@@ -551,7 +599,8 @@ class SessionIndex:
                 return
             sources = self._connection.execute(
                 """
-                SELECT source_key, upper_turn_id, source_fingerprint
+                SELECT source_key, upper_turn_id, source_fingerprint,
+                       upper_head_commit
                 FROM capture_request_sources
                 WHERE request_id = ?
                 ORDER BY source_key
@@ -563,12 +612,14 @@ class SessionIndex:
                     """
                     UPDATE session_checkpoints
                     SET handled_turn_id = ?,
-                        handled_source_fingerprint = ?
+                        handled_source_fingerprint = ?,
+                        handled_head_commit = ?
                     WHERE source_key = ?
                     """,
                     (
                         source["upper_turn_id"],
                         source["source_fingerprint"],
+                        source["upper_head_commit"],
                         source["source_key"],
                     ),
                 )
@@ -602,7 +653,8 @@ class SessionIndex:
             """
             SELECT request_id, source_key, repository_id, session_id, cwd,
                    lineage, previous_handled_turn_id, upper_turn_id,
-                   source_fingerprint
+                   source_fingerprint, previous_handled_head_commit,
+                   upper_head_commit
             FROM capture_request_sources
             WHERE request_id = ? AND excluded_reason IS NULL
             ORDER BY source_key
@@ -620,6 +672,10 @@ class SessionIndex:
                 previous_handled_turn_id=row["previous_handled_turn_id"],
                 upper_turn_id=row["upper_turn_id"],
                 source_fingerprint=row["source_fingerprint"],
+                previous_handled_head_commit=(
+                    row["previous_handled_head_commit"]
+                ),
+                upper_head_commit=row["upper_head_commit"],
             )
             for row in rows
         )

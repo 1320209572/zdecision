@@ -200,13 +200,14 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 (request_b, status_b),
             ):
                 batch = harness.central_store.connection.execute(
-                    "SELECT item_count FROM candidate_batches "
+                    "SELECT receipt_json FROM capture_slices "
                     "WHERE request_id = ?",
                     (request_id,),
                 ).fetchone()
                 self.assertIsNotNone(batch)
                 self.assertEqual(
-                    batch["item_count"], status["candidate_revision_count"]
+                    json.loads(batch["receipt_json"])["candidate_count"],
+                    status["candidate_revision_count"],
                 )
 
             candidates = harness._candidates()
@@ -242,7 +243,7 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
             paths = [path for path, _, _ in harness.bridge.records]
             self.assertIn("/api/v1/plugin/capture-requests", paths)
             self.assertIn("/api/v1/agent/capture-requests/claim", paths)
-            self.assertTrue(any(path.endswith("/candidates") for path in paths))
+            self.assertTrue(any(path.endswith("/batch") for path in paths))
             self.assertTrue(any(path.endswith("/complete") for path in paths))
             self.assertTrue(
                 any("/api/v1/plugin/capture-requests/" in path for path in paths)
@@ -351,6 +352,8 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
     def _table_count(connection, table: str) -> int:
         if table not in {"capture_requests", "candidate_revisions"}:
             raise AssertionError("unexpected table")
+        if table == "capture_requests":
+            table = "capture_groups"
         return connection.execute(
             f"SELECT COUNT(*) FROM {table}"
         ).fetchone()[0]

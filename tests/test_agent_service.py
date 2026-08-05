@@ -14,8 +14,8 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.central_client import CentralClientError
 from zdecision.sync.contracts import (
     ClaimedCaptureRequest,
-    RepositoryView,
 )
+from zdecision.central.decision_spaces import EnabledRepository
 
 try:
     from zdecision.agent.service import (
@@ -26,7 +26,7 @@ try:
         TerminalCaptureRequestError,
         configured_processor,
         load_agent_config,
-        mirror_repository_mappings,
+        mirror_enabled_repositories,
     )
 except ModuleNotFoundError as error:
     SERVICE_IMPORT_ERROR: ModuleNotFoundError | None = error
@@ -293,7 +293,7 @@ class AgentServiceTest(unittest.TestCase):
         self.assertTrue(lease_client.closed.is_set())
         self.assertEqual(["heartbeat", "fail"], client.calls)
 
-    def test_config_is_owner_only_and_mirrors_repository_mapping(self) -> None:
+    def test_config_is_owner_only_and_mirrors_enabled_repository(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "agent.json"
@@ -307,8 +307,6 @@ class AgentServiceTest(unittest.TestCase):
                         "repositories": [
                             {
                                 "repository_id": REPOSITORY_ID,
-                                "product_id": PRODUCT_ID,
-                                "product_name": "ZDecision",
                                 "enabled": True,
                             }
                         ],
@@ -320,13 +318,13 @@ class AgentServiceTest(unittest.TestCase):
             config = load_agent_config(path)
             database = AgentDatabase.open(root / "state.sqlite3")
             try:
-                mirror_repository_mappings(database, config)
-                mapping = database.get_repository_mapping(REPOSITORY_ID)
+                mirror_enabled_repositories(database, config)
+                mapping = database.get_enabled_repository(REPOSITORY_ID)
             finally:
                 database.close()
 
             self.assertIsInstance(config, AgentConfig)
-            self.assertEqual(PRODUCT_ID, mapping.product_id)
+            self.assertEqual(REPOSITORY_ID, mapping.repository_id)
             self.assertTrue(mapping.enabled)
 
             os.chmod(path, 0o644)
@@ -381,8 +379,6 @@ class AgentServiceTest(unittest.TestCase):
                         "repositories": [
                             {
                                 "repository_id": REPOSITORY_ID,
-                                "product_id": PRODUCT_ID,
-                                "product_name": "ZDecision",
                                 "enabled": True,
                             }
                         ],
@@ -435,8 +431,6 @@ class AgentServiceTest(unittest.TestCase):
                         "repositories": [
                             {
                                 "repository_id": REPOSITORY_ID,
-                                "product_id": PRODUCT_ID,
-                                "product_name": "ZDecision",
                                 "enabled": True,
                             }
                         ],
@@ -482,10 +476,8 @@ class AgentServiceTest(unittest.TestCase):
             device_id="device_demo",
             device_token="device-secret-token",
             repositories=(
-                RepositoryView(
+                EnabledRepository(
                     repository_id=REPOSITORY_ID,
-                    product_id=PRODUCT_ID,
-                    product_name="ZDecision",
                     enabled=True,
                 ),
             ),
@@ -515,6 +507,7 @@ class AgentServiceTest(unittest.TestCase):
             self.assertEqual(state_path, processor.control_store.path)
             processor.session_index.close()
             processor.request_state.close()
+            processor.routing_store.close()
             processor.control_store.close()
             processor.capture_runner.operation_store.close()
 

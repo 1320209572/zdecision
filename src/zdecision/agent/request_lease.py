@@ -161,6 +161,44 @@ class LeaseAwareCentralClient:
             lease_token, batch
         )
 
+    def plan_slices(self, group: object, selections: object):
+        self._lease_session.checkpoint()
+        return self._foreground.plan_slices(  # type: ignore[attr-defined,no-any-return]
+            group, selections
+        )
+
+    def upload_slice(self, group: object, batch: object):
+        self._lease_session.checkpoint()
+        return self._foreground.upload_slice(  # type: ignore[attr-defined,no-any-return]
+            group, batch
+        )
+
+    def complete_group(self, group: object, receipt_digest: str) -> None:
+        self._lease_session.checkpoint()
+        self._lease_session.quiesce()
+        request_id = group.request_id  # type: ignore[attr-defined]
+        lease_token = group.lease_token  # type: ignore[attr-defined]
+        try:
+            self._foreground.heartbeat(  # type: ignore[attr-defined]
+                request_id, lease_token
+            )
+        except Exception as error:
+            # Empty slice planning, or a lost completion response, can make
+            # the group terminal before the final heartbeat. The exact
+            # completion replay is authoritative in that case. If it also
+            # fails, delivery is uncertain and no later mutation is allowed.
+            try:
+                self._foreground.complete_group(  # type: ignore[attr-defined]
+                    group, receipt_digest
+                )
+            except Exception as completion_error:
+                self._lease_session.mark_uncertain(completion_error)
+                raise completion_error from error
+            return
+        self._foreground.complete_group(  # type: ignore[attr-defined]
+            group, receipt_digest
+        )
+
     def complete(
         self,
         request_id: str,

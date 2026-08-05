@@ -1,862 +1,418 @@
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
+from zdecision.agent.capture_routing import CaptureRoutingStore
+from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
-from zdecision.agent.events import (
-    AgentEvent,
-    HookInvocation,
-    RepositorySnapshot,
-    TestRepositoryMapping,
-    event_id_for,
-)
+from zdecision.agent.events import AgentEvent, HookInvocation, RepositorySnapshot, event_id_for
+from zdecision.agent.git_path_evidence import FrozenGitPathEvidence
+from zdecision.agent.request_state import RequestStateStore
+from zdecision.agent.session_index import SessionIndex
 from zdecision.app_server.models import FeasibilityModelProfile
 from zdecision.app_server.requested_capture import SessionCaptureResult
-from zdecision.capture.models import (
-    Candidate,
-    CandidateContent,
-    SourceCheckpoint,
-)
-from zdecision.capture.reconciliation import (
-    ReconciliationDecision,
-    apply_reconciliation,
-)
+from zdecision.capture.models import Candidate, CandidateContent, SourceCheckpoint
+from zdecision.capture.reconciliation import ReconciliationDecision, apply_reconciliation
+from zdecision.central.decision_spaces import EnabledRepository, RepositoryDecisionRoute
 from zdecision.ids import candidate_family_id
+from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
-    ClaimedCaptureRequest,
-    UploadReceipt,
+    CandidateOwnershipSnapshot,
+    CaptureSliceView,
+    ClaimedCaptureGroup,
+    SliceUploadReceipt,
 )
 
 
+NOW = datetime(2026, 8, 5, 5, 0, tzinfo=UTC)
 REQUEST_ID = "crq_" + "1" * 32
-SECOND_REQUEST_ID = "crq_" + "2" * 32
-REPOSITORY_ID = "repo_" + "3" * 32
-PRODUCT_ID = "prod_" + "4" * 32
-OTHER_REPOSITORY_ID = "repo_" + "9" * 32
-NOW = datetime(2026, 7, 31, 5, 0, tzinfo=UTC)
+REPOSITORY_ID = "repo_" + "2" * 32
 SESSION_ID = "019fb100-0000-7000-8000-000000000001"
-SECOND_SESSION_ID = "019fb100-0000-7000-8000-000000000004"
-TURN_1 = "019fb100-0000-7000-8000-000000000002"
-TURN_2 = "019fb100-0000-7000-8000-000000000003"
-SECOND_SESSION_TURN = "019fb100-0000-7000-8000-000000000005"
+TURN_ID = "019fb100-0000-7000-8000-000000000002"
 
 
-def claimed_request(
-    *,
-    capture_scope: str = "all_valid_sessions",
-    client_action_id: str = "web_action_001",
-) -> ClaimedCaptureRequest:
-    return ClaimedCaptureRequest(
-        request_id=REQUEST_ID,
-        repository_id=REPOSITORY_ID,
-        product_id=PRODUCT_ID,
-        product_name="ZDecision",
-        template_id="business",
-        capture_scope=capture_scope,  # type: ignore[arg-type]
-        client_action_id=client_action_id,
-        lease_token="lease_0123456789abcdef",
-        lease_expires_at="2026-07-31T05:00:30Z",
-    )
+class FakeGitPaths:
+    def __init__(self, evidence: FrozenGitPathEvidence) -> None:
+        self.evidence = evidence
+        self.calls = 0
 
-
-def stop_event(
-    cwd: str,
-    turn_id: str,
-    observed_at: str,
-    *,
-    session_id: str = SESSION_ID,
-) -> AgentEvent:
-    invocation = HookInvocation.from_dict(
-        {
-            "hook_event_name": "Stop",
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "cwd": cwd,
-        },
-        occurred_at=observed_at,
-        repository=RepositorySnapshot(
-            repository_id=REPOSITORY_ID,
-            worktree_root=cwd,
-            branch="main",
-            head_commit="a" * 40,
-        ),
-    )
-    return AgentEvent(
-        event_id=event_id_for(invocation),
-        invocation=invocation,
-        state="recorded",
-        failure_code=None,
-    )
-
-
-def observation(turn_id: str) -> Candidate:
-    return Candidate(
-        candidate_id="cand_" + "5" * 32 + "_01",
-        capture_id="cap_" + "5" * 32,
-        ordinal=1,
-        content=CandidateContent(
-            product="ZDecision",
-            claim="页面操作是 Candidate 采集授权边界。",
-            future_action="只处理页面请求冻结的 Session 边界。",
-            scope_summary="按需 Candidate 采集",
-            repositories=("zdecision",),
-            paths=(),
-            invalidation_conditions=("产品改变采集授权方式",),
-        ),
-        source=SourceCheckpoint(
-            thread_id=SESSION_ID,
-            turn_id=turn_id,
-        ),
-    )
+    def freeze(self, repository, sources):
+        self.calls += 1
+        return self.evidence
 
 
 class FakeCaptureRunner:
     def __init__(self) -> None:
-        self.call_count = 0
-        self.sweep_count = 0
-        self.error: Exception | None = None
-        self.resolve_error: Exception | None = None
-        self.after_freeze = None
-        self.resolve_calls: list[FeasibilityModelProfile | None] = []
-        self.run_profiles: list[FeasibilityModelProfile] = []
-        self.operation_profiles: dict[str, FeasibilityModelProfile] = {}
-        self.empty_observations = False
+        self.calls: list[str] = []
         self.profile = FeasibilityModelProfile.create(
             model_id="model-default",
             reasoning_effort="medium",
             discovery_digest="a" * 64,
-            discovered_at="2026-07-31T05:00:00Z",
+            discovered_at="2026-08-05T05:00:00Z",
         )
 
-    def operation_profile(self, source):
-        return self.operation_profiles.get(source.source_key)
+    def sweep_archives(self) -> None:
+        pass
+
+    def operation_profile(self, source, route_context):
+        return None
 
     def resolve_request_profile(self, profile):
-        self.resolve_calls.append(profile)
-        if self.resolve_error is not None:
-            raise self.resolve_error
         return self.profile if profile is None else profile
 
     def run(
         self,
         source,
         *,
-        product_name: str,
-        template_id: str,
-        model_profile: FeasibilityModelProfile,
+        route_context,
+        matched_paths,
+        template_id,
+        model_profile,
         heartbeat=None,
-    ) -> SessionCaptureResult:
-        self.call_count += 1
-        self.run_profiles.append(model_profile)
-        if self.error is not None:
-            raise self.error
-        if self.after_freeze is not None:
-            callback = self.after_freeze
-            self.after_freeze = None
-            callback()
+    ):
+        self.calls.append(route_context.decision_space_id)
+        seed = route_context.route_id[4]
+        observation = Candidate(
+            candidate_id="cand_" + seed * 32 + "_01",
+            capture_id="cap_" + seed * 32,
+            ordinal=1,
+            content=CandidateContent(
+                product=route_context.decision_space_name,
+                claim=f"Decision for {route_context.decision_space_name}",
+                future_action="Keep this leaf behavior stable.",
+                scope_summary="One routed Decision space",
+                repositories=(REPOSITORY_ID,),
+                paths=matched_paths,
+                invalidation_conditions=("The routed behavior changes.",),
+            ),
+            source=SourceCheckpoint(source.session_id, source.upper_turn_id),
+        )
         return SessionCaptureResult(
             status="completed",
             source_key=source.source_key,
-            capture_operation_id="cap_" + "5" * 32,
+            capture_operation_id=observation.capture_id,
             inventory_turn_id="inventory-turn",
             extraction_turn_id="extraction-turn",
-            observations=(
-                ()
-                if self.empty_observations
-                else (observation(source.upper_turn_id),)
-            ),
+            observations=(observation,),
             evidence_digest="b" * 64,
             model_profile=model_profile,
         )
 
-    def sweep_archives(self) -> None:
-        self.sweep_count += 1
-
 
 class FakeReconciliationRunner:
-    def __init__(self, request_state) -> None:
-        self.request_state = request_state
-        self.call_count = 0
-        self.sweep_count = 0
-        self.error: Exception | None = None
+    def sweep_archives(self) -> None:
+        pass
 
     def run(
         self,
         *,
         request_id,
+        slice_id,
         repository_id,
+        decision_space_id,
         cwd,
         observations,
         current,
         profile,
         heartbeat=None,
     ):
-        self.call_count += 1
-        if self.error is not None:
-            raise self.error
-        ordered = tuple(sorted(
-            observations, key=lambda item: item.candidate_id
-        ))
         decisions = tuple(
             ReconciliationDecision(
                 item.candidate_id,
                 "unrelated",
                 candidate_family_id(
-                    repository_id, item.candidate_id
+                    repository_id, decision_space_id, item.candidate_id
                 ),
                 None,
             )
-            for item in ordered
+            for item in observations
         )
-        result = apply_reconciliation(
-            repository_id, ordered, current, decisions
+        return apply_reconciliation(
+            repository_id,
+            decision_space_id,
+            observations,
+            current,
+            decisions,
         )
-        return result
-
-    def sweep_archives(self) -> None:
-        self.sweep_count += 1
 
 
 class FakeCentralClient:
-    def __init__(self) -> None:
-        self.upload_error: Exception | None = None
-        self.complete_error: Exception | None = None
+    def __init__(self, group: ClaimedCaptureGroup, views) -> None:
+        self.group = group
+        self.views = tuple(views)
         self.uploads = []
-        self.completed: list[str] = []
-        self.calls: list[str] = []
+        self.completed = []
+        self.fail_on_upload_number: int | None = None
+        self.corrupt_receipt = False
 
-    def start(self, request_id: str, lease_token: str) -> None:
-        self.calls.append("start")
+    def start(self, request_id, lease_token):
+        pass
 
-    def heartbeat(
-        self, request_id: str, lease_token: str
-    ) -> None:
-        self.calls.append("heartbeat")
+    def heartbeat(self, request_id, lease_token):
+        pass
 
-    def progress(
-        self, request_id: str, lease_token: str, code: str
-    ) -> None:
-        self.calls.append(code)
+    def progress(self, request_id, lease_token, code):
+        pass
 
-    def upload_candidates(self, lease_token: str, batch):
-        self.calls.append("upload")
+    def plan_slices(self, group, selections):
+        return self.views
+
+    def upload_slice(self, group, batch):
         self.uploads.append(batch)
-        if self.upload_error is not None:
-            raise self.upload_error
-        return UploadReceipt(
-            request_id=batch.request_id,
-            batch_digest=batch.batch_digest,
-            acknowledged_at="2026-07-31T05:00:10Z",
+        if self.fail_on_upload_number == len(self.uploads):
+            raise ConnectionError("offline")
+        core = {
+            "request_id": batch.request_id,
+            "slice_id": batch.slice_id,
+            "candidate_count": len(batch.items),
+            "batch_digest": batch.batch_digest,
+        }
+        receipt = SliceUploadReceipt(
+            batch.request_id,
+            batch.slice_id,
+            len(batch.items),
+            __import__("hashlib").sha256(canonical_json_bytes(core)).hexdigest(),
         )
+        if self.corrupt_receipt:
+            return SliceUploadReceipt(
+                receipt.request_id,
+                receipt.slice_id,
+                receipt.candidate_count,
+                "f" * 64,
+            )
+        return receipt
 
-    def complete(
-        self,
-        request_id: str,
-        lease_token: str,
-        batch_digest: str,
-    ) -> None:
-        self.calls.append("complete")
-        if self.complete_error is not None:
-            raise self.complete_error
-        self.completed.append(batch_digest)
+    def complete_group(self, group, receipt_digest):
+        self.completed.append(receipt_digest)
 
 
 class CaptureRequestProcessorTest(unittest.TestCase):
     def setUp(self) -> None:
-        temporary_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary_directory.cleanup)
-        self.root = Path(temporary_directory.name).resolve()
-        self.state_path = self.root / "state.sqlite3"
-        self.database = AgentDatabase.open(self.state_path)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.state = self.root / "state.sqlite3"
+        self.database = AgentDatabase.open(self.state)
         self.addCleanup(self.database.close)
-        self.database.put_test_repository_mapping(
-            TestRepositoryMapping(
-                repository_id=REPOSITORY_ID,
-                product_id=PRODUCT_ID,
-                product_name="ZDecision",
-                enabled=True,
-            )
+        self.database.put_enabled_repository(
+            EnabledRepository(REPOSITORY_ID, True)
         )
-        from zdecision.agent.control_bindings import ControlBindingStore
-        from zdecision.agent.request_state import RequestStateStore
-        from zdecision.agent.session_index import SessionIndex
-
-        self.session_index = SessionIndex.open(
-            self.root / "sessions.sqlite3"
+        repository = RepositorySnapshot(
+            REPOSITORY_ID, str(self.root), "main", "d" * 40
         )
+        invocation = HookInvocation.from_dict(
+            {
+                "hook_event_name": "Stop",
+                "session_id": SESSION_ID,
+                "turn_id": TURN_ID,
+                "cwd": str(self.root),
+            },
+            occurred_at="2026-08-05T05:00:00Z",
+            repository=repository,
+        )
+        event = AgentEvent(
+            event_id_for(invocation), invocation, "recorded", None
+        )
+        self.database.record_hook(invocation)
+        self.session_index = SessionIndex.open(self.state)
         self.addCleanup(self.session_index.close)
-        self.request_state = RequestStateStore.open(
-            self.root / "requests.sqlite3"
-        )
+        self.session_index.observe(event)
+        self.request_state = RequestStateStore.open(self.state)
         self.addCleanup(self.request_state.close)
-        self.control_store = ControlBindingStore.open(
-            self.root / "controls.sqlite3"
-        )
+        self.routing_store = CaptureRoutingStore.open(self.state)
+        self.addCleanup(self.routing_store.close)
+        self.control_store = ControlBindingStore.open(self.state)
         self.addCleanup(self.control_store.close)
-        self.capture_runner = FakeCaptureRunner()
-        self.reconciliation_runner = FakeReconciliationRunner(
-            self.request_state
+        self.routes = (
+            self.route("a", "packages/products/cloud", "dsp_" + "3" * 32),
+            self.route("b", "packages/shared/theme", "dsp_" + "4" * 32),
         )
-        try:
-            from zdecision.agent.capture_processor import (
-                OnDemandCaptureProcessor,
+        digest = __import__("hashlib").sha256(
+            canonical_json_bytes(
+                {"routes": [route.to_dict() for route in self.routes]}
             )
-        except ModuleNotFoundError as error:
-            self.fail(f"Capture Request processor is missing: {error}")
-        self.processor = OnDemandCaptureProcessor(
+        ).hexdigest()
+        self.group = ClaimedCaptureGroup(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            "business",
+            "all_valid_sessions",
+            "web_action_task_3",
+            self.routes,
+            digest,
+            "lease_0123456789abcdef",
+            "2026-08-05T05:00:30Z",
+        )
+        evidence = FrozenGitPathEvidence.create(
+            repository_id=REPOSITORY_ID,
+            head_commit="d" * 40,
+            commit_ranges=(),
+            paths=(
+                "packages/products/cloud/src/app.tsx",
+                "packages/shared/theme/src/index.ts",
+            ),
+        )
+        self.git_paths = FakeGitPaths(evidence)
+        self.capture_runner = FakeCaptureRunner()
+        self.reconciliation_runner = FakeReconciliationRunner()
+
+    def route(self, seed, prefix, decision_space_id):
+        return RepositoryDecisionRoute(
+            "drr_" + seed * 32,
+            REPOSITORY_ID,
+            decision_space_id,
+            (prefix,),
+            (),
+            True,
+            1,
+        )
+
+    def views(self):
+        from zdecision.ids import capture_slice_id
+
+        sources = self.session_index.freeze_sources(
+            REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        source_boundary_digest = __import__("hashlib").sha256(
+            canonical_json_bytes(
+                {
+                    "sources": [
+                        {
+                            "source_key": source.source_key,
+                            "source_fingerprint": source.source_fingerprint,
+                            "previous_handled_head_commit": (
+                                source.previous_handled_head_commit
+                            ),
+                            "upper_head_commit": source.upper_head_commit,
+                        }
+                        for source in sources
+                    ]
+                }
+            )
+        ).hexdigest()
+
+        return tuple(
+            CaptureSliceView(
+                REQUEST_ID,
+                capture_slice_id(REQUEST_ID, route.route_id, 1),
+                index,
+                CandidateOwnershipSnapshot(
+                    REPOSITORY_ID,
+                    route.route_id,
+                    1,
+                    route.decision_space_id,
+                    "product" if index == 0 else "shared_unit",
+                    "Cloud" if index == 0 else "theme",
+                    () if index == 0 else ("Shared",),
+                    route.path_prefixes[0],
+                    "prod_" + str(index + 5) * 32,
+                    "Cloud" if index == 0 else "Shared / packages/shared/theme",
+                    source_boundary_digest,
+                ),
+                "planned",
+            )
+            for index, route in enumerate(self.routes)
+        )
+
+    def processor(self):
+        from zdecision.agent.capture_processor import OnDemandCaptureProcessor
+
+        return OnDemandCaptureProcessor(
             database=self.database,
             session_index=self.session_index,
+            git_paths=self.git_paths,
+            routing_store=self.routing_store,
             capture_runner=self.capture_runner,
             reconciliation_runner=self.reconciliation_runner,
             request_state=self.request_state,
             control_store=self.control_store,
             clock=lambda: NOW,
         )
-        self.client = FakeCentralClient()
 
-    def observe_turn_1(self) -> None:
-        self.session_index.observe(
-            stop_event(
-                str(self.root),
-                TURN_1,
-                "2026-07-31T05:00:00Z",
-            )
+    def test_one_request_processes_two_independent_leaf_slices(self) -> None:
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        self.assertEqual(2, len(client.uploads))
+        self.assertEqual(
+            tuple(route.decision_space_id for route in self.routes),
+            tuple(self.capture_runner.calls),
         )
+        self.assertEqual(1, len(client.completed))
 
-    def choose_control(
-        self,
-        *,
-        control_id: str,
-        client_action_id: str,
-        repository_id: str = REPOSITORY_ID,
-        scope: str = "current_session",
-    ) -> None:
-        self.control_store.create_binding(
-            session_id=SESSION_ID,
-            render_turn_id=TURN_1,
-            cwd=str(self.root),
-            repository_id=repository_id,
-            product_id=PRODUCT_ID,
-            created_at=NOW,
-            expires_at=NOW + timedelta(minutes=15),
-            control_id=control_id,
-        )
-        self.control_store.choose_scope(
-            control_id,
-            expected_repository_id=repository_id,
-            scope=scope,  # type: ignore[arg-type]
-            proposed_client_action_id=client_action_id,
-            now=NOW,
-        )
+    def test_route_digest_mismatch_stops_before_git_or_model(self) -> None:
+        invalid = object.__new__(ClaimedCaptureGroup)
+        for name, value in self.group.__dict__.items():
+            object.__setattr__(invalid, name, value)
+        object.__setattr__(invalid, "route_snapshot_digest", "f" * 64)
 
-    def test_empty_result_checks_lease_immediately_before_local_commit(
-        self,
-    ) -> None:
-        original = self.request_state.commit_candidate_result
-
-        def checked_commit(request_id, result, batch):
-            self.assertEqual("heartbeat", self.client.calls[-1])
-            return original(request_id, result, batch)
-
-        with patch.object(
-            self.request_state,
-            "commit_candidate_result",
-            side_effect=checked_commit,
+        from zdecision.agent.service import TerminalCaptureRequestError
+        with self.assertRaisesRegex(
+            TerminalCaptureRequestError, "route_snapshot_mismatch"
         ):
-            self.processor.process(claimed_request(), self.client)
+            self.processor().process(
+                invalid, FakeCentralClient(invalid, self.views())
+            )
 
-    def test_checkpoint_advances_only_after_exact_upload_receipt(
-        self,
-    ) -> None:
-        from zdecision.agent.service import (
-            RetryableCaptureRequestError,
+        self.assertEqual(0, self.git_paths.calls)
+        self.assertEqual([], self.capture_runner.calls)
+
+    def test_no_route_match_completes_without_model(self) -> None:
+        self.git_paths.evidence = FrozenGitPathEvidence.create(
+            repository_id=REPOSITORY_ID,
+            head_commit="d" * 40,
+            commit_ranges=(),
+            paths=("docs/architecture.md",),
         )
+        client = FakeCentralClient(self.group, ())
 
-        self.observe_turn_1()
-        source = self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )[0]
-        self.client.upload_error = ConnectionError("offline")
+        self.processor().process(self.group, client)
 
+        self.assertEqual([], self.capture_runner.calls)
+        self.assertEqual([], client.completed)
+
+    def test_restart_after_one_receipt_skips_all_completed_model_work(self) -> None:
+        first = FakeCentralClient(self.group, self.views())
+        first.fail_on_upload_number = 2
+        from zdecision.agent.service import RetryableCaptureRequestError
         with self.assertRaises(RetryableCaptureRequestError):
-            self.processor.process(claimed_request(), self.client)
-        self.assertIsNone(
-            self.session_index.handled_turn(source.source_key)
-        )
-        self.assertEqual(1, len(self.capture_runner.resolve_calls))
-
-        self.client.upload_error = None
-        self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            TURN_1,
-            self.session_index.handled_turn(source.source_key),
-        )
-        self.assertEqual(1, self.capture_runner.call_count)
-        self.assertEqual(
-            1, self.reconciliation_runner.call_count
-        )
-        self.assertEqual(2, len(self.client.uploads))
-        self.assertEqual(1, len(self.capture_runner.resolve_calls))
-
-    def test_uploaded_receipt_resumes_completion_without_reupload(
-        self,
-    ) -> None:
-        from zdecision.agent.service import (
-            RetryableCaptureRequestError,
-        )
-
-        self.observe_turn_1()
-        self.client.complete_error = ConnectionError("offline")
-        with self.assertRaises(RetryableCaptureRequestError):
-            self.processor.process(claimed_request(), self.client)
-        self.client.complete_error = None
-
-        self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(1, self.capture_runner.call_count)
-        self.assertEqual(1, len(self.client.uploads))
-        self.assertEqual(2, self.client.calls.count("complete"))
-
-    def test_activity_after_freeze_waits_for_the_next_click(
-        self,
-    ) -> None:
-        self.observe_turn_1()
-        self.capture_runner.after_freeze = lambda: (
-            self.session_index.observe(
-                stop_event(
-                    str(self.root),
-                    TURN_2,
-                    "2026-07-31T05:01:00Z",
-                )
-            )
-        )
-
-        self.processor.process(claimed_request(), self.client)
-        next_sources = self.session_index.freeze_sources(
-            SECOND_REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )
-
-        self.assertEqual(1, len(next_sources))
-        self.assertEqual(TURN_2, next_sources[0].upper_turn_id)
-        self.assertEqual(
-            TURN_1, next_sources[0].previous_handled_turn_id
-        )
-
-    def test_mapping_mismatch_fails_before_model_work(self) -> None:
-        from zdecision.agent.service import (
-            TerminalCaptureRequestError,
-        )
-
-        self.observe_turn_1()
-        self.database.put_test_repository_mapping(
-            TestRepositoryMapping(
-                repository_id=REPOSITORY_ID,
-                product_id="prod_" + "f" * 32,
-                product_name="Wrong Product",
-                enabled=True,
-            )
-        )
-
-        with self.assertRaises(TerminalCaptureRequestError):
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(0, self.capture_runner.call_count)
-        self.assertEqual(
-            0, self.reconciliation_runner.call_count
-        )
-
-    def test_disposable_attempt_failure_is_explicitly_retryable(self) -> None:
-        from zdecision.agent.service import (
-            RetryableCaptureRequestError,
-        )
-        from zdecision.app_server.requested_capture import (
-            CaptureAttemptRetryable,
-        )
-
-        self.observe_turn_1()
-        self.capture_runner.error = CaptureAttemptRetryable(
-            "retry whole attempt"
-        )
-
-        with self.assertRaises(
-            RetryableCaptureRequestError
-        ) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            "capture_attempt_retryable", raised.exception.code
-        )
-
-    def test_missing_frozen_boundary_is_explicitly_terminal(self) -> None:
-        from zdecision.agent.service import (
-            TerminalCaptureRequestError,
-        )
-        from zdecision.app_server.requested_capture import (
-            SourceBoundaryUnavailable,
-        )
-
-        self.observe_turn_1()
-        self.capture_runner.error = SourceBoundaryUnavailable(
-            "missing"
-        )
-
-        with self.assertRaises(
-            TerminalCaptureRequestError
-        ) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            "source_boundary_unavailable", raised.exception.code
-        )
-
-    def test_reconciliation_generation_failure_is_retryable(self) -> None:
-        from zdecision.agent.service import (
-            RetryableCaptureRequestError,
-        )
-        from zdecision.app_server.reconciliation_runner import (
-            ReconciliationAttemptRetryable,
-        )
-
-        self.observe_turn_1()
-        self.reconciliation_runner.error = (
-            ReconciliationAttemptRetryable("retry")
-        )
-
-        with self.assertRaises(
-            RetryableCaptureRequestError
-        ) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            "reconciliation_attempt_retryable",
-            raised.exception.code,
-        )
-
-    def test_archive_sweep_runs_before_request_processing(self) -> None:
-        self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(1, self.capture_runner.sweep_count)
-        self.assertEqual(1, self.reconciliation_runner.sweep_count)
-
-    def test_candidate_result_and_outbox_use_one_commit_entrypoint(
-        self,
-    ) -> None:
-        self.observe_turn_1()
-        with patch.object(
-            self.request_state,
-            "commit_candidate_result",
-            wraps=self.request_state.commit_candidate_result,
-        ) as commit:
-            self.processor.process(claimed_request(), self.client)
-
-        commit.assert_called_once()
-
-    def test_no_changed_source_uploads_canonical_empty_batch(
-        self,
-    ) -> None:
-        self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(1, len(self.client.uploads))
-        self.assertEqual((), self.client.uploads[0].items)
-        self.assertEqual(0, self.capture_runner.call_count)
-        self.assertEqual([], self.capture_runner.resolve_calls)
-        self.assertEqual(
-            self.client.uploads[0].batch_digest,
-            self.client.completed[0],
-        )
-
-    def test_committed_reconciliation_replay_skips_profile_resolution(
-        self,
-    ) -> None:
-        self.observe_turn_1()
-        self.processor.process(claimed_request(), self.client)
-        self.assertEqual(1, len(self.capture_runner.resolve_calls))
-
-        with patch.object(
-            self.request_state,
-            "staged_batch",
-            return_value=None,
-        ):
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(1, len(self.capture_runner.resolve_calls))
-        self.assertEqual(1, self.capture_runner.call_count)
-
-    def test_two_changed_sources_share_one_request_profile(self) -> None:
-        self.observe_turn_1()
-        self.session_index.observe(
-            stop_event(
-                str(self.root),
-                SECOND_SESSION_TURN,
-                "2026-07-31T05:00:01Z",
-                session_id=SECOND_SESSION_ID,
-            )
-        )
-        self.capture_runner.empty_observations = True
-
-        self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual([None], self.capture_runner.resolve_calls)
-        self.assertEqual(2, len(self.capture_runner.run_profiles))
+            self.processor().process(self.group, first)
         self.assertTrue(
-            all(
-                profile is self.capture_runner.profile
-                for profile in self.capture_runner.run_profiles
+            self.request_state.has_receipt(
+                REQUEST_ID, self.views()[0].slice_id
             )
         )
+        calls_before = tuple(self.capture_runner.calls)
 
-    def test_pre_amendment_request_resolves_and_stores_profile_once(self) -> None:
-        self.observe_turn_1()
-        self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )
-        self.assertIsNone(
-            self.session_index.request_model_profile(REQUEST_ID)
-        )
+        second = FakeCentralClient(self.group, self.views())
+        self.processor().process(self.group, second)
 
-        self.processor.process(claimed_request(), self.client)
+        self.assertEqual(calls_before, tuple(self.capture_runner.calls))
+        self.assertEqual(1, len(second.uploads))
+        self.assertEqual(self.views()[1].slice_id, second.uploads[0].slice_id)
 
-        self.assertEqual([None], self.capture_runner.resolve_calls)
-        self.assertEqual(
-            self.capture_runner.profile,
-            self.session_index.request_model_profile(REQUEST_ID),
-        )
-
-    def test_existing_operation_profile_seeds_remaining_sources(self) -> None:
-        self.observe_turn_1()
-        self.session_index.observe(
-            stop_event(
-                str(self.root),
-                SECOND_SESSION_TURN,
-                "2026-07-31T05:00:01Z",
-                session_id=SECOND_SESSION_ID,
-            )
-        )
-        sources = self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )
-        self.capture_runner.operation_profiles[sources[0].source_key] = (
-            self.capture_runner.profile
-        )
-        self.capture_runner.empty_observations = True
-
-        self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            [self.capture_runner.profile],
-            self.capture_runner.resolve_calls,
-        )
-        self.assertEqual(
-            [self.capture_runner.profile, self.capture_runner.profile],
-            self.capture_runner.run_profiles,
-        )
-
-    def test_mixed_operation_profiles_fail_before_model_work(self) -> None:
+    def test_receipt_must_bind_the_exact_staged_slice_batch(self) -> None:
+        client = FakeCentralClient(self.group, self.views())
+        client.corrupt_receipt = True
         from zdecision.agent.service import TerminalCaptureRequestError
 
-        self.observe_turn_1()
-        self.session_index.observe(
-            stop_event(
-                str(self.root),
-                SECOND_SESSION_TURN,
-                "2026-07-31T05:00:01Z",
-                session_id=SECOND_SESSION_ID,
-            )
-        )
-        sources = self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )
-        other_profile = FeasibilityModelProfile.create(
-            model_id="model-other",
-            reasoning_effort="medium",
-            discovery_digest="c" * 64,
-            discovered_at="2026-07-31T05:00:00Z",
-        )
-        self.capture_runner.operation_profiles = {
-            sources[0].source_key: self.capture_runner.profile,
-            sources[1].source_key: other_profile,
-        }
-
-        with self.assertRaises(TerminalCaptureRequestError) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual("model_profile_mismatch", raised.exception.code)
-        self.assertEqual([], self.capture_runner.resolve_calls)
-        self.assertEqual(0, self.capture_runner.call_count)
-
-    def test_unavailable_frozen_profile_is_terminal(self) -> None:
-        from zdecision.agent.service import TerminalCaptureRequestError
-        from zdecision.app_server.requested_capture import FrozenModelUnavailable
-
-        self.observe_turn_1()
-        self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )
-        self.session_index.freeze_request_model_profile(
-            REQUEST_ID, self.capture_runner.profile
-        )
-        self.capture_runner.resolve_error = FrozenModelUnavailable(
-            "removed"
-        )
-
-        with self.assertRaises(TerminalCaptureRequestError) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            "frozen_model_unavailable", raised.exception.code
-        )
-
-    def test_corrupt_private_request_profile_fails_closed(self) -> None:
-        from zdecision.agent.service import TerminalCaptureRequestError
-
-        self.observe_turn_1()
-        self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )
-        with sqlite3.connect(self.root / "sessions.sqlite3") as connection:
-            connection.execute(
-                """
-                UPDATE capture_request_freezes
-                SET model_profile_json = 'not-json'
-                WHERE request_id = ?
-                """,
-                (REQUEST_ID,),
-            )
-
-        with self.assertRaises(TerminalCaptureRequestError) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual(
-            "local_capture_state_invalid", raised.exception.code
-        )
-
-    def test_request_and_operation_profile_conflict_is_terminal(self) -> None:
-        from zdecision.agent.service import TerminalCaptureRequestError
-
-        self.observe_turn_1()
-        source = self.session_index.freeze_sources(
-            REQUEST_ID,
-            REPOSITORY_ID,
-            NOW,
-            capture_scope="all_valid_sessions",
-        )[0]
-        self.session_index.freeze_request_model_profile(
-            REQUEST_ID, self.capture_runner.profile
-        )
-        self.capture_runner.operation_profiles[source.source_key] = (
-            FeasibilityModelProfile.create(
-                model_id="model-other",
-                reasoning_effort="medium",
-                discovery_digest="c" * 64,
-                discovered_at="2026-07-31T05:00:00Z",
-            )
-        )
-
-        with self.assertRaises(TerminalCaptureRequestError) as raised:
-            self.processor.process(claimed_request(), self.client)
-
-        self.assertEqual("model_profile_mismatch", raised.exception.code)
-        self.assertEqual([], self.capture_runner.resolve_calls)
-
-    def test_current_session_requires_a_private_action_binding_before_start(
-        self,
-    ) -> None:
-        from zdecision.agent.service import TerminalCaptureRequestError
-
-        request = claimed_request(
-            capture_scope="current_session",
-            client_action_id="codex_action_missing",
-        )
-
-        with self.assertRaises(TerminalCaptureRequestError) as raised:
-            self.processor.process(request, self.client)
-
-        self.assertEqual("current_session_intent_missing", raised.exception.code)
-        self.assertEqual([], self.client.calls)
-        self.assertEqual(0, self.capture_runner.call_count)
-        self.assertEqual(0, self.reconciliation_runner.call_count)
-
-    def test_current_session_rejects_repository_or_scope_binding_mismatch(
-        self,
-    ) -> None:
-        from zdecision.agent.service import TerminalCaptureRequestError
-
-        cases = (
-            (
-                "ctl_" + "1" * 32,
-                "codex_action_wrong_repository",
-                OTHER_REPOSITORY_ID,
-                "current_session",
-            ),
-            (
-                "ctl_" + "2" * 32,
-                "codex_action_wrong_scope",
-                REPOSITORY_ID,
-                "all_valid_sessions",
-            ),
-        )
-        for control_id, action_id, repository_id, scope in cases:
-            with self.subTest(scope=scope, repository_id=repository_id):
-                self.choose_control(
-                    control_id=control_id,
-                    client_action_id=action_id,
-                    repository_id=repository_id,
-                    scope=scope,
-                )
-                with self.assertRaises(TerminalCaptureRequestError) as raised:
-                    self.processor.process(
-                        claimed_request(
-                            capture_scope="current_session",
-                            client_action_id=action_id,
-                        ),
-                        self.client,
-                    )
-                self.assertEqual(
-                    "current_session_intent_mismatch", raised.exception.code
-                )
-                self.assertEqual([], self.client.calls)
-                self.assertEqual(0, self.capture_runner.call_count)
-                self.assertEqual(0, self.reconciliation_runner.call_count)
-
-    def test_all_valid_page_request_never_reads_private_action_binding(
-        self,
-    ) -> None:
-        with patch.object(
-            self.control_store,
-            "get_by_client_action_id",
-            side_effect=AssertionError("page request must not read a control"),
+        with self.assertRaisesRegex(
+            TerminalCaptureRequestError, "local_delivery_conflict"
         ):
-            self.processor.process(claimed_request(), self.client)
+            self.processor().process(self.group, client)
 
-        self.assertEqual(1, len(self.client.uploads))
-        self.assertEqual((), self.client.uploads[0].items)
+        self.assertFalse(
+            self.request_state.has_receipt(
+                REQUEST_ID, self.views()[0].slice_id
+            )
+        )
 
 
 if __name__ == "__main__":

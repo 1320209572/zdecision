@@ -80,15 +80,17 @@ class LocalMcpTools:
 
     def zdecision_status(self) -> dict[str, object]:
         snapshot = RepositoryResolver().resolve(self.cwd)
-        mapping = (
+        repository = (
             None
             if snapshot is None
-            else self.database.get_repository_mapping(snapshot.repository_id)
+            else self.database.get_enabled_repository(snapshot.repository_id)
         )
         boundary = self.database.latest_open_boundary(self.cwd)
         return {
-            "repository_registered": mapping is not None,
-            "repository_enabled": bool(mapping is not None and mapping.enabled),
+            "repository_registered": repository is not None,
+            "repository_enabled": bool(
+                repository is not None and repository.enabled
+            ),
             "event_count": self.database.count_events(cwd=self.cwd),
             "active_session_bound": boundary is not None,
         }
@@ -330,15 +332,12 @@ class LocalMcpTools:
                 and os.path.normpath(binding.cwd) != self.cwd
             ):
                 return None
-            mapping = self.database.get_repository_mapping(
+            repository = self.database.get_enabled_repository(
                 binding.repository_id
             )
-            if mapping is None or not mapping.enabled:
+            if repository is None or not repository.enabled:
                 return None
-            if (
-                binding.repository_id != mapping.repository_id
-                or binding.product_id != mapping.product_id
-            ):
+            if binding.repository_id != repository.repository_id:
                 return None
             if binding.chosen_scope is not None:
                 return binding
@@ -514,7 +513,6 @@ def _request_matches_binding(
     return bool(
         isinstance(view, CaptureRequestView)
         and view.repository_id == binding.repository_id
-        and view.product_id == binding.product_id
         and view.template_id == "business"
     )
 

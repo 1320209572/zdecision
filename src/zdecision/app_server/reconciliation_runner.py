@@ -65,7 +65,9 @@ class ReconciliationRunner:
         self,
         *,
         request_id: str,
+        slice_id: str,
         repository_id: str,
+        decision_space_id: str,
         cwd: str,
         observations: tuple[Candidate, ...],
         current: tuple[CandidateFamilyRevision, ...],
@@ -98,6 +100,19 @@ class ReconciliationRunner:
             )
         self.sweep_archives()
 
+        persisted = self.request_state.slice_reconciliation(
+            request_id, slice_id
+        )
+        if persisted is not None:
+            if (
+                persisted.repository_id != repository_id
+                or persisted.decision_space_id != decision_space_id
+            ):
+                raise ReconciliationRunnerError(
+                    "Persisted slice reconciliation identity conflicts"
+                )
+            return persisted
+
         ordered = tuple(sorted(
             observations, key=lambda item: item.candidate_id
         ))
@@ -107,54 +122,34 @@ class ReconciliationRunner:
         if len(set(observation_ids)) != len(observation_ids):
             raise ValueError("observations contain duplicate ids")
         if not ordered:
-            persisted = self.request_state.get_reconciliation(request_id)
-            empty = ReconciliationResult.empty(repository_id)
-            if persisted is not None and persisted != empty:
-                raise ReconciliationRunnerError(
-                    "Empty reconciliation conflicts with persisted result"
-                )
-            return empty
+            empty = ReconciliationResult.empty(
+                repository_id, decision_space_id
+            )
+            return self.request_state.store_slice_reconciliation(
+                request_id, slice_id, empty
+            )
 
         proposed_family_ids = tuple(
-            candidate_family_id(repository_id, item.candidate_id)
+            candidate_family_id(
+                repository_id, decision_space_id, item.candidate_id
+            )
             for item in ordered
         )
         prompt = self.render_prompt(
             repository_id,
+            decision_space_id,
             ordered,
             proposed_family_ids,
             current,
         )
-        input_digest = _input_digest(
-            repository_id=repository_id,
-            observations=ordered,
-            current=current,
-            prompt=prompt,
-            profile=profile,
-        )
-        attempt = self.request_state.begin_reconciliation_attempt(
-            request_id, input_digest, _now()
-        )
-        if attempt.state in ("validated", "accepted"):
-            return self.request_state.commit_reconciliation_attempt(
-                attempt.attempt_id
-            )
-
         try:
             thread_id = self.gateway.start_disposable_thread(
                 cwd, profile
             )
         except (AppServerError, AppServerGatewayError) as error:
-            self._abandon(
-                attempt.attempt_id,
-                _attempt_failure_code("thread", error),
-            )
             raise ReconciliationAttemptRetryable(
                 "Disposable reconciliation Thread must be retried"
             ) from error
-        self.request_state.attach_reconciliation_thread(
-            attempt.attempt_id, thread_id
-        )
 
         try:
             _heartbeat(heartbeat)
@@ -175,14 +170,15 @@ class ReconciliationRunner:
             )
             _heartbeat(heartbeat)
             _verify_receipt(receipt, thread_id, profile)
-            self.request_state.attach_reconciliation_turn(
-                attempt.attempt_id, receipt.turn_id
-            )
             decisions = validate_reconciliation(
                 receipt.structured_output, ordered, current
             )
             result = apply_reconciliation(
-                repository_id, ordered, current, decisions
+                repository_id,
+                decision_space_id,
+                ordered,
+                current,
+                decisions,
             )
         except (
             AppServerError,
@@ -190,24 +186,41 @@ class ReconciliationRunner:
             ReconciliationRunnerError,
             ValueError,
         ) as error:
-            self._abandon(
-                attempt.attempt_id,
-                _attempt_failure_code("turn", error),
-            )
+            try:
+                self.gateway.archive_thread(thread_id)
+            except (AppServerError, AppServerGatewayError):
+                pass
             raise ReconciliationAttemptRetryable(
                 "Disposable reconciliation Turn must be retried"
             ) from error
 
-        self.request_state.store_validated_reconciliation(
-            attempt.attempt_id, result, _now()
+        result = self.request_state.store_slice_reconciliation(
+            request_id,
+            slice_id,
+            result,
+            archive_thread_id=thread_id,
         )
-        winner = self.request_state.commit_reconciliation_attempt(
-            attempt.attempt_id
-        )
-        self.sweep_archives()
-        return winner
+        try:
+            self.gateway.archive_thread(thread_id)
+        except (AppServerError, AppServerGatewayError):
+            pass
+        else:
+            self.request_state.mark_slice_reconciliation_archived(
+                request_id, slice_id, thread_id
+            )
+        return result
 
     def sweep_archives(self) -> None:
+        for request_id, slice_id, thread_id in (
+            self.request_state.pending_slice_reconciliation_archives()
+        ):
+            try:
+                self.gateway.archive_thread(thread_id)
+            except (AppServerError, AppServerGatewayError):
+                continue
+            self.request_state.mark_slice_reconciliation_archived(
+                request_id, slice_id, thread_id
+            )
         for attempt in (
             self.request_state.pending_reconciliation_archives()
         ):
@@ -229,6 +242,7 @@ class ReconciliationRunner:
     def render_prompt(
         self,
         repository_id: str,
+        decision_space_id: str,
         observations: tuple[Candidate, ...],
         proposed_family_ids: tuple[str, ...],
         current: tuple[CandidateFamilyRevision, ...],
@@ -248,6 +262,7 @@ class ReconciliationRunner:
         )
         data = {
             "repository_id": repository_id,
+            "decision_space_id": decision_space_id,
             "current_families": [
                 item.to_dict() for item in current
             ],

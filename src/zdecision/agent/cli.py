@@ -198,7 +198,7 @@ def _run_service_command(
         AgentServiceConfigError,
         configured_processor,
         load_agent_config,
-        mirror_repository_mappings,
+        mirror_enabled_repositories,
     )
 
     try:
@@ -223,7 +223,7 @@ def _run_service_command(
         )
         database = AgentDatabase.open(state_path)
         try:
-            mirror_repository_mappings(database, config)
+            mirror_enabled_repositories(database, config)
             if arguments.service_action == "install":
                 executable = shutil.which("zdecision-agent")
                 if executable is None:

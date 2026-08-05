@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import sqlite3
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.capture.on_demand import (
     FrozenCaptureInput,
+    FrozenCaptureRouteContext,
     ValidatedCaptureResult,
 )
 from zdecision.capture.templates import TemplateCatalog
@@ -18,6 +20,20 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_ROOT = REPOSITORY_ROOT / "decision-templates"
 ENVELOPE_ROOT = REPOSITORY_ROOT / "src" / "zdecision" / "capture" / "prompt_contracts"
 NOW = "2026-07-31T08:00:00Z"
+
+
+def route_context(**overrides: object) -> FrozenCaptureRouteContext:
+    values: dict[str, object] = {
+        "decision_space_id": "dsp_" + "8" * 32,
+        "decision_space_kind": "product",
+        "decision_space_name": "ZDecision",
+        "route_id": "drr_" + "9" * 32,
+        "route_configuration_version": 1,
+        "compatibility_product_id": "prod_" + "a" * 32,
+        "matched_path_digest": "b" * 64,
+    }
+    values.update(overrides)
+    return FrozenCaptureRouteContext(**values)
 
 
 def valid_candidate(claim: str = "Only page requests authorize capture.") -> dict[str, object]:
@@ -59,7 +75,9 @@ def frozen_input(**overrides: object) -> FrozenCaptureInput:
         "model_discovery_digest": "7" * 64,
         "model_discovered_at": "2026-07-31T07:59:00Z",
         "protocol_revision": "extractor-v3",
+        "route_context": route_context(),
     }
+    values["protocol_revision"] = "extractor-v4"
     values.update(overrides)
     return FrozenCaptureInput.create(**values)
 
@@ -83,7 +101,7 @@ class FrozenCaptureInputTests(unittest.TestCase):
         replay = frozen_input()
 
         self.assertEqual(first.operation_id, replay.operation_id)
-        self.assertEqual(3, first.record_version)
+        self.assertEqual(4, first.record_version)
 
         changes: tuple[dict[str, object], ...] = (
             {"request_id": "crq_" + "8" * 32},
@@ -107,7 +125,12 @@ class FrozenCaptureInputTests(unittest.TestCase):
             {"reasoning_effort": "high"},
             {"model_discovery_digest": "8" * 64},
             {"model_discovered_at": "2026-07-31T08:00:00Z"},
-            {"protocol_revision": "extractor-v3-test"},
+            {"protocol_revision": "extractor-v4-test"},
+            {
+                "route_context": route_context(
+                    decision_space_id="dsp_" + "c" * 32
+                )
+            },
         )
         for change in changes:
             with self.subTest(change=tuple(change)):
@@ -160,6 +183,48 @@ class CaptureOperationStoreTests(unittest.TestCase):
                 frozen.request_id, frozen.source_key
             ),
         )
+
+    def test_old_source_unique_migrates_for_two_leaf_operations(self) -> None:
+        legacy_path = Path(self.temporary_directory.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE capture_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    frozen_json TEXT NOT NULL,
+                    frozen_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    active_generation INTEGER NOT NULL,
+                    winner_generation INTEGER,
+                    committed_result_json TEXT,
+                    committed_result_digest TEXT,
+                    failure_code TEXT,
+                    UNIQUE(request_id, source_key)
+                )
+                """
+            )
+        connection.close()
+
+        migrated = CaptureOperationStore.open(legacy_path)
+        self.addCleanup(migrated.close)
+        first = frozen_input()
+        second = frozen_input(
+            route_context=route_context(
+                decision_space_id="dsp_" + "c" * 32,
+                route_id="drr_" + "d" * 32,
+            )
+        )
+
+        migrated.ensure_operation(first)
+        migrated.ensure_operation(second)
+
+        rows = migrated._connection.execute(
+            "SELECT operation_id FROM capture_operations"
+        ).fetchall()
+        self.assertEqual(2, len(rows))
 
     def test_attempt_generations_increase_monotonically(self) -> None:
         operation = self.store.ensure_operation(frozen_input())

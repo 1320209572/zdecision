@@ -15,15 +15,14 @@ from typing import Protocol
 
 from zdecision.agent.central_client import CentralClient, CentralClientError
 from zdecision.agent.db import AgentDatabase
-from zdecision.agent.events import TestRepositoryMapping
+from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.agent.request_lease import (
     LeaseAwareCentralClient,
     RequestLeaseSession,
 )
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_RENEW_INTERVAL_SECONDS,
-    ClaimedCaptureRequest,
-    RepositoryView,
+    ClaimedCaptureGroup,
 )
 
 
@@ -56,7 +55,7 @@ class TerminalCaptureRequestError(_CaptureRequestError):
 class CaptureRequestProcessor(Protocol):
     def process(
         self,
-        request: ClaimedCaptureRequest,
+        request: ClaimedCaptureGroup,
         client: object,
     ) -> None: ...
 
@@ -67,7 +66,7 @@ class AgentConfig:
     organization_id: str
     device_id: str
     device_token: str
-    repositories: tuple[RepositoryView, ...]
+    repositories: tuple[EnabledRepository, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -90,7 +89,7 @@ class AgentConfig:
             not isinstance(self.repositories, tuple)
             or not 1 <= len(self.repositories) <= 100
             or any(
-                not isinstance(item, RepositoryView)
+                not isinstance(item, EnabledRepository)
                 for item in self.repositories
             )
         ):
@@ -219,14 +218,14 @@ def load_agent_config(path: Path) -> AgentConfig:
             device_id=value["device_id"],
             device_token=value["device_token"],
             repositories=tuple(
-                RepositoryView.from_dict(item) for item in raw_repositories
+                EnabledRepository.from_dict(item) for item in raw_repositories
             ),
         )
     except (TypeError, ValueError) as error:
         raise AgentServiceConfigError("agent_config_invalid") from error
 
 
-def mirror_repository_mappings(
+def mirror_enabled_repositories(
     database: AgentDatabase,
     config: AgentConfig,
 ) -> None:
@@ -235,14 +234,7 @@ def mirror_repository_mappings(
     if not isinstance(config, AgentConfig):
         raise TypeError("config must be an AgentConfig")
     for repository in config.repositories:
-        database.put_test_repository_mapping(
-            TestRepositoryMapping(
-                repository_id=repository.repository_id,
-                product_id=repository.product_id,
-                product_name=repository.product_name,
-                enabled=repository.enabled,
-            )
-        )
+        database.put_enabled_repository(repository)
 
 
 def configured_processor(
@@ -262,7 +254,9 @@ def configured_processor(
     from zdecision.agent.capture_operation_store import (
         CaptureOperationStore,
     )
+    from zdecision.agent.capture_routing import CaptureRoutingStore
     from zdecision.agent.control_bindings import ControlBindingStore
+    from zdecision.agent.git_path_evidence import GitPathEvidenceReader
     from zdecision.agent.request_state import RequestStateStore
     from zdecision.agent.session_index import SessionIndex
     from zdecision.app_server.gateway import AppServerGateway
@@ -280,6 +274,7 @@ def configured_processor(
     session_index = SessionIndex.open(local_state_path)
     operation_store = CaptureOperationStore.open(local_state_path)
     request_state = RequestStateStore.open(local_state_path)
+    routing_store = CaptureRoutingStore.open(local_state_path)
     control_store = ControlBindingStore.open(local_state_path)
     database.retire_legacy_automatic_capture()
     gateway = None
@@ -292,6 +287,8 @@ def configured_processor(
         return OnDemandCaptureProcessor(
             database=database,
             session_index=session_index,
+            git_paths=GitPathEvidenceReader(),
+            routing_store=routing_store,
             capture_runner=RequestedCaptureRunner(
                 gateway=gateway,
                 operation_store=operation_store,
@@ -308,6 +305,7 @@ def configured_processor(
     except Exception:
         session_index.close()
         request_state.close()
+        routing_store.close()
         operation_store.close()
         control_store.close()
         close_gateway = getattr(gateway, "close", None)

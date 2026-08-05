@@ -13,6 +13,7 @@ from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import HookInvocation, HookResponse, InvalidHookInvocation
 from zdecision.agent.repository import RepositoryResolver
+from zdecision.ids import product_id
 
 
 INVALID_HOOK_OUTPUT = {"systemMessage": "ZDecision ignored an invalid hook event."}
@@ -56,8 +57,8 @@ def handle_hook(
         repository = resolver.resolve(unbound.cwd)
         if repository is None:
             return HookResponse(event_id="", output={})
-        mapping = database.get_repository_mapping(repository.repository_id)
-        if mapping is None or not mapping.enabled:
+        enabled = database.get_enabled_repository(repository.repository_id)
+        if enabled is None or not enabled.enabled:
             return HookResponse(event_id="", output={})
         invocation = HookInvocation.from_dict(
             value,
@@ -125,9 +126,10 @@ def handle_control_binding_hook(
         repository = (repository_resolver or RepositoryResolver()).resolve(cwd_value)
         if repository is None:
             raise ValueError("repository is unresolved")
-        mapping = database.get_repository_mapping(repository.repository_id)
-        if mapping is None or not mapping.enabled:
+        enabled = database.get_enabled_repository(repository.repository_id)
+        if enabled is None or not enabled.enabled:
             raise ValueError("repository is not enabled")
+        mapping = database.get_repository_mapping(repository.repository_id)
         if not database.has_open_observed_turn(session_id, turn_id, cwd_value):
             raise ValueError("host turn was not observed")
         created_at = _parse_time(_format_time(clock()))
@@ -145,7 +147,13 @@ def handle_control_binding_hook(
             render_turn_id=turn_id,
             cwd=cwd_value,
             repository_id=repository.repository_id,
-            product_id=mapping.product_id,
+            # Kept only for the archive-compatible binding schema. Active
+            # refresh authorization is repository-scoped.
+            product_id=(
+                mapping.product_id
+                if mapping is not None
+                else product_id(f"Repository {repository.repository_id}")
+            ),
             created_at=created_at,
             expires_at=created_at + timedelta(minutes=15),
             control_id=control_id,

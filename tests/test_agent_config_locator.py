@@ -42,8 +42,6 @@ class AgentConfigLocatorTests(unittest.TestCase):
                     "repositories": [
                         {
                             "repository_id": "repo_" + "2" * 32,
-                            "product_id": "prod_" + "3" * 32,
-                            "product_name": "ZDecision",
                             "enabled": True,
                         }
                     ],

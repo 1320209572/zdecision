@@ -19,6 +19,7 @@ from zdecision.app_server.models import (
     FeasibilityModelProfile,
     SourceBoundary,
 )
+from zdecision.capture.on_demand import FrozenCaptureRouteContext
 from zdecision.capture.templates import TemplateCatalog
 
 
@@ -30,6 +31,7 @@ ENVELOPE_ROOT = (
 REQUEST_ID = "crq_11111111111111111111111111111111"
 SOURCE_SESSION = "019fb100-0000-7000-8000-000000000001"
 SOURCE_TURN = "019fb100-0000-7000-8000-000000000002"
+MATCHED_PATHS = ("packages/shared/theme/src/index.ts",)
 
 
 class FakeGateway:
@@ -74,6 +76,7 @@ class FakeGateway:
         self.drop_first_extraction_result = False
         self.archive_failures_remaining = 0
         self.archived_threads: list[str] = []
+        self.prompts: list[str] = []
 
     def list_interactive_thread_ids(self, cwd: str) -> frozenset[str]:
         if cwd != self.cwd:
@@ -130,6 +133,7 @@ class FakeGateway:
         profile: FeasibilityModelProfile,
         cwd: str,
     ) -> AppServerTurnReceipt:
+        self.prompts.append(prompt)
         properties = output_schema.get("properties", {})
         if "signals" in properties:
             stage = "inventory"
@@ -201,11 +205,27 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
             upper_turn_id=SOURCE_TURN,
             source_fingerprint="5" * 64,
         )
+        self.route_context = FrozenCaptureRouteContext(
+            decision_space_id="dsp_" + "6" * 32,
+            decision_space_kind="shared_unit",
+            decision_space_name="Shared / packages/shared/theme",
+            route_id="drr_" + "7" * 32,
+            route_configuration_version=1,
+            compatibility_product_id="prod_" + "8" * 32,
+            matched_path_digest=(
+                "55608e3199e65049bb726efb3ae14f1a"
+                "08a9040d0a988ab5320c6ad390cf32d0"
+            ),
+        )
+        self.gateway.extraction_output["candidates"][0]["product"] = (
+            self.route_context.decision_space_name
+        )
 
     def _run(self):
         return self.runner.run(
             self.source,
-            product_name="ZDecision",
+            route_context=self.route_context,
+            matched_paths=MATCHED_PATHS,
             template_id="business",
             model_profile=self.request_profile,
         )
@@ -279,7 +299,8 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
 
         self.runner.run(
             self.source,
-            product_name="ZDecision",
+            route_context=self.route_context,
+            matched_paths=MATCHED_PATHS,
             template_id="business",
             model_profile=self.request_profile,
             heartbeat=lambda: heartbeats.append("renewed"),
@@ -403,7 +424,8 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         with self.assertRaises(RequestedCaptureFailed):
             self.runner.run(
                 self.source,
-                product_name="ZDecision",
+                route_context=self.route_context,
+                matched_paths=MATCHED_PATHS,
                 template_id="business",
                 model_profile=changed,
             )
@@ -498,6 +520,20 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         self.assertEqual(
             [(SOURCE_SESSION, SOURCE_TURN)],
             self.gateway.boundary_calls,
+        )
+
+    def test_extraction_is_fixed_to_one_leaf_and_its_matched_paths(self) -> None:
+        self._run()
+
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key
+        )
+        self.assertEqual(self.route_context, operation.frozen.route_context)
+        extraction_prompt = self.gateway.prompts[1]
+        self.assertIn(self.route_context.decision_space_id, extraction_prompt)
+        self.assertIn(MATCHED_PATHS[0], extraction_prompt)
+        self.assertIn(
+            self.route_context.decision_space_name, extraction_prompt
         )
 
 

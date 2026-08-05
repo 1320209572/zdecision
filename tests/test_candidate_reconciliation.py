@@ -13,6 +13,8 @@ from zdecision.jsonio import canonical_json_bytes
 
 
 REPOSITORY_ID = "repo_11111111111111111111111111111111"
+DECISION_SPACE_ID = "dsp_22222222222222222222222222222222"
+OTHER_DECISION_SPACE_ID = "dsp_33333333333333333333333333333333"
 
 
 def content(claim: str, future_action: str) -> CandidateContent:
@@ -73,7 +75,9 @@ CURRENT_CONTENT = content(
     "更新候选决策按钮是采集授权边界",
     "只在用户点击后运行 Candidate 提取",
 )
-CURRENT_FAMILY = candidate_family_id(REPOSITORY_ID, OBSERVATION_A.candidate_id)
+CURRENT_FAMILY = candidate_family_id(
+    REPOSITORY_ID, DECISION_SPACE_ID, OBSERVATION_A.candidate_id
+)
 CURRENT_DIGEST = hashlib.sha256(
     canonical_json_bytes(CURRENT_CONTENT.to_dict())
 ).hexdigest()
@@ -123,7 +127,7 @@ class CandidateReconciliationTest(unittest.TestCase):
             key=lambda item: item.candidate_id,
         )
         first_family = candidate_family_id(
-            REPOSITORY_ID, first.candidate_id
+            REPOSITORY_ID, DECISION_SPACE_ID, first.candidate_id
         )
         decisions = (
             ReconciliationDecision(
@@ -142,6 +146,7 @@ class CandidateReconciliationTest(unittest.TestCase):
 
         result = apply_reconciliation(
             REPOSITORY_ID,
+            DECISION_SPACE_ID,
             (first, second),
             (),
             decisions,
@@ -168,6 +173,7 @@ class CandidateReconciliationTest(unittest.TestCase):
 
         result = apply_reconciliation(
             REPOSITORY_ID,
+            DECISION_SPACE_ID,
             (OBSERVATION_A,),
             (current,),
             (
@@ -205,6 +211,7 @@ class CandidateReconciliationTest(unittest.TestCase):
 
         result = apply_reconciliation(
             REPOSITORY_ID,
+            DECISION_SPACE_ID,
             (OBSERVATION_B,),
             (current,),
             (
@@ -237,6 +244,7 @@ class CandidateReconciliationTest(unittest.TestCase):
 
         result = apply_reconciliation(
             REPOSITORY_ID,
+            DECISION_SPACE_ID,
             (REVERSED_OBSERVATION,),
             (current,),
             (
@@ -274,6 +282,7 @@ class CandidateReconciliationTest(unittest.TestCase):
 
         result = apply_reconciliation(
             REPOSITORY_ID,
+            DECISION_SPACE_ID,
             (OBSERVATION_B,),
             (current,),
             (
@@ -306,11 +315,12 @@ class CandidateReconciliationTest(unittest.TestCase):
             key=lambda item: item.candidate_id,
         )
         family_id = candidate_family_id(
-            REPOSITORY_ID, first.candidate_id
+            REPOSITORY_ID, DECISION_SPACE_ID, first.candidate_id
         )
 
         result = apply_reconciliation(
             REPOSITORY_ID,
+            DECISION_SPACE_ID,
             (first, second),
             (),
             (
@@ -350,12 +360,13 @@ class CandidateReconciliationTest(unittest.TestCase):
             key=lambda item: item.candidate_id,
         )
         later_family = candidate_family_id(
-            REPOSITORY_ID, second.candidate_id
+            REPOSITORY_ID, DECISION_SPACE_ID, second.candidate_id
         )
 
         with self.assertRaises(ValueError):
             apply_reconciliation(
                 REPOSITORY_ID,
+                DECISION_SPACE_ID,
                 (first, second),
                 (),
                 (
@@ -377,6 +388,7 @@ class CandidateReconciliationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_reconciliation(
                 REPOSITORY_ID,
+                DECISION_SPACE_ID,
                 (first,),
                 (),
                 (
@@ -462,7 +474,9 @@ class CandidateReconciliationTest(unittest.TestCase):
             family_ids=(
                 current.family_id,
                 candidate_family_id(
-                    REPOSITORY_ID, OBSERVATION_A.candidate_id
+                    REPOSITORY_ID,
+                    DECISION_SPACE_ID,
+                    OBSERVATION_A.candidate_id,
                 ),
             ),
         )
@@ -478,11 +492,29 @@ class CandidateReconciliationTest(unittest.TestCase):
             sorted(set((
                 current.family_id,
                 candidate_family_id(
-                    REPOSITORY_ID, OBSERVATION_A.candidate_id
+                    REPOSITORY_ID,
+                    DECISION_SPACE_ID,
+                    OBSERVATION_A.candidate_id,
                 ),
             ))),
             family_options[0]["enum"],
         )
+
+    def test_family_continuity_is_repository_and_decision_space_scoped(
+        self,
+    ) -> None:
+        cloud = candidate_family_id(
+            REPOSITORY_ID,
+            DECISION_SPACE_ID,
+            OBSERVATION_A.candidate_id,
+        )
+        shared = candidate_family_id(
+            REPOSITORY_ID,
+            OTHER_DECISION_SPACE_ID,
+            OBSERVATION_A.candidate_id,
+        )
+
+        self.assertNotEqual(cloud, shared)
 
 
 if __name__ == "__main__":

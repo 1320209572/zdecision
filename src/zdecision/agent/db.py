@@ -16,7 +16,9 @@ from zdecision.agent.events import (
     HookInvocation,
     TestRepositoryMapping,
     event_id_for,
+    RepositorySnapshot,
 )
+from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.jsonio import canonical_json_bytes
 
 
@@ -106,6 +108,11 @@ class AgentDatabase:
                     repository_id TEXT PRIMARY KEY,
                     product_id TEXT NOT NULL,
                     product_name TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+                );
+
+                CREATE TABLE IF NOT EXISTS enabled_repositories (
+                    repository_id TEXT PRIMARY KEY,
                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
                 );
 
@@ -339,6 +346,72 @@ class AgentDatabase:
                     int(mapping.enabled),
                 ),
             )
+            self._connection.execute(
+                """
+                INSERT INTO enabled_repositories(repository_id, enabled)
+                VALUES (?, ?)
+                ON CONFLICT(repository_id) DO UPDATE SET
+                    enabled = excluded.enabled
+                """,
+                (mapping.repository_id, int(mapping.enabled)),
+            )
+
+    def put_enabled_repository(self, repository: EnabledRepository) -> None:
+        if not isinstance(repository, EnabledRepository):
+            raise TypeError("repository must be an EnabledRepository")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO enabled_repositories(repository_id, enabled)
+                VALUES (?, ?)
+                ON CONFLICT(repository_id) DO UPDATE SET
+                    enabled = excluded.enabled
+                """,
+                (repository.repository_id, int(repository.enabled)),
+            )
+
+    def get_enabled_repository(
+        self, repository_id: str
+    ) -> EnabledRepository | None:
+        row = self._connection.execute(
+            """
+            SELECT repository_id, enabled
+            FROM enabled_repositories WHERE repository_id = ?
+            """,
+            (repository_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return EnabledRepository(
+            repository_id=row["repository_id"],
+            enabled=bool(row["enabled"]),
+        )
+
+    def get_repository_snapshot(
+        self, repository_id: str
+    ) -> RepositorySnapshot:
+        if _REPOSITORY_ID.fullmatch(repository_id) is None:
+            raise ValueError("repository_id is invalid")
+        row = self._connection.execute(
+            """
+            SELECT repository_id, worktree_root, branch, head_commit
+            FROM events
+            WHERE repository_id = ?
+              AND worktree_root IS NOT NULL
+              AND head_commit IS NOT NULL
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (repository_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("repository_snapshot_unavailable")
+        return RepositorySnapshot(
+            repository_id=row["repository_id"],
+            worktree_root=row["worktree_root"],
+            branch=row["branch"],
+            head_commit=row["head_commit"],
+        )
 
     def get_repository_mapping(
         self, repository_id: str

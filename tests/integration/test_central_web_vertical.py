@@ -14,12 +14,22 @@ from fastapi.testclient import TestClient
 from zdecision.capture.models import CandidateContent
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
+from zdecision.central.decision_spaces import (
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
 from zdecision.central.web.application import CentralWebApplication
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import CentralWebStore
-from zdecision.ids import candidate_revision_id, product_id
+from zdecision.ids import (
+    candidate_revision_id,
+    decision_space_id,
+    product_id,
+    repository_route_id,
+)
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter
@@ -91,6 +101,41 @@ class CentralWebVerticalTest(unittest.TestCase):
             "org_demo",
             RepositoryView(
                 REPOSITORY_ID, PRODUCT_ID, PRODUCT_NAME, True
+            ),
+        )
+        initial.put_repository(
+            "org_demo", EnabledRepository(REPOSITORY_ID, True)
+        )
+        leaf_id = decision_space_id("product", PRODUCT_ID)
+        initial.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                decision_space_id=leaf_id,
+                kind="product",
+                display_name=PRODUCT_NAME,
+                compatibility_product_id=PRODUCT_ID,
+                compatibility_product_name=PRODUCT_NAME,
+                catalog_group_id=None,
+                catalog_breadcrumb=(),
+                source_root=".",
+                package_name=None,
+                asset_type=None,
+                enabled=True,
+            ),
+        )
+        initial.replace_trusted_route_heads(
+            "org_demo",
+            REPOSITORY_ID,
+            (
+                RepositoryDecisionRoute(
+                    route_id=repository_route_id(REPOSITORY_ID, leaf_id),
+                    repository_id=REPOSITORY_ID,
+                    decision_space_id=leaf_id,
+                    path_prefixes=(".",),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=1,
+                ),
             ),
         )
         initial.close()

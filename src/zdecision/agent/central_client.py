@@ -11,10 +11,14 @@ import httpx
 
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
+    CandidateSliceBatchUpload,
     CaptureRequestCreate,
     CaptureRequestView,
-    ClaimedCaptureRequest,
+    ClaimedCaptureGroup,
+    CaptureSliceView,
     ProgressEvent,
+    RouteSelection,
+    SliceUploadReceipt,
     UploadReceipt,
 )
 
@@ -61,7 +65,7 @@ class CentralClient:
     def close(self) -> None:
         self.client.close()
 
-    def claim_next(self) -> ClaimedCaptureRequest | None:
+    def claim_next(self) -> ClaimedCaptureGroup | None:
         status_code, value = self._request(
             "POST",
             "/api/v1/agent/capture-requests/claim",
@@ -71,7 +75,7 @@ class CentralClient:
         if status_code == 204:
             return None
         try:
-            return ClaimedCaptureRequest.from_dict(value)
+            return ClaimedCaptureGroup.from_dict(value)
         except (TypeError, ValueError) as error:
             raise CentralClientError("central_response_invalid") from error
 
@@ -132,6 +136,87 @@ class CentralClient:
         )
         try:
             return UploadReceipt.from_dict(value)
+        except (TypeError, ValueError) as error:
+            raise CentralClientError("central_response_invalid") from error
+
+    def plan_slices(
+        self,
+        group: ClaimedCaptureGroup,
+        selections: tuple[RouteSelection, ...],
+    ) -> tuple[CaptureSliceView, ...]:
+        if not isinstance(group, ClaimedCaptureGroup):
+            raise TypeError("group must be a ClaimedCaptureGroup")
+        if (
+            not isinstance(selections, tuple)
+            or any(not isinstance(item, RouteSelection) for item in selections)
+        ):
+            raise TypeError("selections must contain RouteSelection values")
+        _, value = self._request(
+            "POST",
+            f"/api/v1/agent/capture-requests/{group.request_id}/slices",
+            payload={
+                "lease_token": group.lease_token,
+                "selections": [item.to_dict() for item in selections],
+            },
+            allowed_statuses=(200,),
+        )
+        if not isinstance(value, Mapping) or frozenset(value) != frozenset(
+            ("slices",)
+        ) or not isinstance(value["slices"], list):
+            raise CentralClientError("central_response_invalid")
+        try:
+            return tuple(
+                CaptureSliceView.from_dict(item) for item in value["slices"]
+            )
+        except (TypeError, ValueError) as error:
+            raise CentralClientError("central_response_invalid") from error
+
+    def upload_slice(
+        self,
+        group: ClaimedCaptureGroup,
+        batch: CandidateSliceBatchUpload,
+    ) -> SliceUploadReceipt:
+        if not isinstance(group, ClaimedCaptureGroup):
+            raise TypeError("group must be a ClaimedCaptureGroup")
+        if not isinstance(batch, CandidateSliceBatchUpload):
+            raise TypeError("batch must be a CandidateSliceBatchUpload")
+        if batch.request_id != group.request_id:
+            raise ValueError("slice batch request mismatch")
+        _, value = self._request(
+            "PUT",
+            (
+                f"/api/v1/agent/capture-requests/{batch.request_id}"
+                f"/slices/{batch.slice_id}/batch"
+            ),
+            payload={
+                "lease_token": group.lease_token,
+                "batch": batch.to_dict(),
+            },
+            allowed_statuses=(200,),
+        )
+        try:
+            return SliceUploadReceipt.from_dict(value)
+        except (TypeError, ValueError) as error:
+            raise CentralClientError("central_response_invalid") from error
+
+    def complete_group(
+        self,
+        group: ClaimedCaptureGroup,
+        receipt_digest: str,
+    ) -> None:
+        if not isinstance(group, ClaimedCaptureGroup):
+            raise TypeError("group must be a ClaimedCaptureGroup")
+        _, value = self._request(
+            "POST",
+            _action_path(group.request_id, "complete"),
+            payload={
+                "lease_token": group.lease_token,
+                "receipt_digest": receipt_digest,
+            },
+            allowed_statuses=(200,),
+        )
+        try:
+            CaptureRequestView.from_dict(value)
         except (TypeError, ValueError) as error:
             raise CentralClientError("central_response_invalid") from error
 

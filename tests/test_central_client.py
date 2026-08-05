@@ -7,12 +7,19 @@ import unittest
 import httpx
 
 from zdecision.capture.models import CandidateContent
+from zdecision.central.decision_spaces import RepositoryDecisionRoute
 from zdecision.ids import candidate_family_id, candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
     CandidateRevisionUpload,
     CaptureRequestCreate,
+    CandidateSliceBatchUpload,
+    CandidateOwnershipSnapshot,
+    CaptureSliceView,
+    ClaimedCaptureGroup,
+    RouteSelection,
+    SliceUploadReceipt,
 )
 
 try:
@@ -31,17 +38,29 @@ PRODUCT_ID = "prod_" + "3" * 32
 EMPTY_BATCH_DIGEST = hashlib.sha256(
     canonical_json_bytes({"items": []})
 ).hexdigest()
+ROUTE = RepositoryDecisionRoute(
+    route_id="drr_" + "6" * 32,
+    repository_id=REPOSITORY_ID,
+    decision_space_id="dsp_" + "7" * 32,
+    path_prefixes=("packages/shared/theme",),
+    excluded_prefixes=(),
+    enabled=True,
+    configuration_version=1,
+)
+ROUTE_DIGEST = hashlib.sha256(
+    canonical_json_bytes({"routes": [ROUTE.to_dict()]})
+).hexdigest()
 
 
 def claimed_payload() -> dict[str, object]:
     return {
         "request_id": REQUEST_ID,
         "repository_id": REPOSITORY_ID,
-        "product_id": PRODUCT_ID,
-        "product_name": "ZDecision",
         "template_id": "business",
         "capture_scope": "all_valid_sessions",
         "client_action_id": "web_action_001",
+        "route_snapshot": [ROUTE.to_dict()],
+        "route_snapshot_digest": ROUTE_DIGEST,
         "lease_token": "lease_0123456789abcdef",
         "lease_expires_at": "2026-07-31T03:00:30Z",
     }
@@ -146,6 +165,80 @@ class CentralClientTest(unittest.TestCase):
             "/api/v1/agent/capture-requests/claim",
             request.url.path,
         )
+
+    def test_slice_calls_send_only_server_ids_and_local_digests(self) -> None:
+        group = ClaimedCaptureGroup.from_dict(claimed_payload())
+        selection = RouteSelection(
+            route_id=ROUTE.route_id,
+            configuration_version=1,
+            matched_path_digest="8" * 64,
+            source_boundary_digest="9" * 64,
+        )
+        ownership = CandidateOwnershipSnapshot(
+            repository_id=REPOSITORY_ID,
+            route_id=ROUTE.route_id,
+            route_configuration_version=1,
+            decision_space_id=ROUTE.decision_space_id,
+            decision_space_kind="shared_unit",
+            display_name="theme",
+            catalog_breadcrumb=("Shared",),
+            source_root="packages/shared/theme",
+            compatibility_product_id=PRODUCT_ID,
+            compatibility_product_name="Shared / packages/shared/theme",
+            source_boundary_digest="9" * 64,
+        )
+        slice_view = CaptureSliceView(
+            request_id=REQUEST_ID,
+            slice_id="csl_" + "a" * 32,
+            slice_order=0,
+            ownership=ownership,
+            state="planned",
+        )
+        batch = CandidateSliceBatchUpload(
+            request_id=REQUEST_ID,
+            slice_id=slice_view.slice_id,
+            route_id=ROUTE.route_id,
+            route_configuration_version=1,
+            decision_space_id=ROUTE.decision_space_id,
+            items=(),
+            batch_digest=EMPTY_BATCH_DIGEST,
+        )
+        receipt = SliceUploadReceipt(
+            REQUEST_ID, slice_view.slice_id, 0, "b" * 64
+        )
+        transport = RecordingTransport(
+            [
+                httpx.Response(
+                    200, json={"slices": [slice_view.to_dict()]}
+                ),
+                httpx.Response(200, json=receipt.to_dict()),
+                httpx.Response(200, json=capture_request_payload()),
+            ]
+        )
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(transport),
+        )
+        try:
+            self.assertEqual(
+                (slice_view,), client.plan_slices(group, (selection,))
+            )
+            self.assertEqual(receipt, client.upload_slice(group, batch))
+            client.complete_group(group, "c" * 64)
+        finally:
+            client.close()
+
+        bodies = b"".join(request.content for request in transport.requests)
+        self.assertIn(selection.matched_path_digest.encode(), bodies)
+        for forbidden in (
+            b"packages/shared/theme/src/index.ts",
+            b"session_id",
+            b"prompt",
+            b"diff",
+            b"/Users/",
+        ):
+            self.assertNotIn(forbidden, bodies)
 
     def test_plugin_capture_client_sends_only_command_and_reads_request(self) -> None:
         transport = RecordingTransport(

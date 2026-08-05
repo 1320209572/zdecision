@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 CAPTURE_EXTRACTOR_VERSION = "extractor-v2"
-ON_DEMAND_CAPTURE_PROTOCOL = "extractor-v3"
+ON_DEMAND_CAPTURE_PROTOCOL = "extractor-v4"
 PUBLISHER_FORMAT_VERSION = "zdecision-publisher/v1"
 
 _CAPTURE_ID = re.compile(r"^cap_[0-9a-f]{32}$")
@@ -218,27 +218,39 @@ def capture_slice_id(
 
 def candidate_family_id(
     repository_id: str,
-    first_observation_id: str,
+    decision_space_id: str,
+    first_observation_id: str | None = None,
 ) -> str:
-    """Return the stable family seeded by its first Candidate observation."""
+    """Return family continuity scoped to repository and Decision space.
+
+    The two-argument form remains only for decoding and replaying local V1
+    archive state. New Capture code must always supply ``decision_space_id``.
+    """
 
     if (
         not isinstance(repository_id, str)
         or _REPOSITORY_ID.fullmatch(repository_id) is None
     ):
         raise ValueError("repository_id is invalid")
-    if (
-        not isinstance(first_observation_id, str)
-        or _CANDIDATE_ID.fullmatch(first_observation_id) is None
+    legacy = first_observation_id is None
+    if legacy:
+        first_observation_id = decision_space_id
+    elif (
+        not isinstance(decision_space_id, str)
+        or _DECISION_SPACE_ID.fullmatch(decision_space_id) is None
     ):
+        raise ValueError("decision_space_id is invalid")
+    if not isinstance(first_observation_id, str) or _CANDIDATE_ID.fullmatch(
+        first_observation_id
+    ) is None:
         raise ValueError("first_observation_id is invalid")
-    return _stable_id(
-        "cfm",
-        {
-            "first_observation_id": first_observation_id,
-            "repository_id": repository_id,
-        },
-    )
+    payload = {
+        "first_observation_id": first_observation_id,
+        "repository_id": repository_id,
+    }
+    if not legacy:
+        payload["decision_space_id"] = decision_space_id
+    return _stable_id("cfm", payload)
 
 
 def candidate_revision_id(

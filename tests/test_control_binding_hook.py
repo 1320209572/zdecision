@@ -15,6 +15,7 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import handle_control_binding_hook, handle_hook
 from zdecision.agent.repository import RepositoryResolver
+from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
 
 
@@ -191,6 +192,25 @@ class ControlBindingHookTests(unittest.TestCase):
         self.assertNotIn(MODEL_CONTROL_ID.encode(), database_bytes)
         self.assertNotIn(b"TOOL-INPUT-SECRET", database_bytes)
         self.assertNotIn(b"MODEL-SECRET", database_bytes)
+
+    def test_neutral_enabled_repository_keeps_control_repository_scoped(self) -> None:
+        with self.database._connection:
+            self.database._connection.execute(
+                "DELETE FROM feasibility_repository_mappings"
+            )
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, True)
+        )
+        self._observe_prompt()
+
+        response = self._handle(self._raw())
+
+        self.assertEqual(
+            "allow",
+            response.output["hookSpecificOutput"]["permissionDecision"],
+        )
+        binding = self.control_store.get(CONTROL_ID)
+        self.assertEqual(self.snapshot.repository_id, binding.repository_id)
 
     def test_untrusted_or_unavailable_envelopes_are_denied(self) -> None:
         unregistered = self.root / "unregistered"

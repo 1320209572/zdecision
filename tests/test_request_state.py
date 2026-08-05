@@ -24,6 +24,7 @@ from zdecision.sync.contracts import (
 REQUEST_ID = "crq_11111111111111111111111111111111"
 SECOND_REQUEST_ID = "crq_55555555555555555555555555555555"
 REPOSITORY_ID = "repo_44444444444444444444444444444444"
+DECISION_SPACE_ID = "dsp_66666666666666666666666666666666"
 FAMILY_ID = "cfm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 INPUT_DIGEST = "1" * 64
 NOW = "2026-07-31T08:00:00Z"
@@ -68,6 +69,7 @@ def result_for_claim(claim: str) -> ReconciliationResult:
     revision = _revision(claim)
     return ReconciliationResult(
         repository_id=REPOSITORY_ID,
+        decision_space_id=DECISION_SPACE_ID,
         current_revisions=(revision,),
         new_revisions=(revision,),
         uploadable_revisions=(revision,),
@@ -86,6 +88,7 @@ def replacement_result(
     )
     return ReconciliationResult(
         repository_id=REPOSITORY_ID,
+        decision_space_id=DECISION_SPACE_ID,
         current_revisions=(revision,),
         new_revisions=(revision,),
         uploadable_revisions=(revision,),
@@ -290,7 +293,9 @@ class RequestStateStoreTests(unittest.TestCase):
                 REQUEST_ID, result, batch
             ),
         )
-        empty = ReconciliationResult.empty(REPOSITORY_ID)
+        empty = ReconciliationResult.empty(
+            REPOSITORY_ID, DECISION_SPACE_ID
+        )
         with self.assertRaises(BatchConflict):
             self.store.commit_candidate_result(
                 REQUEST_ID, empty, candidate_batch(empty)

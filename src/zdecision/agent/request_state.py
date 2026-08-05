@@ -19,6 +19,8 @@ from zdecision.sync.contracts import (
     CandidateBatchUpload,
     CandidateRevisionUpload,
     UploadReceipt,
+    CandidateSliceBatchUpload,
+    SliceUploadReceipt,
 )
 
 
@@ -34,6 +36,8 @@ ArchiveState = Literal["not_applicable", "pending", "archived"]
 
 _REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
+_DECISION_SPACE_ID = re.compile(r"^dsp_[0-9a-f]{32}$")
+_SLICE_ID = re.compile(r"^csl_[0-9a-f]{32}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _FAILURE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ATTEMPT_STATES = frozenset(
@@ -211,6 +215,58 @@ class RequestStateStore:
                     )),
                     receipt_json TEXT,
                     receipt_digest TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS slice_reconciliation_results (
+                    request_id TEXT NOT NULL,
+                    slice_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    result_digest TEXT NOT NULL,
+                    PRIMARY KEY(request_id, slice_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS slice_reconciliation_archives (
+                    request_id TEXT NOT NULL,
+                    slice_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending', 'archived')),
+                    PRIMARY KEY(request_id, slice_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS slice_candidate_family_revisions (
+                    repository_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    revision_id TEXT NOT NULL UNIQUE,
+                    record_json TEXT NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    PRIMARY KEY(
+                        repository_id, decision_space_id, family_id, revision
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS slice_candidate_family_heads (
+                    repository_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    PRIMARY KEY(repository_id, decision_space_id, family_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS slice_candidate_outbox (
+                    request_id TEXT NOT NULL,
+                    slice_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    batch_json TEXT NOT NULL,
+                    batch_digest TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending', 'uploaded')),
+                    receipt_json TEXT,
+                    receipt_digest TEXT,
+                    PRIMARY KEY(request_id, slice_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS reconciliation_archive_queue
@@ -1228,6 +1284,457 @@ class RequestStateStore:
             (state, attempt_id),
         )
 
+    def slice_reconciliation(
+        self, request_id: str, slice_id: str
+    ) -> ReconciliationResult | None:
+        request = _request_id(request_id)
+        slice_value = _slice_id(slice_id)
+        row = self._connection.execute(
+            """
+            SELECT result_json, result_digest
+            FROM slice_reconciliation_results
+            WHERE request_id = ? AND slice_id = ?
+            """,
+            (request, slice_value),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return ReconciliationResult.from_dict(
+                _read_canonical(
+                    row["result_json"],
+                    row["result_digest"],
+                    "Slice reconciliation result",
+                )
+            )
+        except ValueError as error:
+            raise RequestStateCorrupt(
+                "Slice reconciliation result is invalid"
+            ) from error
+
+    def store_slice_reconciliation(
+        self,
+        request_id: str,
+        slice_id: str,
+        result: ReconciliationResult,
+        *,
+        archive_thread_id: str | None = None,
+    ) -> ReconciliationResult:
+        request = _request_id(request_id)
+        slice_value = _slice_id(slice_id)
+        if not isinstance(result, ReconciliationResult):
+            raise TypeError("result must be a ReconciliationResult")
+        if archive_thread_id is not None:
+            _nonempty(archive_thread_id, "archive_thread_id")
+        result_json, result_digest = _canonical_record(result.to_dict())
+        with self._connection:
+            existing = self._connection.execute(
+                """
+                SELECT repository_id, decision_space_id,
+                       result_json, result_digest
+                FROM slice_reconciliation_results
+                WHERE request_id = ? AND slice_id = ?
+                """,
+                (request, slice_value),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["repository_id"] != result.repository_id
+                    or existing["decision_space_id"]
+                    != result.decision_space_id
+                    or existing["result_json"] != result_json
+                    or existing["result_digest"] != result_digest
+                ):
+                    raise ReconciliationConflict(
+                        "Slice reconciliation conflicts"
+                    )
+            else:
+                self._connection.execute(
+                    """
+                    INSERT INTO slice_reconciliation_results(
+                        request_id, slice_id, repository_id,
+                        decision_space_id, result_json, result_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request,
+                        slice_value,
+                        result.repository_id,
+                        result.decision_space_id,
+                        result_json,
+                        result_digest,
+                    ),
+                )
+            if archive_thread_id is not None:
+                archive = self._connection.execute(
+                    """
+                    SELECT thread_id FROM slice_reconciliation_archives
+                    WHERE request_id = ? AND slice_id = ?
+                    """,
+                    (request, slice_value),
+                ).fetchone()
+                if archive is not None:
+                    if archive["thread_id"] != archive_thread_id:
+                        raise ReconciliationConflict(
+                            "Slice reconciliation archive conflicts"
+                        )
+                else:
+                    self._connection.execute(
+                        """
+                        INSERT INTO slice_reconciliation_archives(
+                            request_id, slice_id, thread_id, state
+                        ) VALUES (?, ?, ?, 'pending')
+                        """,
+                        (request, slice_value, archive_thread_id),
+                    )
+        return result
+
+    def pending_slice_reconciliation_archives(
+        self,
+    ) -> tuple[tuple[str, str, str], ...]:
+        rows = self._connection.execute(
+            """
+            SELECT request_id, slice_id, thread_id
+            FROM slice_reconciliation_archives
+            WHERE state = 'pending'
+            ORDER BY request_id, slice_id
+            """
+        ).fetchall()
+        return tuple(
+            (row["request_id"], row["slice_id"], row["thread_id"])
+            for row in rows
+        )
+
+    def mark_slice_reconciliation_archived(
+        self, request_id: str, slice_id: str, thread_id: str
+    ) -> None:
+        request = _request_id(request_id)
+        slice_value = _slice_id(slice_id)
+        thread = _nonempty(thread_id, "thread_id")
+        with self._connection:
+            row = self._connection.execute(
+                """
+                SELECT thread_id FROM slice_reconciliation_archives
+                WHERE request_id = ? AND slice_id = ?
+                """,
+                (request, slice_value),
+            ).fetchone()
+            if row is None or row["thread_id"] != thread:
+                raise ReconciliationConflict(
+                    "Slice reconciliation archive conflicts"
+                )
+            self._connection.execute(
+                """
+                UPDATE slice_reconciliation_archives SET state = 'archived'
+                WHERE request_id = ? AND slice_id = ?
+                """,
+                (request, slice_value),
+            )
+
+    def slice_current_families(
+        self, repository_id: str, decision_space_id: str
+    ) -> tuple[CandidateFamilyRevision, ...]:
+        repository = _repository_id(repository_id)
+        decision_space = _decision_space_id(decision_space_id)
+        rows = self._connection.execute(
+            """
+            SELECT revisions.record_json, revisions.record_digest
+            FROM slice_candidate_family_heads AS heads
+            JOIN slice_candidate_family_revisions AS revisions
+              ON revisions.repository_id = heads.repository_id
+             AND revisions.decision_space_id = heads.decision_space_id
+             AND revisions.family_id = heads.family_id
+             AND revisions.revision_id = heads.revision_id
+            WHERE heads.repository_id = ? AND heads.decision_space_id = ?
+            ORDER BY heads.family_id
+            """,
+            (repository, decision_space),
+        ).fetchall()
+        return tuple(
+            CandidateFamilyRevision.from_dict(
+                _read_canonical(
+                    row["record_json"],
+                    row["record_digest"],
+                    "Slice Candidate family revision",
+                )
+            )
+            for row in rows
+        )
+
+    def commit_slice_result(
+        self,
+        request_id: str,
+        slice_id: str,
+        result: ReconciliationResult,
+        batch: CandidateSliceBatchUpload,
+    ) -> CandidateSliceBatchUpload:
+        request = _request_id(request_id)
+        slice_value = _slice_id(slice_id)
+        if not isinstance(result, ReconciliationResult):
+            raise TypeError("result must be a ReconciliationResult")
+        if not isinstance(batch, CandidateSliceBatchUpload):
+            raise TypeError("batch must be a CandidateSliceBatchUpload")
+        if (
+            batch.request_id != request
+            or batch.slice_id != slice_value
+            or batch.decision_space_id != result.decision_space_id
+        ):
+            raise BatchConflict("Candidate slice batch identity conflicts")
+        expected_items = tuple(
+            CandidateRevisionUpload(
+                family_id=revision.family_id,
+                revision_id=revision.revision_id,
+                revision=revision.revision,
+                content=revision.content,
+                content_digest=revision.content_digest,
+                evidence_digest=revision.evidence_digest,
+            )
+            for revision in result.uploadable_revisions
+        )
+        if batch.items != expected_items:
+            raise BatchConflict("Candidate slice revisions conflict")
+        batch_json, batch_record_digest = _canonical_record(batch.to_dict())
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            persisted = self.slice_reconciliation(request, slice_value)
+            if persisted is not None and persisted != result:
+                raise BatchConflict("Candidate slice result conflicts")
+            existing = self._connection.execute(
+                """
+                SELECT batch_json, batch_digest
+                FROM slice_candidate_outbox
+                WHERE request_id = ? AND slice_id = ?
+                """,
+                (request, slice_value),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["batch_json"] != batch_json
+                    or existing["batch_digest"] != batch_record_digest
+                ):
+                    raise BatchConflict("Candidate slice batch conflicts")
+                stored = CandidateSliceBatchUpload.from_dict(
+                    _read_canonical(
+                        existing["batch_json"],
+                        existing["batch_digest"],
+                        "Candidate slice batch",
+                    )
+                )
+                self._connection.commit()
+                return stored
+            if persisted is None:
+                result_json, result_digest = _canonical_record(result.to_dict())
+                self._connection.execute(
+                    """
+                    INSERT INTO slice_reconciliation_results(
+                        request_id, slice_id, repository_id,
+                        decision_space_id, result_json, result_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request,
+                        slice_value,
+                        result.repository_id,
+                        result.decision_space_id,
+                        result_json,
+                        result_digest,
+                    ),
+                )
+            revisions = {
+                revision.revision_id: revision
+                for revision in (*result.new_revisions, *result.current_revisions)
+            }
+            for revision in sorted(
+                revisions.values(),
+                key=lambda item: (item.family_id, item.revision),
+            ):
+                record_json, record_digest = _canonical_record(
+                    revision.to_dict()
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO slice_candidate_family_revisions(
+                        repository_id, decision_space_id, family_id,
+                        revision, revision_id, record_json, record_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(
+                        repository_id, decision_space_id, family_id, revision
+                    ) DO UPDATE SET
+                        revision_id = excluded.revision_id,
+                        record_json = excluded.record_json,
+                        record_digest = excluded.record_digest
+                    """,
+                    (
+                        result.repository_id,
+                        result.decision_space_id,
+                        revision.family_id,
+                        revision.revision,
+                        revision.revision_id,
+                        record_json,
+                        record_digest,
+                    ),
+                )
+            for revision in result.current_revisions:
+                self._connection.execute(
+                    """
+                    INSERT INTO slice_candidate_family_heads(
+                        repository_id, decision_space_id,
+                        family_id, revision_id
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(
+                        repository_id, decision_space_id, family_id
+                    ) DO UPDATE SET revision_id = excluded.revision_id
+                    """,
+                    (
+                        result.repository_id,
+                        result.decision_space_id,
+                        revision.family_id,
+                        revision.revision_id,
+                    ),
+                )
+            self._connection.execute(
+                """
+                INSERT INTO slice_candidate_outbox(
+                    request_id, slice_id, repository_id,
+                    decision_space_id, batch_json, batch_digest,
+                    state, receipt_json, receipt_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+                """,
+                (
+                    request,
+                    slice_value,
+                    result.repository_id,
+                    result.decision_space_id,
+                    batch_json,
+                    batch_record_digest,
+                ),
+            )
+            self._connection.commit()
+            return batch
+        except sqlite3.IntegrityError as error:
+            self._connection.rollback()
+            raise BatchConflict("Candidate slice persistence conflicts") from error
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def staged_slice_batch(
+        self, request_id: str, slice_id: str
+    ) -> CandidateSliceBatchUpload | None:
+        row = self._connection.execute(
+            """
+            SELECT batch_json, batch_digest
+            FROM slice_candidate_outbox
+            WHERE request_id = ? AND slice_id = ?
+            """,
+            (_request_id(request_id), _slice_id(slice_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        return CandidateSliceBatchUpload.from_dict(
+            _read_canonical(
+                row["batch_json"], row["batch_digest"],
+                "Candidate slice batch"
+            )
+        )
+
+    def slice_receipt(
+        self, request_id: str, slice_id: str
+    ) -> SliceUploadReceipt | None:
+        row = self._connection.execute(
+            """
+            SELECT receipt_json, receipt_digest
+            FROM slice_candidate_outbox
+            WHERE request_id = ? AND slice_id = ? AND state = 'uploaded'
+            """,
+            (_request_id(request_id), _slice_id(slice_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        return SliceUploadReceipt.from_dict(
+            _read_canonical(
+                row["receipt_json"], row["receipt_digest"],
+                "Slice upload receipt"
+            )
+        )
+
+    def mark_slice_uploaded(self, receipt: SliceUploadReceipt) -> None:
+        if not isinstance(receipt, SliceUploadReceipt):
+            raise TypeError("receipt must be a SliceUploadReceipt")
+        receipt_json, receipt_digest = _canonical_record(receipt.to_dict())
+        with self._connection:
+            row = self._connection.execute(
+                """
+                SELECT state, batch_json, batch_digest,
+                       receipt_json, receipt_digest
+                FROM slice_candidate_outbox
+                WHERE request_id = ? AND slice_id = ?
+                """,
+                (receipt.request_id, receipt.slice_id),
+            ).fetchone()
+            if row is None:
+                raise BatchConflict("Candidate slice outbox is missing")
+            batch = CandidateSliceBatchUpload.from_dict(
+                _read_canonical(
+                    row["batch_json"],
+                    row["batch_digest"],
+                    "Candidate slice batch",
+                )
+            )
+            expected_receipt_digest = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "request_id": batch.request_id,
+                        "slice_id": batch.slice_id,
+                        "candidate_count": len(batch.items),
+                        "batch_digest": batch.batch_digest,
+                    }
+                )
+            ).hexdigest()
+            if (
+                receipt.candidate_count != len(batch.items)
+                or receipt.receipt_digest != expected_receipt_digest
+            ):
+                raise BatchConflict("Slice upload receipt conflicts")
+            if row["state"] == "uploaded":
+                if (
+                    row["receipt_json"] != receipt_json
+                    or row["receipt_digest"] != receipt_digest
+                ):
+                    raise BatchConflict("Slice upload receipt conflicts")
+                return
+            self._connection.execute(
+                """
+                UPDATE slice_candidate_outbox
+                SET state = 'uploaded', receipt_json = ?, receipt_digest = ?
+                WHERE request_id = ? AND slice_id = ?
+                """,
+                (
+                    receipt_json,
+                    receipt_digest,
+                    receipt.request_id,
+                    receipt.slice_id,
+                ),
+            )
+
+    def has_receipt(self, request_id: str, slice_id: str) -> bool:
+        return self.slice_receipt(request_id, slice_id) is not None
+
+    def receipts_digest(
+        self, request_id: str, slice_ids: tuple[str, ...]
+    ) -> str:
+        receipts: list[SliceUploadReceipt] = []
+        for slice_id in slice_ids:
+            receipt = self.slice_receipt(request_id, slice_id)
+            if receipt is None:
+                raise BatchConflict("Slice upload receipt is missing")
+            receipts.append(receipt)
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {"receipts": [receipt.to_dict() for receipt in receipts]}
+            )
+        ).hexdigest()
+
 
 def _retire_native_attempts(connection: sqlite3.Connection) -> bool:
     tables = {
@@ -1271,6 +1778,21 @@ def _repository_id(value: object) -> str:
         or _REPOSITORY_ID.fullmatch(value) is None
     ):
         raise ValueError("repository_id is invalid")
+    return value
+
+
+def _decision_space_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or _DECISION_SPACE_ID.fullmatch(value) is None
+    ):
+        raise ValueError("decision_space_id is invalid")
+    return value
+
+
+def _slice_id(value: object) -> str:
+    if not isinstance(value, str) or _SLICE_ID.fullmatch(value) is None:
+        raise ValueError("slice_id is invalid")
     return value
 
 

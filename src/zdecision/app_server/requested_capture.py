@@ -40,6 +40,7 @@ from zdecision.capture.on_demand import (
     CaptureCommit,
     CaptureOperation,
     FrozenCaptureInput,
+    FrozenCaptureRouteContext,
     ValidatedCaptureResult,
 )
 from zdecision.capture.service import ExtractionValidationError
@@ -107,7 +108,8 @@ class RequestedCaptureRunner:
         self,
         source: FrozenSessionSource,
         *,
-        product_name: str,
+        route_context: FrozenCaptureRouteContext,
+        matched_paths: tuple[str, ...],
         template_id: str,
         model_profile: FeasibilityModelProfile,
         heartbeat: Callable[[], None] | None = None,
@@ -116,12 +118,28 @@ class RequestedCaptureRunner:
             raise TypeError("source must be a FrozenSessionSource")
         if not isinstance(model_profile, FeasibilityModelProfile):
             raise TypeError("model_profile must be a FeasibilityModelProfile")
-        product = _nonempty(product_name, "product_name")
+        if not isinstance(route_context, FrozenCaptureRouteContext):
+            raise TypeError(
+                "route_context must be a FrozenCaptureRouteContext"
+            )
+        if (
+            not isinstance(matched_paths, tuple)
+            or any(not isinstance(path, str) or not path for path in matched_paths)
+        ):
+            raise TypeError("matched_paths must contain path strings")
+        matched_digest = hashlib.sha256(
+            canonical_json_bytes({"paths": list(matched_paths)})
+        ).hexdigest()
+        if matched_digest != route_context.matched_path_digest:
+            raise ValueError("matched_path_digest_mismatch")
+        product = route_context.decision_space_name
         template_id_value = _nonempty(template_id, "template_id")
         self.sweep_archives()
 
         existing = self.operation_store.operation_for_source(
-            source.request_id, source.source_key
+            source.request_id,
+            source.source_key,
+            route_context.decision_space_id,
         )
         try:
             interactive = self.gateway.list_interactive_thread_ids(
@@ -180,6 +198,7 @@ class RequestedCaptureRunner:
                 reasoning_effort=profile.reasoning_effort,
                 model_discovery_digest=profile.discovery_digest,
                 model_discovered_at=profile.discovered_at,
+                route_context=route_context,
             )
             operation = self.operation_store.ensure_operation(frozen)
         else:
@@ -188,6 +207,7 @@ class RequestedCaptureRunner:
                 operation,
                 source,
                 product,
+                route_context,
                 template_id_value,
                 model_profile,
             )
@@ -274,7 +294,10 @@ class RequestedCaptureRunner:
             _heartbeat(heartbeat)
             extraction_receipt = self.gateway.run_structured_turn(
                 thread_id=fork_thread_id,
-                prompt=operation.frozen.template.extraction_prompt,
+                prompt=(
+                    operation.frozen.template.extraction_prompt
+                    + _leaf_instruction(route_context, matched_paths)
+                ),
                 output_schema=extraction_output_schema(
                     operation.frozen.product
                 ),
@@ -324,12 +347,18 @@ class RequestedCaptureRunner:
         return self._result(source, committed, profile)
 
     def operation_profile(
-        self, source: FrozenSessionSource
+        self,
+        source: FrozenSessionSource,
+        route_context: FrozenCaptureRouteContext | None = None,
     ) -> FeasibilityModelProfile | None:
         if not isinstance(source, FrozenSessionSource):
             raise TypeError("source must be a FrozenSessionSource")
         operation = self.operation_store.operation_for_source(
-            source.request_id, source.source_key
+            source.request_id,
+            source.source_key,
+            None
+            if route_context is None
+            else route_context.decision_space_id,
         )
         return None if operation is None else _profile(operation.frozen)
 
@@ -384,6 +413,7 @@ class RequestedCaptureRunner:
         operation: CaptureOperation,
         source: FrozenSessionSource,
         product: str,
+        route_context: FrozenCaptureRouteContext,
         template_id: str,
         profile: FeasibilityModelProfile,
     ) -> None:
@@ -399,6 +429,7 @@ class RequestedCaptureRunner:
             source.upper_turn_id,
             source.source_fingerprint,
             product,
+            route_context,
             template_id,
             profile.profile_id,
             profile.model_id,
@@ -417,6 +448,7 @@ class RequestedCaptureRunner:
             frozen.upper_turn_id,
             frozen.source_fingerprint,
             frozen.product,
+            frozen.route_context,
             frozen.template.template_id,
             frozen.model_profile_id,
             frozen.model_id,
@@ -522,6 +554,29 @@ def _nonempty(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _leaf_instruction(
+    route_context: FrozenCaptureRouteContext,
+    matched_paths: tuple[str, ...],
+) -> str:
+    payload = canonical_json_bytes(
+        {
+            "decision_space_id": route_context.decision_space_id,
+            "decision_space_kind": route_context.decision_space_kind,
+            "decision_space_name": route_context.decision_space_name,
+            "matched_paths": list(matched_paths),
+        }
+    ).decode("utf-8")
+    return (
+        "\n\nZDECISION_FIXED_DECISION_SPACE\n"
+        "Extract Candidates only for this exact Decision space and only from "
+        "the listed matched repository paths. Every Candidate product must "
+        "equal decision_space_name. Do not infer or emit any other product or "
+        "Shared leaf.\n"
+        f"{payload}\n"
+        "END_ZDECISION_FIXED_DECISION_SPACE"
+    )
 
 
 def _heartbeat(callback: Callable[[], None] | None) -> None:

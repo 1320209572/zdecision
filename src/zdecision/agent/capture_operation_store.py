@@ -96,8 +96,7 @@ class CaptureOperationStore:
                     winner_generation INTEGER,
                     committed_result_json TEXT,
                     committed_result_digest TEXT,
-                    failure_code TEXT,
-                    UNIQUE(request_id, source_key)
+                    failure_code TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS capture_execution_attempts (
@@ -128,6 +127,7 @@ class CaptureOperationStore:
                     ON capture_execution_attempts(archive_state, state);
                 """
             )
+        _migrate_slice_operations(connection)
         return cls(database_path, connection)
 
     def close(self) -> None:
@@ -154,18 +154,23 @@ class CaptureOperationStore:
                 self._connection.commit()
                 return operation
 
-            source_row = self._connection.execute(
+            source_rows = self._connection.execute(
                 """
-                SELECT operation_id
+                SELECT *
                 FROM capture_operations
                 WHERE request_id = ? AND source_key = ?
                 """,
                 (frozen.request_id, frozen.source_key),
-            ).fetchone()
-            if source_row is not None:
-                raise CaptureOperationConflict(
-                    "Capture request source is already frozen differently"
-                )
+            ).fetchall()
+            for source_row in source_rows:
+                source_operation = self._operation(source_row)
+                if (
+                    source_operation.frozen.route_context
+                    == frozen.route_context
+                ):
+                    raise CaptureOperationConflict(
+                        "Capture request slice source is already frozen differently"
+                    )
             self._connection.execute(
                 """
                 INSERT INTO capture_operations(
@@ -193,7 +198,10 @@ class CaptureOperationStore:
             raise
 
     def operation_for_source(
-        self, request_id: str, source_key: str
+        self,
+        request_id: str,
+        source_key: str,
+        decision_space_id: str | None = None,
     ) -> CaptureOperation | None:
         request = _nonempty(request_id, "request_id")
         source = _nonempty(source_key, "source_key")
@@ -205,11 +213,20 @@ class CaptureOperationStore:
             """,
             (request, source),
         ).fetchall()
-        if len(rows) > 1:
-            raise CaptureOperationCorrupt(
-                "Capture request source has multiple operations"
+        operations = tuple(self._operation(row) for row in rows)
+        if decision_space_id is not None:
+            operations = tuple(
+                operation
+                for operation in operations
+                if operation.frozen.route_context is not None
+                and operation.frozen.route_context.decision_space_id
+                == decision_space_id
             )
-        return None if not rows else self._operation(rows[0])
+        if len(operations) > 1:
+            raise CaptureOperationCorrupt(
+                "Capture request slice source has multiple operations"
+            )
+        return None if not operations else operations[0]
 
     def active_validated_attempt(
         self, operation_id: str
@@ -886,3 +903,71 @@ class CaptureOperationStore:
         if not isinstance(value, str) or _FAILURE_CODE.fullmatch(value) is None:
             raise CaptureAttemptConflict("failure_code is invalid")
         return value
+
+
+def _migrate_slice_operations(connection: sqlite3.Connection) -> None:
+    """Remove the V3 one-source-per-request constraint without losing state."""
+
+    has_legacy_unique = False
+    for index in connection.execute(
+        "PRAGMA index_list(capture_operations)"
+    ).fetchall():
+        if not bool(index["unique"]):
+            continue
+        columns = tuple(
+            row["name"]
+            for row in connection.execute(
+                f'PRAGMA index_info("{index["name"]}")'
+            ).fetchall()
+        )
+        if columns == ("request_id", "source_key"):
+            has_legacy_unique = True
+            break
+    if not has_legacy_unique:
+        return
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE capture_operations_slice_migration (
+                    operation_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    frozen_json TEXT NOT NULL,
+                    frozen_digest TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN (
+                        'open', 'committed', 'failed_terminal'
+                    )),
+                    active_generation INTEGER NOT NULL
+                        CHECK(active_generation >= 0),
+                    winner_generation INTEGER,
+                    committed_result_json TEXT,
+                    committed_result_digest TEXT,
+                    failure_code TEXT
+                );
+
+                INSERT INTO capture_operations_slice_migration(
+                    operation_id, request_id, source_key, frozen_json,
+                    frozen_digest, status, active_generation,
+                    winner_generation, committed_result_json,
+                    committed_result_digest, failure_code
+                )
+                SELECT operation_id, request_id, source_key, frozen_json,
+                    frozen_digest, status, active_generation,
+                    winner_generation, committed_result_json,
+                    committed_result_digest, failure_code
+                FROM capture_operations;
+
+                DROP TABLE capture_operations;
+                ALTER TABLE capture_operations_slice_migration
+                    RENAME TO capture_operations;
+                """
+            )
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise CaptureOperationCorrupt(
+            "Capture operation migration violated foreign keys"
+        )

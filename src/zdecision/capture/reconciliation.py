@@ -25,6 +25,7 @@ _RELATIONS = frozenset(
     ("same", "refine", "replace", "unrelated", "ambiguous")
 )
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
+_DECISION_SPACE_ID = re.compile(r"^dsp_[0-9a-f]{32}$")
 _OBSERVATION_ID = re.compile(
     r"^cand_[0-9a-f]{32}_(?:0[1-9]|1[0-9]|20)$"
 )
@@ -197,6 +198,7 @@ class CandidateFamilyRevision:
 @dataclass(frozen=True)
 class ReconciliationResult:
     repository_id: str
+    decision_space_id: str
     current_revisions: tuple[CandidateFamilyRevision, ...]
     new_revisions: tuple[CandidateFamilyRevision, ...]
     uploadable_revisions: tuple[CandidateFamilyRevision, ...]
@@ -205,6 +207,11 @@ class ReconciliationResult:
 
     def __post_init__(self) -> None:
         _pattern(self.repository_id, _REPOSITORY_ID, "repository_id")
+        _pattern(
+            self.decision_space_id,
+            _DECISION_SPACE_ID,
+            "decision_space_id",
+        )
         for field_name in (
             "current_revisions",
             "new_revisions",
@@ -272,12 +279,15 @@ class ReconciliationResult:
             raise ValueError("observation result sets overlap")
 
     @classmethod
-    def empty(cls, repository_id: str) -> "ReconciliationResult":
-        return cls(repository_id, (), (), (), (), ())
+    def empty(
+        cls, repository_id: str, decision_space_id: str
+    ) -> "ReconciliationResult":
+        return cls(repository_id, decision_space_id, (), (), (), (), ())
 
     def to_dict(self) -> dict[str, object]:
         return {
             "repository_id": self.repository_id,
+            "decision_space_id": self.decision_space_id,
             "current_revisions": [
                 item.to_dict() for item in self.current_revisions
             ],
@@ -304,6 +314,7 @@ class ReconciliationResult:
             frozenset(
                 (
                     "repository_id",
+                    "decision_space_id",
                     "current_revisions",
                     "new_revisions",
                     "uploadable_revisions",
@@ -315,6 +326,7 @@ class ReconciliationResult:
         )
         return cls(
             repository_id=value["repository_id"],
+            decision_space_id=value["decision_space_id"],
             current_revisions=_revision_list(
                 value["current_revisions"], "current_revisions"
             ),
@@ -459,12 +471,18 @@ def validate_reconciliation(
 
 def apply_reconciliation(
     repository_id: str,
+    decision_space_id: str,
     observations: Sequence[Candidate],
     current: Sequence[CandidateFamilyRevision],
     decisions: Sequence[ReconciliationDecision],
 ) -> ReconciliationResult:
     repository = _pattern(
         repository_id, _REPOSITORY_ID, "repository_id"
+    )
+    decision_space = _pattern(
+        decision_space_id,
+        _DECISION_SPACE_ID,
+        "decision_space_id",
     )
     ordered = _ordered_observations(observations)
     if (
@@ -491,7 +509,9 @@ def apply_reconciliation(
                 "Decision does not match the ordered observation"
             )
         proposed_family = candidate_family_id(
-            repository, observation_value.candidate_id
+            repository,
+            decision_space,
+            observation_value.candidate_id,
         )
         if decision.relation == "ambiguous":
             ambiguous_ids.append(observation_value.candidate_id)
@@ -548,6 +568,7 @@ def apply_reconciliation(
     )
     return ReconciliationResult(
         repository_id=repository,
+        decision_space_id=decision_space,
         current_revisions=current_revisions,
         new_revisions=ordered_new,
         uploadable_revisions=uploadable,

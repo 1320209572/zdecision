@@ -20,10 +20,12 @@ from fastapi.testclient import TestClient
 from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.agent.capture_processor import OnDemandCaptureProcessor
+from zdecision.agent.capture_routing import CaptureRoutingStore
 from zdecision.agent.central_client import CentralClient
 from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
+from zdecision.agent.git_path_evidence import GitPathEvidenceReader
 from zdecision.agent.hooks import handle_hook
 from zdecision.agent.request_state import RequestStateStore
 from zdecision.agent.service import AgentService
@@ -44,9 +46,18 @@ from zdecision.capture.on_demand import ValidatedCaptureResult
 from zdecision.capture.templates import TemplateCatalog
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
+from zdecision.central.decision_spaces import (
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
-from zdecision.ids import product_id
+from zdecision.ids import (
+    decision_space_id,
+    product_id,
+    repository_route_id,
+)
 from zdecision.sync.contracts import RepositoryView
 
 
@@ -119,7 +130,7 @@ class TestClientBridge:
             )
             self.condition.notify_all()
         if (
-            request.url.path.endswith("/candidates")
+            request.url.path.endswith(("/candidates", "/batch"))
             and self.drop_upload_responses > 0
         ):
             self.drop_upload_responses -= 1
@@ -438,6 +449,16 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.repository_id = snapshot.repository_id
         self.product_id = product_id(PRODUCT_NAME)
+        self.decision_space_id = decision_space_id(
+            "product", self.product_id
+        )
+        self.route_id = repository_route_id(
+            self.repository_id, self.decision_space_id
+        )
+        (self.registered_repository / "source.py").write_text(
+            f"{RAW_SOURCE}\n# locally changed for trusted route evidence\n",
+            "utf-8",
+        )
         self.clock = MutableClock()
         self.central_path = self.root / "central.sqlite3"
         self.agent_path = self.root / "agent.sqlite3"
@@ -449,6 +470,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.session_index: SessionIndex | None = None
         self.operation_store: CaptureOperationStore | None = None
         self.request_state: RequestStateStore | None = None
+        self.routing_store: CaptureRoutingStore | None = None
         self.control_store: ControlBindingStore | None = None
         self.capture_runner: RequestedCaptureRunner | None = None
         self.reconciliation_runner: ReconciliationRunner | None = None
@@ -492,6 +514,113 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             "succeeded", events.json()["events"][-1]["state"]
         )
         self._assert_central_has_no_raw_source()
+
+    def test_one_action_routes_three_changed_leaves_to_three_slices(self) -> None:
+        prefixes = (
+            "packages/products/cloud/apps/core-shell",
+            "packages/products/shared/zcf-license",
+            "packages/shared/theme",
+        )
+        routes: list[RepositoryDecisionRoute] = []
+        for index, prefix in enumerate(prefixes, start=1):
+            compatibility_id = product_id(f"ZDecision leaf {index}")
+            leaf_id = decision_space_id("product", compatibility_id)
+            self.central_store.put_decision_space(
+                "org_demo",
+                LeafDecisionSpace(
+                    decision_space_id=leaf_id,
+                    kind="product",
+                    display_name=f"Leaf {index}",
+                    compatibility_product_id=compatibility_id,
+                    compatibility_product_name=PRODUCT_NAME,
+                    catalog_group_id=None,
+                    catalog_breadcrumb=(),
+                    source_root=prefix,
+                    package_name=None,
+                    asset_type=None,
+                    enabled=True,
+                ),
+            )
+            routes.append(
+                RepositoryDecisionRoute(
+                    route_id=repository_route_id(
+                        self.repository_id, leaf_id
+                    ),
+                    repository_id=self.repository_id,
+                    decision_space_id=leaf_id,
+                    path_prefixes=(prefix,),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=1,
+                )
+            )
+            changed = self.registered_repository / prefix / "changed.ts"
+            changed.parent.mkdir(parents=True, exist_ok=True)
+            changed.write_text("private local source\n", "utf-8")
+        self.central_store.replace_trusted_route_heads(
+            "org_demo", self.repository_id, tuple(routes)
+        )
+        self._observe(SESSION_A, TURN_A1, self.registered_repository)
+        self._drain_hooks()
+
+        request_id = self._click("web_action_three_slices")
+        self.assertTrue(self._run_agent_once())
+
+        slices = self.central_store.connection.execute(
+            "SELECT state, decision_space_id FROM capture_slices "
+            "WHERE request_id = ? ORDER BY slice_order",
+            (request_id,),
+        ).fetchall()
+        self.assertEqual(3, len(slices))
+        self.assertEqual({"accepted"}, {item["state"] for item in slices})
+        self.assertEqual(
+            {route.decision_space_id for route in routes},
+            {item["decision_space_id"] for item in slices},
+        )
+        self.assertEqual(3, len(self._candidates()))
+        self.assertEqual(
+            {"inventory": 3, "extraction": 3, "reconciliation": 3},
+            self.gateway.structured_turn_creates,
+        )
+
+    def test_no_routable_path_finishes_without_model_and_acknowledges(self) -> None:
+        self.central_store.replace_trusted_route_heads(
+            "org_demo",
+            self.repository_id,
+            (
+                RepositoryDecisionRoute(
+                    route_id=self.route_id,
+                    repository_id=self.repository_id,
+                    decision_space_id=self.decision_space_id,
+                    path_prefixes=("packages/unmodified",),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=2,
+                ),
+            ),
+        )
+        self._observe(SESSION_A, TURN_A1, self.registered_repository)
+        self._drain_hooks()
+        request_id = self._click("web_action_no_route")
+        source = self.session_index.freeze_sources(
+            request_id,
+            self.repository_id,
+            self.clock(),
+            capture_scope="all_valid_sessions",
+        )[0]
+
+        self.assertTrue(self._run_agent_once())
+
+        self.assertEqual(
+            "succeeded_no_candidates", self._request(request_id)["state"]
+        )
+        self.assertEqual(
+            {"inventory": 0, "extraction": 0, "reconciliation": 0},
+            self.gateway.structured_turn_creates,
+        )
+        self.assertEqual(
+            TURN_A1, self.session_index.handled_turn(source.source_key)
+        )
 
     def test_blocking_inventory_keeps_one_live_lease_past_thirty_seconds(
         self,
@@ -816,7 +945,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         request_id = self._click("web_action_before_candidate_tx")
         with patch.object(
             self.request_state,
-            "commit_candidate_result",
+            "commit_slice_result",
             side_effect=RuntimeError("crash before Candidate transaction"),
         ):
             self.assertTrue(self._run_agent_once())
@@ -834,7 +963,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self._observe(SESSION_A, TURN_A1, self.registered_repository)
         self._drain_hooks()
         request_id = self._click("web_action_after_candidate_tx")
-        original = self.request_state.commit_candidate_result
+        original = self.request_state.commit_slice_result
 
         def commit_then_crash(*args, **kwargs):
             original(*args, **kwargs)
@@ -842,12 +971,15 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
 
         with patch.object(
             self.request_state,
-            "commit_candidate_result",
+            "commit_slice_result",
             side_effect=commit_then_crash,
         ):
             self.assertTrue(self._run_agent_once())
         self.assertEqual("failed_retryable", self._request(request_id)["state"])
-        self.assertIsNotNone(self.request_state.staged_batch(request_id))
+        self.assertEqual(
+            1,
+            self._local_count("slice_candidate_outbox", request_id),
+        )
         before = dict(self.gateway.structured_turn_creates)
 
         self._restart_local()
@@ -988,14 +1120,15 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         upload_batches = [
             json.loads(body)["batch"]
             for path, body, _ in self.bridge.records
-            if path.endswith("/candidates")
+            if path.endswith(("/candidates", "/batch"))
         ]
         self.assertEqual(4, len(upload_batches))
         self.assertTrue(
             all(batch == upload_batches[0] for batch in upload_batches)
         )
         batch_count = self.central_store.connection.execute(
-            "SELECT COUNT(*) AS count FROM candidate_batches"
+            "SELECT COUNT(*) AS count FROM capture_slices "
+            "WHERE receipt_json IS NOT NULL"
         ).fetchone()["count"]
         self.assertEqual(1, batch_count)
 
@@ -1008,6 +1141,40 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
                 product_id=self.product_id,
                 product_name=PRODUCT_NAME,
                 enabled=True,
+            ),
+        )
+        self.central_store.put_repository(
+            "org_demo", EnabledRepository(self.repository_id, True)
+        )
+        self.central_store.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                decision_space_id=self.decision_space_id,
+                kind="product",
+                display_name=PRODUCT_NAME,
+                compatibility_product_id=self.product_id,
+                compatibility_product_name=PRODUCT_NAME,
+                catalog_group_id=None,
+                catalog_breadcrumb=(),
+                source_root=".",
+                package_name=None,
+                asset_type=None,
+                enabled=True,
+            ),
+        )
+        self.central_store.replace_trusted_route_heads(
+            "org_demo",
+            self.repository_id,
+            (
+                RepositoryDecisionRoute(
+                    route_id=self.route_id,
+                    repository_id=self.repository_id,
+                    decision_space_id=self.decision_space_id,
+                    path_prefixes=(".",),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=1,
+                ),
             ),
         )
         identity = DemoIdentityProvider(
@@ -1051,6 +1218,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.session_index = SessionIndex.open(self.agent_path)
         self.operation_store = CaptureOperationStore.open(self.agent_path)
         self.request_state = RequestStateStore.open(self.agent_path)
+        self.routing_store = CaptureRoutingStore.open(self.agent_path)
         self.control_store = ControlBindingStore.open(self.agent_path)
         self.agent_database.retire_legacy_automatic_capture()
         catalog = TemplateCatalog(
@@ -1069,6 +1237,8 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         processor = OnDemandCaptureProcessor(
             database=self.agent_database,
             session_index=self.session_index,
+            git_paths=GitPathEvidenceReader(timeout_seconds=1.0),
+            routing_store=self.routing_store,
             capture_runner=self.capture_runner,
             reconciliation_runner=self.reconciliation_runner,
             request_state=self.request_state,
@@ -1100,6 +1270,9 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         if self.request_state is not None:
             self.request_state.close()
             self.request_state = None
+        if self.routing_store is not None:
+            self.routing_store.close()
+            self.routing_store = None
         if self.control_store is not None:
             self.control_store.close()
             self.control_store = None
@@ -1228,6 +1401,14 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
     def _central_count(self, table: str, request_id: str) -> int:
         if table not in {"capture_requests", "candidate_batches"}:
             raise AssertionError("unexpected central table")
+        if table == "candidate_batches":
+            return self.central_store.connection.execute(
+                "SELECT COUNT(*) AS count FROM capture_slices "
+                "WHERE request_id = ? AND receipt_json IS NOT NULL",
+                (request_id,),
+            ).fetchone()["count"]
+        if table == "capture_requests":
+            table = "capture_groups"
         return self.central_store.connection.execute(
             f"SELECT COUNT(*) AS count FROM {table} WHERE request_id = ?",
             (request_id,),
@@ -1248,7 +1429,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             reconciliations = connection.execute(
                 """
                 SELECT COUNT(*) AS count
-                FROM reconciliation_results
+                FROM slice_reconciliation_results
                 WHERE request_id = ?
                 """,
                 (request_id,),
@@ -1256,7 +1437,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             outbox = connection.execute(
                 """
                 SELECT batch_json, batch_digest
-                FROM candidate_outbox
+                FROM slice_candidate_outbox
                 WHERE request_id = ?
                 """,
                 (request_id,),
@@ -1273,12 +1454,22 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.assertEqual(1, len(outbox))
         self.assertEqual(1, self._central_count("capture_requests", request_id))
         self.assertEqual(1, self._central_count("candidate_batches", request_id))
-        central_digest = self.central_store.connection.execute(
-            "SELECT batch_digest FROM candidate_batches WHERE request_id = ?",
+        central_batch = self.central_store.connection.execute(
+            "SELECT batch_json FROM capture_slices WHERE request_id = ?",
             (request_id,),
-        ).fetchone()["batch_digest"]
+        ).fetchone()["batch_json"]
+        central_digest = json.loads(central_batch)["batch_digest"]
         local_batch = json.loads(outbox[0]["batch_json"])
         self.assertEqual(local_batch["batch_digest"], central_digest)
+
+    def _local_count(self, table: str, request_id: str) -> int:
+        if table != "slice_candidate_outbox":
+            raise AssertionError("unexpected local table")
+        with closing(sqlite3.connect(self.agent_path)) as connection:
+            return connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()[0]
 
     def _request(self, request_id: str) -> dict[str, object]:
         response = self.browser.get(
