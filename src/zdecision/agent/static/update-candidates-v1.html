@@ -216,6 +216,7 @@
         failed: "本次更新未完成",
         empty: "没有发现新的候选决策",
       };
+      const pendingRetryDelays = [1500, 3000, 6000, 12000, 24000, 48000];
 
       let nextRequestId = 1;
       let initialized = false;
@@ -227,6 +228,32 @@
       let controlId = null;
       let safeState = "disabled";
       let pageUrl = null;
+      let pendingRetryIndex = 0;
+      let pendingRetryTimer = null;
+
+      function cancelPendingRetry(resetBudget = false) {
+        if (pendingRetryTimer !== null) {
+          clearTimeout(pendingRetryTimer);
+          pendingRetryTimer = null;
+        }
+        if (resetBudget) pendingRetryIndex = 0;
+      }
+
+      function schedulePendingRetry() {
+        if (pendingRetryTimer !== null) return;
+        if (pendingRetryIndex >= pendingRetryDelays.length) {
+          safeState = "unavailable";
+          status.textContent = labels.unavailable;
+          return;
+        }
+        const delay = pendingRetryDelays[pendingRetryIndex++];
+        pendingRetryTimer = setTimeout(() => {
+          pendingRetryTimer = null;
+          if (submissionState === "pending" && chosenScope !== null) {
+            start(chosenScope, true);
+          }
+        }, delay);
+      }
 
       function request(method, params, timeoutMs = null) {
         const id = nextRequestId++;
@@ -409,6 +436,7 @@
 
         if (enabled === true && initial.safe_state !== "ready") return;
         if (enabled && typeof metaControl !== "string") return;
+        cancelPendingRetry(true);
         initialResultAccepted = true;
         restorationStarted = false;
         submissionState = null;
@@ -479,13 +507,15 @@
         } catch {
           safeState = "unavailable";
           status.textContent = labels.unavailable;
-          setTimeout(restoreBinding, 1500);
+          if (submissionState === "pending") schedulePendingRetry();
+          else setTimeout(restoreBinding, 1500);
         }
       }
 
       function applyBindingResult(result, source) {
         const value = boundedResult(result);
         if (!value.valid) {
+          cancelPendingRetry();
           submissionState = null;
           safeState = "unavailable";
           lockActions();
@@ -493,6 +523,7 @@
           return;
         }
         if (value.safe_state === "expired") {
+          cancelPendingRetry();
           submissionState = null;
           chosenScope = null;
           selected = true;
@@ -505,17 +536,19 @@
         selected = submissionState !== "ready";
         renderResult(value);
         if (submissionState === "ready") {
+          cancelPendingRetry();
           updateInitialAvailability();
           return;
         }
         lockActions();
         if (submissionState === "pending") {
           if (source === "restore") start(chosenScope, true);
-          else setTimeout(() => start(chosenScope, true), 1500);
-        } else if (
-          submissionState === "attached" && activeStates.has(safeState)
-        ) {
-          setTimeout(poll, 1500);
+          else schedulePendingRetry();
+        } else {
+          cancelPendingRetry();
+          if (submissionState === "attached" && activeStates.has(safeState)) {
+            setTimeout(poll, 1500);
+          }
         }
       }
 

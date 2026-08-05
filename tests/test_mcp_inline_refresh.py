@@ -1327,6 +1327,14 @@ __SCENARIO__
     replay.params.arguments.scope === "all_valid_sessions",
     "remount replay changed the persisted scope",
   );
+  await remount.respond(
+    replay,
+    state("submitting", "pending", "all_valid_sessions"),
+  );
+  check(
+    remount.takeTimer(1500),
+    "remount did not begin a fresh bounded retry window",
+  );
   process.stdout.write("real-remount-recovery-ok");
 """,
             "real-remount-recovery-ok",
@@ -1439,7 +1447,7 @@ __SCENARIO__
             "card-freshness-ok",
         )
 
-    async def test_widget_same_mount_retries_durable_pending_submission(
+    async def test_widget_bounds_same_mount_pending_retries(
         self,
     ) -> None:
         self._run_widget_recovery_scenario(
@@ -1453,23 +1461,37 @@ __SCENARIO__
     state("submitting", "pending", "current_session"),
   );
   await click;
-  const retryTimer = widget.takeTimer(1500);
-  check(retryTimer, "same mount did not schedule a durable pending retry");
-  retryTimer();
-  await flush();
-  const starts = widget.toolCalls("start_zdecision_candidate_refresh");
-  check(starts.length === 2, "same mount did not replay exactly once");
+  const delays = [1500, 3000, 6000, 12000, 24000, 48000];
+  for (const delay of delays) {
+    check(widget.timers.length === 1, "pending scheduled more than one timer");
+    const retry = widget.takeTimer(delay);
+    check(retry, `missing pending retry at ${delay}ms`);
+    retry();
+    await flush();
+    const replay = widget.latestToolCall(
+      "start_zdecision_candidate_refresh",
+    );
+    check(
+      replay.params.arguments.scope === "current_session",
+      "same-mount replay changed scope",
+    );
+    await widget.respond(
+      replay,
+      state("submitting", "pending", "current_session"),
+    );
+  }
   check(
-    starts[1].params.arguments.scope === "current_session",
-    "same-mount replay changed scope",
+    widget.toolCalls("start_zdecision_candidate_refresh").length === 7,
+    "pending replay exceeded or missed the six-attempt budget",
   );
-  await widget.respond(
-    starts[1],
-    state("queued", "attached", "current_session"),
+  check(widget.timers.length === 0, "exhausted pending scheduled another retry");
+  check(
+    widget.elements.status.textContent === "暂时无法更新",
+    "exhausted pending did not show the generic unavailable state",
   );
-  process.stdout.write("same-mount-retry-ok");
+  process.stdout.write("bounded-pending-retry-ok");
 """,
-            "same-mount-retry-ok",
+            "bounded-pending-retry-ok",
         )
 
     async def test_widget_reused_iframe_rebinds_unselected_latest_control(
