@@ -17,6 +17,9 @@ const REQUEST_ID = "crq_" + "d".repeat(32);
 const FAMILY_B = "cfm_" + "e".repeat(32);
 const REVISION_B = "crv_" + "f".repeat(32);
 const DIGEST_B = "1".repeat(64);
+const FAMILY_C = "cfm_" + "2".repeat(32);
+const REVISION_C = "crv_" + "3".repeat(32);
+const DIGEST_C = "4".repeat(64);
 
 function draftItem(action: ReviewDraft["items"][number]["action"]) {
   return {
@@ -112,6 +115,114 @@ function twoItemInbox(
   return view;
 }
 
+function candidate(
+  template: CandidateInbox["items"][number],
+  familyId: string,
+  claim: string,
+  revisionId: string,
+  digest: string,
+): CandidateInbox["items"][number] {
+  return {
+    ...template,
+    family_id: familyId,
+    revision_id: revisionId,
+    content_digest: digest,
+    content: { ...template.content, claim },
+    draft_action: null,
+  };
+}
+
+function threeCandidateInbox(): CandidateInbox {
+  const view = inbox();
+  view.items[0].content.claim = "决策 A";
+  view.items.push(
+    candidate(view.items[0], FAMILY_B, "决策 B", REVISION_B, DIGEST_B),
+    candidate(view.items[0], FAMILY_C, "决策 C", REVISION_C, DIGEST_C),
+  );
+  return view;
+}
+
+function mixedDraftInbox(): CandidateInbox {
+  const view = threeCandidateInbox();
+  const rejected = {
+    ...draftItem("reject"),
+    family_id: FAMILY_B,
+    revision_id: REVISION_B,
+    content_digest: DIGEST_B,
+  };
+  const edited = {
+    ...draftItem("edit_accept"),
+    family_id: FAMILY_C,
+    revision_id: REVISION_C,
+    content_digest: DIGEST_C,
+    effective_content: view.items[2].content,
+  };
+  view.draft = { ...view.draft, version: 1, items: [rejected, edited] };
+  view.items[1].draft_action = "reject";
+  view.items[2].draft_action = "edit_accept";
+  return view;
+}
+
+function candidateInboxWithCount(count: number): CandidateInbox {
+  const view = inbox();
+  view.items = Array.from({ length: count }, (_, index) => {
+    const hex = (index + 1).toString(16).padStart(32, "0");
+    return candidate(
+      view.items[0],
+      `cfm_${hex}`,
+      `决策 ${String(index + 1).padStart(2, "0")}`,
+      `crv_${hex}`,
+      (index % 16).toString(16).repeat(64),
+    );
+  });
+  return view;
+}
+
+interface CapturedRequests {
+  reviewPosts: Array<{ items: ReviewDraft["items"] }>;
+  previewPosts: unknown[];
+}
+
+async function renderCandidatePage(
+  view: CandidateInbox,
+): Promise<CapturedRequests> {
+  const requests: CapturedRequests = { reviewPosts: [], previewPosts: [] };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/candidates")) return json(view);
+      if (url.includes("/review-draft") && init?.method === "PUT") {
+        const body = JSON.parse(String(init.body));
+        return json({ ...view.draft, version: view.draft.version + 1, items: body.items });
+      }
+      if (url.endsWith("/reviews") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        requests.reviewPosts.push(body);
+        return json({
+          review_batch_id: "rvb_" + "5".repeat(32),
+          items: [],
+          preview_eligible: body.items.some(
+            (item: ReviewDraft["items"][number]) =>
+              item.action === "accept" || item.action === "edit_accept",
+          ),
+          remaining_pending_count: view.items.length - body.items.length,
+          draft_version: view.draft.version + 2,
+        });
+      }
+      if (url.endsWith("/previews") && init?.method === "POST") {
+        requests.previewPosts.push(JSON.parse(String(init.body)));
+        return json({ preview_id: "pub_" + "6".repeat(32) });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }),
+  );
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
+  render(<RouterProvider router={router} />);
+  await screen.findByRole("heading", { name: "theme" });
+  return requests;
+}
+
 function json(value: unknown, status = 200): Promise<Response> {
   return Promise.resolve(
     new Response(JSON.stringify(value), {
@@ -125,6 +236,115 @@ beforeEach(() => localStorage.clear());
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+it("does not treat Checkbox selection as acceptance", async () => {
+  const user = userEvent.setup();
+  await renderCandidatePage(threeCandidateInbox());
+
+  await user.click(screen.getByRole("checkbox", { name: "选择决策 A" }));
+
+  expect(screen.getByText("已选 1 条")).toBeVisible();
+  expect(
+    within(screen.getByRole("article", { name: "候选 决策 A" }))
+      .getByText("未处理"),
+  ).toBeVisible();
+});
+
+it("batch accepts exactly selected rows and undo restores mixed actions", async () => {
+  const user = userEvent.setup();
+  await renderCandidatePage(mixedDraftInbox());
+
+  await user.click(screen.getByRole("checkbox", { name: "选择决策 A" }));
+  await user.click(screen.getByRole("checkbox", { name: "选择决策 C" }));
+  await user.click(screen.getByRole("button", { name: "批量接受" }));
+
+  expect(within(screen.getByRole("article", { name: "候选 决策 A" })).getByText("已接受")).toBeVisible();
+  expect(within(screen.getByRole("article", { name: "候选 决策 C" })).getByText("已接受")).toBeVisible();
+  expect(within(screen.getByRole("article", { name: "候选 决策 B" })).getByText("已拒绝")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "撤销" }));
+
+  expect(within(screen.getByRole("article", { name: "候选 决策 A" })).getByText("未处理")).toBeVisible();
+  expect(within(screen.getByRole("article", { name: "候选 决策 C" })).getByText(
+    "编辑后接受",
+    { selector: ".candidate-row__state strong" },
+  )).toBeVisible();
+});
+
+it("blocks a 21-row batch instead of truncating it", async () => {
+  const user = userEvent.setup();
+  await renderCandidatePage(candidateInboxWithCount(21));
+
+  await user.click(screen.getByRole("checkbox", { name: "选择当前页 21 条" }));
+
+  expect(screen.getByText("单次最多审核 20 条")).toBeVisible();
+  expect(screen.getByRole("button", { name: "批量接受" })).toBeDisabled();
+  expect(within(screen.getByRole("region", { name: "候选决策列表" })).getAllByText("未处理"))
+    .toHaveLength(21);
+});
+
+it("disables a twenty-first direct classification before state changes", async () => {
+  const user = userEvent.setup();
+  const view = candidateInboxWithCount(21);
+  view.draft = {
+    ...view.draft,
+    version: 1,
+    items: view.items.slice(0, 20).map((item) => ({
+      family_id: item.family_id,
+      repository_id: item.repository_id,
+      revision_id: item.revision_id,
+      revision: item.revision,
+      content_digest: item.content_digest,
+      action: "accept" as const,
+      effective_content: null,
+      note: null,
+    })),
+  };
+
+  await renderCandidatePage(view);
+
+  const lastRow = screen.getByRole("article", { name: "候选 决策 21" });
+  expect(within(lastRow).getByRole("button", { name: "接受决策 21" }))
+    .toBeDisabled();
+  expect(within(lastRow).getByRole("button", { name: "拒绝决策 21" }))
+    .toBeDisabled();
+  expect(within(lastRow).getByRole("button", { name: "编辑决策 21" }))
+    .toBeDisabled();
+  expect(within(lastRow).getByText("未处理")).toBeVisible();
+  expect(screen.getByText("单次最多审核 20 条")).toBeVisible();
+  await user.click(within(lastRow).getByRole("checkbox", { name: "选择决策 21" }));
+  expect(within(lastRow).getByText("未处理")).toBeVisible();
+});
+
+it("submits only explicitly classified current revisions without creating Preview", async () => {
+  const user = userEvent.setup();
+  const requests = await renderCandidatePage(threeCandidateInbox());
+
+  await user.click(screen.getByRole("button", { name: "接受决策 A" }));
+  await user.click(screen.getByRole("button", { name: "拒绝决策 B" }));
+  await user.click(screen.getByRole("checkbox", { name: "选择决策 C" }));
+  await user.click(screen.getByRole("button", { name: "提交审核" }));
+
+  await waitFor(() => expect(requests.reviewPosts).toHaveLength(1));
+  expect(requests.reviewPosts[0].items.map((item) => item.family_id)).toEqual([
+    FAMILY_ID,
+    FAMILY_B,
+  ]);
+  expect(requests.previewPosts).toHaveLength(0);
+});
+
+it("clears transient selection on material filters while preserving local draft", async () => {
+  const user = userEvent.setup();
+  await renderCandidatePage(threeCandidateInbox());
+
+  await user.click(screen.getByRole("checkbox", { name: "选择决策 A" }));
+  await user.click(screen.getByRole("button", { name: "接受决策 B" }));
+  await user.type(screen.getByRole("searchbox", { name: "搜索候选决策" }), "decision");
+  await user.click(screen.getByRole("button", { name: "应用筛选" }));
+
+  await waitFor(() => expect(screen.getByText("已选 0 条")).toBeVisible());
+  expect(within(screen.getByRole("article", { name: "候选 决策 B" })).getByText("已接受")).toBeVisible();
 });
 
 it("refreshes one owned repository and restores a partial draft", async () => {
@@ -162,13 +382,20 @@ it("refreshes one owned repository and restores a partial draft", async () => {
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
 
-  expect(await screen.findByDisplayValue("接受")).toBeVisible();
+  expect(await screen.findByText("已接受", { selector: ".candidate-row__state strong" }))
+    .toBeVisible();
   const heading = screen.getByRole("heading", { name: "theme" });
   expect(heading).toBeVisible();
-  expect(screen.getByText("Shared / packages/shared / theme")).toBeVisible();
+  expect(within(heading.closest("header")!).getByText(
+    "Shared / packages/shared / theme",
+    { selector: ".decision-space-context span" },
+  )).toBeVisible();
   expect(within(heading.closest("header")!).queryByText("ZDecision"))
     .not.toBeInTheDocument();
-  expect(screen.getByText("zdecision")).toBeVisible();
+  fireEvent.click(screen.getByText("查看证据"));
+  expect(within(screen.getByRole("article", {
+    name: "候选 候选内容必须由用户明确审核。",
+  })).getByText(REPOSITORY_ID, { selector: "code" })).toBeVisible();
   await user.click(screen.getByRole("button", { name: "更新候选决策" }));
 
   expect(captureBody).toEqual({
@@ -246,6 +473,9 @@ it("never executes Candidate markup and preserves exact provenance", async () =>
   expect(screen.getByRole("link", { name: "候选审核" })).toHaveClass(
     "rail__link--active",
   );
+  const details = within(card).getByText("查看证据").closest("details")!;
+  expect(details).not.toHaveAttribute("open");
+  fireEvent.click(within(card).getByText("查看证据"));
   expect(within(card).getByText(REVISION_ID)).toBeVisible();
   expect(within(card).getByText(DIGEST)).toBeVisible();
   expect(within(card).getByText(REPOSITORY_ID)).toBeVisible();
@@ -323,12 +553,13 @@ it("keeps local actions visible when draft compare-and-swap conflicts", async ()
   await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
-  const selector = await screen.findByLabelText("审核动作");
-
-  await user.selectOptions(selector, "reject");
+  await user.click(await screen.findByRole("button", {
+    name: "拒绝候选内容必须由用户明确审核。",
+  }));
   await user.click(screen.getByRole("button", { name: "保存审核草稿" }));
 
-  expect(screen.getByDisplayValue("拒绝")).toBeVisible();
+  expect(screen.getByText("已拒绝", { selector: ".candidate-row__state strong" }))
+    .toBeVisible();
   expect(screen.getByText("审核草稿已在其他页面更新")).toBeVisible();
 });
 
@@ -341,7 +572,11 @@ it("marks a restored action that still targets an older revision", async () => {
   render(<RouterProvider router={router} />);
 
   expect(await screen.findByText("已有新版本")).toBeVisible();
-  expect(screen.getByDisplayValue("接受")).toBeVisible();
+  expect(screen.getByText("已接受", { selector: ".candidate-row__state strong" }))
+    .toBeVisible();
+  expect(screen.getByRole("button", { name: "提交审核" })).toBeDisabled();
+  expect(screen.queryByLabelText("审核动作")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "跳过" })).not.toBeInTheDocument();
 });
 
 it("resumes durable capture progress from the stored event cursor", async () => {
@@ -448,7 +683,7 @@ it("submits an ordered partial accept and reject for preview eligibility", async
   render(<RouterProvider router={router} />);
 
   await user.click(
-    await screen.findByRole("button", { name: "生成发布预览" }),
+    await screen.findByRole("button", { name: "提交审核" }),
   );
 
   expect(reviewBody).toEqual({
@@ -456,6 +691,11 @@ it("submits an ordered partial accept and reject for preview eligibility", async
     expected_draft_version: 1,
     items: view.draft.items,
   });
+  expect(previewBody).toBeUndefined();
+  expect(router.state.location.pathname).toBe(`/spaces/${SPACE_ID}/candidates`);
+
+  await user.click(screen.getByRole("button", { name: "生成发布预览" }));
+
   expect(previewBody).toEqual({
     client_action_id: expect.stringMatching(/^web_action_/),
   });
@@ -502,8 +742,11 @@ it("retries a failed preview with the same durable action identity", async () =>
   render(<RouterProvider router={router} />);
 
   await user.click(
-    await screen.findByRole("button", { name: "生成发布预览" }),
+    await screen.findByRole("button", { name: "提交审核" }),
   );
+  expect(previewBodies).toHaveLength(0);
+
+  await user.click(screen.getByRole("button", { name: "生成发布预览" }));
 
   expect(await screen.findByText("审核已提交，但发布预览生成失败")).toBeVisible();
   const pending = JSON.parse(
@@ -514,7 +757,7 @@ it("retries a failed preview with the same durable action identity", async () =>
     client_action_id: expect.stringMatching(/^web_action_/),
   });
 
-  await user.click(screen.getByRole("button", { name: "重试生成发布预览" }));
+  await user.click(screen.getByRole("button", { name: "生成发布预览" }));
 
   expect(previewBodies).toEqual([
     { client_action_id: pending.client_action_id },
@@ -564,11 +807,11 @@ it("submits reject-only review without claiming a preview", async () => {
   render(<RouterProvider router={router} />);
 
   await user.click(
-    await screen.findByRole("button", { name: "提交审核结果" }),
+    await screen.findByRole("button", { name: "提交审核" }),
   );
 
   expect(screen.getByText("审核结果已提交")).toBeVisible();
-  expect(screen.getByRole("button", { name: "提交审核结果" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "提交审核" })).toBeDisabled();
 });
 
 it("retains a stale selection and loads the latest revision without resubmitting", async () => {
@@ -606,10 +849,11 @@ it("retains a stale selection and loads the latest revision without resubmitting
   render(<RouterProvider router={router} />);
 
   await user.click(
-    await screen.findByRole("button", { name: "生成发布预览" }),
+    await screen.findByRole("button", { name: "提交审核" }),
   );
 
-  expect(screen.getByDisplayValue("接受")).toBeVisible();
+  expect(screen.getByText("已接受", { selector: ".candidate-row__state strong" }))
+    .toBeVisible();
   expect(screen.getByText("已有新版本")).toBeVisible();
   expect(candidateReads).toBe(1);
   expect(reviewWrites).toBe(1);
@@ -617,7 +861,8 @@ it("retains a stale selection and loads the latest revision without resubmitting
   await user.click(screen.getByRole("button", { name: "载入最新版本" }));
 
   expect(await screen.findByText("最新候选版本")).toBeVisible();
-  expect(screen.getByDisplayValue("接受")).toBeVisible();
+  expect(screen.getByText("已接受", { selector: ".candidate-row__state strong" }))
+    .toBeVisible();
   expect(screen.queryByText("已有新版本")).not.toBeInTheDocument();
   expect(reviewWrites).toBe(1);
 });
@@ -669,7 +914,7 @@ it("merges remote-only draft choices before adopting a newer CAS version", async
   render(<RouterProvider router={router} />);
 
   await user.click(
-    await screen.findByRole("button", { name: "生成发布预览" }),
+    await screen.findByRole("button", { name: "提交审核" }),
   );
   await user.click(screen.getByRole("button", { name: "载入最新版本" }));
   await user.click(screen.getByRole("button", { name: "保存审核草稿" }));

@@ -155,6 +155,7 @@ export interface DecisionDetail {
 }
 
 export type ReviewAction = "accept" | "edit_accept" | "reject" | "skip";
+export type ClassifiedReviewAction = Exclude<ReviewAction, "skip">;
 export type CandidateReviewState =
   | "pending"
   | "accepted"

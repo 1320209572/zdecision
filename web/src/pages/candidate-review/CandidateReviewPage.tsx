@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   useNavigate,
   useParams,
@@ -7,14 +7,17 @@ import {
 
 import { api, ApiError } from "../../api/client";
 import type {
+  CandidateContent,
   CandidateInbox,
+  CandidateInboxItem,
+  ClassifiedReviewAction,
   ReviewDraft,
   ReviewDraftItem,
   ReviewSubmissionResult,
 } from "../../api/types";
 import { useCandidateRefresh } from "../../features/candidate-refresh/useCandidateRefresh";
 import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
-import { ReviewEditor } from "../../features/reviews/ReviewEditor";
+import { CandidateReviewRow } from "../../features/reviews/CandidateReviewRow";
 import { AsyncState } from "../../shared/AsyncState";
 
 
@@ -32,6 +35,38 @@ const candidateStates = new Set<CandidateStateFilter>([
   "published",
   "all",
 ]);
+
+const MAX_REVIEW_ITEMS = 20;
+
+interface BatchUndo {
+  message: string;
+  previousByFamily: Map<string, ReviewDraftItem | undefined>;
+}
+
+function isClassified(
+  action: ReviewDraftItem | undefined,
+): action is ReviewDraftItem & { action: ClassifiedReviewAction } {
+  return action?.action === "accept" ||
+    action?.action === "edit_accept" ||
+    action?.action === "reject";
+}
+
+function actionForCandidate(
+  item: CandidateInboxItem,
+  action: ClassifiedReviewAction,
+  effectiveContent: CandidateContent | null = null,
+): ReviewDraftItem {
+  return {
+    family_id: item.family_id,
+    repository_id: item.repository_id,
+    revision_id: item.revision_id,
+    revision: item.revision,
+    content_digest: item.content_digest,
+    action,
+    effective_content: action === "edit_accept" ? effectiveContent : null,
+    note: null,
+  };
+}
 
 function staleFamilyIds(error: ApiError): string[] {
   if (typeof error.details !== "object" || error.details === null) return [];
@@ -114,6 +149,12 @@ export function CandidateReviewPage() {
   const [staleFamilies, setStaleFamilies] = useState(
     () => new Set<string>(),
   );
+  const [selectedFamilyIds, setSelectedFamilyIds] = useState(
+    () => new Set<string>(),
+  );
+  const [lastBatchUndo, setLastBatchUndo] = useState<BatchUndo | null>(null);
+  const loadedDecisionSpace = useRef<string | null>(null);
+  const selectPageCheckbox = useRef<HTMLInputElement | null>(null);
 
   const candidatePath = useMemo(() => {
     const query = new URLSearchParams();
@@ -132,11 +173,21 @@ export function CandidateReviewPage() {
     api<CandidateInbox>(candidatePath)
       .then((value) => {
         if (!active) return;
+        const sameDecisionSpace = loadedDecisionSpace.current === decisionSpaceId;
+        loadedDecisionSpace.current = decisionSpaceId;
         setInbox(value);
         setDraftVersion(value.draft.version);
-        setDraftByFamily(
-          new Map(value.draft.items.map((item) => [item.family_id, item])),
-        );
+        setDraftByFamily((current) => {
+          const replacement = new Map(
+            value.draft.items.map((item) => [item.family_id, item]),
+          );
+          if (sameDecisionSpace) {
+            for (const [familyId, action] of current) {
+              replacement.set(familyId, action);
+            }
+          }
+          return replacement;
+        });
         setSavedDraftSignature(JSON.stringify(value.draft.items));
         setStaleFamilies(new Set());
         setSelectedRepository(
@@ -150,6 +201,16 @@ export function CandidateReviewPage() {
       active = false;
     };
   }, [candidatePath, reload, routedRepository]);
+
+  useEffect(() => {
+    setSelectedFamilyIds(new Set());
+  }, [
+    decisionSpaceId,
+    routedRepository,
+    routedSearch,
+    captureRequestId,
+    routedState,
+  ]);
 
   useEffect(() => {
     setFilterSearch(routedSearch);
@@ -174,13 +235,67 @@ export function CandidateReviewPage() {
   const orderedClassifiedItems = useMemo(
     () =>
       inbox?.items
-        .map((item) => draftByFamily.get(item.family_id))
-        .filter((item): item is ReviewDraftItem => item !== undefined) ?? [],
-    [draftByFamily, inbox],
+        .filter(
+          (item) => !item.stale_draft && !staleFamilies.has(item.family_id),
+        )
+        .map((item) => {
+          const action = draftByFamily.get(item.family_id);
+          if (!isClassified(action)) return undefined;
+          if (
+            action?.repository_id !== item.repository_id ||
+            action.revision_id !== item.revision_id ||
+            action.revision !== item.revision ||
+            action.content_digest !== item.content_digest
+          ) return undefined;
+          return action;
+        })
+        .filter(
+          (item): item is ReviewDraftItem & { action: ClassifiedReviewAction } =>
+            item !== undefined,
+        ) ?? [],
+    [draftByFamily, inbox, staleFamilies],
   );
-  const previewEligible = orderedClassifiedItems.some(
-    (item) => item.action === "accept" || item.action === "edit_accept",
+  const classifiedCount = useMemo(
+    () => draftItems.filter(isClassified).length,
+    [draftItems],
   );
+  const selectedNewClassifications = useMemo(
+    () => Array.from(selectedFamilyIds).filter(
+      (familyId) => !isClassified(draftByFamily.get(familyId)),
+    ).length,
+    [draftByFamily, selectedFamilyIds],
+  );
+  const batchWouldExceedLimit =
+    classifiedCount + selectedNewClassifications > MAX_REVIEW_ITEMS;
+  const classificationLimitReached = classifiedCount >= MAX_REVIEW_ITEMS;
+  const allVisibleSelected = Boolean(inbox?.items.length) &&
+    inbox!.items.every((item) => selectedFamilyIds.has(item.family_id));
+  const someVisibleSelected = inbox?.items.some(
+    (item) => selectedFamilyIds.has(item.family_id),
+  ) ?? false;
+
+  useEffect(() => {
+    if (selectPageCheckbox.current) {
+      selectPageCheckbox.current.indeterminate =
+        someVisibleSelected && !allVisibleSelected;
+    }
+  }, [allVisibleSelected, someVisibleSelected]);
+
+  const reviewCounts = useMemo(() => {
+    const counts = { accepted: 0, rejected: 0, unprocessed: 0, stale: 0 };
+    for (const item of inbox?.items ?? []) {
+      const action = draftByFamily.get(item.family_id);
+      if (item.stale_draft || staleFamilies.has(item.family_id)) counts.stale += 1;
+      if (action?.action === "accept" || action?.action === "edit_accept") {
+        counts.accepted += 1;
+      } else if (action?.action === "reject") {
+        counts.rejected += 1;
+      } else {
+        counts.unprocessed += 1;
+      }
+    }
+    return counts;
+  }, [draftByFamily, inbox, staleFamilies]);
 
   function updateLocalDraft(
     familyId: string,
@@ -193,6 +308,86 @@ export function CandidateReviewPage() {
       else replacement.delete(familyId);
       return replacement;
     });
+  }
+
+  function candidateByFamily(familyId: string): CandidateInboxItem | undefined {
+    return inbox?.items.find((item) => item.family_id === familyId);
+  }
+
+  function setSelected(familyId: string, selected: boolean) {
+    setSelectedFamilyIds((current) => {
+      const replacement = new Set(current);
+      if (selected) replacement.add(familyId);
+      else replacement.delete(familyId);
+      return replacement;
+    });
+  }
+
+  function selectCurrentPage(selected: boolean) {
+    setSelectedFamilyIds((current) => {
+      const replacement = new Set(current);
+      for (const item of inbox?.items ?? []) {
+        if (selected) replacement.add(item.family_id);
+        else replacement.delete(item.family_id);
+      }
+      return replacement;
+    });
+  }
+
+  function directAction(familyId: string, action: "accept" | "reject") {
+    const item = candidateByFamily(familyId);
+    if (!item) return;
+    if (!isClassified(draftByFamily.get(familyId)) && classificationLimitReached) {
+      return;
+    }
+    updateLocalDraft(familyId, actionForCandidate(item, action));
+  }
+
+  function editAccept(familyId: string, content: CandidateContent) {
+    const item = candidateByFamily(familyId);
+    if (!item) return;
+    if (!isClassified(draftByFamily.get(familyId)) && classificationLimitReached) {
+      return;
+    }
+    updateLocalDraft(
+      familyId,
+      actionForCandidate(item, "edit_accept", content),
+    );
+  }
+
+  function applyBatch(action: "accept" | "reject") {
+    if (selectedFamilyIds.size === 0 || batchWouldExceedLimit) return;
+    const previousByFamily = new Map<string, ReviewDraftItem | undefined>();
+    const replacement = new Map(draftByFamily);
+    for (const familyId of selectedFamilyIds) {
+      const item = candidateByFamily(familyId);
+      if (!item) continue;
+      previousByFamily.set(familyId, draftByFamily.get(familyId));
+      replacement.set(familyId, actionForCandidate(item, action));
+    }
+    setDraftByFamily(replacement);
+    setSaveMessage(null);
+    setLastBatchUndo({
+      message: `已将 ${selectedFamilyIds.size} 条标记为${
+        action === "accept" ? "接受" : "拒绝"
+      }`,
+      previousByFamily,
+    });
+    setSelectedFamilyIds(new Set());
+  }
+
+  function undoBatch() {
+    if (!lastBatchUndo) return;
+    setDraftByFamily((current) => {
+      const replacement = new Map(current);
+      for (const [familyId, previous] of lastBatchUndo.previousByFamily) {
+        if (previous) replacement.set(familyId, previous);
+        else replacement.delete(familyId);
+      }
+      return replacement;
+    });
+    setSaveMessage("已撤销上一次批量操作");
+    setLastBatchUndo(null);
   }
 
   async function saveDraft() {
@@ -228,12 +423,16 @@ export function CandidateReviewPage() {
   }
 
   async function submitReview() {
-    if (orderedClassifiedItems.length === 0 || submitting) return;
+    if (
+      orderedClassifiedItems.length === 0 ||
+      orderedClassifiedItems.length > MAX_REVIEW_ITEMS ||
+      submitting
+    ) return;
     setSaveMessage(null);
     setSubmitting(true);
     try {
       let version = draftVersion;
-      let submittedItems = orderedClassifiedItems;
+      let submittedItems: ReviewDraftItem[] = orderedClassifiedItems;
       if (JSON.stringify(draftItems) !== savedDraftSignature) {
         const saved = await api<ReviewDraft>(
           `/api/v1/web/spaces/${decisionSpaceId}/review-draft`,
@@ -253,7 +452,10 @@ export function CandidateReviewPage() {
         );
         submittedItems = orderedClassifiedItems
           .map((item) => savedByFamily.get(item.family_id))
-          .filter((item): item is ReviewDraftItem => item !== undefined);
+          .filter(
+            (item): item is ReviewDraftItem & { action: ClassifiedReviewAction } =>
+              isClassified(item),
+          );
       }
       const result = await api<ReviewSubmissionResult>(
         `/api/v1/web/spaces/${decisionSpaceId}/reviews`,
@@ -285,10 +487,10 @@ export function CandidateReviewPage() {
         };
         localStorage.setItem(pendingPreviewKey(decisionSpaceId), JSON.stringify(action));
         setPendingPreview(action);
-        await openPendingPreview(action);
-        return;
+        setSaveMessage("审核已提交，可单独生成发布预览");
+      } else {
+        setSaveMessage("审核结果已提交");
       }
-      setSaveMessage("审核结果已提交");
     } catch (error) {
       if (
         error instanceof ApiError &&
@@ -520,12 +722,57 @@ export function CandidateReviewPage() {
         <button className="filter-button" type="submit">应用筛选</button>
       </form>
 
-      <div className="candidate-toolbar">
-        <div>
-          <span className="candidate-toolbar__count">{inbox.items.length}</span>
-          <span>条当前候选</span>
+      <div className="candidate-review-console">
+        <div className="candidate-summary" aria-label="审核汇总">
+          <span><strong>{reviewCounts.accepted}</strong> 已接受</span>
+          <span><strong>{reviewCounts.rejected}</strong> 已拒绝</span>
+          <span><strong>{reviewCounts.unprocessed}</strong> 未处理</span>
+          <span><strong>{reviewCounts.stale}</strong> 已过期</span>
         </div>
-        <div className="candidate-toolbar__save">
+
+        <div className="candidate-batch-toolbar" aria-label="批量审核工具栏">
+          <label className="candidate-batch-toolbar__select">
+            <input
+              ref={selectPageCheckbox}
+              type="checkbox"
+              aria-label={`选择当前页 ${inbox.items.length} 条`}
+              checked={allVisibleSelected}
+              onChange={(event) => selectCurrentPage(event.target.checked)}
+            />
+            <span>当前页 {inbox.items.length} 条</span>
+          </label>
+          <span className="candidate-batch-toolbar__selected">
+            已选 {selectedFamilyIds.size} 条
+          </span>
+          <button
+            type="button"
+            disabled={selectedFamilyIds.size === 0 || batchWouldExceedLimit}
+            onClick={() => applyBatch("accept")}
+          >
+            批量接受
+          </button>
+          <button
+            type="button"
+            disabled={selectedFamilyIds.size === 0 || batchWouldExceedLimit}
+            onClick={() => applyBatch("reject")}
+          >
+            批量拒绝
+          </button>
+          {lastBatchUndo ? (
+            <span className="candidate-batch-toolbar__undo" role="status">
+              {lastBatchUndo.message}
+              <button type="button" onClick={undoBatch}>撤销</button>
+            </span>
+          ) : null}
+          {batchWouldExceedLimit || classificationLimitReached ? (
+            <span className="candidate-batch-toolbar__limit" role="status">
+              单次最多审核 20 条
+            </span>
+          ) : null}
+        </div>
+
+        <div className="candidate-toolbar">
+          <div className="candidate-toolbar__save">
           {saveMessage ? <span role="status">{saveMessage}</span> : null}
           <button
             className="quiet-button"
@@ -541,17 +788,22 @@ export function CandidateReviewPage() {
               disabled={submitting}
               onClick={() => void retryPendingPreview()}
             >
-              重试生成发布预览
+              生成发布预览
             </button>
           ) : null}
           <button
             className="primary-button"
             type="button"
-            disabled={orderedClassifiedItems.length === 0 || submitting}
+            disabled={
+              orderedClassifiedItems.length === 0 ||
+              orderedClassifiedItems.length > MAX_REVIEW_ITEMS ||
+              submitting
+            }
             onClick={() => void submitReview()}
           >
-            {previewEligible ? "生成发布预览" : "提交审核结果"}
+            提交审核
           </button>
+          </div>
         </div>
       </div>
 
@@ -567,13 +819,21 @@ export function CandidateReviewPage() {
       ) : (
         <section className="candidate-stack" aria-label="候选决策列表">
           {inbox.items.map((item) => (
-            <ReviewEditor
+            <CandidateReviewRow
               item={item}
+              space={inbox.space}
               action={draftByFamily.get(item.family_id)}
-              onChange={(value) => updateLocalDraft(item.family_id, value)}
-              stale={staleFamilies.has(item.family_id)}
+              selected={selectedFamilyIds.has(item.family_id)}
+              stale={item.stale_draft || staleFamilies.has(item.family_id)}
+              classificationDisabled={
+                !isClassified(draftByFamily.get(item.family_id)) &&
+                classificationLimitReached
+              }
+              onSelectedChange={setSelected}
+              onDirectAction={directAction}
+              onEditAccept={editAccept}
               onLoadLatest={
-                staleFamilies.has(item.family_id)
+                item.stale_draft || staleFamilies.has(item.family_id)
                   ? () => void loadLatestVersions()
                   : undefined
               }
