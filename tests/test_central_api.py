@@ -8,9 +8,19 @@ from pathlib import Path
 
 from zdecision.capture.models import CandidateContent
 from zdecision.central.auth import DemoIdentityProvider
+from zdecision.central.decision_spaces import (
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
-from zdecision.ids import candidate_family_id, candidate_revision_id
+from zdecision.ids import (
+    candidate_family_id,
+    candidate_revision_id,
+    decision_space_id,
+    repository_route_id,
+)
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
@@ -108,6 +118,38 @@ class CentralApiTest(unittest.TestCase):
                 enabled=True,
             ),
         )
+        self.store.put_repository(
+            "org_demo", EnabledRepository(REPOSITORY_ID, True)
+        )
+        cloud = LeafDecisionSpace(
+            decision_space_id=decision_space_id("product", PRODUCT_ID),
+            kind="product",
+            display_name="ZDecision",
+            compatibility_product_id=PRODUCT_ID,
+            compatibility_product_name="ZDecision",
+            catalog_group_id=None,
+            catalog_breadcrumb=(),
+            source_root="src",
+            package_name=None,
+            asset_type=None,
+            enabled=True,
+        )
+        self.store.put_decision_space("org_demo", cloud)
+        self.store.replace_trusted_route_heads(
+            "org_demo",
+            REPOSITORY_ID,
+            (
+                RepositoryDecisionRoute(
+                    route_id=repository_route_id(REPOSITORY_ID, cloud.decision_space_id),
+                    repository_id=REPOSITORY_ID,
+                    decision_space_id=cloud.decision_space_id,
+                    path_prefixes=(".",),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=1,
+                ),
+            ),
+        )
         service = CaptureRequestService(self.store)
         identity = DemoIdentityProvider(
             organization_id="org_demo",
@@ -201,6 +243,13 @@ class CentralApiTest(unittest.TestCase):
         request_id = self.create_request()
         request = self.client.get(f"/api/v1/capture-requests/{request_id}")
         self.assertEqual("queued", request.json()["state"])
+
+    def test_repository_spaces_returns_the_enabled_route_catalog(self) -> None:
+        response = self.client.get(f"/api/v1/repositories/{REPOSITORY_ID}/spaces")
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(REPOSITORY_ID, response.json()["repository_id"])
+        self.assertIn("spaces", response.json())
 
     def test_create_rejects_unknown_identity_or_source_fields(self) -> None:
         response = self.client.post(

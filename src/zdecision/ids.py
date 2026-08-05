@@ -23,6 +23,9 @@ _CANDIDATE_ID = re.compile(
     r"^cand_[0-9a-f]{32}_(?:0[1-9]|1[0-9]|20)$"
 )
 _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
+_DECISION_SPACE_ID = re.compile(r"^dsp_[0-9a-f]{32}$")
+_CATALOG_GROUP_ID = re.compile(r"^dsg_[0-9a-f]{32}$")
+_REPOSITORY_ROUTE_ID = re.compile(r"^drr_[0-9a-f]{32}$")
 _REVIEW_BATCH_ID = re.compile(r"^rvb_[0-9a-f]{32}$")
 _DECISION_ID = re.compile(r"^dec_[0-9a-f]{32}$")
 _REVIEW_ID = re.compile(r"^rvi_[0-9a-f]{32}$")
@@ -101,6 +104,59 @@ def product_id(canonical_name: str) -> str:
     return _stable_id(
         "prod",
         {"product_name": canonical_product_name(canonical_name)},
+    )
+
+
+def decision_space_id(kind: str, compatibility_product_id: str) -> str:
+    """Return the stable leaf Decision-space identity."""
+
+    if kind not in ("product", "shared_unit"):
+        raise ValueError("kind is invalid")
+    if not isinstance(compatibility_product_id, str) or (
+        _PRODUCT_ID.fullmatch(compatibility_product_id) is None
+    ):
+        raise ValueError("compatibility_product_id is invalid")
+    return _stable_id(
+        "dsp",
+        {
+            "kind": kind,
+            "compatibility_product_id": compatibility_product_id,
+        },
+    )
+
+
+def catalog_group_id(breadcrumb: Sequence[str]) -> str:
+    """Return the stable identity for a navigation-only catalog group."""
+
+    if isinstance(breadcrumb, (str, bytes)) or not isinstance(
+        breadcrumb, Sequence
+    ):
+        raise ValueError("breadcrumb is invalid")
+    normalized = [canonical_product_name(item) for item in breadcrumb]
+    if not normalized:
+        raise ValueError("breadcrumb is invalid")
+    return _stable_id("dsg", {"breadcrumb": normalized})
+
+
+def repository_route_id(
+    repository_id: str, decision_space_id_value: str
+) -> str:
+    """Return the stable route identity for a repository and one leaf."""
+
+    if not isinstance(repository_id, str) or _REPOSITORY_ID.fullmatch(
+        repository_id
+    ) is None:
+        raise ValueError("repository_id is invalid")
+    if not isinstance(decision_space_id_value, str) or (
+        _DECISION_SPACE_ID.fullmatch(decision_space_id_value) is None
+    ):
+        raise ValueError("decision_space_id is invalid")
+    return _stable_id(
+        "drr",
+        {
+            "repository_id": repository_id,
+            "decision_space_id": decision_space_id_value,
+        },
     )
 
 

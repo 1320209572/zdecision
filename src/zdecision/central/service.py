@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Iterator
 
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import RepositoryCatalogView
 from zdecision.central.store import CentralStore
 from zdecision.central.web.schema import record_candidate_revision_batch
 from zdecision.ids import capture_request_id
@@ -98,6 +99,17 @@ class CaptureRequestService:
             )
             for row in rows
         )
+
+    def list_repository_spaces(
+        self, user: Principal, repository_id: str
+    ) -> RepositoryCatalogView:
+        principal = _require_user(user)
+        try:
+            return self.store.repository_catalog(
+                principal.organization_id, repository_id
+            )
+        except ValueError as error:
+            raise RepositoryUnavailable(str(error)) from None
 
     def list_current_candidates(
         self,

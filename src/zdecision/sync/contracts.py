@@ -12,6 +12,10 @@ from typing import Literal, cast
 from zdecision.capture.models import CandidateContent
 from zdecision.ids import candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.central.decision_spaces import (
+    EnabledRepository,
+    RepositoryCatalogView,
+)
 
 
 CaptureRequestState = Literal[

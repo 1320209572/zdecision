@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from zdecision.central.auth import require_id
+from zdecision.central.decision_spaces import (
+    CatalogGroup,
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryCatalogView,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.web.schema import initialize_web_schema
 from zdecision.ids import capture_request_id
+from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import RepositoryView
 
 
@@ -65,6 +75,61 @@ class CentralStore:
                     product_name TEXT NOT NULL,
                     enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
                     PRIMARY KEY(organization_id, repository_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS catalog_groups (
+                    organization_id TEXT NOT NULL,
+                    catalog_group_id TEXT NOT NULL,
+                    parent_group_id TEXT,
+                    display_name TEXT NOT NULL,
+                    breadcrumb_json TEXT NOT NULL,
+                    source_prefix TEXT,
+                    sort_order INTEGER NOT NULL,
+                    PRIMARY KEY(organization_id, catalog_group_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS decision_spaces (
+                    organization_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN ('product','shared_unit')),
+                    display_name TEXT NOT NULL,
+                    compatibility_product_id TEXT NOT NULL,
+                    compatibility_product_name TEXT NOT NULL,
+                    catalog_group_id TEXT,
+                    catalog_breadcrumb_json TEXT NOT NULL,
+                    source_root TEXT NOT NULL,
+                    package_name TEXT,
+                    asset_type TEXT,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                    PRIMARY KEY(organization_id, decision_space_id),
+                    UNIQUE(organization_id, compatibility_product_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS repositories (
+                    organization_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                    PRIMARY KEY(organization_id, repository_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS repository_route_versions (
+                    organization_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    configuration_version INTEGER NOT NULL CHECK(configuration_version > 0),
+                    repository_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    path_prefixes_json TEXT NOT NULL,
+                    excluded_prefixes_json TEXT NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                    PRIMARY KEY(organization_id, route_id, configuration_version)
+                );
+
+                CREATE TABLE IF NOT EXISTS repository_route_heads (
+                    organization_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    configuration_version INTEGER NOT NULL,
+                    PRIMARY KEY(organization_id, route_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS capture_requests (
@@ -215,6 +280,305 @@ class CentralStore:
                 ),
             )
 
+    def put_catalog_group(
+        self, organization_id: str, group: CatalogGroup
+    ) -> None:
+        organization = require_id(organization_id, "organization_id")
+        if not isinstance(group, CatalogGroup):
+            raise TypeError("group must be a CatalogGroup")
+        with self.connection:
+            if group.parent_group_id is not None:
+                parent = self.connection.execute(
+                    """
+                    SELECT breadcrumb_json FROM catalog_groups
+                    WHERE organization_id = ? AND catalog_group_id = ?
+                    """,
+                    (organization, group.parent_group_id),
+                ).fetchone()
+                if parent is None:
+                    raise ValueError("catalog_parent_not_found")
+                if tuple(json.loads(parent["breadcrumb_json"])) + (
+                    group.display_name,
+                ) != group.breadcrumb:
+                    raise ValueError("catalog_breadcrumb_invalid")
+            self.connection.execute(
+                """
+                INSERT INTO catalog_groups(
+                    organization_id, catalog_group_id, parent_group_id,
+                    display_name, breadcrumb_json, source_prefix, sort_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, catalog_group_id) DO UPDATE SET
+                    parent_group_id = excluded.parent_group_id,
+                    display_name = excluded.display_name,
+                    breadcrumb_json = excluded.breadcrumb_json,
+                    source_prefix = excluded.source_prefix,
+                    sort_order = excluded.sort_order
+                """,
+                (
+                    organization, group.catalog_group_id, group.parent_group_id,
+                    group.display_name, _json_text(list(group.breadcrumb)),
+                    group.source_prefix, group.sort_order,
+                ),
+            )
+
+    def put_decision_space(
+        self, organization_id: str, space: LeafDecisionSpace
+    ) -> None:
+        organization = require_id(organization_id, "organization_id")
+        if not isinstance(space, LeafDecisionSpace):
+            raise TypeError("space must be a LeafDecisionSpace")
+        with self.connection:
+            if space.catalog_group_id is not None and self.connection.execute(
+                """SELECT 1 FROM catalog_groups
+                WHERE organization_id = ? AND catalog_group_id = ?""",
+                (organization, space.catalog_group_id),
+            ).fetchone() is None:
+                raise ValueError("catalog_group_not_found")
+            self.connection.execute(
+                """
+                INSERT INTO decision_spaces(
+                    organization_id, decision_space_id, kind, display_name,
+                    compatibility_product_id, compatibility_product_name,
+                    catalog_group_id, catalog_breadcrumb_json, source_root,
+                    package_name, asset_type, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, decision_space_id) DO UPDATE SET
+                    kind = excluded.kind, display_name = excluded.display_name,
+                    compatibility_product_id = excluded.compatibility_product_id,
+                    compatibility_product_name = excluded.compatibility_product_name,
+                    catalog_group_id = excluded.catalog_group_id,
+                    catalog_breadcrumb_json = excluded.catalog_breadcrumb_json,
+                    source_root = excluded.source_root,
+                    package_name = excluded.package_name,
+                    asset_type = excluded.asset_type, enabled = excluded.enabled
+                """,
+                (
+                    organization, space.decision_space_id, space.kind,
+                    space.display_name, space.compatibility_product_id,
+                    space.compatibility_product_name, space.catalog_group_id,
+                    _json_text(list(space.catalog_breadcrumb)), space.source_root,
+                    space.package_name, space.asset_type, int(space.enabled),
+                ),
+            )
+
+    def put_repository(
+        self, organization_id: str, repository: EnabledRepository
+    ) -> None:
+        organization = require_id(organization_id, "organization_id")
+        if not isinstance(repository, EnabledRepository):
+            raise TypeError("repository must be an EnabledRepository")
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO repositories(organization_id, repository_id, enabled)
+                VALUES (?, ?, ?)
+                ON CONFLICT(organization_id, repository_id) DO UPDATE SET
+                    enabled = excluded.enabled""",
+                (organization, repository.repository_id, int(repository.enabled)),
+            )
+
+    def put_route_version(
+        self, organization_id: str, route: RepositoryDecisionRoute
+    ) -> None:
+        organization = require_id(organization_id, "organization_id")
+        if not isinstance(route, RepositoryDecisionRoute):
+            raise TypeError("route must be a RepositoryDecisionRoute")
+        with self.connection:
+            self._validate_route_target(organization, route)
+            self._insert_route_version(organization, route)
+            current = self._head_routes(organization, route.repository_id)
+            previous = next(
+                (item for item in current if item.route_id == route.route_id), None
+            )
+            if previous is None or route.configuration_version > previous.configuration_version:
+                current = tuple(
+                    route if item.route_id == route.route_id else item
+                    for item in current
+                )
+                if previous is None:
+                    current += (route,)
+                _validate_route_set(
+                    current, self._spaces_for_ids(organization, current)
+                )
+                self.connection.execute(
+                    """INSERT INTO repository_route_heads(
+                        organization_id, route_id, configuration_version
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(organization_id, route_id) DO UPDATE SET
+                        configuration_version = excluded.configuration_version""",
+                    (organization, route.route_id, route.configuration_version),
+                )
+
+    def replace_trusted_route_heads(
+        self,
+        organization_id: str,
+        repository_id: str,
+        routes: tuple[RepositoryDecisionRoute, ...],
+    ) -> None:
+        organization = require_id(organization_id, "organization_id")
+        if not isinstance(routes, tuple) or not routes:
+            raise ValueError("routes are invalid")
+        if any(
+            not isinstance(route, RepositoryDecisionRoute)
+            or route.repository_id != repository_id
+            for route in routes
+        ):
+            raise ValueError("routes are invalid")
+        if len({route.route_id for route in routes}) != len(routes):
+            raise ValueError("routes contain duplicates")
+        with self.connection:
+            repository = self.connection.execute(
+                """SELECT enabled FROM repositories
+                WHERE organization_id = ? AND repository_id = ?""",
+                (organization, repository_id),
+            ).fetchone()
+            if repository is None:
+                raise ValueError("repository_unavailable")
+            for route in routes:
+                self._validate_route_target(organization, route)
+            _validate_route_set(routes, self._spaces_for_ids(organization, routes))
+            for route in routes:
+                self._insert_route_version(organization, route)
+            self.connection.execute(
+                """DELETE FROM repository_route_heads WHERE organization_id = ?
+                AND route_id IN (
+                    SELECT route_id FROM repository_route_versions
+                    WHERE organization_id = ? AND repository_id = ?
+                )""",
+                (organization, organization, repository_id),
+            )
+            self.connection.executemany(
+                """INSERT INTO repository_route_heads(
+                    organization_id, route_id, configuration_version
+                ) VALUES (?, ?, ?)""",
+                [(organization, route.route_id, route.configuration_version) for route in routes],
+            )
+
+    def route_history(
+        self, organization_id: str, route_id: str
+    ) -> tuple[RepositoryDecisionRoute, ...]:
+        organization = require_id(organization_id, "organization_id")
+        rows = self.connection.execute(
+            """SELECT * FROM repository_route_versions
+            WHERE organization_id = ? AND route_id = ?
+            ORDER BY configuration_version""",
+            (organization, route_id),
+        ).fetchall()
+        return tuple(_route_from_row(row) for row in rows)
+
+    def repository_catalog(
+        self, organization_id: str, repository_id: str
+    ) -> RepositoryCatalogView:
+        organization = require_id(organization_id, "organization_id")
+        repository = self.connection.execute(
+            """SELECT enabled FROM repositories
+            WHERE organization_id = ? AND repository_id = ?""",
+            (organization, repository_id),
+        ).fetchone()
+        if repository is None or not bool(repository["enabled"]):
+            raise ValueError("repository_unavailable")
+        routes = self._head_routes(organization, repository_id)
+        spaces = self._spaces_for_ids(organization, routes)
+        if any(not space.enabled for space in spaces.values()):
+            raise ValueError("route_target_disabled")
+        _validate_route_set(routes, spaces)
+        ordered_spaces = tuple(
+            sorted(spaces.values(), key=lambda item: (item.display_name, item.decision_space_id))
+        )
+        groups = self._catalog_groups(organization)
+        _validate_catalog_cycles(groups)
+        shared_tree = next(
+            (group for group in groups.values() if group.parent_group_id is None and group.display_name == "Shared"),
+            None,
+        )
+        return RepositoryCatalogView(
+            repository_id, True, ordered_spaces,
+            tuple(sorted(routes, key=lambda item: item.route_id)), shared_tree,
+        )
+
+    def _validate_route_target(
+        self, organization: str, route: RepositoryDecisionRoute
+    ) -> None:
+        repository = self.connection.execute(
+            """SELECT 1 FROM repositories
+            WHERE organization_id = ? AND repository_id = ?""",
+            (organization, route.repository_id),
+        ).fetchone()
+        if repository is None:
+            raise ValueError("repository_unavailable")
+        row = self.connection.execute(
+            """SELECT enabled FROM decision_spaces
+            WHERE organization_id = ? AND decision_space_id = ?""",
+            (organization, route.decision_space_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("route_target_must_be_leaf")
+        if not bool(row["enabled"]):
+            raise ValueError("route_target_disabled")
+
+    def _insert_route_version(
+        self, organization: str, route: RepositoryDecisionRoute
+    ) -> None:
+        record = route.to_dict()
+        digest = hashlib.sha256(canonical_json_bytes(record)).hexdigest()
+        existing = self.connection.execute(
+            """SELECT record_digest FROM repository_route_versions
+            WHERE organization_id = ? AND route_id = ? AND configuration_version = ?""",
+            (organization, route.route_id, route.configuration_version),
+        ).fetchone()
+        if existing is not None:
+            if existing["record_digest"] != digest:
+                raise ValueError("route_version_conflict")
+            return
+        self.connection.execute(
+            """INSERT INTO repository_route_versions(
+                organization_id, route_id, configuration_version, repository_id,
+                decision_space_id, path_prefixes_json, excluded_prefixes_json,
+                record_digest, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (organization, route.route_id, route.configuration_version,
+             route.repository_id, route.decision_space_id,
+             _json_text(list(route.path_prefixes)),
+             _json_text(list(route.excluded_prefixes)), digest, int(route.enabled)),
+        )
+
+    def _head_routes(
+        self, organization: str, repository_id: str
+    ) -> tuple[RepositoryDecisionRoute, ...]:
+        rows = self.connection.execute(
+            """SELECT version.* FROM repository_route_heads AS head
+            JOIN repository_route_versions AS version
+              ON version.organization_id = head.organization_id
+             AND version.route_id = head.route_id
+             AND version.configuration_version = head.configuration_version
+            WHERE head.organization_id = ? AND version.repository_id = ?
+            ORDER BY version.route_id""",
+            (organization, repository_id),
+        ).fetchall()
+        return tuple(_route_from_row(row) for row in rows)
+
+    def _spaces_for_ids(
+        self, organization: str, routes: tuple[RepositoryDecisionRoute, ...]
+    ) -> dict[str, LeafDecisionSpace]:
+        identifiers = sorted({route.decision_space_id for route in routes})
+        if not identifiers:
+            return {}
+        marks = ",".join("?" for _ in identifiers)
+        rows = self.connection.execute(
+            f"SELECT * FROM decision_spaces WHERE organization_id = ? AND decision_space_id IN ({marks})",
+            (organization, *identifiers),
+        ).fetchall()
+        spaces = {row["decision_space_id"]: _space_from_row(row) for row in rows}
+        if len(spaces) != len(identifiers):
+            raise ValueError("route_target_must_be_leaf")
+        return spaces
+
+    def _catalog_groups(self, organization: str) -> dict[str, CatalogGroup]:
+        rows = self.connection.execute(
+            "SELECT * FROM catalog_groups WHERE organization_id = ?",
+            (organization,),
+        ).fetchall()
+        return {row["catalog_group_id"]: _group_from_row(row) for row in rows}
+
     def get_request_record(
         self, request_id: str
     ) -> CaptureRequestRecord | None:
@@ -250,6 +614,115 @@ def request_record_from_row(row: sqlite3.Row) -> CaptureRequestRecord:
         last_sequence=row["last_sequence"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _json_text(value: object) -> str:
+    return canonical_json_bytes(value).decode("utf-8").rstrip("\n")
+
+
+def _group_from_row(row: sqlite3.Row) -> CatalogGroup:
+    return CatalogGroup(
+        catalog_group_id=row["catalog_group_id"],
+        parent_group_id=row["parent_group_id"],
+        display_name=row["display_name"],
+        breadcrumb=tuple(json.loads(row["breadcrumb_json"])),
+        source_prefix=row["source_prefix"],
+        sort_order=row["sort_order"],
+    )
+
+
+def _space_from_row(row: sqlite3.Row) -> LeafDecisionSpace:
+    return LeafDecisionSpace(
+        decision_space_id=row["decision_space_id"],
+        kind=row["kind"],
+        display_name=row["display_name"],
+        compatibility_product_id=row["compatibility_product_id"],
+        compatibility_product_name=row["compatibility_product_name"],
+        catalog_group_id=row["catalog_group_id"],
+        catalog_breadcrumb=tuple(json.loads(row["catalog_breadcrumb_json"])),
+        source_root=row["source_root"],
+        package_name=row["package_name"],
+        asset_type=row["asset_type"],
+        enabled=bool(row["enabled"]),
+    )
+
+
+def _route_from_row(row: sqlite3.Row) -> RepositoryDecisionRoute:
+    record = {
+        "route_id": row["route_id"],
+        "repository_id": row["repository_id"],
+        "decision_space_id": row["decision_space_id"],
+        "path_prefixes": json.loads(row["path_prefixes_json"]),
+        "excluded_prefixes": json.loads(row["excluded_prefixes_json"]),
+        "enabled": bool(row["enabled"]),
+        "configuration_version": row["configuration_version"],
+    }
+    digest = hashlib.sha256(canonical_json_bytes(record)).hexdigest()
+    if row["record_digest"] != digest:
+        raise ValueError("route_head_record_corrupt")
+    return RepositoryDecisionRoute.from_dict(record)
+
+
+def _validate_catalog_cycles(groups: dict[str, CatalogGroup]) -> None:
+    for group in groups.values():
+        seen: set[str] = set()
+        current = group
+        while current.parent_group_id is not None:
+            if current.catalog_group_id in seen:
+                raise ValueError("catalog_cycle")
+            seen.add(current.catalog_group_id)
+            parent = groups.get(current.parent_group_id)
+            if parent is None:
+                raise ValueError("catalog_parent_not_found")
+            current = parent
+
+
+def _validate_route_set(
+    routes: tuple[RepositoryDecisionRoute, ...],
+    spaces: dict[str, LeafDecisionSpace],
+) -> None:
+    enabled = tuple(route for route in routes if route.enabled)
+    root_routes = tuple(route for route in enabled if "." in route.path_prefixes)
+    if root_routes and (
+        len(enabled) != 1
+        or spaces[root_routes[0].decision_space_id].kind != "product"
+    ):
+        raise ValueError("root_route_requires_single_product_leaf")
+    for index, route in enumerate(enabled):
+        for other in enabled[index + 1 :]:
+            if route.decision_space_id == other.decision_space_id:
+                continue
+            if _routes_overlap(route, other):
+                raise ValueError("route_targets_overlap")
+
+
+def _routes_overlap(
+    first: RepositoryDecisionRoute, second: RepositoryDecisionRoute
+) -> bool:
+    for left in first.path_prefixes:
+        for right in second.path_prefixes:
+            if left == ".":
+                overlap = right
+            elif right == ".":
+                overlap = left
+            elif left == right or left.startswith(right + "/"):
+                overlap = left
+            elif right.startswith(left + "/"):
+                overlap = right
+            else:
+                continue
+            if not _fully_excluded(overlap, first.excluded_prefixes) and not _fully_excluded(
+                overlap, second.excluded_prefixes
+            ):
+                return True
+    return False
+
+
+def _fully_excluded(prefix: str, exclusions: tuple[str, ...]) -> bool:
+    return any(
+        excluded == prefix or prefix.startswith(excluded + "/")
+        for excluded in exclusions
     )
 
 

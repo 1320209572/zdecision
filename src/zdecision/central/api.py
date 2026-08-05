@@ -289,6 +289,14 @@ def create_app(
             ]
         }
 
+    @app.get("/api/v1/repositories/{repository_id}/spaces")
+    async def list_repository_spaces(
+        repository_id: str,
+    ) -> dict[str, object]:
+        return service.list_repository_spaces(
+            browser(), repository_id
+        ).to_dict()
+
     @app.get("/api/v1/repositories/{repository_id}/candidates")
     async def list_current_candidates(
         repository_id: str,

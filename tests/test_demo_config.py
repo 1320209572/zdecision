@@ -11,7 +11,6 @@ import unittest
 from pathlib import Path
 
 from zdecision.agent.repository import RepositoryResolver
-from zdecision.ids import product_id
 
 try:
     from zdecision.central.cli import main
@@ -67,7 +66,7 @@ class DemoConfigTest(unittest.TestCase):
                     "--repository-cwd",
                     str(self.repository),
                     "--product-name",
-                    "ZDecision",
+                    "Cloud",
                     "--output-dir",
                     str(output_directory),
                 ]
@@ -84,12 +83,13 @@ class DemoConfigTest(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         expected_repository = {
             "repository_id": snapshot.repository_id,
-            "product_id": product_id("ZDecision"),
-            "product_name": "ZDecision",
             "enabled": True,
         }
         self.assertEqual([expected_repository], central["repositories"])
         self.assertEqual([expected_repository], agent["repositories"])
+        self.assertEqual("Cloud", central["decision_spaces"][0]["display_name"])
+        self.assertEqual("Shared", central["catalog_groups"][0]["display_name"])
+        self.assertTrue(central["repository_routes"])
         self.assertEqual(central["organization_id"], agent["organization_id"])
         self.assertEqual(central["device_id"], agent["device_id"])
         self.assertNotIn("device_token", central)

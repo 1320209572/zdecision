@@ -16,17 +16,28 @@ from pathlib import Path
 
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.auth import DemoIdentityProvider, require_id, require_sha256
+from zdecision.central.decision_spaces import (
+    CatalogGroup,
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
 from zdecision.central.web.application import CentralWebApplication
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import CentralWebStore
-from zdecision.ids import canonical_product_name, product_id
+from zdecision.ids import (
+    canonical_product_name,
+    catalog_group_id,
+    decision_space_id,
+    product_id,
+    repository_route_id,
+)
 from zdecision.jsonio import atomic_create_json
 from zdecision.registry.git import GitRegistryAdapter
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.query import RegistryQuery
-from zdecision.sync.contracts import RepositoryView
 
 
 _DEFAULT_CENTRAL_URL = "http://127.0.0.1:8765"
@@ -118,18 +129,19 @@ def _initialize_demo_config(arguments: argparse.Namespace) -> int:
     device_token_digest = hashlib.sha256(
         device_token.encode("utf-8")
     ).hexdigest()
-    repository = RepositoryView(
-        repository_id=snapshot.repository_id,
-        product_id=product_id(product_name),
-        product_name=product_name,
-        enabled=True,
-    ).to_dict()
+    catalog_groups, spaces, routes = _demo_catalog(
+        snapshot.repository_id, product_name
+    )
+    repository = EnabledRepository(snapshot.repository_id, True).to_dict()
     central = {
         "organization_id": organization_id,
         "user_id": user_id,
         "device_id": device_id,
         "device_token_sha256": device_token_digest,
         "repositories": [repository],
+        "catalog_groups": [item.to_dict() for item in catalog_groups],
+        "decision_spaces": [item.to_dict() for item in spaces],
+        "repository_routes": [item.to_dict() for item in routes],
     }
     agent = {
         "central_url": _DEFAULT_CENTRAL_URL,
@@ -180,9 +192,18 @@ def _run_server(arguments: argparse.Namespace) -> int:
     store = CentralStore.open(database_path)
     try:
         for repository in config["repositories"]:
-            store.put_repository_mapping(
-                config["organization_id"],
-                repository,
+            store.put_repository(config["organization_id"], repository)
+        for group in config["catalog_groups"]:
+            store.put_catalog_group(config["organization_id"], group)
+        for space in config["decision_spaces"]:
+            store.put_decision_space(config["organization_id"], space)
+        for repository in config["repositories"]:
+            routes = tuple(
+                route for route in config["repository_routes"]
+                if route.repository_id == repository.repository_id
+            )
+            store.replace_trusted_route_heads(
+                config["organization_id"], repository.repository_id, routes
             )
         provider = DemoIdentityProvider(
             organization_id=config["organization_id"],
@@ -261,6 +282,9 @@ def _load_central_config(path: Path) -> dict[str, object]:
             "device_id",
             "device_token_sha256",
             "repositories",
+            "catalog_groups",
+            "decision_spaces",
+            "repository_routes",
         )
     )
     if not isinstance(value, Mapping) or frozenset(value) != expected:
@@ -278,9 +302,16 @@ def _load_central_config(path: Path) -> dict[str, object]:
             or not 1 <= len(raw_repositories) <= 100
         ):
             raise ValueError("repositories are invalid")
-        repositories = tuple(
-            RepositoryView.from_dict(item) for item in raw_repositories
-        )
+        repositories = tuple(EnabledRepository.from_dict(item) for item in raw_repositories)
+        raw_groups = value["catalog_groups"]
+        raw_spaces = value["decision_spaces"]
+        raw_routes = value["repository_routes"]
+        if not isinstance(raw_groups, list) or not isinstance(raw_spaces, list) or not isinstance(raw_routes, list):
+            raise ValueError("catalog is invalid")
+        groups = tuple(CatalogGroup.from_dict(item) for item in raw_groups)
+        spaces = tuple(LeafDecisionSpace.from_dict(item) for item in raw_spaces)
+        routes = tuple(RepositoryDecisionRoute.from_dict(item) for item in raw_routes)
+        _validate_trusted_catalog(repositories, groups, spaces, routes)
     except (TypeError, ValueError) as error:
         raise CentralCliError("central_config_invalid") from error
     return {
@@ -289,7 +320,173 @@ def _load_central_config(path: Path) -> dict[str, object]:
         "device_id": device_id,
         "device_token_sha256": digest,
         "repositories": repositories,
+        "catalog_groups": groups,
+        "decision_spaces": spaces,
+        "repository_routes": routes,
     }
+
+
+def _validate_trusted_catalog(
+    repositories: tuple[EnabledRepository, ...],
+    groups: tuple[CatalogGroup, ...],
+    spaces: tuple[LeafDecisionSpace, ...],
+    routes: tuple[RepositoryDecisionRoute, ...],
+) -> None:
+    if len({item.repository_id for item in repositories}) != len(repositories):
+        raise ValueError("repositories contain duplicates")
+    group_by_id = {item.catalog_group_id: item for item in groups}
+    if len(group_by_id) != len(groups):
+        raise ValueError("catalog groups contain duplicates")
+    for group in groups:
+        if group.parent_group_id is not None:
+            parent = group_by_id.get(group.parent_group_id)
+            if parent is None or parent.breadcrumb + (group.display_name,) != group.breadcrumb:
+                raise ValueError("catalog parent is invalid")
+        seen: set[str] = set()
+        cursor = group
+        while cursor.parent_group_id is not None:
+            if cursor.catalog_group_id in seen:
+                raise ValueError("catalog cycle")
+            seen.add(cursor.catalog_group_id)
+            cursor = group_by_id.get(cursor.parent_group_id)
+            if cursor is None:
+                raise ValueError("catalog parent is invalid")
+    space_by_id = {item.decision_space_id: item for item in spaces}
+    if len(space_by_id) != len(spaces) or len(
+        {item.compatibility_product_id for item in spaces}
+    ) != len(spaces):
+        raise ValueError("decision spaces contain duplicates")
+    for space in spaces:
+        if space.catalog_group_id is not None:
+            group = group_by_id.get(space.catalog_group_id)
+            if group is None or group.breadcrumb != space.catalog_breadcrumb:
+                raise ValueError("decision space catalog is invalid")
+    repository_ids = {item.repository_id for item in repositories}
+    if not routes or {item.repository_id for item in routes} != repository_ids:
+        raise ValueError("routes do not cover repositories")
+    route_ids = set()
+    for route in routes:
+        target = space_by_id.get(route.decision_space_id)
+        if (
+            route.route_id in route_ids
+            or target is None
+            or not target.enabled
+        ):
+            raise ValueError("route target is invalid")
+        route_ids.add(route.route_id)
+    for repository_id in repository_ids:
+        enabled = tuple(
+            item for item in routes
+            if item.repository_id == repository_id and item.enabled
+        )
+        roots = tuple(item for item in enabled if "." in item.path_prefixes)
+        if roots and (
+            len(enabled) != 1
+            or space_by_id[roots[0].decision_space_id].kind != "product"
+        ):
+            raise ValueError("root route is invalid")
+
+
+def _demo_catalog(
+    repository_id: str, product_name: str
+) -> tuple[
+    tuple[CatalogGroup, ...],
+    tuple[LeafDecisionSpace, ...],
+    tuple[RepositoryDecisionRoute, ...],
+]:
+    shared = CatalogGroup(
+        catalog_group_id=catalog_group_id(("Shared",)),
+        parent_group_id=None,
+        display_name="Shared",
+        breadcrumb=("Shared",),
+        source_prefix=None,
+        sort_order=20,
+    )
+    shared_groups = tuple(
+        CatalogGroup(
+            catalog_group_id=catalog_group_id(("Shared", label)),
+            parent_group_id=shared.catalog_group_id,
+            display_name=label,
+            breadcrumb=("Shared", label),
+            source_prefix=prefix,
+            sort_order=order,
+        )
+        for label, prefix, order in (
+            ("packages/products/shared", "packages/products/shared", 10),
+            ("packages/shared", "packages/shared", 20),
+            ("packages", "packages", 30),
+        )
+    )
+    product_compatibility_id = product_id(product_name)
+    product_root = "packages/products/" + product_name.casefold().replace(" ", "-")
+    product = LeafDecisionSpace(
+        decision_space_id=decision_space_id("product", product_compatibility_id),
+        kind="product",
+        display_name=product_name,
+        compatibility_product_id=product_compatibility_id,
+        compatibility_product_name=product_name,
+        catalog_group_id=None,
+        catalog_breadcrumb=(),
+        source_root=product_root,
+        package_name=None,
+        asset_type=None,
+        enabled=True,
+    )
+    group_by_prefix = {group.source_prefix: group for group in shared_groups}
+    shared_specs = (
+        ("audit-nest", "packages/products/shared/audit-nest", "@zstack/audit-nest", "cross_product_module"),
+        ("zcf-alert", "packages/products/shared/zcf-alert", "@zstack/zcf-alert", "cross_product_module"),
+        ("zcf-audit", "packages/products/shared/zcf-audit", "@zstack/zcf-audit", "cross_product_module"),
+        ("zcf-license", "packages/products/shared/zcf-license", "@zstack/zcf-license", "cross_product_module"),
+        ("zcf-region-management", "packages/products/shared/zcf-region-management", "@zstack/zcf-region-management", "cross_product_module"),
+        ("design-x", "packages/shared/design-x", "@zstack/design-x", "library"),
+        ("theme", "packages/shared/theme", "@zstack/theme", "library"),
+        ("design", "packages/design", "@zstack/design", "component_library"),
+        ("form", "packages/form", "@zstack/form", "library"),
+        ("table", "packages/table", "@zstack/table", "component_library"),
+        ("hooks", "packages/hooks", "@zstack/hooks", "library"),
+        ("auth", "packages/auth", "@zstack/auth", "library"),
+        ("i18n", "packages/i18n", "@zstack/i18n", "library"),
+        ("utils", "packages/utils", "@zstack/utils", "library"),
+        ("zephyr", "packages/zephyr", "@zstack/zephyr", "component_library"),
+    )
+    shared_spaces: list[LeafDecisionSpace] = []
+    for name, source_root, package_name, asset_type in shared_specs:
+        group = max(
+            (candidate for prefix, candidate in group_by_prefix.items() if source_root.startswith(prefix + "/")),
+            key=lambda candidate: len(candidate.source_prefix or ""),
+        )
+        compatibility_name = f"Shared / {source_root}"
+        compatibility_id = product_id(compatibility_name)
+        shared_spaces.append(
+            LeafDecisionSpace(
+                decision_space_id=decision_space_id("shared_unit", compatibility_id),
+                kind="shared_unit",
+                display_name=name,
+                compatibility_product_id=compatibility_id,
+                compatibility_product_name=compatibility_name,
+                catalog_group_id=group.catalog_group_id,
+                catalog_breadcrumb=group.breadcrumb,
+                source_root=source_root,
+                package_name=package_name,
+                asset_type=asset_type,
+                enabled=True,
+            )
+        )
+    spaces = (product, *shared_spaces)
+    routes = tuple(
+        RepositoryDecisionRoute(
+            route_id=repository_route_id(repository_id, space.decision_space_id),
+            repository_id=repository_id,
+            decision_space_id=space.decision_space_id,
+            path_prefixes=(space.source_root,),
+            excluded_prefixes=(),
+            enabled=True,
+            configuration_version=1,
+        )
+        for space in spaces
+    )
+    return (shared, *shared_groups), spaces, routes
 
 
 def _is_loopback(host: str) -> bool:

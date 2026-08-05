@@ -66,6 +66,8 @@ class SyncContractsTest(unittest.TestCase):
                 ProgressEvent,
                 RepositoryView,
                 UploadReceipt,
+                EnabledRepository,
+                RepositoryCatalogView,
             )
         except (ImportError, ModuleNotFoundError) as error:
             self.fail(f"On-demand sync contract API is missing: {error}")
@@ -79,10 +81,27 @@ class SyncContractsTest(unittest.TestCase):
             ProgressEvent=ProgressEvent,
             RepositoryView=RepositoryView,
             UploadReceipt=UploadReceipt,
+            EnabledRepository=EnabledRepository,
+            RepositoryCatalogView=RepositoryCatalogView,
             candidate_family_id=candidate_family_id,
             candidate_revision_id=candidate_revision_id,
             capture_request_id=capture_request_id,
         )
+
+    def test_neutral_repository_contract_round_trips_without_product_ownership(self) -> None:
+        api = self.sync_api()
+        repository = api.EnabledRepository.from_dict(
+            {"repository_id": REPOSITORY_ID, "enabled": True}
+        )
+
+        self.assertEqual(
+            {"repository_id": REPOSITORY_ID, "enabled": True},
+            repository.to_dict(),
+        )
+        with self.assertRaisesRegex(ValueError, "EnabledRepository fields are invalid"):
+            api.EnabledRepository.from_dict(
+                {"repository_id": REPOSITORY_ID, "enabled": True, "product_id": PRODUCT_ID}
+            )
 
     def test_stable_ids_match_hand_checked_canonical_fixtures(self) -> None:
         """Catch random IDs or hashes that omit an identity input."""
