@@ -346,15 +346,6 @@ class AgentDatabase:
                     int(mapping.enabled),
                 ),
             )
-            self._connection.execute(
-                """
-                INSERT INTO enabled_repositories(repository_id, enabled)
-                VALUES (?, ?)
-                ON CONFLICT(repository_id) DO UPDATE SET
-                    enabled = excluded.enabled
-                """,
-                (mapping.repository_id, int(mapping.enabled)),
-            )
 
     def put_enabled_repository(self, repository: EnabledRepository) -> None:
         if not isinstance(repository, EnabledRepository):

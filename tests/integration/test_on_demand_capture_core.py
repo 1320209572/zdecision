@@ -1215,6 +1215,9 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
                 enabled=True,
             )
         )
+        self.agent_database.put_enabled_repository(
+            EnabledRepository(self.repository_id, True)
+        )
         self.session_index = SessionIndex.open(self.agent_path)
         self.operation_store = CaptureOperationStore.open(self.agent_path)
         self.request_state = RequestStateStore.open(self.agent_path)

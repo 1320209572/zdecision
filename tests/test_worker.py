@@ -20,6 +20,7 @@ from zdecision.agent.events import (
 )
 from zdecision.agent.hooks import handle_hook
 from zdecision.agent.session_index import SessionIndex, SessionIndexEventProcessor
+from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
 
 try:
@@ -279,6 +280,9 @@ class WorkerTests(unittest.TestCase):
                 product_name="Worker Test",
                 enabled=True,
             )
+        )
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, True)
         )
         resolver = StaticResolver(self.snapshot)
         wake_counts: list[int] = []

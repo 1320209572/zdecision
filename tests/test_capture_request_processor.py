@@ -29,6 +29,7 @@ from zdecision.sync.contracts import (
 
 NOW = datetime(2026, 8, 5, 5, 0, tzinfo=UTC)
 REQUEST_ID = "crq_" + "1" * 32
+OTHER_REQUEST_ID = "crq_" + "9" * 32
 REPOSITORY_ID = "repo_" + "2" * 32
 SESSION_ID = "019fb100-0000-7000-8000-000000000001"
 TURN_ID = "019fb100-0000-7000-8000-000000000002"
@@ -38,9 +39,12 @@ class FakeGitPaths:
     def __init__(self, evidence: FrozenGitPathEvidence) -> None:
         self.evidence = evidence
         self.calls = 0
+        self.fail = False
 
     def freeze(self, repository, sources):
         self.calls += 1
+        if self.fail:
+            raise OSError("repository is unavailable")
         return self.evidence
 
 
@@ -147,6 +151,7 @@ class FakeCentralClient:
         self.completed = []
         self.fail_on_upload_number: int | None = None
         self.corrupt_receipt = False
+        self.completion_error: Exception | None = None
 
     def start(self, request_id, lease_token):
         pass
@@ -186,6 +191,8 @@ class FakeCentralClient:
         return receipt
 
     def complete_group(self, group, receipt_digest):
+        if self.completion_error is not None:
+            raise self.completion_error
         self.completed.append(receipt_digest)
 
 
@@ -392,9 +399,11 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         calls_before = tuple(self.capture_runner.calls)
 
         second = FakeCentralClient(self.group, self.views())
+        self.git_paths.fail = True
         self.processor().process(self.group, second)
 
         self.assertEqual(calls_before, tuple(self.capture_runner.calls))
+        self.assertEqual(1, self.git_paths.calls)
         self.assertEqual(1, len(second.uploads))
         self.assertEqual(self.views()[1].slice_id, second.uploads[0].slice_id)
 
@@ -413,6 +422,27 @@ class CaptureRequestProcessorTest(unittest.TestCase):
                 REQUEST_ID, self.views()[0].slice_id
             )
         )
+
+    def test_invalid_completion_response_does_not_acknowledge_sources(self) -> None:
+        from zdecision.agent.central_client import CentralClientError
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        client = FakeCentralClient(self.group, self.views())
+        client.completion_error = CentralClientError("central_response_invalid")
+
+        with self.assertRaisesRegex(
+            TerminalCaptureRequestError, "central_response_invalid"
+        ):
+            self.processor().process(self.group, client)
+
+        next_sources = self.session_index.freeze_sources(
+            OTHER_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="all_valid_sessions",
+        )
+        self.assertEqual(1, len(next_sources))
+        self.assertIsNone(next_sources[0].previous_handled_turn_id)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import handle_hook
 from zdecision.agent.repository import RepositoryResolver
+from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
 
 try:
@@ -71,6 +72,9 @@ class HookLatencyTests(unittest.TestCase):
                 product_name="Latency Test",
                 enabled=True,
             )
+        )
+        self.database.put_enabled_repository(
+            EnabledRepository(snapshot.repository_id, True)
         )
 
     def tearDown(self) -> None:

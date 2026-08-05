@@ -175,13 +175,15 @@ class OnDemandCaptureProcessor:
             capture_scope=group.capture_scope,
             selected_session_id=self._selected_session_id(group),
         )
-        evidence = self.git_paths.freeze(
-            self.database.get_repository_snapshot(group.repository_id),
-            sources,
-        )
-        plan = self.routing_store.get_or_create_plan(
-            group, snapshot, sources, evidence
-        )
+        plan = self.routing_store.load_plan(group, snapshot)
+        if plan is None:
+            evidence = self.git_paths.freeze(
+                self.database.get_repository_snapshot(group.repository_id),
+                sources,
+            )
+            plan = self.routing_store.get_or_create_plan(
+                group, snapshot, sources, evidence
+            )
         slices = client.plan_slices(group, plan.route_selections())
         self._verify_slice_plan(group, plan, slices)
 

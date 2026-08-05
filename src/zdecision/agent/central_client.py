@@ -216,9 +216,16 @@ class CentralClient:
             allowed_statuses=(200,),
         )
         try:
-            CaptureRequestView.from_dict(value)
+            completed = CaptureRequestView.from_dict(value)
         except (TypeError, ValueError) as error:
             raise CentralClientError("central_response_invalid") from error
+        if (
+            completed.request_id != group.request_id
+            or completed.repository_id != group.repository_id
+            or completed.state not in ("succeeded", "succeeded_no_candidates")
+            or completed.candidate_revision_count is None
+        ):
+            raise CentralClientError("central_response_invalid")
 
     def complete(
         self,

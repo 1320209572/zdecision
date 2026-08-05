@@ -82,6 +82,15 @@ def capture_request_payload() -> dict[str, object]:
     }
 
 
+def completed_capture_request_payload() -> dict[str, object]:
+    return {
+        **capture_request_payload(),
+        "state": "succeeded_no_candidates",
+        "progress_code": "capture_succeeded_no_candidates",
+        "candidate_revision_count": 0,
+    }
+
+
 def valid_upload_batch() -> CandidateBatchUpload:
     content = CandidateContent(
         product="ZDecision",
@@ -212,7 +221,7 @@ class CentralClientTest(unittest.TestCase):
                     200, json={"slices": [slice_view.to_dict()]}
                 ),
                 httpx.Response(200, json=receipt.to_dict()),
-                httpx.Response(200, json=capture_request_payload()),
+                httpx.Response(200, json=completed_capture_request_payload()),
             ]
         )
         client = CentralClient(
@@ -239,6 +248,33 @@ class CentralClientTest(unittest.TestCase):
             b"/Users/",
         ):
             self.assertNotIn(forbidden, bodies)
+
+    def test_group_completion_requires_matching_terminal_success(self) -> None:
+        group = ClaimedCaptureGroup.from_dict(claimed_payload())
+        cases = (
+            {**completed_capture_request_payload(), "request_id": "crq_" + "e" * 32},
+            {**completed_capture_request_payload(), "repository_id": "repo_" + "e" * 32},
+            capture_request_payload(),
+            {**completed_capture_request_payload(), "candidate_revision_count": None},
+        )
+
+        for response_payload in cases:
+            with self.subTest(response=response_payload):
+                transport = RecordingTransport(
+                    [httpx.Response(200, json=response_payload)]
+                )
+                client = CentralClient(
+                    BASE_URL,
+                    DEVICE_TOKEN,
+                    transport=httpx.MockTransport(transport),
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        CentralClientError, "central_response_invalid"
+                    ):
+                        client.complete_group(group, "c" * 64)
+                finally:
+                    client.close()
 
     def test_plugin_capture_client_sends_only_command_and_reads_request(self) -> None:
         transport = RecordingTransport(

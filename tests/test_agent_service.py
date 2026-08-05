@@ -6,12 +6,14 @@ import tempfile
 import threading
 import unittest
 from argparse import Namespace
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.central_client import CentralClientError
+from zdecision.agent.events import TestRepositoryMapping
 from zdecision.sync.contracts import (
     ClaimedCaptureRequest,
 )
@@ -332,6 +334,67 @@ class AgentServiceTest(unittest.TestCase):
                 AgentServiceConfigError, "agent_config_permissions_invalid"
             ):
                 load_agent_config(path)
+
+    def test_feasibility_mapping_does_not_enable_active_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = AgentDatabase.open(Path(directory) / "state.sqlite3")
+            try:
+                database.put_test_repository_mapping(
+                    TestRepositoryMapping(
+                        repository_id=REPOSITORY_ID,
+                        product_id=PRODUCT_ID,
+                        product_name="Legacy Product",
+                        enabled=True,
+                    )
+                )
+
+                self.assertIsNone(
+                    database.get_enabled_repository(REPOSITORY_ID)
+                )
+            finally:
+                database.close()
+
+    def test_test_repository_enable_is_product_neutral(self) -> None:
+        from zdecision.agent.cli import _configure_test_repository, build_parser
+
+        arguments = build_parser().parse_args(
+            ["test-repository", "enable", "--cwd", "/workspace/repository"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            database = AgentDatabase.open(Path(directory) / "state.sqlite3")
+            output = _CapturedOutput()
+            try:
+                with patch(
+                    "zdecision.agent.repository.RepositoryResolver.resolve",
+                    return_value=SimpleNamespace(repository_id=REPOSITORY_ID),
+                ), patch("sys.stdout", output):
+                    result = _configure_test_repository(arguments, database)
+
+                self.assertEqual(0, result)
+                self.assertEqual(
+                    {"enabled": True, "repository_id": REPOSITORY_ID},
+                    json.loads(output.buffer.getvalue()),
+                )
+                self.assertTrue(
+                    database.get_enabled_repository(REPOSITORY_ID).enabled
+                )
+                self.assertIsNone(
+                    database.get_repository_mapping(REPOSITORY_ID)
+                )
+            finally:
+                database.close()
+
+        with patch("sys.stderr", StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "test-repository",
+                    "enable",
+                    "--cwd",
+                    "/workspace/repository",
+                    "--product-name",
+                    "Legacy Product",
+                ]
+            )
 
     def test_service_install_publishes_locator_only_after_config_validation(
         self,

@@ -7,7 +7,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from tests.test_inventory import VALID_INVENTORY
-from zdecision.agent.capture_operation_store import CaptureOperationStore
+from zdecision.agent.capture_operation_store import (
+    CaptureOperationStore,
+    _migrate_slice_operations,
+)
 from zdecision.capture.on_demand import (
     FrozenCaptureInput,
     FrozenCaptureRouteContext,
@@ -225,6 +228,68 @@ class CaptureOperationStoreTests(unittest.TestCase):
             "SELECT operation_id FROM capture_operations"
         ).fetchall()
         self.assertEqual(2, len(rows))
+
+    def test_slice_migration_rolls_back_if_rename_fails_after_drop(self) -> None:
+        legacy_path = Path(self.temporary_directory.name) / "failed-migration.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE capture_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    frozen_json TEXT NOT NULL,
+                    frozen_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    active_generation INTEGER NOT NULL,
+                    winner_generation INTEGER,
+                    committed_result_json TEXT,
+                    committed_result_digest TEXT,
+                    failure_code TEXT,
+                    UNIQUE(request_id, source_key)
+                )
+                """
+            )
+            connection.execute(
+                """INSERT INTO capture_operations VALUES (
+                    'operation-1', 'request-1', 'source-1', '{}', 'digest',
+                    'open', 0, NULL, NULL, NULL, NULL
+                )"""
+            )
+        connection.close()
+
+        class RenameFailingConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql.lstrip().startswith(
+                    "ALTER TABLE capture_operations_slice_migration"
+                ):
+                    raise sqlite3.OperationalError("injected rename failure")
+                return super().execute(sql, parameters)
+
+        failing = sqlite3.connect(
+            legacy_path, factory=RenameFailingConnection
+        )
+        self.addCleanup(failing.close)
+        failing.row_factory = sqlite3.Row
+
+        with self.assertRaisesRegex(
+            sqlite3.OperationalError, "injected rename failure"
+        ):
+            _migrate_slice_operations(failing)
+
+        tables = {
+            row[0]
+            for row in failing.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertIn("capture_operations", tables)
+        self.assertNotIn("capture_operations_slice_migration", tables)
+        self.assertEqual(
+            1,
+            failing.execute("SELECT COUNT(*) FROM capture_operations").fetchone()[0],
+        )
 
     def test_attempt_generations_increase_monotonically(self) -> None:
         operation = self.store.ensure_operation(frozen_input())

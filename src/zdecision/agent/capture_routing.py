@@ -144,6 +144,19 @@ class CaptureRoutingStore:
     def close(self) -> None:
         self._connection.close()
 
+    def load_plan(
+        self,
+        group: ClaimedCaptureGroup,
+        snapshot: RepositoryRouteSnapshot,
+    ) -> CaptureGroupPlan | None:
+        row = self._connection.execute(
+            "SELECT * FROM capture_group_plans WHERE request_id = ?",
+            (group.request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._stored_plan(row, group, snapshot)
+
     def get_or_create_plan(
         self,
         group: ClaimedCaptureGroup,
@@ -158,25 +171,7 @@ class CaptureRoutingStore:
                 (group.request_id,),
             ).fetchone()
             if row is not None:
-                if (
-                    row["repository_id"] != group.repository_id
-                    or row["route_snapshot_digest"]
-                    != group.route_snapshot_digest
-                ):
-                    raise ValueError("capture_group_plan_conflict")
-                stored_snapshot = _read_json(
-                    row["route_snapshot_json"],
-                    row["route_snapshot_digest"],
-                    snapshot_record=True,
-                )
-                if stored_snapshot != {
-                    "routes": [route.to_dict() for route in group.route_snapshot]
-                }:
-                    raise ValueError("capture_group_plan_corrupt")
-                value = _read_json(
-                    row["plan_json"], row["plan_digest"]
-                )
-                plan = _plan_from_dict(value)
+                plan = self._stored_plan(row, group, snapshot)
                 self._connection.commit()
                 return plan
 
@@ -210,6 +205,40 @@ class CaptureRoutingStore:
         except Exception:
             self._connection.rollback()
             raise
+
+    @staticmethod
+    def _stored_plan(
+        row: sqlite3.Row,
+        group: ClaimedCaptureGroup,
+        snapshot: RepositoryRouteSnapshot,
+    ) -> CaptureGroupPlan:
+        if (
+            row["repository_id"] != group.repository_id
+            or row["route_snapshot_digest"] != group.route_snapshot_digest
+            or snapshot.digest != group.route_snapshot_digest
+        ):
+            raise ValueError("capture_group_plan_conflict")
+        stored_snapshot = _read_json(
+            row["route_snapshot_json"],
+            row["route_snapshot_digest"],
+            snapshot_record=True,
+        )
+        if stored_snapshot != {
+            "routes": [route.to_dict() for route in group.route_snapshot]
+        }:
+            raise ValueError("capture_group_plan_corrupt")
+        plan = _plan_from_dict(
+            _read_json(row["plan_json"], row["plan_digest"])
+        )
+        if (
+            plan.request_id != group.request_id
+            or plan.repository_id != group.repository_id
+            or plan.route_snapshot_digest != group.route_snapshot_digest
+            or plan.evidence_digest != row["evidence_digest"]
+            or plan.source_boundary_digest != row["source_boundary_digest"]
+        ):
+            raise ValueError("capture_group_plan_corrupt")
+        return plan
 
 
 def plan_capture_group(

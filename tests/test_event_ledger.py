@@ -17,6 +17,7 @@ try:
     from zdecision.agent.hooks import handle_hook
     from zdecision.agent.mcp_server import LocalMcpTools
     from zdecision.agent.repository import RepositoryResolver
+    from zdecision.central.decision_spaces import EnabledRepository
 except ModuleNotFoundError as error:
     AGENT_IMPORT_ERROR: ModuleNotFoundError | None = error
 else:
@@ -58,6 +59,9 @@ class EventLedgerTests(unittest.TestCase):
             enabled=True,
         )
         self.database.put_test_repository_mapping(self.mapping)
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, True)
+        )
 
     def tearDown(self) -> None:
         if hasattr(self, "database"):
@@ -197,7 +201,9 @@ class EventLedgerTests(unittest.TestCase):
         self.assertEqual(0, self.database.count_events())
 
     def test_unregistered_repository_is_a_silent_no_op(self) -> None:
-        self.database.put_test_repository_mapping(replace(self.mapping, enabled=False))
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, False)
+        )
 
         response = self._handle(
             self._raw("UserPromptSubmit", turn_id="turn_unregistered", prompt=SECRET)

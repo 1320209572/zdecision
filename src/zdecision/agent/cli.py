@@ -58,12 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repository = subparsers.add_parser(
         "test-repository",
-        help="configure a feasibility-only local repository mapping",
+        help="configure feasibility-only local repository enablement",
     )
     actions = repository.add_subparsers(dest="repository_action", required=True)
     enable = actions.add_parser("enable", help="enable one feasibility repository")
     enable.add_argument("--cwd", required=True)
-    enable.add_argument("--product-name", required=True)
     disable = actions.add_parser("disable", help="disable one feasibility repository")
     disable.add_argument("--cwd", required=True)
     return parser
@@ -134,41 +133,26 @@ def _configure_test_repository(
     arguments: argparse.Namespace,
     database: AgentDatabase,
 ) -> int:
-    from zdecision.agent.events import TestRepositoryMapping
     from zdecision.agent.repository import RepositoryResolver
-    from zdecision.ids import canonical_product_name, product_id
+    from zdecision.central.decision_spaces import EnabledRepository
 
     snapshot = RepositoryResolver().resolve(Path(arguments.cwd).expanduser().resolve())
     if snapshot is None:
         _write_error("repository_not_resolved")
         return 1
-    existing = database.get_repository_mapping(snapshot.repository_id)
-    if arguments.repository_action == "enable":
-        product_name = canonical_product_name(arguments.product_name)
-        mapping = TestRepositoryMapping(
-            repository_id=snapshot.repository_id,
-            product_id=product_id(product_name),
-            product_name=product_name,
-            enabled=True,
-        )
-    else:
+    existing = database.get_enabled_repository(snapshot.repository_id)
+    enabled = arguments.repository_action == "enable"
+    if not enabled:
         if existing is None:
             _write_error("repository_not_registered")
             return 1
-        mapping = TestRepositoryMapping(
-            repository_id=existing.repository_id,
-            product_id=existing.product_id,
-            product_name=existing.product_name,
-            enabled=False,
-        )
-    database.put_test_repository_mapping(mapping)
+    repository = EnabledRepository(snapshot.repository_id, enabled)
+    database.put_enabled_repository(repository)
     sys.stdout.buffer.write(
         canonical_json_bytes(
             {
-                "enabled": mapping.enabled,
-                "product_id": mapping.product_id,
-                "product_name": mapping.product_name,
-                "repository_id": mapping.repository_id,
+                "enabled": repository.enabled,
+                "repository_id": repository.repository_id,
             }
         )
     )

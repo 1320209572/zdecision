@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import signal
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -17,6 +20,8 @@ from zdecision.jsonio import canonical_json_bytes
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _COMMIT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_MAX_STDOUT_BYTES = 8 * 1024 * 1024
+_MAX_STDERR_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -160,9 +165,22 @@ class GitPathEvidenceReader:
         root = Path(resolved.worktree_root)
         paths: set[str] = set()
         for arguments in (
-            ("diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD"),
-            ("diff", "--cached", "--name-only", "--diff-filter=ACMRTUXB"),
-            ("ls-files", "--others", "--exclude-standard"),
+            (
+                "diff",
+                "--name-only",
+                "-z",
+                "--diff-filter=ACMRTUXB",
+                resolved.head_commit,
+            ),
+            (
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--diff-filter=ACMRTUXB",
+                resolved.head_commit,
+            ),
+            ("ls-files", "-z", "--others", "--exclude-standard"),
         ):
             paths.update(self._path_output(root, arguments))
 
@@ -190,6 +208,7 @@ class GitPathEvidenceReader:
                     (
                         "diff",
                         "--name-only",
+                        "-z",
                         "--diff-filter=ACMRTUXB",
                         f"{base}..{head}",
                     ),
@@ -213,30 +232,103 @@ class GitPathEvidenceReader:
         result = self._run(root, arguments)
         if result.returncode != 0:
             raise OSError("git_path_command_failed")
-        if "\x00" in result.stdout:
+        if result.stdout and not result.stdout.endswith(b"\x00"):
             raise ValueError("git_path_invalid")
-        return tuple(
-            _normalized_path(line)
-            for line in result.stdout.splitlines()
-            if line
-        )
+        try:
+            return tuple(
+                _normalized_path(encoded.decode("utf-8", errors="strict"))
+                for encoded in result.stdout.split(b"\x00")
+                if encoded
+            )
+        except UnicodeError as error:
+            raise ValueError("git_path_invalid") from error
 
     def _run(
         self, root: Path, arguments: tuple[str, ...]
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
+        command_arguments = list(arguments)
+        if command_arguments[0] == "diff":
+            command_arguments[1:1] = ["--no-ext-diff", "--no-textconv"]
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_NO_LAZY_FETCH": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        command = [
+            self.git_executable,
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "diff.external=",
+            *command_arguments,
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+        output: list[bytes] = []
+        errors: list[bytes] = []
+        readers = (
+            threading.Thread(
+                target=_read_bounded,
+                args=(process.stdout, _MAX_STDOUT_BYTES, output),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_read_bounded,
+                args=(process.stderr, _MAX_STDERR_BYTES, errors),
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            reader.start()
         try:
-            return subprocess.run(
-                [self.git_executable, *arguments],
-                cwd=root,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="strict",
-                timeout=self.timeout_seconds,
-            )
-        except (subprocess.TimeoutExpired, UnicodeError) as error:
+            returncode = process.wait(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            for reader in readers:
+                reader.join()
+            process.stdout.close()
+            process.stderr.close()
             raise OSError("git_path_command_failed") from error
+        for reader in readers:
+            reader.join()
+        process.stdout.close()
+        process.stderr.close()
+        stdout = output[0]
+        stderr = errors[0]
+        if (
+            len(stdout) > _MAX_STDOUT_BYTES
+            or len(stderr) > _MAX_STDERR_BYTES
+        ):
+            raise OSError("git_path_output_too_large")
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout,
+            stderr,
+        )
 
 
 def _normalized_path(value: str) -> str:
@@ -244,7 +336,6 @@ def _normalized_path(value: str) -> str:
         not isinstance(value, str)
         or not value
         or "\x00" in value
-        or "\\" in value
         or value.startswith("/")
     ):
         raise ValueError("git_path_invalid")
@@ -255,6 +346,15 @@ def _normalized_path(value: str) -> str:
     if normalized != value:
         raise ValueError("git_path_invalid")
     return normalized
+
+
+def _read_bounded(stream, limit: int, target: list[bytes]) -> None:
+    buffered = bytearray()
+    while chunk := stream.read(64 * 1024):
+        remaining = limit + 1 - len(buffered)
+        if remaining > 0:
+            buffered.extend(chunk[:remaining])
+    target.append(bytes(buffered))
 
 
 def _evidence_digest(
@@ -273,4 +373,3 @@ def _evidence_digest(
             }
         )
     ).hexdigest()
-

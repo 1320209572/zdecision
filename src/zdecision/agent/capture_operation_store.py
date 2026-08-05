@@ -928,10 +928,10 @@ def _migrate_slice_operations(connection: sqlite3.Connection) -> None:
 
     connection.execute("PRAGMA foreign_keys = OFF")
     try:
-        with connection:
-            connection.executescript(
-                """
-                CREATE TABLE capture_operations_slice_migration (
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """CREATE TABLE capture_operations_slice_migration (
                     operation_id TEXT PRIMARY KEY,
                     request_id TEXT NOT NULL,
                     source_key TEXT NOT NULL,
@@ -946,9 +946,10 @@ def _migrate_slice_operations(connection: sqlite3.Connection) -> None:
                     committed_result_json TEXT,
                     committed_result_digest TEXT,
                     failure_code TEXT
-                );
-
-                INSERT INTO capture_operations_slice_migration(
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO capture_operations_slice_migration(
                     operation_id, request_id, source_key, frozen_json,
                     frozen_digest, status, active_generation,
                     winner_generation, committed_result_json,
@@ -958,13 +959,17 @@ def _migrate_slice_operations(connection: sqlite3.Connection) -> None:
                     frozen_digest, status, active_generation,
                     winner_generation, committed_result_json,
                     committed_result_digest, failure_code
-                FROM capture_operations;
-
-                DROP TABLE capture_operations;
-                ALTER TABLE capture_operations_slice_migration
-                    RENAME TO capture_operations;
-                """
+                FROM capture_operations"""
             )
+            connection.execute("DROP TABLE capture_operations")
+            connection.execute(
+                """ALTER TABLE capture_operations_slice_migration
+                RENAME TO capture_operations"""
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
     finally:
         connection.execute("PRAGMA foreign_keys = ON")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:

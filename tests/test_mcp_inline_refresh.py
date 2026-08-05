@@ -19,6 +19,7 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import RepositorySnapshot, TestRepositoryMapping
 from zdecision.agent.mcp_server import LocalMcpTools
 from zdecision.agent.service import AgentServiceConfigError
+from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.sync.contracts import CaptureRequestCreate, CaptureRequestView
 
 
@@ -142,6 +143,9 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
                 product_name="ZDecision",
                 enabled=True,
             )
+        )
+        self.database.put_enabled_repository(
+            EnabledRepository(REPOSITORY_ID, True)
         )
         self.resolver = StaticRepositoryResolver()
         self.client = RecordingCentralClient()
@@ -302,13 +306,8 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         domain.start_zdecision_candidate_refresh(
             CONTROL_ID, "current_session"
         )
-        self.database.put_test_repository_mapping(
-            TestRepositoryMapping(
-                repository_id=REPOSITORY_ID,
-                product_id=PRODUCT_ID,
-                product_name="ZDecision",
-                enabled=False,
-            )
+        self.database.put_enabled_repository(
+            EnabledRepository(REPOSITORY_ID, False)
         )
 
         self.assertEqual(

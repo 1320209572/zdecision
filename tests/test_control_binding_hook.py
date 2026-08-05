@@ -83,6 +83,9 @@ class ControlBindingHookTests(unittest.TestCase):
             enabled=True,
         )
         self.database.put_test_repository_mapping(self.mapping)
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, True)
+        )
 
     def _git(self, *arguments: str) -> str:
         result = subprocess.run(
@@ -260,7 +263,9 @@ class ControlBindingHookTests(unittest.TestCase):
                 self.assertIsNone(self.control_store.get(CONTROL_ID))
 
         self._observe_prompt()
-        self.database.put_test_repository_mapping(replace(self.mapping, enabled=False))
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, False)
+        )
         self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
         self.assertIsNone(self.control_store.get(CONTROL_ID))
 
