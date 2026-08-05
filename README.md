@@ -35,6 +35,7 @@ zdecision-central demo-config init \
 zdecision-central run \
   --database /absolute/path/to/central.sqlite3 \
   --config /absolute/path/to/new-config-directory/central.json \
+  --registry-repository-root /absolute/path/to/zdecision-checkout \
   --host 127.0.0.1 \
   --port 8765
 

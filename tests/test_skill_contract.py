@@ -325,6 +325,13 @@ class ZDecisionSkillContractTests(unittest.TestCase):
         self.assertIn("automatic Decision recall is Packet 3", text)
         self.assertIn("zdecision-central run", text)
         self.assertIn("zdecision-agent service run", text)
+        central_run = text.split("zdecision-central run", 1)[1].split(
+            "zdecision-agent service run", 1
+        )[0]
+        self.assertIn(
+            "--registry-repository-root /absolute/path/to/zdecision-checkout",
+            central_run,
+        )
         self.assertIn("业务决策压缩模板", text)
         self.assertIn("architecture", text)
         self.assertRegex(
