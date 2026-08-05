@@ -298,6 +298,19 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
         turn_id: str,
         control_id: str,
     ) -> str:
+        observed = handle_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "cwd": str(harness.registered_repository),
+                "prompt": RAW_PROMPT,
+            },
+            database=harness.agent_database,
+            clock=harness.clock,
+            worker_waker=lambda _: None,
+        )
+        self.assertNotEqual("", observed.event_id)
         response = handle_hook(
             {
                 "hook_event_name": "PreToolUse",
