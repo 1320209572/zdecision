@@ -108,6 +108,7 @@ def handle_control_binding_hook(
     """Replace render input with one trusted, device-local control binding."""
 
     updated_input: dict[str, str] = {}
+    allowed = False
     owned_store: ControlBindingStore | None = None
     try:
         session_id = _safe_host_identifier(value.get("session_id"))
@@ -127,6 +128,8 @@ def handle_control_binding_hook(
         mapping = database.get_repository_mapping(repository.repository_id)
         if mapping is None or not mapping.enabled:
             raise ValueError("repository is not enabled")
+        if not database.has_open_observed_turn(session_id, turn_id, cwd_value):
+            raise ValueError("host turn was not observed")
         created_at = _parse_time(_format_time(clock()))
         control_id = (
             control_id_factory or (lambda: f"ctl_{secrets.token_hex(16)}")
@@ -148,23 +151,26 @@ def handle_control_binding_hook(
             control_id=control_id,
         )
         updated_input = {"control_id": control_id}
+        allowed = True
     except Exception:
         updated_input = {}
+        allowed = False
     finally:
         if owned_store is not None:
             try:
                 owned_store.close()
             except Exception:
                 updated_input = {}
+                allowed = False
+    hook_output: dict[str, object] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow" if allowed else "deny",
+    }
+    if allowed:
+        hook_output["updatedInput"] = updated_input
     return HookResponse(
         event_id="",
-        output={
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "updatedInput": updated_input,
-            }
-        },
+        output={"hookSpecificOutput": hook_output},
     )
 
 

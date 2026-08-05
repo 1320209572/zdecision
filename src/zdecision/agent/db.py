@@ -240,6 +240,48 @@ class AgentDatabase:
             return None
         return event.invocation.session_id, event.invocation.turn_id
 
+    def has_open_observed_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        cwd: str,
+    ) -> bool:
+        """Return whether the exact host Turn is the Session's open Turn."""
+
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is invalid")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("turn_id is invalid")
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise ValueError("cwd is invalid")
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM events AS prompt
+            WHERE prompt.session_id = ?
+              AND prompt.turn_id = ?
+              AND prompt.cwd = ?
+              AND prompt.event_type = 'UserPromptSubmit'
+              AND NOT EXISTS (
+                  SELECT 1 FROM events AS ended
+                  WHERE ended.session_id = prompt.session_id
+                    AND ended.event_type = 'SessionEnd'
+                    AND ended.rowid > prompt.rowid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM events AS newer
+                  WHERE newer.session_id = prompt.session_id
+                    AND newer.cwd = prompt.cwd
+                    AND newer.turn_id IS NOT NULL
+                    AND newer.turn_id <> prompt.turn_id
+                    AND newer.rowid > prompt.rowid
+              )
+            LIMIT 1
+            """,
+            (session_id, turn_id, cwd),
+        ).fetchone()
+        return row is not None
+
     def latest_turn_event(self, cwd: str) -> AgentEvent | None:
         rows = self._connection.execute(
             """

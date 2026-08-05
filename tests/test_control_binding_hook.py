@@ -23,11 +23,10 @@ CONTROL_ID = "ctl_0123456789abcdef0123456789abcdef"
 MODEL_CONTROL_ID = "ctl_ffffffffffffffffffffffffffffffff"
 TOOL_NAME = "mcp__zdecision_local__show_zdecision_update"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-EMPTY_INPUT_OUTPUT = {
+DENIED_OUTPUT = {
     "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
-        "updatedInput": {},
+        "permissionDecision": "deny",
     }
 }
 
@@ -121,7 +120,46 @@ class ControlBindingHookTests(unittest.TestCase):
             worker_waker=lambda _: self.fail("must not wake worker"),
         )
 
+    def _observe_prompt(
+        self,
+        *,
+        session_id: str = "session_a",
+        turn_id: str = "turn_a",
+        cwd: Path | None = None,
+    ) -> None:
+        response = handle_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "cwd": str(cwd or self.repository),
+            },
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.repository_resolver,
+            worker_waker=lambda _: None,
+        )
+        self.assertNotEqual("", response.event_id)
+
+    def _end_session(self, *, session_id: str = "session_a") -> None:
+        response = handle_hook(
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": session_id,
+                "cwd": str(self.repository),
+                "reason": "other",
+            },
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.repository_resolver,
+            worker_waker=lambda _: None,
+        )
+        self.assertNotEqual("", response.event_id)
+
     def test_trusted_envelope_replaces_all_model_input_with_local_binding(self) -> None:
+        self._observe_prompt()
+        event_count = self.database.count_events()
+
         response = self._handle(self._raw())
 
         self.assertEqual(
@@ -135,7 +173,7 @@ class ControlBindingHookTests(unittest.TestCase):
             response.output,
         )
         self.assertEqual("", response.event_id)
-        self.assertEqual(0, self.database.count_events())
+        self.assertEqual(event_count, self.database.count_events())
         binding = self.control_store.get(CONTROL_ID)
         self.assertIsNotNone(binding)
         self.assertEqual("session_a", binding.session_id)
@@ -154,7 +192,7 @@ class ControlBindingHookTests(unittest.TestCase):
         self.assertNotIn(b"TOOL-INPUT-SECRET", database_bytes)
         self.assertNotIn(b"MODEL-SECRET", database_bytes)
 
-    def test_untrusted_or_unavailable_envelopes_allow_with_empty_input(self) -> None:
+    def test_untrusted_or_unavailable_envelopes_are_denied(self) -> None:
         unregistered = self.root / "unregistered"
         unregistered.mkdir()
         subprocess.run(
@@ -198,13 +236,44 @@ class ControlBindingHookTests(unittest.TestCase):
 
         for name, raw in cases:
             with self.subTest(name=name):
-                self.assertEqual(EMPTY_INPUT_OUTPUT, self._handle(raw).output)
+                self.assertEqual(DENIED_OUTPUT, self._handle(raw).output)
+                self.assertIsNone(self.control_store.get(CONTROL_ID))
 
+        self._observe_prompt()
         self.database.put_test_repository_mapping(replace(self.mapping, enabled=False))
-        self.assertEqual(EMPTY_INPUT_OUTPUT, self._handle(self._raw()).output)
-        self.assertEqual(0, self.database.count_events())
+        self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
+        self.assertIsNone(self.control_store.get(CONTROL_ID))
+
+    def test_unobserved_envelope_is_denied(self) -> None:
+        self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
+        self.assertIsNone(self.control_store.get(CONTROL_ID))
+
+    def test_different_session_in_same_cwd_is_denied(self) -> None:
+        self._observe_prompt(session_id="session_b")
+
+        self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
+        self.assertIsNone(self.control_store.get(CONTROL_ID))
+
+    def test_wrong_or_superseded_turn_is_denied(self) -> None:
+        self._observe_prompt(turn_id="turn_old")
+        self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
+
+        self._observe_prompt(turn_id="turn_new")
+        self.assertEqual(
+            DENIED_OUTPUT,
+            self._handle(self._raw(turn_id="turn_old")).output,
+        )
+        self.assertIsNone(self.control_store.get(CONTROL_ID))
+
+    def test_ended_session_is_denied(self) -> None:
+        self._observe_prompt()
+        self._end_session()
+
+        self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
+        self.assertIsNone(self.control_store.get(CONTROL_ID))
 
     def test_persistence_failure_is_silent_and_injected_store_stays_open(self) -> None:
+        self._observe_prompt()
         store = FailingControlStore()
 
         response = handle_control_binding_hook(
@@ -216,11 +285,11 @@ class ControlBindingHookTests(unittest.TestCase):
             control_id_factory=lambda: CONTROL_ID,
         )
 
-        self.assertEqual(EMPTY_INPUT_OUTPUT, response.output)
+        self.assertEqual(DENIED_OUTPUT, response.output)
         self.assertFalse(store.closed)
-        self.assertEqual(0, self.database.count_events())
 
     def test_invalid_generated_control_ids_are_rejected_before_persistence(self) -> None:
+        self._observe_prompt()
         invalid_ids: tuple[object, ...] = (
             "ctl_not-canonical",
             "ctl_0123456789ABCDEF0123456789ABCDEF",
@@ -239,10 +308,11 @@ class ControlBindingHookTests(unittest.TestCase):
                     control_id_factory=lambda: invalid_id,  # type: ignore[return-value]
                 )
 
-                self.assertEqual(EMPTY_INPUT_OUTPUT, response.output)
+                self.assertEqual(DENIED_OUTPUT, response.output)
                 self.assertEqual([], store.control_ids)
 
     def test_handle_hook_closes_its_temporary_store_on_success_and_failure(self) -> None:
+        self._observe_prompt()
         for fails in (False, True):
             with self.subTest(fails=fails):
                 store = FailingControlStore()
@@ -262,7 +332,7 @@ class ControlBindingHookTests(unittest.TestCase):
                     )
 
                 expected = (
-                    EMPTY_INPUT_OUTPUT
+                    DENIED_OUTPUT
                     if fails
                     else {
                         "hookSpecificOutput": {
@@ -277,6 +347,8 @@ class ControlBindingHookTests(unittest.TestCase):
 
     def test_cli_pre_tool_hook_does_not_load_unrelated_runtime_stacks(self) -> None:
         """A render hook must not load MCP, HTTP, or worker runtime stacks."""
+
+        self._observe_prompt()
 
         guard_directory = self.root / "import-guard"
         guard_directory.mkdir()
