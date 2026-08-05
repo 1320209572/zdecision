@@ -146,3 +146,68 @@ full/build commands were not repeated.
 - Unsaved same-leaf choices intentionally win when a material filter refreshes
   the Inbox. The existing draft compare-and-swap still detects a concurrent
   remote update at save or submit time.
+
+## Fix Round 1: Single-row transient editing
+
+### Summary
+
+- Separated editor visibility and field values from durable review actions.
+  The page now owns one `CandidateEdit` buffer, and each row receives explicit
+  controlled `editing` and `editContent` props.
+- Opening editor A and then editor B discards A's unsaved buffer and leaves
+  only B open. Opening, switching, canceling, filter/leaf changes, candidate
+  refresh, direct actions, and batch actions do not turn a candidate into
+  `edit_accept`.
+- Added explicit accessible `保存并接受` and `取消` actions. Only the save
+  boundary writes the buffered content as `edit_accept`; cancel leaves both
+  the local draft and the next draft PUT unchanged.
+- Preserved the 20-item boundary: an unclassified twenty-first row cannot open
+  or save an editor, while any of the existing 20 classified rows remains
+  editable without increasing the classified count. Decision-space and
+  repository inputs remain read-only.
+
+### RED evidence
+
+The new page tests were run before changing production code:
+
+```text
+npm test -- --run src/pages/candidate-review/CandidateReviewPage.test.tsx
+Test Files  1 failed (1)
+Tests       3 failed | 17 passed (20)
+```
+
+The failures showed the previous action-derived panel, immediate
+`edit_accept` mutation, missing explicit save/cancel controls, and editor state
+remaining attached to a material filter refresh.
+
+### GREEN evidence
+
+```text
+npm test -- --run src/pages/candidate-review/CandidateReviewPage.test.tsx src/features/reviews/CandidateReviewRow.test.tsx
+Test Files  2 passed (2)
+Tests       24 passed (24)
+
+npm test
+Test Files  9 passed (9)
+Tests       42 passed (42)
+
+npm run typecheck
+exit 0
+
+npm run build
+43 modules transformed
+src/zdecision/central/static/assets/index-DoM6JbCG.css
+src/zdecision/central/static/assets/index-CrMsAOpJ.js
+exit 0
+```
+
+### Self-review
+
+- Confirmed no panel visibility is derived from `draft.action`; restored
+  `edit_accept` actions display their classification without auto-opening.
+- Confirmed transient edits never enter `draftByFamily` until explicit save,
+  and the page test inspects the actual draft PUT after cancel and after save.
+- Confirmed row switching replaces the single buffer, and material route,
+  leaf, reload, latest-version, direct, and batch boundaries clear it.
+- Confirmed this round changes only Task 6 Web source, tests, styles, report,
+  and rebuilt static assets. Backend and Task 7 files remain untouched.

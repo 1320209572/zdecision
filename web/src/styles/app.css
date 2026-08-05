@@ -144,6 +144,10 @@
 .candidate-row__edit textarea { min-height: 76px; padding: 9px; resize: vertical; line-height: 1.45; }
 .candidate-row__edit input[readonly] { color: #63758a; background: #e9efed; cursor: not-allowed; }
 .candidate-row__edit-wide { grid-column: 1 / -1; }
+.candidate-row__edit-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
+.candidate-row__edit-actions button { min-height: 34px; padding: 0 12px; border: 1px solid #aebdca; background: white; color: #29445f; font: 700 10px/1 ui-monospace, monospace; cursor: pointer; }
+.candidate-row__edit-actions button:last-child { border-color: #087b5b; background: #087b5b; color: white; }
+.candidate-row__edit-actions button:disabled { cursor: not-allowed; opacity: .4; }
 .preview-page { width: min(1360px, calc(100% - 72px)); }
 .preview-page__header { align-items: flex-end; }
 .preview-page__status { display: grid; justify-items: end; gap: 10px; }

@@ -43,6 +43,11 @@ interface BatchUndo {
   previousByFamily: Map<string, ReviewDraftItem | undefined>;
 }
 
+interface CandidateEdit {
+  familyId: string;
+  content: CandidateContent;
+}
+
 function isClassified(
   action: ReviewDraftItem | undefined,
 ): action is ReviewDraftItem & { action: ClassifiedReviewAction } {
@@ -152,6 +157,7 @@ export function CandidateReviewPage() {
   const [selectedFamilyIds, setSelectedFamilyIds] = useState(
     () => new Set<string>(),
   );
+  const [candidateEdit, setCandidateEdit] = useState<CandidateEdit | null>(null);
   const [lastBatchUndo, setLastBatchUndo] = useState<BatchUndo | null>(null);
   const loadedDecisionSpace = useRef<string | null>(null);
   const selectPageCheckbox = useRef<HTMLInputElement | null>(null);
@@ -168,6 +174,7 @@ export function CandidateReviewPage() {
 
   useEffect(() => {
     let active = true;
+    setCandidateEdit(null);
     setInbox(null);
     setLoadFailed(false);
     api<CandidateInbox>(candidatePath)
@@ -204,6 +211,7 @@ export function CandidateReviewPage() {
 
   useEffect(() => {
     setSelectedFamilyIds(new Set());
+    setCandidateEdit(null);
   }, [
     decisionSpaceId,
     routedRepository,
@@ -335,6 +343,7 @@ export function CandidateReviewPage() {
   }
 
   function directAction(familyId: string, action: "accept" | "reject") {
+    setCandidateEdit(null);
     const item = candidateByFamily(familyId);
     if (!item) return;
     if (!isClassified(draftByFamily.get(familyId)) && classificationLimitReached) {
@@ -343,19 +352,50 @@ export function CandidateReviewPage() {
     updateLocalDraft(familyId, actionForCandidate(item, action));
   }
 
-  function editAccept(familyId: string, content: CandidateContent) {
+  function startEditing(familyId: string) {
     const item = candidateByFamily(familyId);
     if (!item) return;
     if (!isClassified(draftByFamily.get(familyId)) && classificationLimitReached) {
       return;
     }
+    const action = draftByFamily.get(familyId);
+    setCandidateEdit({
+      familyId,
+      content:
+        action?.action === "edit_accept" && action.effective_content
+          ? action.effective_content
+          : item.content,
+    });
+  }
+
+  function changeEditing(familyId: string, content: CandidateContent) {
+    setCandidateEdit((current) =>
+      current?.familyId === familyId ? { familyId, content } : current,
+    );
+  }
+
+  function saveEditing(familyId: string) {
+    const item = candidateByFamily(familyId);
+    if (!item || candidateEdit?.familyId !== familyId) return;
+    if (!isClassified(draftByFamily.get(familyId)) && classificationLimitReached) {
+      setCandidateEdit(null);
+      return;
+    }
     updateLocalDraft(
       familyId,
-      actionForCandidate(item, "edit_accept", content),
+      actionForCandidate(item, "edit_accept", candidateEdit.content),
+    );
+    setCandidateEdit(null);
+  }
+
+  function cancelEditing(familyId: string) {
+    setCandidateEdit((current) =>
+      current?.familyId === familyId ? null : current,
     );
   }
 
   function applyBatch(action: "accept" | "reject") {
+    setCandidateEdit(null);
     if (selectedFamilyIds.size === 0 || batchWouldExceedLimit) return;
     const previousByFamily = new Map<string, ReviewDraftItem | undefined>();
     const replacement = new Map(draftByFamily);
@@ -542,6 +582,7 @@ export function CandidateReviewPage() {
   }
 
   async function loadLatestVersions() {
+    setCandidateEdit(null);
     setSaveMessage(null);
     try {
       const latest = await api<CandidateInbox>(candidatePath);
@@ -825,13 +866,23 @@ export function CandidateReviewPage() {
               action={draftByFamily.get(item.family_id)}
               selected={selectedFamilyIds.has(item.family_id)}
               stale={item.stale_draft || staleFamilies.has(item.family_id)}
+              editing={candidateEdit?.familyId === item.family_id}
+              editContent={
+                candidateEdit?.familyId === item.family_id
+                  ? candidateEdit.content
+                  : draftByFamily.get(item.family_id)?.effective_content ??
+                    item.content
+              }
               classificationDisabled={
                 !isClassified(draftByFamily.get(item.family_id)) &&
                 classificationLimitReached
               }
               onSelectedChange={setSelected}
               onDirectAction={directAction}
-              onEditAccept={editAccept}
+              onEditStart={startEditing}
+              onEditChange={changeEditing}
+              onEditSave={saveEditing}
+              onEditCancel={cancelEditing}
               onLoadLatest={
                 item.stale_draft || staleFamilies.has(item.family_id)
                   ? () => void loadLatestVersions()

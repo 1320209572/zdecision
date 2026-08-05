@@ -12,10 +12,15 @@ export interface CandidateReviewRowProps {
   action: ReviewDraftItem | undefined;
   selected: boolean;
   stale: boolean;
+  editing: boolean;
+  editContent: CandidateContent;
   classificationDisabled?: boolean;
   onSelectedChange(familyId: string, selected: boolean): void;
   onDirectAction(familyId: string, action: "accept" | "reject"): void;
-  onEditAccept(familyId: string, content: CandidateContent): void;
+  onEditStart(familyId: string): void;
+  onEditChange(familyId: string, content: CandidateContent): void;
+  onEditSave(familyId: string): void;
+  onEditCancel(familyId: string): void;
   onLoadLatest?(): void;
 }
 
@@ -36,18 +41,21 @@ export function CandidateReviewRow({
   action,
   selected,
   stale,
+  editing,
+  editContent,
   classificationDisabled = false,
   onSelectedChange,
   onDirectAction,
-  onEditAccept,
+  onEditStart,
+  onEditChange,
+  onEditSave,
+  onEditCancel,
   onLoadLatest,
 }: CandidateReviewRowProps) {
   const claim = item.content.claim;
-  const edited = action?.effective_content ?? item.content;
-  const editing = action?.action === "edit_accept";
 
   function updateEdited(patch: Partial<CandidateContent>) {
-    onEditAccept(item.family_id, { ...edited, ...patch });
+    onEditChange(item.family_id, { ...editContent, ...patch });
   }
 
   return (
@@ -108,7 +116,7 @@ export function CandidateReviewRow({
             type="button"
             aria-label={`编辑${claim}`}
             disabled={classificationDisabled}
-            onClick={() => onEditAccept(item.family_id, edited)}
+            onClick={() => onEditStart(item.family_id)}
           >
             编辑
           </button>
@@ -142,7 +150,10 @@ export function CandidateReviewRow({
       </details>
 
       {editing ? (
-        <fieldset className="candidate-row__edit">
+        <fieldset
+          className="candidate-row__edit"
+          aria-label={`编辑${claim}`}
+        >
           <legend>编辑后接受</legend>
           <label>
             <span>决策空间（锁定）</span>
@@ -150,19 +161,19 @@ export function CandidateReviewRow({
           </label>
           <label>
             <span>仓库（锁定）</span>
-            <input value={edited.repositories.join(", ")} readOnly />
+            <input value={editContent.repositories.join(", ")} readOnly />
           </label>
           <label className="candidate-row__edit-wide">
             <span>决策主张</span>
             <textarea
-              value={edited.claim}
+              value={editContent.claim}
               onChange={(event) => updateEdited({ claim: event.target.value })}
             />
           </label>
           <label className="candidate-row__edit-wide">
             <span>后续行动</span>
             <textarea
-              value={edited.future_action}
+              value={editContent.future_action}
               onChange={(event) =>
                 updateEdited({ future_action: event.target.value })
               }
@@ -171,7 +182,7 @@ export function CandidateReviewRow({
           <label>
             <span>适用范围</span>
             <textarea
-              value={edited.scope_summary}
+              value={editContent.scope_summary}
               onChange={(event) =>
                 updateEdited({ scope_summary: event.target.value })
               }
@@ -180,14 +191,14 @@ export function CandidateReviewRow({
           <label>
             <span>路径（每行一项）</span>
             <textarea
-              value={edited.paths.join("\n")}
+              value={editContent.paths.join("\n")}
               onChange={(event) => updateEdited({ paths: lines(event.target.value) })}
             />
           </label>
           <label className="candidate-row__edit-wide">
             <span>失效条件（每行一项）</span>
             <textarea
-              value={edited.invalidation_conditions.join("\n")}
+              value={editContent.invalidation_conditions.join("\n")}
               onChange={(event) =>
                 updateEdited({
                   invalidation_conditions: lines(event.target.value),
@@ -195,6 +206,23 @@ export function CandidateReviewRow({
               }
             />
           </label>
+          <div className="candidate-row__edit-actions">
+            <button
+              type="button"
+              aria-label={`取消编辑${claim}`}
+              onClick={() => onEditCancel(item.family_id)}
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              aria-label={`保存并接受${claim}`}
+              disabled={classificationDisabled}
+              onClick={() => onEditSave(item.family_id)}
+            >
+              保存并接受
+            </button>
+          </div>
         </fieldset>
       ) : null}
     </article>

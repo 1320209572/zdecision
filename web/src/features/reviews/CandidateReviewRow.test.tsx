@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, it, vi } from "vitest";
 
@@ -47,19 +47,28 @@ const item: CandidateInboxItem = {
   stale_draft: false,
 };
 
-function renderRow(action?: ReviewDraftItem) {
+function renderRow(options?: {
+  action?: ReviewDraftItem;
+  editing?: boolean;
+  editContent?: CandidateInboxItem["content"];
+}) {
   const handlers = {
     onSelectedChange: vi.fn(),
     onDirectAction: vi.fn(),
-    onEditAccept: vi.fn(),
+    onEditStart: vi.fn(),
+    onEditChange: vi.fn(),
+    onEditSave: vi.fn(),
+    onEditCancel: vi.fn(),
   };
   render(
     <CandidateReviewRow
       item={item}
       space={space}
-      action={action}
+      action={options?.action}
       selected={false}
       stale={false}
+      editing={options?.editing ?? false}
+      editContent={options?.editContent ?? item.content}
       {...handlers}
     />,
   );
@@ -94,10 +103,40 @@ it("reveals exact evidence as React text only on request", async () => {
   expect(within(evidence).getByText(REQUEST_ID)).toBeVisible();
 });
 
-it("opens one inline edit panel with locked ownership fields", async () => {
+it("requests one controlled inline edit panel", async () => {
   const user = userEvent.setup();
   const handlers = renderRow();
 
   await user.click(screen.getByRole("button", { name: "编辑决策 A" }));
-  expect(handlers.onEditAccept).toHaveBeenCalledWith(FAMILY_ID, item.content);
+  expect(handlers.onEditStart).toHaveBeenCalledWith(FAMILY_ID);
+  expect(screen.queryByRole("group", { name: "编辑决策 A" }))
+    .not.toBeInTheDocument();
+});
+
+it("exposes controlled edits with explicit save and cancel actions", async () => {
+  const user = userEvent.setup();
+  const handlers = renderRow({ editing: true });
+  const editor = screen.getByRole("group", { name: "编辑决策 A" });
+
+  expect(within(editor).getByRole("textbox", { name: "决策空间（锁定）" }))
+    .toHaveAttribute("readonly");
+  expect(within(editor).getByRole("textbox", { name: "仓库（锁定）" }))
+    .toHaveAttribute("readonly");
+  fireEvent.change(
+    within(editor).getByRole("textbox", { name: "决策主张" }),
+    { target: { value: "更新后的决策 A" } },
+  );
+  expect(handlers.onEditChange).toHaveBeenLastCalledWith(
+    FAMILY_ID,
+    expect.objectContaining({ claim: "更新后的决策 A" }),
+  );
+
+  await user.click(within(editor).getByRole("button", {
+    name: "保存并接受决策 A",
+  }));
+  await user.click(within(editor).getByRole("button", {
+    name: "取消编辑决策 A",
+  }));
+  expect(handlers.onEditSave).toHaveBeenCalledWith(FAMILY_ID);
+  expect(handlers.onEditCancel).toHaveBeenCalledWith(FAMILY_ID);
 });

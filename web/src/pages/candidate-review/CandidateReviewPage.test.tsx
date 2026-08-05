@@ -179,6 +179,7 @@ function candidateInboxWithCount(count: number): CandidateInbox {
 }
 
 interface CapturedRequests {
+  draftPuts: Array<{ items: ReviewDraft["items"] }>;
   reviewPosts: Array<{ items: ReviewDraft["items"] }>;
   previewPosts: unknown[];
 }
@@ -186,7 +187,11 @@ interface CapturedRequests {
 async function renderCandidatePage(
   view: CandidateInbox,
 ): Promise<CapturedRequests> {
-  const requests: CapturedRequests = { reviewPosts: [], previewPosts: [] };
+  const requests: CapturedRequests = {
+    draftPuts: [],
+    reviewPosts: [],
+    previewPosts: [],
+  };
   vi.stubGlobal(
     "fetch",
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -194,6 +199,7 @@ async function renderCandidatePage(
       if (url.includes("/candidates")) return json(view);
       if (url.includes("/review-draft") && init?.method === "PUT") {
         const body = JSON.parse(String(init.body));
+        requests.draftPuts.push(body);
         return json({ ...view.draft, version: view.draft.version + 1, items: body.items });
       }
       if (url.endsWith("/reviews") && init?.method === "POST") {
@@ -255,10 +261,16 @@ it("batch accepts exactly selected rows and undo restores mixed actions", async 
   const user = userEvent.setup();
   await renderCandidatePage(mixedDraftInbox());
 
+  expect(screen.queryByRole("group", { name: "编辑决策 C" }))
+    .not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "编辑决策 C" }));
+  expect(screen.getByRole("group", { name: "编辑决策 C" })).toBeVisible();
   await user.click(screen.getByRole("checkbox", { name: "选择决策 A" }));
   await user.click(screen.getByRole("checkbox", { name: "选择决策 C" }));
   await user.click(screen.getByRole("button", { name: "批量接受" }));
 
+  expect(screen.queryByRole("group", { name: "编辑决策 C" }))
+    .not.toBeInTheDocument();
   expect(within(screen.getByRole("article", { name: "候选 决策 A" })).getByText("已接受")).toBeVisible();
   expect(within(screen.getByRole("article", { name: "候选 决策 C" })).getByText("已接受")).toBeVisible();
   expect(within(screen.getByRole("article", { name: "候选 决策 B" })).getByText("已拒绝")).toBeVisible();
@@ -313,8 +325,98 @@ it("disables a twenty-first direct classification before state changes", async (
     .toBeDisabled();
   expect(within(lastRow).getByText("未处理")).toBeVisible();
   expect(screen.getByText("单次最多审核 20 条")).toBeVisible();
+  fireEvent.click(within(lastRow).getByRole("button", { name: "编辑决策 21" }));
+  expect(within(lastRow).queryByRole("group", { name: "编辑决策 21" }))
+    .not.toBeInTheDocument();
+
+  const firstRow = screen.getByRole("article", { name: "候选 决策 01" });
+  expect(within(firstRow).getByRole("button", { name: "编辑决策 01" }))
+    .toBeEnabled();
+  await user.click(within(firstRow).getByRole("button", { name: "编辑决策 01" }));
+  expect(within(firstRow).getByRole("group", { name: "编辑决策 01" }))
+    .toBeVisible();
+  await user.click(within(firstRow).getByRole("button", {
+    name: "保存并接受决策 01",
+  }));
+  expect(within(firstRow).getByText("编辑后接受")).toBeVisible();
+
   await user.click(within(lastRow).getByRole("checkbox", { name: "选择决策 21" }));
   expect(within(lastRow).getByText("未处理")).toBeVisible();
+});
+
+it("keeps editing single-row and transient until an explicit save", async () => {
+  const user = userEvent.setup();
+  const view = twoItemInbox("accept", "reject");
+  view.items[0].content.claim = "决策 A";
+  view.items[1].content.claim = "决策 B";
+  const requests = await renderCandidatePage(view);
+  const rowA = screen.getByRole("article", { name: "候选 决策 A" });
+  const rowB = screen.getByRole("article", { name: "候选 决策 B" });
+  const summary = screen.getByLabelText("审核汇总");
+
+  await user.click(within(rowA).getByRole("button", { name: "编辑决策 A" }));
+  expect(within(rowA).getByRole("group", { name: "编辑决策 A" })).toBeVisible();
+  expect(within(rowB).queryByRole("group", { name: "编辑决策 B" }))
+    .not.toBeInTheDocument();
+  expect(within(rowA).getByText("已接受")).toBeVisible();
+  expect(within(rowB).getByText("已拒绝")).toBeVisible();
+  expect(summary).toHaveTextContent("1 已接受");
+  expect(summary).toHaveTextContent("1 已拒绝");
+
+  await user.click(within(rowB).getByRole("button", { name: "编辑决策 B" }));
+  expect(within(rowA).queryByRole("group", { name: "编辑决策 A" }))
+    .not.toBeInTheDocument();
+  expect(within(rowB).getByRole("group", { name: "编辑决策 B" })).toBeVisible();
+  expect(within(rowA).getByText("已接受")).toBeVisible();
+  expect(within(rowB).getByText("已拒绝")).toBeVisible();
+  expect(summary).toHaveTextContent("1 已接受");
+  expect(summary).toHaveTextContent("1 已拒绝");
+
+  await user.clear(within(rowB).getByRole("textbox", { name: "决策主张" }));
+  await user.type(
+    within(rowB).getByRole("textbox", { name: "决策主张" }),
+    "未保存的决策 B",
+  );
+  await user.click(within(rowB).getByRole("button", { name: "取消编辑决策 B" }));
+  expect(within(rowB).queryByRole("group", { name: "编辑决策 B" }))
+    .not.toBeInTheDocument();
+  expect(within(rowB).getByText("已拒绝")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "保存审核草稿" }));
+  await waitFor(() => expect(requests.draftPuts).toHaveLength(1));
+  expect(requests.draftPuts[0].items.map(({ family_id, action }) => [
+    family_id,
+    action,
+  ])).toEqual([
+    [FAMILY_ID, "accept"],
+    [FAMILY_B, "reject"],
+  ]);
+
+  await user.click(within(rowB).getByRole("button", { name: "编辑决策 B" }));
+  await user.clear(within(rowB).getByRole("textbox", { name: "决策主张" }));
+  await user.type(
+    within(rowB).getByRole("textbox", { name: "决策主张" }),
+    "已保存的决策 B",
+  );
+  await user.click(within(rowB).getByRole("button", {
+    name: "保存并接受决策 B",
+  }));
+
+  expect(within(rowB).getByText("编辑后接受")).toBeVisible();
+  expect(summary).toHaveTextContent("2 已接受");
+  expect(summary).toHaveTextContent("0 已拒绝");
+  await user.click(screen.getByRole("button", { name: "保存审核草稿" }));
+  await waitFor(() => expect(requests.draftPuts).toHaveLength(2));
+  expect(requests.draftPuts[1].items[1]).toMatchObject({
+    family_id: FAMILY_B,
+    action: "edit_accept",
+    effective_content: { claim: "已保存的决策 B" },
+  });
+
+  await user.click(within(rowB).getByRole("button", { name: "编辑决策 B" }));
+  await user.click(within(rowA).getByRole("button", { name: "接受决策 A" }));
+  expect(within(rowB).queryByRole("group", { name: "编辑决策 B" }))
+    .not.toBeInTheDocument();
 });
 
 it("submits only explicitly classified current revisions without creating Preview", async () => {
@@ -340,10 +442,14 @@ it("clears transient selection on material filters while preserving local draft"
 
   await user.click(screen.getByRole("checkbox", { name: "选择决策 A" }));
   await user.click(screen.getByRole("button", { name: "接受决策 B" }));
+  await user.click(screen.getByRole("button", { name: "编辑决策 B" }));
+  expect(screen.getByRole("group", { name: "编辑决策 B" })).toBeVisible();
   await user.type(screen.getByRole("searchbox", { name: "搜索候选决策" }), "decision");
   await user.click(screen.getByRole("button", { name: "应用筛选" }));
 
   await waitFor(() => expect(screen.getByText("已选 0 条")).toBeVisible());
+  expect(screen.queryByRole("group", { name: "编辑决策 B" }))
+    .not.toBeInTheDocument();
   expect(within(screen.getByRole("article", { name: "候选 决策 B" })).getByText("已接受")).toBeVisible();
 });
 
