@@ -50,7 +50,7 @@ self.assertIn(
 Run:
 
 ```bash
-.venv/bin/python -m unittest tests.test_skill_contract.SkillContractTests.test_readme_documents_page_trigger_and_installed_templates
+.venv/bin/python -m unittest tests.test_skill_contract.ZDecisionSkillContractTests.test_readme_documents_page_trigger_and_installed_templates
 ```
 
 Expected: FAIL because the current README command omits the Registry root.
@@ -72,7 +72,7 @@ The command must contain these arguments in order:
 Run:
 
 ```bash
-.venv/bin/python -m unittest tests.test_skill_contract.SkillContractTests.test_readme_documents_page_trigger_and_installed_templates
+.venv/bin/python -m unittest tests.test_skill_contract.ZDecisionSkillContractTests.test_readme_documents_page_trigger_and_installed_templates
 git diff --check
 ```
 
