@@ -17,6 +17,7 @@ function decision(
   decisionId: string,
 ): DecisionListItem {
   return {
+    decision_space_id: `dsp_${productId.slice(-32)}`,
     product_id: productId,
     product_name: productName,
     decision_id: decisionId,
@@ -65,7 +66,7 @@ it("keeps global ownership visible and product routes isolated", async () => {
   expect(screen.getByText("ZMetis")).toBeVisible();
   expect(screen.getAllByRole("link", { name: "查看决策" })[0]).toHaveAttribute(
     "href",
-    `/products/${CLOUD_PRODUCT_ID}/decisions/${CLOUD_DECISION_ID}`,
+    `/spaces/dsp_${CLOUD_PRODUCT_ID.slice(-32)}/decisions/${CLOUD_DECISION_ID}`,
   );
   expect(screen.getAllByText("中央决策目录")).toHaveLength(2);
 });

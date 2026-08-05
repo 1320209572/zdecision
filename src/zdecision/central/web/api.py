@@ -84,6 +84,7 @@ async def dashboard(request: Request) -> dict[str, object]:
 async def decisions(
     request: Request,
     product_id: str | None = None,
+    decision_space_id: str | None = None,
     search: str = Query(default="", max_length=200),
     repository: str = Query(default="", max_length=200),
     published_after: str | None = None,
@@ -94,11 +95,60 @@ async def decisions(
     return _application(request).list_decisions(
         identity_provider.browser_principal(),
         product_id=product_id,
+        decision_space_id=decision_space_id,
         search=search,
         repository=repository,
         published_after=published_after,
         limit=limit,
         offset=offset,
+    ).to_dict()
+
+
+@router.get("/repositories/{repository_id}/spaces")
+async def repository_spaces(
+    request: Request, repository_id: str
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    return _application(request).repository_spaces(
+        identity_provider.browser_principal(), repository_id
+    ).to_dict()
+
+
+@router.get("/spaces/{decision_space_id}/decisions")
+async def space_decisions(
+    request: Request,
+    decision_space_id: str,
+    search: str = Query(default="", max_length=200),
+    repository: str = Query(default="", max_length=200),
+    published_after: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).list_decisions(
+        identity_provider.browser_principal(),
+        decision_space_id=decision_space_id,
+        search=search,
+        repository=repository,
+        published_after=published_after,
+        limit=limit,
+        offset=offset,
+    ).to_dict()
+
+
+@router.get("/spaces/{decision_space_id}/decisions/{decision_id}")
+async def space_decision_detail(
+    request: Request, decision_space_id: str, decision_id: str
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).get_decision(
+        identity_provider.browser_principal(), decision_space_id, decision_id
     ).to_dict()
 
 
@@ -138,6 +188,35 @@ async def candidates(
     ).to_dict()
 
 
+@router.get("/spaces/{decision_space_id}/candidates")
+async def space_candidates(
+    request: Request,
+    decision_space_id: str,
+    search: str = Query(default="", max_length=200),
+    repository_id: str | None = None,
+    capture_request_id: str | None = None,
+    state: Literal[
+        "pending", "accepted", "rejected", "published", "all"
+    ] = "pending",
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).list_candidates(
+        identity_provider.browser_principal(),
+        decision_space_id,
+        search=search,
+        repository_id=repository_id,
+        capture_request_id=capture_request_id,
+        state=state,
+        limit=limit,
+        offset=offset,
+    ).to_dict()
+
+
 @router.get("/products/{product_id}/review-draft")
 async def get_review_draft(
     request: Request, product_id: str
@@ -145,6 +224,19 @@ async def get_review_draft(
     identity_provider = request.app.state.identity_provider
     return _application(request).get_review_draft(
         identity_provider.browser_principal(), product_id
+    ).to_dict()
+
+
+@router.get("/spaces/{decision_space_id}/review-draft")
+async def get_space_review_draft(
+    request: Request, decision_space_id: str
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).get_review_draft(
+        identity_provider.browser_principal(), decision_space_id
     ).to_dict()
 
 
@@ -162,6 +254,23 @@ async def save_review_draft(
     ).to_dict()
 
 
+@router.put("/spaces/{decision_space_id}/review-draft")
+async def save_space_review_draft(
+    request: Request, decision_space_id: str, body: _SaveDraftBody
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).save_review_draft(
+        identity_provider.browser_principal(),
+        decision_space_id,
+        body.expected_version,
+        tuple(item.to_contract() for item in body.items),
+        request.app.state.current_time(),
+    ).to_dict()
+
+
 @router.post("/products/{product_id}/reviews")
 async def submit_review(
     request: Request, product_id: str, body: _SubmitReviewBody
@@ -170,6 +279,24 @@ async def submit_review(
     return _application(request).submit_review(
         identity_provider.browser_principal(),
         product_id,
+        body.client_action_id,
+        body.expected_draft_version,
+        tuple(item.to_contract() for item in body.items),
+        request.app.state.current_time(),
+    ).to_dict()
+
+
+@router.post("/spaces/{decision_space_id}/reviews")
+async def submit_space_review(
+    request: Request, decision_space_id: str, body: _SubmitReviewBody
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).submit_review(
+        identity_provider.browser_principal(),
+        decision_space_id,
         body.client_action_id,
         body.expected_draft_version,
         tuple(item.to_contract() for item in body.items),
@@ -253,4 +380,27 @@ async def publication_detail(
     identity_provider = request.app.state.identity_provider
     return _application(request).get_publication(
         identity_provider.browser_principal(), publication_id
+    ).to_dict()
+
+
+@router.get("/spaces/{decision_space_id}/publications")
+async def space_publications(
+    request: Request,
+    decision_space_id: str,
+    state: Literal[
+        "confirmed", "committed_pending_push", "completed", "ambiguous"
+    ] | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    identity_provider = request.app.state.identity_provider
+    _application(request).require_canonical_leaf(
+        identity_provider.browser_principal(), decision_space_id
+    )
+    return _application(request).list_publications(
+        identity_provider.browser_principal(),
+        product_id=decision_space_id,
+        state=state,
+        limit=limit,
+        offset=offset,
     ).to_dict()

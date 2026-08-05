@@ -10,21 +10,21 @@ const navigation = [
     marker: "02",
     owns: (path: string) =>
       path.startsWith("/publication-previews/") ||
-      (path.startsWith("/products/") && path.endsWith("/candidates")),
+      (path.startsWith("/spaces/") && path.endsWith("/candidates")),
   },
   {
     to: "/decisions",
     label: "正式决策",
     marker: "03",
     owns: (path: string) =>
-      path.startsWith("/products/") && path.includes("/decisions"),
+      path.startsWith("/spaces/") && path.includes("/decisions"),
   },
   {
     to: "/publications",
     label: "发布历史",
     marker: "04",
     owns: (path: string) =>
-      path.startsWith("/products/") && path.endsWith("/publications"),
+      path.startsWith("/spaces/") && path.endsWith("/publications"),
   },
 ];
 

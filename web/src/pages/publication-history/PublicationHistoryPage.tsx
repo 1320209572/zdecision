@@ -51,20 +51,22 @@ function PublicationRow({ publication }: { publication: PublicationDetail }) {
 }
 
 export function PublicationHistoryPage() {
-  const { productId } = useParams();
+  const { decisionSpaceId } = useParams();
   const [history, setHistory] = useState<PublicationHistory | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let active = true;
-    const query = productId ? `?product_id=${encodeURIComponent(productId)}` : "";
+    const path = decisionSpaceId
+      ? `/api/v1/web/spaces/${decisionSpaceId}/publications`
+      : "/api/v1/web/publications";
     setHistory(null);
     setFailed(false);
-    api<PublicationHistory>(`/api/v1/web/publications${query}`)
+    api<PublicationHistory>(path)
       .then((value) => { if (active) setHistory(value); })
       .catch(() => { if (active) setFailed(true); });
     return () => { active = false; };
-  }, [productId]);
+  }, [decisionSpaceId]);
 
   const groups = useMemo(() => {
     const values = new Map<string, PublicationDetail[]>();
@@ -83,7 +85,7 @@ export function PublicationHistoryPage() {
       <header className="page-header publication-history__header">
         <div>
           <p className="eyebrow">PUBLICATION / PROOF LEDGER</p>
-          <h1>{productId ? "产品发布历史" : "发布历史"}</h1>
+          <h1>{decisionSpaceId ? "决策空间发布历史" : "发布历史"}</h1>
           <p className="page-header__lead">
             每一行只陈列用户批准、耐久状态与 origin/main 提交证明。
           </p>

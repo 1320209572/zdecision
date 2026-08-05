@@ -40,6 +40,7 @@ function detail(): DecisionDetail {
   };
   return {
     ...formal,
+    decision_space_id: "dsp_" + "9".repeat(32),
     canonical_json: JSON.stringify(formal),
     registry_commit: "a".repeat(40),
     publication_id: PUBLICATION_ID,
@@ -60,7 +61,9 @@ it("renders Decision text inert and exposes no mutation controls", async () => {
       }),
     ),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/decisions/${DECISION_ID}`);
+  await router.navigate(
+    `/spaces/${detail().decision_space_id}/decisions/${DECISION_ID}`,
+  );
   render(<RouterProvider router={router} />);
 
   expect(

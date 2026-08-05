@@ -10,6 +10,7 @@ const ZMETIS_ID = "prod_" + "2".repeat(32);
 
 function publication(productId: string, productName: string, ordinal: string) {
   return {
+    decision_space_id: "dsp_" + productId.slice(-32),
     publication_id: "plb_" + ordinal.repeat(32),
     preview_id: "pub_" + ordinal.repeat(32),
     product_id: productId,
@@ -65,9 +66,9 @@ it("shows safe resume only for pending push and never for ambiguity", async () =
 
   expect(await screen.findByText("已提交，等待推送")).toBeVisible();
   expect(screen.getByRole("button", { name: "继续安全推送" })).toBeVisible();
-  expect(screen.getByRole("link", { name: "产品决策目录" })).toHaveAttribute(
+  expect(screen.getByRole("link", { name: "决策空间目录" })).toHaveAttribute(
     "href",
-    `/products/${CLOUD_ID}/decisions`,
+    `/spaces/${pending.decision_space_id}/decisions`,
   );
 
   view.unmount();

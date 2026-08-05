@@ -32,6 +32,7 @@ from zdecision.central.web.queries import (
     DecisionRegistryUnavailable,
 )
 from zdecision.central.web.reviews import (
+    DecisionSpaceNotLeaf,
     ProductNotFound,
     ProductOwnershipConflict,
     ReviewStale,
@@ -181,6 +182,12 @@ def create_app(
     @app.exception_handler(ProductNotFound)
     async def product_not_found_handler(
         request: Request, error: ProductNotFound
+    ) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"error": error.code})
+
+    @app.exception_handler(DecisionSpaceNotLeaf)
+    async def decision_space_not_leaf_handler(
+        request: Request, error: DecisionSpaceNotLeaf
     ) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": error.code})
 

@@ -8,6 +8,7 @@ import type { PublicationPreview } from "../../api/types";
 
 
 const PRODUCT_ID = "prod_" + "1".repeat(32);
+const SPACE_ID = "dsp_" + "0".repeat(32);
 const PREVIEW_ID = "pub_" + "2".repeat(32);
 const DECISION_ID = "dec_" + "3".repeat(32);
 const DECISION_PATH =
@@ -71,6 +72,7 @@ function preview(
     review_ids: ["rvi_" + "8".repeat(32)],
     candidate_ids: ["cand_" + "9".repeat(32) + "_01"],
     decision_ids: [DECISION_ID],
+    decision_space_id: SPACE_ID,
     product_id: PRODUCT_ID,
     product_name: "ZDecision",
     base_commit: "c".repeat(40),
@@ -126,6 +128,9 @@ it("shows exact files and uses the preview page as the only confirmation", async
   expect(screen.getByText("产品 Registry")).toBeVisible();
   expect(screen.getByText("提交消息")).toBeVisible();
   expect(screen.getByText("user")).toBeVisible();
+  expect(screen.getByRole("link", { name: "← 返回修改审核" })).toHaveAttribute(
+    "href", `/spaces/${SPACE_ID}/candidates`,
+  );
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 

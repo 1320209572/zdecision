@@ -17,6 +17,7 @@ from zdecision.central.web.queries import (
     DecisionDetailView,
     DecisionListView,
     DecisionRegistryUnavailable,
+    RepositorySpacesView,
 )
 from zdecision.central.web.previews import (
     CentralPreviewService,
@@ -30,6 +31,8 @@ from zdecision.central.web.publications import (
 )
 from zdecision.central.web.reviews import (
     CentralReviewService,
+    DecisionSpaceNotFound,
+    DecisionSpaceNotLeaf,
     ReviewSubmissionResult,
 )
 from zdecision.central.web.store import CentralWebStore
@@ -81,6 +84,7 @@ class CentralWebApplication:
         principal: Principal,
         *,
         product_id: str | None = None,
+        decision_space_id: str | None = None,
         search: str = "",
         repository: str = "",
         published_after: str | None = None,
@@ -90,6 +94,7 @@ class CentralWebApplication:
         view = self.queries.list_decisions(
             principal,
             product_id=product_id,
+            decision_space_id=decision_space_id,
             search=search,
             repository=repository,
             published_after=published_after,
@@ -101,14 +106,31 @@ class CentralWebApplication:
         return view
 
     def get_decision(
-        self, principal: Principal, product_id: str, decision_id: str
+        self, principal: Principal, decision_space_id: str, decision_id: str
     ) -> DecisionDetailView:
-        return self.queries.get_decision(principal, product_id, decision_id)
+        return self.queries.get_decision(
+            principal, decision_space_id, decision_id
+        )
+
+    def repository_spaces(
+        self, principal: Principal, repository_id: str
+    ) -> RepositorySpacesView:
+        return self.queries.repository_spaces(principal, repository_id)
+
+    def require_canonical_leaf(
+        self, principal: Principal, decision_space_id: str
+    ) -> None:
+        space = self.queries.decision_space(principal, decision_space_id)
+        if space is not None and space.decision_space_id == decision_space_id:
+            return
+        if self.queries.catalog_group_exists(principal, decision_space_id):
+            raise DecisionSpaceNotLeaf()
+        raise DecisionSpaceNotFound()
 
     def list_candidates(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         *,
         search: str = "",
         repository_id: str | None = None,
@@ -119,7 +141,7 @@ class CentralWebApplication:
     ) -> CandidateInboxView:
         return self.reviews.list_candidates(
             principal,
-            product_id,
+            decision_space_id,
             search=search,
             repository_id=repository_id,
             capture_request_id=capture_request_id,
@@ -129,26 +151,26 @@ class CentralWebApplication:
         )
 
     def get_review_draft(
-        self, principal: Principal, product_id: str
+        self, principal: Principal, decision_space_id: str
     ) -> ReviewDraft:
-        return self.reviews.get_draft(principal, product_id)
+        return self.reviews.get_draft(principal, decision_space_id)
 
     def save_review_draft(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         expected_version: int,
         items: Sequence[DraftItem],
         now: str | datetime,
     ) -> ReviewDraft:
         return self.reviews.save_draft(
-            principal, product_id, expected_version, items, now
+            principal, decision_space_id, expected_version, items, now
         )
 
     def submit_review(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         client_action_id: str,
         expected_draft_version: int,
         items: Sequence[DraftItem],
@@ -156,7 +178,7 @@ class CentralWebApplication:
     ) -> ReviewSubmissionResult:
         return self.reviews.submit(
             principal,
-            product_id,
+            decision_space_id,
             client_action_id,
             expected_draft_version,
             items,

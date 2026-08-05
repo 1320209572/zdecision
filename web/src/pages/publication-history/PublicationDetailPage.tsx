@@ -110,8 +110,8 @@ export function PublicationDetailPage() {
       </section>
 
       <nav className="publication-detail__product-nav" aria-label="产品发布上下文">
-        <Link to={`/products/${publication.product_id}/decisions`}>产品决策目录</Link>
-        <Link to={`/products/${publication.product_id}/publications`}>产品发布历史</Link>
+        <Link to={`/spaces/${publication.decision_space_id}/decisions`}>决策空间目录</Link>
+        <Link to={`/spaces/${publication.decision_space_id}/publications`}>决策空间发布历史</Link>
       </nav>
 
       <section className="publication-detail__decisions">
@@ -120,7 +120,7 @@ export function PublicationDetailPage() {
           {publication.decision_ids.map((decisionId, index) => (
             <Link
               key={decisionId}
-              to={`/products/${publication.product_id}/decisions/${decisionId}`}
+              to={`/spaces/${publication.decision_space_id}/decisions/${decisionId}`}
             >
               <span>{String(index + 1).padStart(2, "0")}</span>
               <code>{decisionId}</code>

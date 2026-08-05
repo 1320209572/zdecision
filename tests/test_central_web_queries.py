@@ -7,12 +7,18 @@ import unittest
 from pathlib import Path
 
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.store import CentralStore
 from zdecision.central.web.contracts import CentralPublication
 from zdecision.central.web.queries import CentralWebQueries, DecisionNotFound
 from zdecision.capture.models import CandidateContent, SourceCheckpoint
 from zdecision.capture.reviews import ApprovalRef
-from zdecision.ids import central_publication_id, decision_id, product_id
+from zdecision.ids import (
+    central_publication_id,
+    decision_id,
+    decision_space_id,
+    product_id,
+)
 from zdecision.registry.models import (
     DecisionHead,
     DecisionRevision,
@@ -34,6 +40,7 @@ from zdecision.sync.contracts import RepositoryView
 
 PRODUCT_NAME = "ZDecision"
 PRODUCT_ID = product_id(PRODUCT_NAME)
+PRODUCT_SPACE_ID = decision_space_id("product", PRODUCT_ID)
 PRODUCT_REPOSITORY_ID = "repo_" + "1" * 32
 OTHER_PRODUCT_NAME = "Other Product"
 OTHER_PRODUCT_ID = product_id(OTHER_PRODUCT_NAME)
@@ -300,6 +307,22 @@ class CentralWebQueriesTest(unittest.TestCase):
                 True,
             ),
         )
+        self.store.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                PRODUCT_SPACE_ID,
+                "product",
+                PRODUCT_NAME,
+                PRODUCT_ID,
+                PRODUCT_NAME,
+                None,
+                (),
+                ".",
+                None,
+                None,
+                True,
+            ),
+        )
         self.store.put_repository_mapping(
             "org_other",
             RepositoryView(
@@ -391,7 +414,8 @@ class CentralWebQueriesTest(unittest.TestCase):
             publication_id=publication_id,
             organization_id="org_demo",
             actor_id="user_demo",
-            product_id=PRODUCT_ID,
+            decision_space_id=PRODUCT_SPACE_ID,
+            compatibility_product_id=PRODUCT_ID,
             preview_id=revision.publication_preview_id,
             confirm_action_id="web_action_catalog-fixture",
             confirm_request_digest="d" * 64,
@@ -413,14 +437,16 @@ class CentralWebQueriesTest(unittest.TestCase):
             self.store.connection.execute(
                 """
                 INSERT INTO web_publications(
-                    organization_id, product_id, publication_id, preview_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, publication_id, preview_id,
                     actor_id, state, recovery_code, commit_sha, record_json,
                     record_digest, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     publication.organization_id,
-                    publication.product_id,
+                    publication.decision_space_id,
+                    publication.compatibility_product_id,
                     publication.publication_id,
                     publication.preview_id,
                     publication.actor_id,
@@ -436,13 +462,15 @@ class CentralWebQueriesTest(unittest.TestCase):
             self.store.connection.execute(
                 """
                 INSERT INTO web_candidate_receipts(
-                    organization_id, product_id, family_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, family_id,
                     publication_candidate_id, decision_id, preview_id,
                     commit_sha, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "org_demo",
+                    PRODUCT_SPACE_ID,
                     PRODUCT_ID,
                     "cfm_" + "3" * 32,
                     "cand_" + "3" * 32 + "_01",
@@ -528,6 +556,22 @@ class CentralWebQueriesTest(unittest.TestCase):
                 True,
             ),
         )
+        self.store.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                PRODUCT_SPACE_ID,
+                "product",
+                "Mismatched Product Name",
+                PRODUCT_ID,
+                "Mismatched Product Name",
+                None,
+                (),
+                ".",
+                None,
+                None,
+                True,
+            ),
+        )
         queries = CentralWebQueries(
             self.store.connection, _RegistryQuery(decisions=(revision,))
         )
@@ -543,7 +587,8 @@ class CentralWebQueriesTest(unittest.TestCase):
         dashboard = self.queries.dashboard(self.user)
 
         self.assertEqual(
-            [PRODUCT_ID], [item.product_id for item in dashboard.products]
+            [PRODUCT_SPACE_ID],
+            [item.decision_space_id for item in dashboard.products],
         )
         self.assertEqual(1, dashboard.metrics.product_count)
         self.assertEqual(1, dashboard.metrics.pending_candidate_count)
@@ -621,21 +666,25 @@ class CentralWebQueriesTest(unittest.TestCase):
                     """
                     SELECT COALESCE(MAX(submission_order), 0) + 1
                     FROM web_review_batches
-                    WHERE organization_id = ? AND product_id = ?
+                    WHERE organization_id = ? AND decision_space_id = ?
                     """,
-                    ("org_demo", PRODUCT_ID),
+                    ("org_demo", PRODUCT_SPACE_ID),
                 ).fetchone()[0]
             self.store.connection.execute(
                 """
                 INSERT INTO web_review_batches(
-                    organization_id, product_id, review_batch_id, actor_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, compatibility_product_name,
+                    review_batch_id, actor_id,
                     client_action_id, request_digest, record_json,
                     record_digest, created_at, submission_order
-                ) VALUES (?, ?, ?, 'user_demo', ?, ?, '{}', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'user_demo', ?, ?, '{}', ?, ?, ?)
                 """,
                 (
                     "org_demo",
+                    PRODUCT_SPACE_ID,
                     PRODUCT_ID,
+                    PRODUCT_NAME,
                     batch_id,
                     f"web_action_review-{ordinal}",
                     ordinal * 64,
@@ -647,7 +696,7 @@ class CentralWebQueriesTest(unittest.TestCase):
             self.store.connection.execute(
                 """
                 INSERT INTO web_review_items(
-                    organization_id, product_id, review_batch_id, item_order,
+                    organization_id, decision_space_id, review_batch_id, item_order,
                     review_id, family_id, publication_candidate_id,
                     repository_id, revision_id, revision, content_digest,
                     action, effective_content_json, effective_content_digest,
@@ -656,7 +705,7 @@ class CentralWebQueriesTest(unittest.TestCase):
                 """,
                 (
                     "org_demo",
-                    PRODUCT_ID,
+                    PRODUCT_SPACE_ID,
                     batch_id,
                     "rvi_" + ordinal * 32,
                     "cfm_" + "1" * 32,
@@ -675,7 +724,8 @@ class CentralWebQueriesTest(unittest.TestCase):
             publication_id=central_publication_id(preview),
             organization_id="org_demo",
             actor_id="user_demo",
-            product_id=PRODUCT_ID,
+            decision_space_id=PRODUCT_SPACE_ID,
+            compatibility_product_id=PRODUCT_ID,
             preview_id=preview,
             confirm_action_id=f"web_action_catalog-{ordinal}",
             confirm_request_digest=ordinal * 64,
@@ -697,14 +747,16 @@ class CentralWebQueriesTest(unittest.TestCase):
             self.store.connection.execute(
                 """
                 INSERT INTO web_publications(
-                    organization_id, product_id, publication_id, preview_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, publication_id, preview_id,
                     actor_id, state, recovery_code, commit_sha, record_json,
                     record_digest, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     publication.organization_id,
-                    publication.product_id,
+                    publication.decision_space_id,
+                    publication.compatibility_product_id,
                     publication.publication_id,
                     publication.preview_id,
                     publication.actor_id,
@@ -720,13 +772,15 @@ class CentralWebQueriesTest(unittest.TestCase):
             self.store.connection.execute(
                 """
                 INSERT INTO web_candidate_receipts(
-                    organization_id, product_id, family_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, family_id,
                     publication_candidate_id, decision_id, preview_id,
                     commit_sha, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "org_demo",
+                    PRODUCT_SPACE_ID,
                     PRODUCT_ID,
                     "cfm_" + ordinal * 32,
                     "cand_" + ordinal * 32 + "_01",

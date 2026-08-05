@@ -25,6 +25,7 @@ from zdecision.sync.contracts import RepositoryView
 
 ReviewAction = Literal["accept", "edit_accept", "reject", "skip"]
 CandidateReviewState = Literal["pending", "accepted", "rejected", "published"]
+DecisionSpaceKind = Literal["product", "shared_unit"]
 PublicationState = Literal["confirmed", "committed_pending_push", "completed"]
 ActionKind = Literal["review", "preview", "publish", "resume"]
 
@@ -49,6 +50,71 @@ _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _RECOVERY_CODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CAPTURE_REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
 _REVIEW_STATES = frozenset(("pending", "accepted", "rejected", "published"))
+
+
+@dataclass(frozen=True)
+class DecisionSpaceRef:
+    decision_space_id: str
+    kind: DecisionSpaceKind
+    display_name: str
+    breadcrumb: tuple[str, ...]
+    source_root: str
+    package_name: str | None
+    asset_type: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "decision_space_id": self.decision_space_id,
+            "kind": self.kind,
+            "display_name": self.display_name,
+            "breadcrumb": list(self.breadcrumb),
+            "source_root": self.source_root,
+            "package_name": self.package_name,
+            "asset_type": self.asset_type,
+        }
+
+
+@dataclass(frozen=True)
+class DecisionSpaceSummary(DecisionSpaceRef):
+    repository_ids: tuple[str, ...]
+    pending_candidate_count: int
+    active_decision_count: int | None
+    last_activity_at: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            **super().to_dict(),
+            "repository_ids": list(self.repository_ids),
+            "pending_candidate_count": self.pending_candidate_count,
+            "active_decision_count": self.active_decision_count,
+            "last_activity_at": self.last_activity_at,
+        }
+
+
+@dataclass(frozen=True)
+class CatalogNode:
+    node_id: str
+    kind: Literal["catalog_group", "product", "shared_unit"]
+    display_name: str
+    breadcrumb: tuple[str, ...]
+    pending_candidate_count: int
+    active_decision_count: int | None
+    last_activity_at: str | None
+    space: DecisionSpaceSummary | None
+    children: tuple["CatalogNode", ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "node_id": self.node_id,
+            "kind": self.kind,
+            "display_name": self.display_name,
+            "breadcrumb": list(self.breadcrumb),
+            "pending_candidate_count": self.pending_candidate_count,
+            "active_decision_count": self.active_decision_count,
+            "last_activity_at": self.last_activity_at,
+            "space": self.space.to_dict() if self.space is not None else None,
+            "children": [child.to_dict() for child in self.children],
+        }
 
 
 def _require_fields(
@@ -304,6 +370,7 @@ class CandidateInboxView:
     repositories: tuple[RepositoryView, ...]
     items: tuple[CandidateInboxItem, ...]
     draft: ReviewDraft
+    space: DecisionSpaceRef | None = None
 
     def __post_init__(self) -> None:
         _id(self.product_id, _PRODUCT_ID, "product_id")
@@ -328,6 +395,7 @@ class CandidateInboxView:
         return {
             "product_id": self.product_id,
             "product_name": self.product_name,
+            "space": self.space.to_dict() if self.space is not None else None,
             "repositories": [item.to_dict() for item in self.repositories],
             "items": [item.to_dict() for item in self.items],
             "draft": self.draft.to_dict(),

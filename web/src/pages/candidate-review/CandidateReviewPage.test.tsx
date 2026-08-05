@@ -8,6 +8,7 @@ import type { CandidateInbox, ReviewDraft } from "../../api/types";
 
 
 const PRODUCT_ID = "prod_56af5528bcf4f5a5dc629562dee92d01";
+const SPACE_ID = "dsp_" + "9".repeat(32);
 const REPOSITORY_ID = "repo_" + "1".repeat(32);
 const FAMILY_ID = "cfm_" + "a".repeat(32);
 const REVISION_ID = "crv_" + "b".repeat(32);
@@ -39,6 +40,15 @@ function inbox(options?: {
   return {
     product_id: PRODUCT_ID,
     product_name: "ZDecision",
+    space: {
+      decision_space_id: "dsp_" + "9".repeat(32),
+      kind: "product",
+      display_name: "ZDecision",
+      breadcrumb: ["ZDecision"],
+      source_root: ".",
+      package_name: null,
+      asset_type: null,
+    },
     repositories: [
       {
         repository_id: REPOSITORY_ID,
@@ -72,7 +82,7 @@ function inbox(options?: {
     draft: {
       organization_id: "org_demo",
       actor_id: "user_demo",
-      product_id: PRODUCT_ID,
+      decision_space_id: "dsp_" + "9".repeat(32),
       version: options?.draftVersion ?? 0,
       items: action ? [draftItem(action)] : [],
       updated_at: action ? "2026-08-04T08:00:00Z" : null,
@@ -151,7 +161,7 @@ it("refreshes one owned repository and restores a partial draft", async () => {
     }),
   );
   await router.navigate(
-    `/products/${PRODUCT_ID}/candidates?repository_id=${REPOSITORY_ID}`,
+    `/spaces/${SPACE_ID}/candidates?repository_id=${REPOSITORY_ID}`,
   );
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
@@ -189,7 +199,7 @@ it("exposes safe Inbox filters and sends every approved filter", async () => {
     }),
   );
   await router.navigate(
-    `/products/${PRODUCT_ID}/candidates?repository_id=${REPOSITORY_ID}` +
+    `/spaces/${SPACE_ID}/candidates?repository_id=${REPOSITORY_ID}` +
       `&capture_request_id=${REQUEST_ID}&search=explicit&state=accepted`,
   );
   const user = userEvent.setup();
@@ -228,7 +238,7 @@ it("never executes Candidate markup and preserves exact provenance", async () =>
   view.items[0].content.claim =
     '<button onclick="fetch(\'/secret\')">run</button>';
   vi.stubGlobal("fetch", vi.fn(() => json(view)));
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   render(<RouterProvider router={router} />);
 
   const card = (await screen.findByText(/onclick=/)).closest("article")!;
@@ -281,7 +291,7 @@ it("does not let a resolved stale repository poll schedule more work", async () 
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   render(<RouterProvider router={router} />);
   const repository = await screen.findByLabelText("登记仓库");
   await waitFor(() => expect(eventUrls).toHaveLength(1));
@@ -311,7 +321,7 @@ it("keeps local actions visible when draft compare-and-swap conflicts", async ()
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
   const selector = await screen.findByLabelText("审核动作");
@@ -328,7 +338,7 @@ it("marks a restored action that still targets an older revision", async () => {
     "fetch",
     vi.fn(() => json(inbox({ draftVersion: 3, action: "accept", stale: true }))),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   render(<RouterProvider router={router} />);
 
   expect(await screen.findByText("已有新版本")).toBeVisible();
@@ -364,7 +374,7 @@ it("resumes durable capture progress from the stored event cursor", async () => 
   });
   vi.stubGlobal("fetch", fetcher);
   await router.navigate(
-    `/products/${PRODUCT_ID}/candidates?repository_id=${REPOSITORY_ID}`,
+    `/spaces/${SPACE_ID}/candidates?repository_id=${REPOSITORY_ID}`,
   );
   render(<RouterProvider router={router} />);
 
@@ -380,23 +390,18 @@ it("resumes durable capture progress from the stored event cursor", async () => 
 it("does not guess a product route for an unknown repository deep link", async () => {
   const unknownRepository = "repo_" + "f".repeat(32);
   const fetcher = vi.fn(() =>
-    json({
-      repositories: [
-        {
-          repository_id: REPOSITORY_ID,
-          product_id: PRODUCT_ID,
-          product_name: "ZDecision",
-          enabled: true,
-        },
-      ],
-    }),
+    json({ error: "not_found" }, 404),
   );
   vi.stubGlobal("fetch", fetcher);
   await router.navigate(`/?repository_id=${unknownRepository}`);
   render(<RouterProvider router={router} />);
 
-  expect(await screen.findByText("仓库未登记或未启用")).toBeVisible();
+  expect(await screen.findByText("仓库或决策空间未登记")).toBeVisible();
   expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(fetcher).toHaveBeenCalledWith(
+    `/api/v1/web/repositories/${unknownRepository}/spaces`,
+    expect.any(Object),
+  );
 });
 
 it("submits an ordered partial accept and reject for preview eligibility", async () => {
@@ -439,7 +444,7 @@ it("submits an ordered partial accept and reject for preview eligibility", async
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
 
@@ -493,7 +498,7 @@ it("retries a failed preview with the same durable action identity", async () =>
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
 
@@ -503,7 +508,7 @@ it("retries a failed preview with the same durable action identity", async () =>
 
   expect(await screen.findByText("审核已提交，但发布预览生成失败")).toBeVisible();
   const pending = JSON.parse(
-    String(localStorage.getItem(`zdecision:preview:${PRODUCT_ID}`)),
+    String(localStorage.getItem(`zdecision:preview:${SPACE_ID}`)),
   );
   expect(pending).toEqual({
     review_batch_id: reviewBatchId,
@@ -521,7 +526,7 @@ it("retries a failed preview with the same durable action identity", async () =>
       `/publication-previews/${previewId}`,
     ),
   );
-  expect(localStorage.getItem(`zdecision:preview:${PRODUCT_ID}`)).toBeNull();
+  expect(localStorage.getItem(`zdecision:preview:${SPACE_ID}`)).toBeNull();
 });
 
 it("submits reject-only review without claiming a preview", async () => {
@@ -555,7 +560,7 @@ it("submits reject-only review without claiming a preview", async () => {
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
 
@@ -597,7 +602,7 @@ it("retains a stale selection and loads the latest revision without resubmitting
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
 
@@ -660,7 +665,7 @@ it("merges remote-only draft choices before adopting a newer CAS version", async
       throw new Error(`Unexpected fetch: ${url}`);
     }),
   );
-  await router.navigate(`/products/${PRODUCT_ID}/candidates`);
+  await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   const user = userEvent.setup();
   render(<RouterProvider router={router} />);
 

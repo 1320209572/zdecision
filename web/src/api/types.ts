@@ -17,16 +17,44 @@ export interface RegistryStatus {
   commit_sha: string | null;
 }
 
-export interface ProductSummary {
-  product_id: string;
-  product_name: string;
+export type DecisionSpaceKind = "product" | "shared_unit";
+
+export interface DecisionSpaceRef {
+  decision_space_id: string;
+  kind: DecisionSpaceKind;
+  display_name: string;
+  breadcrumb: string[];
+  source_root: string;
+  package_name: string | null;
+  asset_type: string | null;
+}
+
+export interface DecisionSpaceSummary extends DecisionSpaceRef {
   repository_ids: string[];
   pending_candidate_count: number;
   active_decision_count: number | null;
   last_activity_at: string | null;
 }
 
+export interface CatalogNode {
+  node_id: string;
+  kind: "catalog_group" | DecisionSpaceKind;
+  display_name: string;
+  breadcrumb: string[];
+  pending_candidate_count: number;
+  active_decision_count: number | null;
+  last_activity_at: string | null;
+  space: DecisionSpaceSummary | null;
+  children: CatalogNode[];
+}
+
+export interface RepositorySpacesView {
+  repository_id: string;
+  spaces: DecisionSpaceSummary[];
+}
+
 export interface PublicationSummary {
+  decision_space_id: string;
   publication_id: string;
   preview_id: string;
   product_id: string;
@@ -53,11 +81,13 @@ export interface PublicationHistory {
 export interface Dashboard {
   metrics: DashboardMetrics;
   registry: RegistryStatus;
-  products: ProductSummary[];
+  products: DecisionSpaceSummary[];
+  shared_tree: CatalogNode | null;
   recent_publications: PublicationSummary[];
 }
 
 export interface DecisionListItem {
+  decision_space_id: string;
   product_id: string;
   product_name: string;
   decision_id: string;
@@ -81,6 +111,7 @@ export interface DecisionListView {
 }
 
 export interface DecisionDetail {
+  decision_space_id: string;
   format: "zdecision-decision/v1";
   schema_version: 1;
   decision_id: string;
@@ -151,7 +182,7 @@ export interface ReviewDraftItem {
 export interface ReviewDraft {
   organization_id: string;
   actor_id: string;
-  product_id: string;
+  decision_space_id: string;
   version: number;
   items: ReviewDraftItem[];
   updated_at: string | null;
@@ -192,6 +223,7 @@ export interface CandidateInboxItem {
 export interface CandidateInbox {
   product_id: string;
   product_name: string;
+  space: DecisionSpaceRef;
   repositories: RepositoryView[];
   items: CandidateInboxItem[];
   draft: ReviewDraft;
@@ -271,6 +303,7 @@ export interface PublicationPreview {
   review_ids: string[];
   candidate_ids: string[];
   decision_ids: string[];
+  decision_space_id: string;
   product_id: string;
   product_name: string;
   base_commit: string;

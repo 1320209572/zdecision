@@ -13,10 +13,13 @@ from typing import Literal, cast
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.web.contracts import (
+    CatalogNode,
     CandidateInboxItem,
     CandidateInboxView,
     CandidateReviewState,
     CentralPublication,
+    DecisionSpaceRef,
+    DecisionSpaceSummary,
     ReviewDraft,
 )
 from zdecision.central.web.store import WebRecordCorrupt
@@ -116,7 +119,8 @@ class PublicationSummary:
 class DashboardView:
     metrics: DashboardMetrics
     registry: RegistryStatus
-    products: tuple[ProductSummary, ...]
+    products: tuple[DecisionSpaceSummary, ...]
+    shared_tree: CatalogNode | None
     recent_publications: tuple[PublicationSummary, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -124,6 +128,9 @@ class DashboardView:
             "metrics": self.metrics.to_dict(),
             "registry": self.registry.to_dict(),
             "products": [item.to_dict() for item in self.products],
+            "shared_tree": (
+                self.shared_tree.to_dict() if self.shared_tree is not None else None
+            ),
             "recent_publications": [
                 item.to_dict() for item in self.recent_publications
             ],
@@ -144,6 +151,7 @@ class DecisionRegistryUnavailable(DecisionReadError):
 
 @dataclass(frozen=True)
 class DecisionListItem:
+    decision_space_id: str
     product_id: str
     product_name: str
     decision_id: str
@@ -160,6 +168,7 @@ class DecisionListItem:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "decision_space_id": self.decision_space_id,
             "product_id": self.product_id,
             "product_name": self.product_name,
             "decision_id": self.decision_id,
@@ -198,6 +207,7 @@ class DecisionListView:
 
 @dataclass(frozen=True)
 class DecisionDetailView:
+    decision_space_id: str
     registry_commit: str
     decision: DecisionRevision
     publication_id: str | None
@@ -210,6 +220,7 @@ class DecisionDetailView:
         )
         return {
             **self.decision.to_dict(),
+            "decision_space_id": self.decision_space_id,
             "canonical_json": canonical,
             "registry_commit": self.registry_commit,
             "publication_id": self.publication_id,
@@ -224,6 +235,18 @@ class _DecisionPublication:
     preview_id: str
     published_at: str
     commit_sha: str
+
+
+@dataclass(frozen=True)
+class RepositorySpacesView:
+    repository_id: str
+    spaces: tuple[DecisionSpaceSummary, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "repository_id": self.repository_id,
+            "spaces": [space.to_dict() for space in self.spaces],
+        }
 
 
 class CentralWebQueries:
@@ -245,6 +268,7 @@ class CentralWebQueries:
         principal: Principal,
         *,
         product_id: str | None = None,
+        decision_space_id: str | None = None,
         search: str = "",
         repository: str = "",
         published_after: str | None = None,
@@ -255,18 +279,31 @@ class CentralWebQueries:
         self._validate_decision_filters(
             search, repository, published_after, limit, offset
         )
-        products = self._owned_products(principal)
-        if product_id is not None and product_id not in products:
-            raise DecisionNotFound("not_found")
         snapshot = self._registry_snapshot()
         if snapshot is None:
             return DecisionListView("unavailable", None, None, None)
-
-        selected_products = (
-            {product_id: products[product_id]}
-            if product_id is not None
-            else products
-        )
+        summaries = self._space_summaries(principal, snapshot)
+        by_id = {space.decision_space_id: space for space in summaries}
+        if decision_space_id is not None:
+            selected = by_id.get(decision_space_id)
+            if selected is None:
+                raise DecisionNotFound("not_found")
+            selected_spaces = (selected,)
+        elif product_id is not None:
+            leaf = self.decision_space(principal, product_id)
+            selected = by_id.get(leaf.decision_space_id) if leaf is not None else None
+            if selected is None or selected.kind != "product":
+                raise DecisionNotFound("not_found")
+            selected_spaces = (selected,)
+        else:
+            selected_spaces = summaries
+        selected_products = {
+            self.decision_space(principal, space.decision_space_id).compatibility_product_id: (
+                self.decision_space(principal, space.decision_space_id).compatibility_product_name,
+                space.decision_space_id,
+            )
+            for space in selected_spaces
+        }
         publications = self._decision_publications(
             principal, frozenset(selected_products)
         )
@@ -277,7 +314,7 @@ class CentralWebQueries:
         )
         folded_search = search.casefold()
         items: list[DecisionListItem] = []
-        for revision in snapshot.active_decisions(product_id):
+        for revision in snapshot.active_decisions():
             mapped = selected_products.get(revision.product_id)
             if mapped is None or mapped[0] != revision.product_name:
                 continue
@@ -304,7 +341,7 @@ class CentralWebQueries:
             ):
                 continue
             items.append(
-                self._decision_list_item(revision, publication)
+                self._decision_list_item(revision, publication, mapped[1])
             )
         items.sort(
             key=lambda item: (
@@ -322,26 +359,31 @@ class CentralWebQueries:
         )
 
     def get_decision(
-        self, principal: Principal, product_id: str, decision_id: str
+        self, principal: Principal, decision_space_id: str, decision_id: str
     ) -> DecisionDetailView:
         self._require_user(principal)
-        products = self._owned_products(principal)
-        if product_id not in products:
+        space = self.decision_space(principal, decision_space_id)
+        if space is None:
+            raise DecisionNotFound("not_found")
+        if decision_space_id.startswith("prod_") and space.kind != "product":
             raise DecisionNotFound("not_found")
         snapshot = self._registry_snapshot()
         if snapshot is None:
             raise DecisionRegistryUnavailable("registry_unavailable")
-        revision = snapshot.decisions.get((product_id, decision_id))
+        revision = snapshot.decisions.get(
+            (space.compatibility_product_id, decision_id)
+        )
         if (
             revision is None
             or revision.lifecycle != "active"
-            or revision.product_name != products[product_id][0]
+            or revision.product_name != space.compatibility_product_name
         ):
             raise DecisionNotFound("not_found")
         publication = self._decision_publications(
-            principal, frozenset((product_id,))
-        ).get((product_id, decision_id, revision.publication_preview_id))
+            principal, frozenset((space.compatibility_product_id,))
+        ).get((space.compatibility_product_id, decision_id, revision.publication_preview_id))
         return DecisionDetailView(
+            decision_space_id=space.decision_space_id,
             registry_commit=snapshot.commit_sha,
             decision=revision,
             publication_id=(
@@ -402,14 +444,17 @@ class CentralWebQueries:
     def decision_space(
         self, principal: Principal, identifier: str
     ) -> LeafDecisionSpace | None:
-        """Resolve an enabled leaf by canonical ID or its V1 product alias."""
+        """Resolve an enabled leaf by canonical ID or a product-only V1 alias."""
 
         self._require_user(principal)
         row = self.connection.execute(
             """
             SELECT * FROM decision_spaces
             WHERE organization_id = ? AND enabled = 1
-              AND (decision_space_id = ? OR compatibility_product_id = ?)
+              AND (
+                decision_space_id = ? OR
+                (kind = 'product' AND compatibility_product_id = ?)
+              )
             """,
             (principal.organization_id, identifier, identifier),
         ).fetchone()
@@ -429,6 +474,68 @@ class CentralWebQueries:
             package_name=row["package_name"],
             asset_type=row["asset_type"],
             enabled=bool(row["enabled"]),
+        )
+
+    def catalog_group_exists(
+        self, principal: Principal, catalog_group_id: str
+    ) -> bool:
+        self._require_user(principal)
+        return self.connection.execute(
+            """SELECT 1 FROM catalog_groups
+            WHERE organization_id = ? AND catalog_group_id = ?""",
+            (principal.organization_id, catalog_group_id),
+        ).fetchone() is not None
+
+    def repository_spaces(
+        self, principal: Principal, repository_id: str
+    ) -> RepositorySpacesView:
+        self._require_user(principal)
+        enabled = self.connection.execute(
+            """SELECT 1 FROM repositories
+            WHERE organization_id = ? AND repository_id = ? AND enabled = 1
+            UNION
+            SELECT 1 FROM repository_mappings
+            WHERE organization_id = ? AND repository_id = ? AND enabled = 1""",
+            (
+                principal.organization_id,
+                repository_id,
+                principal.organization_id,
+                repository_id,
+            ),
+        ).fetchone()
+        if enabled is None:
+            raise DecisionNotFound("not_found")
+        identifiers = {
+            row["decision_space_id"]
+            for row in self.connection.execute(
+                """SELECT version.decision_space_id
+                FROM repository_route_heads AS head
+                JOIN repository_route_versions AS version
+                  ON version.organization_id = head.organization_id
+                 AND version.route_id = head.route_id
+                 AND version.configuration_version = head.configuration_version
+                JOIN decision_spaces AS space
+                  ON space.organization_id = version.organization_id
+                 AND space.decision_space_id = version.decision_space_id
+                WHERE head.organization_id = ?
+                  AND version.repository_id = ?
+                  AND version.enabled = 1 AND space.enabled = 1""",
+                (principal.organization_id, repository_id),
+            ).fetchall()
+        }
+        mapping = self.resolve_repository(principal, repository_id)
+        if mapping is not None:
+            product = self.decision_space(principal, mapping.product_id)
+            if product is not None and product.kind == "product":
+                identifiers.add(product.decision_space_id)
+        summaries = self._space_summaries(principal, self._registry_snapshot())
+        return RepositorySpacesView(
+            repository_id,
+            tuple(
+                summary
+                for summary in summaries
+                if summary.decision_space_id in identifiers
+            ),
         )
 
     def decision_space_repositories(
@@ -464,14 +571,31 @@ class CentralWebQueries:
                 decision_space_id,
             ),
         ).fetchall()
+        repositories = {
+            row["repository_id"]
+            for row in rows
+        }
+        if space.kind == "product":
+            repositories.update(
+                row["repository_id"]
+                for row in self.connection.execute(
+                    """SELECT repository_id FROM repository_mappings
+                    WHERE organization_id = ? AND product_id = ?
+                      AND enabled = 1""",
+                    (
+                        principal.organization_id,
+                        space.compatibility_product_id,
+                    ),
+                ).fetchall()
+            )
         return tuple(
             RepositoryView(
-                row["repository_id"],
+                repository_id,
                 space.compatibility_product_id,
                 space.compatibility_product_name,
                 True,
             )
-            for row in rows
+            for repository_id in sorted(repositories)
         )
 
     def candidate_revision_ownership(
@@ -767,6 +891,15 @@ class CentralWebQueries:
             repositories,
             tuple(selected[offset : offset + limit]),
             draft,
+            DecisionSpaceRef(
+                space.decision_space_id,
+                space.kind,
+                space.display_name,
+                (*space.catalog_breadcrumb, space.display_name),
+                space.source_root,
+                space.package_name,
+                space.asset_type,
+            ),
         )
 
     def _capture_request_ids(
@@ -864,7 +997,9 @@ class CentralWebQueries:
     def dashboard(self, principal: Principal) -> DashboardView:
         self._require_user(principal)
         snapshot = self._registry_snapshot()
-        products = self._list_products(principal, snapshot)
+        spaces = self._space_summaries(principal, snapshot)
+        products = tuple(space for space in spaces if space.kind == "product")
+        shared_tree = self._shared_tree(principal, spaces)
         registry = RegistryStatus(
             "available" if snapshot is not None else "unavailable",
             snapshot.commit_sha if snapshot is not None else None,
@@ -874,7 +1009,15 @@ class CentralWebQueries:
             if snapshot is not None
             else None
         )
-        publications = self._recent_publications(principal)
+        allowed_products = {
+            self.decision_space(principal, space.decision_space_id).compatibility_product_id
+            for space in spaces
+        }
+        publications = tuple(
+            publication
+            for publication in self._recent_publications(principal)
+            if publication.product_id in allowed_products
+        )
         return DashboardView(
             DashboardMetrics(
                 product_count=len(products),
@@ -886,8 +1029,156 @@ class CentralWebQueries:
             ),
             registry,
             products,
+            shared_tree,
             publications,
         )
+
+    def _space_summaries(
+        self, principal: Principal, snapshot: RegistrySnapshot | None
+    ) -> tuple[DecisionSpaceSummary, ...]:
+        rows = self.connection.execute(
+            """SELECT * FROM decision_spaces
+            WHERE organization_id = ? AND enabled = 1
+            ORDER BY kind, display_name, decision_space_id""",
+            (principal.organization_id,),
+        ).fetchall()
+        summaries: list[DecisionSpaceSummary] = []
+        for row in rows:
+            space = self.decision_space(principal, row["decision_space_id"])
+            if space is None:
+                continue
+            repositories = self.decision_space_repositories(
+                principal, space.decision_space_id
+            )
+            if not repositories:
+                continue
+            summaries.append(
+                DecisionSpaceSummary(
+                    decision_space_id=space.decision_space_id,
+                    kind=space.kind,
+                    display_name=space.display_name,
+                    breadcrumb=(
+                        *space.catalog_breadcrumb,
+                        space.display_name,
+                    ),
+                    source_root=space.source_root,
+                    package_name=space.package_name,
+                    asset_type=space.asset_type,
+                    repository_ids=tuple(
+                        repository.repository_id for repository in repositories
+                    ),
+                    pending_candidate_count=self._pending_count_space(
+                        principal.organization_id, space
+                    ),
+                    active_decision_count=(
+                        sum(
+                            revision.product_name
+                            == space.compatibility_product_name
+                            for revision in snapshot.active_decisions(
+                                space.compatibility_product_id
+                            )
+                        )
+                        if snapshot is not None
+                        else None
+                    ),
+                    last_activity_at=self._last_activity_space(
+                        principal.organization_id, space
+                    ),
+                )
+            )
+        return tuple(summaries)
+
+    def _shared_tree(
+        self,
+        principal: Principal,
+        spaces: tuple[DecisionSpaceSummary, ...],
+    ) -> CatalogNode | None:
+        shared_spaces = tuple(space for space in spaces if space.kind == "shared_unit")
+        if not shared_spaces:
+            return None
+        rows = self.connection.execute(
+            """SELECT * FROM catalog_groups WHERE organization_id = ?
+            ORDER BY sort_order, display_name, catalog_group_id""",
+            (principal.organization_id,),
+        ).fetchall()
+        groups = {row["catalog_group_id"]: row for row in rows}
+        root = next(
+            (
+                row for row in rows
+                if row["parent_group_id"] is None and row["display_name"] == "Shared"
+            ),
+            None,
+        )
+        if root is None:
+            return None
+        leaves_by_group: dict[str, list[DecisionSpaceSummary]] = {}
+        for summary in shared_spaces:
+            row = self.connection.execute(
+                """SELECT catalog_group_id FROM decision_spaces
+                WHERE organization_id = ? AND decision_space_id = ?""",
+                (principal.organization_id, summary.decision_space_id),
+            ).fetchone()
+            if row is not None and row["catalog_group_id"] in groups:
+                leaves_by_group.setdefault(row["catalog_group_id"], []).append(summary)
+        children_by_group: dict[str, list[str]] = {}
+        for row in rows:
+            if row["parent_group_id"] is not None:
+                children_by_group.setdefault(row["parent_group_id"], []).append(
+                    row["catalog_group_id"]
+                )
+
+        def leaf_node(space: DecisionSpaceSummary) -> CatalogNode:
+            return CatalogNode(
+                space.decision_space_id,
+                space.kind,
+                space.display_name,
+                space.breadcrumb,
+                space.pending_candidate_count,
+                space.active_decision_count,
+                space.last_activity_at,
+                space,
+                (),
+            )
+
+        def group_node(group_id: str) -> CatalogNode | None:
+            row = groups[group_id]
+            children = [
+                node
+                for child_id in children_by_group.get(group_id, [])
+                if (node := group_node(child_id)) is not None
+            ]
+            children.extend(
+                leaf_node(space)
+                for space in sorted(
+                    leaves_by_group.get(group_id, []),
+                    key=lambda item: (item.display_name.casefold(), item.decision_space_id),
+                )
+            )
+            if not children:
+                return None
+            active = (
+                None
+                if any(child.active_decision_count is None for child in children)
+                else sum(child.active_decision_count or 0 for child in children)
+            )
+            activities = [
+                child.last_activity_at
+                for child in children
+                if child.last_activity_at is not None
+            ]
+            return CatalogNode(
+                group_id,
+                "catalog_group",
+                row["display_name"],
+                tuple(json.loads(row["breadcrumb_json"])),
+                sum(child.pending_candidate_count for child in children),
+                active,
+                max(activities) if activities else None,
+                None,
+                tuple(children),
+            )
+
+        return group_node(root["catalog_group_id"])
 
     def _owned_products(
         self, principal: Principal
@@ -992,8 +1283,10 @@ class CentralWebQueries:
     def _decision_list_item(
         revision: DecisionRevision,
         publication: _DecisionPublication | None,
+        decision_space_id: str,
     ) -> DecisionListItem:
         return DecisionListItem(
+            decision_space_id=decision_space_id,
             product_id=revision.product_id,
             product_name=revision.product_name,
             decision_id=revision.decision_id,
@@ -1131,6 +1424,78 @@ class CentralWebQueries:
             (organization_id, product_id),
         ).fetchone()
         return int(row["count"])
+
+    def _pending_count_space(
+        self, organization_id: str, space: LeafDecisionSpace
+    ) -> int:
+        row = self.connection.execute(
+            """SELECT COUNT(*) AS count
+            FROM candidate_family_heads AS head
+            JOIN candidate_revision_ownership AS ownership
+              ON ownership.organization_id = head.organization_id
+             AND ownership.repository_id = head.repository_id
+             AND ownership.family_id = head.family_id
+             AND ownership.revision = head.revision
+            LEFT JOIN web_candidate_receipts AS receipt
+              ON receipt.organization_id = head.organization_id
+             AND receipt.decision_space_id = ownership.decision_space_id
+             AND receipt.family_id = head.family_id
+            WHERE head.organization_id = ?
+              AND ownership.decision_space_id = ?
+              AND receipt.family_id IS NULL
+              AND COALESCE((
+                SELECT item.action
+                FROM web_review_items AS item
+                JOIN web_review_batches AS batch
+                  ON batch.organization_id = item.organization_id
+                 AND batch.decision_space_id = item.decision_space_id
+                 AND batch.review_batch_id = item.review_batch_id
+                WHERE item.organization_id = head.organization_id
+                  AND item.decision_space_id = ownership.decision_space_id
+                  AND item.repository_id = head.repository_id
+                  AND item.family_id = head.family_id
+                  AND item.revision_id = head.revision_id
+                ORDER BY batch.submission_order DESC, batch.rowid DESC,
+                         item.item_order DESC
+                LIMIT 1
+              ), '') NOT IN ('accept', 'edit_accept', 'reject')""",
+            (organization_id, space.decision_space_id),
+        ).fetchone()
+        count = int(row["count"])
+        if count == 0 and space.kind == "product":
+            return self._pending_count(
+                organization_id, space.compatibility_product_id
+            )
+        return count
+
+    def _last_activity_space(
+        self, organization_id: str, space: LeafDecisionSpace
+    ) -> str | None:
+        row = self.connection.execute(
+            """SELECT MAX(activity_at) AS activity_at FROM (
+              SELECT batch.observed_at AS activity_at
+              FROM web_candidate_revision_batches AS batch
+              WHERE batch.organization_id = ? AND batch.decision_space_id = ?
+              UNION ALL
+              SELECT publication.updated_at AS activity_at
+              FROM web_publications AS publication
+              WHERE publication.organization_id = ?
+                AND publication.decision_space_id = ?
+            )""",
+            (
+                organization_id,
+                space.decision_space_id,
+                organization_id,
+                space.decision_space_id,
+            ),
+        ).fetchone()
+        if row is not None and row["activity_at"] is not None:
+            return row["activity_at"]
+        if space.kind == "product":
+            return self._last_activity(
+                organization_id, space.compatibility_product_id
+            )
+        return None
 
     def _last_activity(
         self, organization_id: str, product_id: str

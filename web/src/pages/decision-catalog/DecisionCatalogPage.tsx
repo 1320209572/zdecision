@@ -19,7 +19,7 @@ function formatPublished(value: string | null): string {
 }
 
 export function DecisionCatalogPage() {
-  const { productId } = useParams();
+  const { decisionSpaceId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const routedSearch = searchParams.get("search") ?? "";
   const routedRepository = searchParams.get("repository") ?? "";
@@ -32,15 +32,17 @@ export function DecisionCatalogPage() {
 
   const requestPath = useMemo(() => {
     const query = new URLSearchParams();
-    if (productId) query.set("product_id", productId);
     if (routedSearch) query.set("search", routedSearch);
     if (routedRepository) query.set("repository", routedRepository);
     if (routedPublishedAfter) {
       query.set("published_after", routedPublishedAfter);
     }
     const suffix = query.size ? `?${query.toString()}` : "";
-    return `/api/v1/web/decisions${suffix}`;
-  }, [productId, routedPublishedAfter, routedRepository, routedSearch]);
+    const base = decisionSpaceId
+      ? `/api/v1/web/spaces/${decisionSpaceId}/decisions`
+      : "/api/v1/web/decisions";
+    return `${base}${suffix}`;
+  }, [decisionSpaceId, routedPublishedAfter, routedRepository, routedSearch]);
 
   useEffect(() => {
     let active = true;
@@ -96,13 +98,13 @@ export function DecisionCatalogPage() {
   if (!view) return <AsyncState kind="loading" title="正在验证 Registry 快照" />;
 
   const items = view.items ?? [];
-  const productName = productId && items.length ? items[0].product_name : null;
+  const productName = decisionSpaceId && items.length ? items[0].product_name : null;
   return (
     <div className="page decision-catalog">
       <header className="page-header decision-catalog__header">
         <div>
           <p className="eyebrow">FORMAL / COMMIT-BOUND REGISTRY</p>
-          <h1>{productName ?? (productId ? "产品正式决策" : "正式决策目录")}</h1>
+          <h1>{productName ?? (decisionSpaceId ? "决策空间正式决策" : "正式决策目录")}</h1>
           <p className="page-header__lead">
             仅显示当前 Registry 提交中的 active V1 正式决策；产品归属由服务端登记关系确定。
           </p>
@@ -162,7 +164,7 @@ export function DecisionCatalogPage() {
               </div>
               <Link
                 className="decision-row__open"
-                to={`/products/${item.product_id}/decisions/${item.decision_id}`}
+                to={`/spaces/${item.decision_space_id}/decisions/${item.decision_id}`}
               >
                 查看决策
               </Link>

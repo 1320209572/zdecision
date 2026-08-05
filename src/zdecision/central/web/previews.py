@@ -84,6 +84,7 @@ class PublicationPreviewView:
     record: PublicationRecord
     publishability: Publishability
     publication_id: str | None
+    decision_space_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, PublicationRecord):
@@ -121,6 +122,7 @@ class PublicationPreviewView:
             {
                 "publishability": self.publishability,
                 "publication_id": self.publication_id,
+                "decision_space_id": self.decision_space_id,
                 "decisions": [
                     decisions_by_id[decision_id]
                     for decision_id in self.record.decision_ids
@@ -291,7 +293,9 @@ class CentralPreviewService:
             return self.get(principal, replayed_preview_id)
         if stored is None:
             raise WebRecordCorrupt("preview_action_result")
-        return PublicationPreviewView(stored, "publishable", None)
+        return PublicationPreviewView(
+            stored, "publishable", None, batch.decision_space_id
+        )
 
     def get(
         self, principal: Principal, preview_id: str
@@ -310,6 +314,7 @@ class CentralPreviewService:
             publication_id=(
                 publication.publication_id if publication is not None else None
             ),
+            decision_space_id=batch.decision_space_id,
         )
 
     def check_publishability(

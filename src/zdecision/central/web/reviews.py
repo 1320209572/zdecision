@@ -50,6 +50,10 @@ class DecisionSpaceNotFound(CentralReviewError):
     code = "not_found"
 
 
+class DecisionSpaceNotLeaf(CentralReviewError):
+    code = "decision_space_not_leaf"
+
+
 class DecisionSpaceOwnershipConflict(CentralReviewError):
     code = "decision_space_ownership_conflict"
 
@@ -497,6 +501,8 @@ class CentralReviewService:
     ) -> LeafDecisionSpace:
         space = self.queries.decision_space(principal, identifier)
         if space is None or not space.enabled:
+            if self.queries.catalog_group_exists(principal, identifier):
+                raise DecisionSpaceNotLeaf()
             raise DecisionSpaceNotFound()
         return space
 

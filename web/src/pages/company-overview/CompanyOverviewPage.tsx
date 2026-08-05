@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { api } from "../../api/client";
 import type { Dashboard } from "../../api/types";
+import { DecisionSpaceTree } from "../../features/decision-spaces/DecisionSpaceTree";
 import { AsyncState } from "../../shared/AsyncState";
 import { StatusBadge } from "../../shared/StatusBadge";
 
@@ -100,12 +101,12 @@ export function CompanyOverviewPage() {
             {dashboard.products.map((product, index) => (
               <article
                 className="product-row"
-                key={product.product_id}
+                key={product.decision_space_id}
                 style={{ "--delay": `${220 + index * 55}ms` } as React.CSSProperties}
               >
                 <span className="product-row__index">{String(index + 1).padStart(2, "0")}</span>
                 <span className="product-row__identity">
-                  <strong>{product.product_name}</strong>
+                  <strong>{product.display_name}</strong>
                   <small>{product.repository_ids.length} 个已启用仓库</small>
                 </span>
                 <span className="product-row__stat"><strong>{product.pending_candidate_count}</strong><small>待审核</small></span>
@@ -116,19 +117,32 @@ export function CompanyOverviewPage() {
                 <span className="product-row__actions">
                   <Link
                     aria-label={`候选 ${product.pending_candidate_count}`}
-                    to={`/products/${product.product_id}/candidates`}
+                    to={`/spaces/${product.decision_space_id}/candidates`}
                   >候选</Link>
                   <Link
                     aria-label={`决策 ${product.active_decision_count ?? "未知"}`}
-                    to={`/products/${product.product_id}/decisions`}
+                    to={`/spaces/${product.decision_space_id}/decisions`}
                   >决策</Link>
-                  <Link to={`/products/${product.product_id}/publications`}>发布</Link>
+                  <Link to={`/spaces/${product.decision_space_id}/publications`}>发布</Link>
                 </span>
               </article>
             ))}
           </div>
         )}
       </section>
+
+      {dashboard.shared_tree ? (
+        <section className="section-block shared-catalog">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">SHARED / SOURCE-ROOT CATALOG</p>
+              <h2>Shared</h2>
+            </div>
+            <span className="section-heading__count">按真实目录边界</span>
+          </div>
+          <DecisionSpaceTree root={dashboard.shared_tree} />
+        </section>
+      ) : null}
 
       <section className="section-block section-block--compact">
         <div className="section-heading">

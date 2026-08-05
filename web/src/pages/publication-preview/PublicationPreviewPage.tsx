@@ -246,7 +246,7 @@ export function PublicationPreviewPage() {
       </section>
 
       <footer className="preview-confirmation">
-        <Link to={`/products/${preview.product_id}/candidates`}>
+        <Link to={`/spaces/${preview.decision_space_id}/candidates`}>
           ← 返回修改审核
         </Link>
         <div>

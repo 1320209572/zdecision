@@ -13,6 +13,12 @@ from fastapi.testclient import TestClient
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
 from zdecision.central.cli import CentralCliError, _registry_repository_root
+from zdecision.central.decision_spaces import (
+    CatalogGroup,
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
 from zdecision.central.web.application import CentralWebApplication
@@ -20,7 +26,14 @@ from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import CentralWebStore
 from zdecision.capture.models import CandidateContent, SourceCheckpoint
 from zdecision.capture.reviews import ApprovalRef
-from zdecision.ids import candidate_revision_id, decision_id, product_id
+from zdecision.ids import (
+    candidate_revision_id,
+    catalog_group_id,
+    decision_id,
+    decision_space_id,
+    product_id,
+    repository_route_id,
+)
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter
@@ -36,11 +49,16 @@ from zdecision.registry.query import (
     RegistryQueryUnavailable,
     RegistrySnapshot,
 )
-from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+from zdecision.sync.contracts import (
+    CandidateOwnershipSnapshot,
+    CandidateRevisionUpload,
+    RepositoryView,
+)
 
 
 PRODUCT_NAME = "ZDecision"
 PRODUCT_ID = product_id(PRODUCT_NAME)
+PRODUCT_SPACE_ID = decision_space_id("product", PRODUCT_ID)
 REPOSITORY_ID = "repo_" + "1" * 32
 COMMIT_SHA = "b" * 40
 
@@ -124,6 +142,25 @@ class CentralWebApiTest(unittest.TestCase):
                 REPOSITORY_ID, PRODUCT_ID, PRODUCT_NAME, True
             ),
         )
+        self.store.put_repository(
+            "org_demo", EnabledRepository(REPOSITORY_ID, True)
+        )
+        self.store.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                PRODUCT_SPACE_ID,
+                "product",
+                PRODUCT_NAME,
+                PRODUCT_ID,
+                PRODUCT_NAME,
+                None,
+                (),
+                ".",
+                None,
+                None,
+                True,
+            ),
+        )
         content = CandidateContent(
             product=PRODUCT_NAME,
             claim="Review the current product Candidate.",
@@ -164,6 +201,20 @@ class CentralWebApiTest(unittest.TestCase):
             evidence_digest="e" * 64,
         )
         record = canonical_json_bytes(self.revision.to_dict())
+        ownership = CandidateOwnershipSnapshot(
+            repository_id=REPOSITORY_ID,
+            route_id=repository_route_id(REPOSITORY_ID, PRODUCT_SPACE_ID),
+            route_configuration_version=1,
+            decision_space_id=PRODUCT_SPACE_ID,
+            decision_space_kind="product",
+            display_name=PRODUCT_NAME,
+            catalog_breadcrumb=(),
+            source_root=".",
+            compatibility_product_id=PRODUCT_ID,
+            compatibility_product_name=PRODUCT_NAME,
+            source_boundary_digest="9" * 64,
+        )
+        ownership_bytes = canonical_json_bytes(ownership.to_dict())
         with self.store.connection:
             self.store.connection.execute(
                 """
@@ -188,6 +239,23 @@ class CentralWebApiTest(unittest.TestCase):
                 ) VALUES ('org_demo', ?, ?, 1, ?)
                 """,
                 (REPOSITORY_ID, family_id, self.revision.revision_id),
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO candidate_revision_ownership(
+                    organization_id, repository_id, family_id, revision,
+                    decision_space_id, route_id, route_configuration_version,
+                    ownership_json, ownership_digest
+                ) VALUES ('org_demo', ?, ?, 1, ?, ?, 1, ?, ?)
+                """,
+                (
+                    REPOSITORY_ID,
+                    family_id,
+                    PRODUCT_SPACE_ID,
+                    ownership.route_id,
+                    ownership_bytes.decode("utf-8"),
+                    hashlib.sha256(ownership_bytes).hexdigest(),
+                ),
             )
         static_root = root / "static"
         (static_root / "assets").mkdir(parents=True)
@@ -243,18 +311,143 @@ class CentralWebApiTest(unittest.TestCase):
                 },
                 "products": [
                     {
-                        "product_id": PRODUCT_ID,
-                        "product_name": PRODUCT_NAME,
+                        "decision_space_id": PRODUCT_SPACE_ID,
+                        "kind": "product",
+                        "display_name": PRODUCT_NAME,
+                        "breadcrumb": [PRODUCT_NAME],
+                        "source_root": ".",
+                        "package_name": None,
+                        "asset_type": None,
                         "repository_ids": [REPOSITORY_ID],
                         "pending_candidate_count": 1,
                         "active_decision_count": 1,
                         "last_activity_at": None,
                     }
                 ],
+                "shared_tree": None,
                 "recent_publications": [],
             },
             response.json(),
         )
+
+    def test_dashboard_counts_products_and_nests_shared_leaves(self) -> None:
+        shared = CatalogGroup(
+            catalog_group_id(("Shared",)), None, "Shared", ("Shared",), None, 20
+        )
+        self.store.put_catalog_group("org_demo", shared)
+        specifications = (
+            ("packages/products/shared", "zcf-audit", "cross_product_module"),
+            ("packages/shared", "theme", "library"),
+            ("packages", "design", "component_library"),
+        )
+        routes = []
+        for order, (directory, name, asset_type) in enumerate(specifications, 1):
+            group = CatalogGroup(
+                catalog_group_id(("Shared", directory)),
+                shared.catalog_group_id,
+                directory,
+                ("Shared", directory),
+                directory,
+                order,
+            )
+            self.store.put_catalog_group("org_demo", group)
+            compatibility_name = f"Shared / {directory}/{name}"
+            compatibility_id = product_id(compatibility_name)
+            space = LeafDecisionSpace(
+                decision_space_id("shared_unit", compatibility_id),
+                "shared_unit",
+                name,
+                compatibility_id,
+                compatibility_name,
+                group.catalog_group_id,
+                group.breadcrumb,
+                f"{directory}/{name}",
+                f"@zstack/{name}",
+                asset_type,
+                True,
+            )
+            self.store.put_decision_space("org_demo", space)
+            routes.append(
+                RepositoryDecisionRoute(
+                    repository_route_id(REPOSITORY_ID, space.decision_space_id),
+                    REPOSITORY_ID,
+                    space.decision_space_id,
+                    (space.source_root,),
+                    (),
+                    True,
+                    1,
+                )
+            )
+        self.store.replace_trusted_route_heads(
+            "org_demo", REPOSITORY_ID, tuple(routes)
+        )
+
+        response = self.client.get("/api/v1/web/dashboard")
+
+        self.assertEqual(200, response.status_code, response.text)
+        body = response.json()
+        self.assertEqual(1, body["metrics"]["product_count"])
+        self.assertEqual("Shared", body["shared_tree"]["display_name"])
+
+        def leaf_names(node: dict[str, object]) -> list[str]:
+            children = node["children"]
+            assert isinstance(children, list)
+            if not children:
+                return [str(node["display_name"])]
+            return [name for child in children for name in leaf_names(child)]
+
+        self.assertEqual(
+            ["design", "theme", "zcf-audit"],
+            sorted(leaf_names(body["shared_tree"])),
+        )
+
+    def test_catalog_group_cannot_open_candidate_inbox(self) -> None:
+        shared_group_id = catalog_group_id(("Shared",))
+        self.store.put_catalog_group(
+            "org_demo",
+            CatalogGroup(
+                shared_group_id, None, "Shared", ("Shared",), None, 20
+            ),
+        )
+
+        response = self.client.get(
+            f"/api/v1/web/spaces/{shared_group_id}/candidates"
+        )
+
+        self.assertEqual(404, response.status_code)
+        self.assertEqual("decision_space_not_leaf", response.json()["error"])
+
+    def test_repository_spaces_returns_only_enabled_server_leaves(self) -> None:
+        private_space_id = decision_space_id(
+            "shared_unit", product_id("Registry Only Private")
+        )
+        self.store.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                private_space_id,
+                "shared_unit",
+                "private",
+                product_id("Registry Only Private"),
+                "Registry Only Private",
+                None,
+                (),
+                "private/package",
+                "@private/package",
+                "library",
+                True,
+            ),
+        )
+
+        response = self.client.get(
+            f"/api/v1/web/repositories/{REPOSITORY_ID}/spaces"
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        identifiers = {
+            item["decision_space_id"] for item in response.json()["spaces"]
+        }
+        self.assertEqual({PRODUCT_SPACE_ID}, identifiers)
+        self.assertNotIn(private_space_id, response.text)
 
     def test_decision_catalog_and_detail_are_complete_read_only_views(self) -> None:
         catalog = self.client.get(
@@ -428,7 +621,7 @@ class CentralWebApiTest(unittest.TestCase):
         self.assertEqual(404, unknown.status_code)
         self.assertEqual(409, cross_product.status_code)
         self.assertEqual(
-            {"error": "product_ownership_conflict"}, cross_product.json()
+            {"error": "decision_space_ownership_conflict"}, cross_product.json()
         )
 
     def test_review_route_returns_only_safe_submission_results(self) -> None:

@@ -13,7 +13,7 @@ function TextList({ values }: { values: string[] }) {
 }
 
 export function DecisionDetailPage() {
-  const { productId = "", decisionId = "" } = useParams();
+  const { decisionSpaceId = "", decisionId = "" } = useParams();
   const [decision, setDecision] = useState<DecisionDetail | null>(null);
   const [failure, setFailure] = useState<"registry" | "request" | null>(null);
 
@@ -22,7 +22,7 @@ export function DecisionDetailPage() {
     setDecision(null);
     setFailure(null);
     api<DecisionDetail>(
-      `/api/v1/web/products/${productId}/decisions/${decisionId}`,
+      `/api/v1/web/spaces/${decisionSpaceId}/decisions/${decisionId}`,
     )
       .then((value) => { if (active) setDecision(value); })
       .catch((error: unknown) => {
@@ -34,7 +34,7 @@ export function DecisionDetailPage() {
         );
       });
     return () => { active = false; };
-  }, [decisionId, productId]);
+  }, [decisionId, decisionSpaceId]);
 
   if (failure === "registry") {
     return <AsyncState kind="error" title="正式决策仓库暂不可用" />;
@@ -56,7 +56,7 @@ export function DecisionDetailPage() {
       </header>
 
       <nav className="decision-detail__nav" aria-label="决策上下文">
-        <Link to={`/products/${decision.product_id}/decisions`}>← 返回产品决策目录</Link>
+        <Link to={`/spaces/${decision.decision_space_id}/decisions`}>← 返回决策空间目录</Link>
         {decision.publication_id ? (
           <Link to={`/publications/${decision.publication_id}`}>查看发布凭据</Link>
         ) : null}

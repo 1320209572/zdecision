@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  useLocation,
   useNavigate,
   useParams,
   useSearchParams,
@@ -12,12 +11,10 @@ import type {
   ReviewDraft,
   ReviewDraftItem,
   ReviewSubmissionResult,
-  RepositoryView,
 } from "../../api/types";
 import { useCandidateRefresh } from "../../features/candidate-refresh/useCandidateRefresh";
 import { ReviewEditor } from "../../features/reviews/ReviewEditor";
 import { AsyncState } from "../../shared/AsyncState";
-import { CompanyOverviewPage } from "../company-overview/CompanyOverviewPage";
 
 
 type CandidateStateFilter =
@@ -51,13 +48,13 @@ interface PendingPreviewAction {
   client_action_id: string;
 }
 
-function pendingPreviewKey(productId: string) {
-  return `zdecision:preview:${productId}`;
+function pendingPreviewKey(decisionSpaceId: string) {
+  return `zdecision:preview:${decisionSpaceId}`;
 }
 
-function readPendingPreview(productId: string): PendingPreviewAction | null {
+function readPendingPreview(decisionSpaceId: string): PendingPreviewAction | null {
   try {
-    const raw = localStorage.getItem(pendingPreviewKey(productId));
+    const raw = localStorage.getItem(pendingPreviewKey(decisionSpaceId));
     if (!raw) return null;
     const value: unknown = JSON.parse(raw);
     if (
@@ -78,48 +75,8 @@ function readPendingPreview(productId: string): PendingPreviewAction | null {
 }
 
 
-export function RepositoryEntryPage() {
-  const location = useLocation();
-  const navigate = useNavigate();
-  const repositoryId = new URLSearchParams(location.search).get("repository_id");
-  const [unavailable, setUnavailable] = useState(false);
-
-  useEffect(() => {
-    if (!repositoryId) return;
-    let active = true;
-    api<{ repositories: RepositoryView[] }>("/api/v1/repositories")
-      .then((result) => {
-        if (!active) return;
-        const repository = result.repositories.find(
-          (item) => item.repository_id === repositoryId && item.enabled,
-        );
-        if (!repository) {
-          setUnavailable(true);
-          return;
-        }
-        void navigate(
-          `/products/${repository.product_id}/candidates?repository_id=${repository.repository_id}`,
-          { replace: true },
-        );
-      })
-      .catch(() => {
-        if (active) setUnavailable(true);
-      });
-    return () => {
-      active = false;
-    };
-  }, [navigate, repositoryId]);
-
-  if (!repositoryId) return <CompanyOverviewPage />;
-  if (unavailable) {
-    return <AsyncState kind="error" title="仓库未登记或未启用" />;
-  }
-  return <AsyncState kind="loading" title="正在查找仓库对应产品" />;
-}
-
-
 export function CandidateReviewPage() {
-  const { productId = "" } = useParams();
+  const { decisionSpaceId = "" } = useParams();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const routedRepository = searchParams.get("repository_id") ?? "";
@@ -151,7 +108,7 @@ export function CandidateReviewPage() {
   const [savedDraftSignature, setSavedDraftSignature] = useState("[]");
   const [submitting, setSubmitting] = useState(false);
   const [pendingPreview, setPendingPreview] = useState<PendingPreviewAction | null>(
-    () => readPendingPreview(productId),
+    () => readPendingPreview(decisionSpaceId),
   );
   const [staleFamilies, setStaleFamilies] = useState(
     () => new Set<string>(),
@@ -164,8 +121,8 @@ export function CandidateReviewPage() {
     if (captureRequestId) query.set("capture_request_id", captureRequestId);
     query.set("state", routedState);
     const suffix = query.size ? `?${query.toString()}` : "";
-    return `/api/v1/web/products/${productId}/candidates${suffix}`;
-  }, [captureRequestId, productId, routedRepository, routedSearch, routedState]);
+    return `/api/v1/web/spaces/${decisionSpaceId}/candidates${suffix}`;
+  }, [captureRequestId, decisionSpaceId, routedRepository, routedSearch, routedState]);
 
   useEffect(() => {
     let active = true;
@@ -201,8 +158,8 @@ export function CandidateReviewPage() {
   }, [captureRequestId, routedRepository, routedSearch, routedState]);
 
   useEffect(() => {
-    setPendingPreview(readPendingPreview(productId));
-  }, [productId]);
+    setPendingPreview(readPendingPreview(decisionSpaceId));
+  }, [decisionSpaceId]);
 
   const refreshCompleted = useCallback(() => {
     setReload((value) => value + 1);
@@ -241,7 +198,7 @@ export function CandidateReviewPage() {
     setSaveMessage(null);
     try {
       const saved = await api<ReviewDraft>(
-        `/api/v1/web/products/${productId}/review-draft`,
+        `/api/v1/web/spaces/${decisionSpaceId}/review-draft`,
         {
           method: "PUT",
           body: JSON.stringify({
@@ -278,7 +235,7 @@ export function CandidateReviewPage() {
       let submittedItems = orderedClassifiedItems;
       if (JSON.stringify(draftItems) !== savedDraftSignature) {
         const saved = await api<ReviewDraft>(
-          `/api/v1/web/products/${productId}/review-draft`,
+          `/api/v1/web/spaces/${decisionSpaceId}/review-draft`,
           {
             method: "PUT",
             body: JSON.stringify({
@@ -298,7 +255,7 @@ export function CandidateReviewPage() {
           .filter((item): item is ReviewDraftItem => item !== undefined);
       }
       const result = await api<ReviewSubmissionResult>(
-        `/api/v1/web/products/${productId}/reviews`,
+        `/api/v1/web/spaces/${decisionSpaceId}/reviews`,
         {
           method: "POST",
           body: JSON.stringify({
@@ -325,7 +282,7 @@ export function CandidateReviewPage() {
           review_batch_id: result.review_batch_id,
           client_action_id: `web_action_${crypto.randomUUID()}`,
         };
-        localStorage.setItem(pendingPreviewKey(productId), JSON.stringify(action));
+        localStorage.setItem(pendingPreviewKey(decisionSpaceId), JSON.stringify(action));
         setPendingPreview(action);
         await openPendingPreview(action);
         return;
@@ -362,7 +319,7 @@ export function CandidateReviewPage() {
           body: JSON.stringify({ client_action_id: action.client_action_id }),
         },
       );
-      localStorage.removeItem(pendingPreviewKey(productId));
+      localStorage.removeItem(pendingPreviewKey(decisionSpaceId));
       setPendingPreview(null);
       void navigate(`/publication-previews/${preview.preview_id}`);
     } catch {

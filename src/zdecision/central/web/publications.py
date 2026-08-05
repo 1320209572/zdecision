@@ -57,6 +57,7 @@ class PublicationAmbiguous(CentralPublicationError):
 
 @dataclass(frozen=True)
 class PublicationView:
+    decision_space_id: str
     publication_id: str
     preview_id: str
     product_id: str
@@ -71,6 +72,7 @@ class PublicationView:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "decision_space_id": self.decision_space_id,
             "publication_id": self.publication_id,
             "preview_id": self.preview_id,
             "product_id": self.product_id,
@@ -299,7 +301,12 @@ class CentralPublicationService:
             self.previews.queries.decision_space(principal, product_id)
             if product_id is not None else None
         )
-        if product_id is not None and space is None:
+        if product_id is not None and (
+            space is None
+            or not self.previews.queries.decision_space_repositories(
+                principal, space.decision_space_id
+            )
+        ):
             raise PublicationNotFound("not_found")
         publications, total = self.store.list_publications(
             principal.organization_id,
@@ -308,9 +315,16 @@ class CentralPublicationService:
             limit=limit,
             offset=offset,
         )
+        visible = tuple(
+            publication
+            for publication in publications
+            if self.previews.queries.decision_space_repositories(
+                principal, publication.decision_space_id
+            )
+        )
         return PublicationHistory(
-            tuple(self._view(publication) for publication in publications),
-            total,
+            tuple(self._view(publication) for publication in visible),
+            len(visible) if product_id is None else total,
             limit,
             offset,
         )
@@ -457,6 +471,7 @@ class CentralPublicationService:
             else publication.state
         )
         return PublicationView(
+            publication.decision_space_id,
             publication.publication_id,
             publication.preview_id,
             publication.product_id,
