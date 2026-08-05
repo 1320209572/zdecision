@@ -11,6 +11,10 @@ Candidate reconciliation, central Review, publication, and later Decision
 recall. This design changes only the user entry point, source-scope selection,
 and inline progress presentation.
 
+**Further amended by:** `2026-08-05-repository-bound-refresh-guard-design.md`,
+which is authoritative for native same-task authority, repository eligibility,
+and denied render behavior.
+
 ## 1. Proven host capability
 
 The minimal MCP Apps probe was accepted in Codex Desktop on 2026-07-31:
@@ -51,9 +55,9 @@ Both actions immediately create a durable Capture Request. There is no second
 confirmation because the request creates only reviewable Candidates. It never
 accepts, publishes, or mutates a formal Decision.
 
-If the current task cannot be bound to an organization-registered, enabled
-Git repository, the card still renders but both actions are disabled. It does
-not display the reason.
+If the current task cannot be bound to an organization-registered, enabled Git
+repository and an already observed active Session, the Plugin does not render
+the card. It returns only a bounded unavailable response without the reason.
 
 The card displays safe request progress and the number of Candidate revisions
 synchronized by that request. It does not display Candidate content. On
@@ -70,7 +74,8 @@ enabled repository.
 Rendering the card is not Capture authorization and performs no model-based
 extraction. The user must still choose one of its two actions. If proactive
 rendering does not occur, the user may say **更新候选决策** in the same Codex
-task and the Skill renders the card immediately.
+task. The Skill first rejects delegated/cross-task input and checks registered,
+enabled, and active-Session status before it invokes the render tool.
 
 The Plugin does not render the card at Session start, after every Turn, or for
 non-code work in this slice. Duplicate render attempts are harmless and do not
@@ -167,9 +172,8 @@ It contains no Prompt, transcript path, tool input, source code, diff, or
 Candidate content. A control expires 15 minutes after creation if no action
 has been selected. Rendering another card creates another control.
 
-If any validation or repository check fails, the Hook does not create a
-binding. The render tool accepts the missing binding and returns a disabled
-card without a reason string.
+If any validation, exact observed-Turn, or repository check fails, the Hook
+does not create a binding and denies the render tool call. No card is shown.
 
 ### 5.2 Scope selection and replay
 
@@ -298,8 +302,8 @@ authoritative.
 Before selection:
 
 - show **当前 Session** and **所有有效 Session**;
-- enable both only when a trusted Control Binding exists; and
-- show no repository-disable explanation.
+- show the card only after a trusted Control Binding exists; and
+- enable both actions.
 
 After selection:
 
@@ -342,8 +346,8 @@ the manual-address fallback.
 
 | Condition | Required behavior |
 | --- | --- |
-| Missing or disabled repository mapping | Render both actions disabled without a reason. |
-| Hook missing, rejected, or unable to persist a binding | Render both actions disabled without a reason. |
+| Missing or disabled repository mapping | Do not render the card; return only a bounded unavailable result. |
+| Hook missing, rejected, unable to prove the exact observed Turn, or unable to persist a binding | Deny the render call and show no card. |
 | Expired unused control | Reject the action and require a newly rendered card. |
 | Same control and same scope replay | Return or resume the same local intent and central request. |
 | Same control with another scope | Return a bounded conflict and create no request. |
@@ -379,18 +383,21 @@ Ordinary Codex work remains independent of every failure above.
 ### Gate 1: Trusted Codex binding
 
 - An enabled repository renders two usable actions.
-- An unregistered, disabled, or unresolved repository renders both actions
-  disabled with no explanation.
+- An unregistered, disabled, unresolved, or unobserved task renders no card and
+  exposes no detailed reason.
 - Completing and verifying a normal code task renders the card once without
   starting Capture.
-- Saying **更新候选决策** in the same task renders the card as a deterministic
-  fallback.
+- A native **更新候选决策** message in the same eligible task renders the card
+  as a deterministic fallback; delegated or cross-task input calls no
+  ZDecision tool and does not replace the receiving task's goal.
 - Session start, ordinary intermediate Turns, and non-code work do not
   proactively render the card.
 - Two concurrent Codex tasks in the same repository receive distinct local
   bindings.
 - Each task's **当前 Session** action resolves its own native Session, never
   the most recently active Session.
+- **所有有效 Session** reads only eligible same-repository sources and sends no
+  prompt, delegation, follow-up, or steer to them.
 - A fabricated, expired, or cross-repository control ID is rejected.
 
 ### Gate 2: Scope semantics

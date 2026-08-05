@@ -9,8 +9,8 @@ The implemented pre-Demo **Packet 1** is user-triggered:
 1. The installed Plugin observes Codex activity only in company-enabled Git
    repositories.
 2. After a completed and verified code-development boundary, Codex renders an
-   inline card once. The same-task phrase **更新候选决策** renders it
-   immediately as a fallback.
+   inline card once. The exact native same-task phrase **更新候选决策** is a
+   fallback only after repository and active-Session status gates pass.
 3. The user clicks **当前 Session** or **所有有效 Session** on that card, or
    clicks **更新候选决策** for the repository on the central page.
 4. The local Agent selects the authorized changed Sessions, runs two-stage decision
@@ -61,7 +61,9 @@ The product authority is [docs/architecture.md](docs/architecture.md). The
 active Plugin contract is the
 [on-demand Candidate refresh design](docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md),
 as amended by the
-[Codex inline Candidate refresh design](docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md).
+[Codex inline Candidate refresh design](docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md)
+and its
+[repository-bound presentation guard](docs/superpowers/specs/2026-08-05-repository-bound-refresh-guard-design.md).
 Repository instructions for Codex are in [AGENTS.md](AGENTS.md).
 
 ## V1 storage

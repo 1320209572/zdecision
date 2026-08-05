@@ -6,6 +6,10 @@ This amendment refines only the presentation and resource identity of the
 approved Codex inline Candidate-refresh card. It does not change Capture,
 Review, publication, repository eligibility, or Control Binding authorization.
 
+The later `2026-08-05-repository-bound-refresh-guard-design.md` is
+authoritative for whether a new card may be rendered. This document still
+governs already-rendered valid and historical cards.
+
 ## 1. Observed problem
 
 Real Codex Desktop acceptance on 2026-08-03 showed that returning to a task can
@@ -32,12 +36,12 @@ or private identifiers:
   displays **此更新卡已失效**, and keeps both actions disabled;
 - a valid current binding whose central request is temporarily unavailable
   retains the existing generic **暂时无法更新** presentation; and
-- an unregistered, disabled, or unresolved repository still renders both
-  actions disabled without an explanation, as required by the approved design.
+- an unregistered, disabled, unresolved, or unobserved task does not render a
+  new card under the repository-bound presentation guard.
 
 Historical cards do not retry, create a replacement binding, or redirect an
 action to the newest card. The user creates a new card through the existing
-same-task **更新候选决策** flow.
+eligible native same-task **更新候选决策** flow.
 
 ## 3. Resource identity
 

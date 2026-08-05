@@ -145,7 +145,17 @@ class PluginContractTests(unittest.TestCase):
             "enabled repository",
             "render `show_zdecision_update` once",
             "更新候选决策",
-            "render `show_zdecision_update` immediately",
+            "native user message in the current task",
+            "call `zdecision_status` first",
+            "`repository_registered`",
+            "`repository_enabled`",
+            "`active_session_bound`",
+            "must not call any ZDecision tool",
+            "<codex_delegation>",
+            "send_message_to_thread",
+            "turn/steer",
+            "must not replace the task's existing goal",
+            "never send a prompt, delegation, follow-up, or steer",
             "Rendering the card is not Capture authorization",
             "Session start",
             "intermediate Turns",
@@ -156,6 +166,10 @@ class PluginContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, text)
+        self.assertNotIn(
+            "render `show_zdecision_update` immediately",
+            text,
+        )
 
     def test_plugin_defaults_to_the_explicit_inline_refresh_phrase(self) -> None:
         agent_config = (

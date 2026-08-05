@@ -1,6 +1,6 @@
 # Repository-Bound Candidate Refresh Guard Design
 
-**Status:** Draft for user review
+**Status:** Approved for implementation
 
 ## Problem
 

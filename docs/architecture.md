@@ -6,7 +6,9 @@ Plugin product direction is the on-demand extension in section 12, with the
 detailed base contract in
 `docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md` and
 the approved Codex inline amendment in
-`docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md`.
+`docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md`,
+as tightened by the repository-bound presentation guard in
+`docs/superpowers/specs/2026-08-05-repository-bound-refresh-guard-design.md`.
 
 Where the historical manual interaction and the Plugin interaction differ,
 section 12 governs new product implementation. Existing Capture, Review,
@@ -532,6 +534,13 @@ identity locally, but neither kind of Hook runs a model or starts Capture.
 `Stop`, `SessionEnd`, silence, tests, commits, pushes, and a model's work-state
 report do not independently start Capture.
 
+The inline card is presented only inside the same enabled-repository task. An
+exact native refresh phrase first passes repository and active-Session status
+gates; delegation, task steering, copied text, and an ineligible task render no
+card. The `PreToolUse` Hook then proves the exact already-observed Session,
+current Turn, and CWD or blocks the render tool. `所有有效 Session` performs
+read-only same-repository selection and never sends or steers a source task.
+
 The user does not provide Session IDs, open a compression conversation, run a
 CLI command, or merge Session results. The page action selects every changed
 eligible Session for the repository. The inline card selects either the
@@ -575,6 +584,8 @@ accepts a Session ID to authorize Candidate generation.
 The detailed component contracts, DeepTutor reuse boundary, migration impact,
 and base acceptance Gates are defined in the on-demand Candidate refresh
 design. The trusted Codex binding, two inline scopes, card progress, and their
-additional Gates are defined in the approved Codex inline amendment.
+additional Gates are defined in the approved Codex inline amendment. Native
+same-task authority and repository-bound presentation follow its approved
+2026-08-05 guard amendment.
 The superseded automatic feasibility specification and its implementation
 plans are historical evidence and must not drive new work.
