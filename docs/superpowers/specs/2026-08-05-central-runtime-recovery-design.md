@@ -1,6 +1,6 @@
 # Central Runtime Recovery Design
 
-**Status:** Under review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Repair the proven Demo outage in which the inline Candidate-refresh
 card freezes a valid action locally but the loopback central Web service is not
