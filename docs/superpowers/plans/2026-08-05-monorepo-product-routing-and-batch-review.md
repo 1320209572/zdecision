@@ -775,7 +775,6 @@ class RepositoryRouteSnapshot:
             key=lambda item: (item.route_id, item.configuration_version),
         ))
         digest = hashlib.sha256(canonical_json_bytes({
-            "repository_id": repository_id,
             "routes": [route.to_dict() for route in ordered],
         })).hexdigest()
         return cls(repository_id=repository_id, routes=ordered, digest=digest)
@@ -997,7 +996,10 @@ only `RouteSelection` IDs/digests to central.
 Build `RepositoryRouteSnapshot` only from the claimed group's
 `route_snapshot`; its digest must equal the server-frozen digest before any Git
 command or model call. Persist that exact snapshot with the Capture-group plan
-for retry, rather than consulting a newer route head. Replace
+for retry, rather than consulting a newer route head. The digest reuses the
+Task 2 Wire projection `{"routes": [...]}` exactly; each canonical route record
+already contains and validates the same `repository_id`, and snapshot creation
+also rejects any member bound to a different repository. Replace
 `feasibility_repository_mappings` product fields with neutral enabled
 repository state. Current/All-valid buttons remain repository-scoped and do
 not add a product selector.
