@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 
 import { api } from "../../api/client";
 import type { PublicationDetail } from "../../api/types";
+import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
 import { AsyncState } from "../../shared/AsyncState";
 import { StatusBadge } from "../../shared/StatusBadge";
 import { publicationLabels, publicationTone } from "./PublicationHistoryPage";
@@ -60,7 +61,8 @@ export function PublicationDetailPage() {
       <header className="page-header publication-detail__header">
         <div>
           <p className="eyebrow">PUBLICATION / EXACT REMOTE PROOF</p>
-          <h1>{publication.product_name}</h1>
+          <h1>{publication.space.display_name}</h1>
+          <DecisionSpaceContext space={publication.space} />
           <p className="page-header__lead">
             一次确认、一份冻结预览、一个可验证的 Git 提交。
           </p>
@@ -103,13 +105,13 @@ export function PublicationDetailPage() {
       <section className="publication-detail__ledger">
         <div><span>PUBLICATION</span><code>{publication.publication_id}</code></div>
         <div><span>PREVIEW</span><code>{publication.preview_id}</code></div>
-        <div><span>PRODUCT</span><code>{publication.product_id}</code></div>
+        <div><span>DECISION SPACE</span><code>{publication.space.decision_space_id}</code></div>
         <div><span>APPROVED BY</span><strong>{publication.actor_id}</strong><time>{publication.approved_at}</time></div>
         <div className="publication-detail__commit"><span>COMMIT SHA</span><code>{publication.commit_sha ?? "—"}</code></div>
         <div><span>RECOVERY</span><code>{publication.recovery_code ?? "none"}</code></div>
       </section>
 
-      <nav className="publication-detail__product-nav" aria-label="产品发布上下文">
+      <nav className="publication-detail__product-nav" aria-label="决策空间发布上下文">
         <Link to={`/spaces/${publication.decision_space_id}/decisions`}>决策空间目录</Link>
         <Link to={`/spaces/${publication.decision_space_id}/publications`}>决策空间发布历史</Link>
       </nav>

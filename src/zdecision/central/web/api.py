@@ -92,7 +92,7 @@ async def decisions(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
     identity_provider = request.app.state.identity_provider
-    return _application(request).list_decisions(
+    view = _application(request).list_decisions(
         identity_provider.browser_principal(),
         product_id=product_id,
         decision_space_id=decision_space_id,
@@ -101,7 +101,8 @@ async def decisions(
         published_after=published_after,
         limit=limit,
         offset=offset,
-    ).to_dict()
+    )
+    return view.to_dict() if product_id is not None else view.to_safe_dict()
 
 
 @router.get("/repositories/{repository_id}/spaces")
@@ -136,7 +137,7 @@ async def space_decisions(
         published_after=published_after,
         limit=limit,
         offset=offset,
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.get("/spaces/{decision_space_id}/decisions/{decision_id}")
@@ -149,7 +150,7 @@ async def space_decision_detail(
     )
     return _application(request).get_decision(
         identity_provider.browser_principal(), decision_space_id, decision_id
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.get("/products/{product_id}/decisions/{decision_id}")
@@ -214,7 +215,7 @@ async def space_candidates(
         state=state,
         limit=limit,
         offset=offset,
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.get("/products/{product_id}/review-draft")
@@ -314,7 +315,7 @@ async def create_preview(
         review_batch_id,
         body.client_action_id,
         request.app.state.current_time(),
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.get("/publication-previews/{preview_id}")
@@ -324,7 +325,7 @@ async def get_preview(
     identity_provider = request.app.state.identity_provider
     return _application(request).get_preview(
         identity_provider.browser_principal(), preview_id
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.post("/publication-previews/{preview_id}/publish")
@@ -337,7 +338,7 @@ async def publish(
         preview_id,
         body.client_action_id,
         request.app.state.current_time(),
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.post("/publications/{publication_id}/resume")
@@ -350,7 +351,7 @@ async def resume_publication(
         publication_id,
         body.client_action_id,
         request.app.state.current_time(),
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.get("/publications")
@@ -364,13 +365,14 @@ async def publications(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
     identity_provider = request.app.state.identity_provider
-    return _application(request).list_publications(
+    view = _application(request).list_publications(
         identity_provider.browser_principal(),
         product_id=product_id,
         state=state,
         limit=limit,
         offset=offset,
-    ).to_dict()
+    )
+    return view.to_dict() if product_id is not None else view.to_safe_dict()
 
 
 @router.get("/publications/{publication_id}")
@@ -380,7 +382,7 @@ async def publication_detail(
     identity_provider = request.app.state.identity_provider
     return _application(request).get_publication(
         identity_provider.browser_principal(), publication_id
-    ).to_dict()
+    ).to_safe_dict()
 
 
 @router.get("/spaces/{decision_space_id}/publications")
@@ -403,4 +405,4 @@ async def space_publications(
         state=state,
         limit=limit,
         offset=offset,
-    ).to_dict()
+    ).to_safe_dict()

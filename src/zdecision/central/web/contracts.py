@@ -401,6 +401,19 @@ class CandidateInboxView:
             "draft": self.draft.to_dict(),
         }
 
+    def to_safe_dict(self) -> dict[str, object]:
+        value = self.to_dict()
+        value.pop("product_id")
+        value.pop("product_name")
+        value["repositories"] = [
+            {
+                "repository_id": item.repository_id,
+                "enabled": item.enabled,
+            }
+            for item in self.repositories
+        ]
+        return value
+
 
 @dataclass(frozen=True)
 class CentralReviewItem:

@@ -7,6 +7,7 @@ import type {
   PublicationHistory,
   PublicationState,
 } from "../../api/types";
+import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
 import { AsyncState } from "../../shared/AsyncState";
 import { StatusBadge } from "../../shared/StatusBadge";
 
@@ -71,7 +72,7 @@ export function PublicationHistoryPage() {
   const groups = useMemo(() => {
     const values = new Map<string, PublicationDetail[]>();
     for (const item of history?.items ?? []) {
-      const key = `${item.product_id}:${item.product_name}`;
+      const key = item.space.decision_space_id;
       values.set(key, [...(values.get(key) ?? []), item]);
     }
     return [...values.entries()];
@@ -99,10 +100,11 @@ export function PublicationHistoryPage() {
         <section className="publication-history__group" key={key}>
           <header>
             <div>
-              <p className="eyebrow">PRODUCT LEDGER</p>
-              <h2>{items[0].product_name}</h2>
+              <p className="eyebrow">DECISION SPACE LEDGER</p>
+              <h2>{items[0].space.display_name}</h2>
+              <DecisionSpaceContext space={items[0].space} />
             </div>
-            <code>{items[0].product_id}</code>
+            <code>{items[0].space.decision_space_id}</code>
           </header>
           <div>{items.map((item) => (
             <PublicationRow publication={item} key={item.publication_id} />

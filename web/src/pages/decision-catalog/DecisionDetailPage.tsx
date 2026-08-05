@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 
 import { api, ApiError } from "../../api/client";
 import type { DecisionDetail } from "../../api/types";
+import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
 import { AsyncState } from "../../shared/AsyncState";
 import { StatusBadge } from "../../shared/StatusBadge";
 
@@ -49,7 +50,8 @@ export function DecisionDetailPage() {
       <header className="page-header decision-detail__header">
         <div>
           <p className="eyebrow">FORMAL DECISION / READ ONLY</p>
-          <h1>{decision.product_name}</h1>
+          <h1>{decision.space.display_name}</h1>
+          <DecisionSpaceContext space={decision.space} />
           <p className="page-header__lead">完整 V1 正式文档，由 Registry 提交与中央发布凭据共同定位。</p>
         </div>
         <StatusBadge tone="success">R{decision.revision} · {decision.lifecycle}</StatusBadge>
@@ -70,7 +72,7 @@ export function DecisionDetailPage() {
 
       <section className="decision-detail__ledger" aria-label="正式决策元数据">
         <div><span>DECISION</span><code>{decision.decision_id}</code></div>
-        <div><span>PRODUCT</span><code>{decision.product_id}</code></div>
+        <div><span>DECISION SPACE</span><code>{decision.space.decision_space_id}</code></div>
         <div><span>PREVIEW</span><code>{decision.publication_preview_id}</code></div>
         <div><span>PUBLICATION</span><code>{decision.publication_id ?? "—"}</code></div>
         <div><span>PUBLISHED</span><time>{decision.published_at ?? "—"}</time></div>

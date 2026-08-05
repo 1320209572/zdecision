@@ -71,12 +71,14 @@ class _RegistryQuery:
     def snapshot(self) -> RegistrySnapshot:
         if self.unavailable:
             raise RegistryQueryUnavailable("registry_unavailable")
+        product_id = self.decision.product_id
+        product_name = self.decision.product_name
         return RegistrySnapshot(
             COMMIT_SHA,
-            {PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME)},
+            {product_id: ProductMetadata(product_id, product_name)},
             {
-                PRODUCT_ID: ProductRegistry(
-                    PRODUCT_ID,
+                product_id: ProductRegistry(
+                    product_id,
                     {
                         self.decision.decision_id: DecisionHead(
                             1,
@@ -89,7 +91,7 @@ class _RegistryQuery:
                     },
                 )
             },
-            {(PRODUCT_ID, self.decision.decision_id): self.decision},
+            {(product_id, self.decision.decision_id): self.decision},
         )
 
 
@@ -448,6 +450,228 @@ class CentralWebApiTest(unittest.TestCase):
         }
         self.assertEqual({PRODUCT_SPACE_ID}, identifiers)
         self.assertNotIn(private_space_id, response.text)
+
+    def test_shared_canonical_flows_expose_leaf_identity_not_v1_partition(
+        self,
+    ) -> None:
+        group = CatalogGroup(
+            catalog_group_id(("Shared", "packages/shared")),
+            None,
+            "packages/shared",
+            ("Shared", "packages/shared"),
+            "packages/shared",
+            1,
+        )
+        self.store.put_catalog_group("org_demo", group)
+        compatibility_name = "Shared / packages/shared/theme"
+        compatibility_id = product_id(compatibility_name)
+        space = LeafDecisionSpace(
+            decision_space_id("shared_unit", compatibility_id),
+            "shared_unit",
+            "theme",
+            compatibility_id,
+            compatibility_name,
+            group.catalog_group_id,
+            group.breadcrumb,
+            "packages/shared/theme",
+            "@zstack/theme",
+            "library",
+            True,
+        )
+        self.store.put_decision_space("org_demo", space)
+        route = RepositoryDecisionRoute(
+            repository_route_id(REPOSITORY_ID, space.decision_space_id),
+            REPOSITORY_ID,
+            space.decision_space_id,
+            (space.source_root,),
+            (),
+            True,
+            1,
+        )
+        self.store.replace_trusted_route_heads(
+            "org_demo", REPOSITORY_ID, (route,)
+        )
+        shared_content = replace(
+            self.revision.content, product=compatibility_name
+        )
+        content_digest = hashlib.sha256(
+            canonical_json_bytes(shared_content.to_dict())
+        ).hexdigest()
+        shared_revision = CandidateRevisionUpload(
+            family_id=self.revision.family_id,
+            revision_id=candidate_revision_id(
+                self.revision.family_id, 1, content_digest
+            ),
+            revision=1,
+            content=shared_content,
+            content_digest=content_digest,
+            evidence_digest=self.revision.evidence_digest,
+        )
+        revision_bytes = canonical_json_bytes(shared_revision.to_dict())
+        ownership = CandidateOwnershipSnapshot(
+            repository_id=REPOSITORY_ID,
+            route_id=route.route_id,
+            route_configuration_version=1,
+            decision_space_id=space.decision_space_id,
+            decision_space_kind="shared_unit",
+            display_name=space.display_name,
+            catalog_breadcrumb=space.catalog_breadcrumb,
+            source_root=space.source_root,
+            compatibility_product_id=compatibility_id,
+            compatibility_product_name=compatibility_name,
+            source_boundary_digest="8" * 64,
+        )
+        ownership_bytes = canonical_json_bytes(ownership.to_dict())
+        with self.store.connection:
+            self.store.connection.execute(
+                """
+                UPDATE candidate_revisions
+                SET revision_id = ?, record_json = ?, record_digest = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ? AND revision = 1
+                """,
+                (
+                    shared_revision.revision_id,
+                    revision_bytes.decode("utf-8"),
+                    hashlib.sha256(revision_bytes).hexdigest(),
+                    REPOSITORY_ID,
+                    shared_revision.family_id,
+                ),
+            )
+            self.store.connection.execute(
+                """
+                UPDATE candidate_family_heads SET revision_id = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ?
+                """,
+                (
+                    shared_revision.revision_id,
+                    REPOSITORY_ID,
+                    shared_revision.family_id,
+                ),
+            )
+            self.store.connection.execute(
+                """
+                UPDATE candidate_revision_ownership
+                SET decision_space_id = ?, route_id = ?, ownership_json = ?,
+                    ownership_digest = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ? AND revision = 1
+                """,
+                (
+                    space.decision_space_id,
+                    route.route_id,
+                    ownership_bytes.decode("utf-8"),
+                    hashlib.sha256(ownership_bytes).hexdigest(),
+                    REPOSITORY_ID,
+                    shared_revision.family_id,
+                ),
+            )
+        self.revision = shared_revision
+        formal_candidate_id = "cand_" + "7" * 32 + "_01"
+        self.formal_decision = DecisionRevision.from_seed(
+            DecisionSeed(
+                candidate_id=formal_candidate_id,
+                decision_id=decision_id(formal_candidate_id, compatibility_id),
+                product_id=compatibility_id,
+                product_name=compatibility_name,
+                content=shared_content,
+                source=SourceCheckpoint("opaque-shared", "shared-checkpoint"),
+                review_approval=ApprovalRef(
+                    "user",
+                    "shared-review-thread",
+                    "shared-review-turn",
+                    "2026-08-03T09:00:00Z",
+                ),
+            ),
+            "pub_" + "7" * 32,
+        )
+        self.registry_query.decision = self.formal_decision
+        expected_space = {
+            "decision_space_id": space.decision_space_id,
+            "kind": "shared_unit",
+            "display_name": "theme",
+            "breadcrumb": ["Shared", "packages/shared", "theme"],
+            "source_root": "packages/shared/theme",
+            "package_name": "@zstack/theme",
+            "asset_type": "library",
+        }
+
+        inbox = self.client.get(
+            f"/api/v1/web/spaces/{space.decision_space_id}/candidates"
+        )
+        catalog = self.client.get(
+            f"/api/v1/web/spaces/{space.decision_space_id}/decisions"
+        )
+        detail = self.client.get(
+            f"/api/v1/web/spaces/{space.decision_space_id}/decisions/"
+            f"{self.formal_decision.decision_id}"
+        )
+        draft = self.client.put(
+            f"/api/v1/web/spaces/{space.decision_space_id}/review-draft",
+            json=self.draft_body(action="accept"),
+        ).json()
+        review = self.client.post(
+            f"/api/v1/web/spaces/{space.decision_space_id}/reviews",
+            json={
+                "client_action_id": "web_action_shared-review",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        ).json()
+        preview = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json={"client_action_id": "web_action_shared-preview"},
+        )
+
+        self.assertEqual(200, inbox.status_code, inbox.text)
+        self.assertEqual(expected_space, inbox.json()["space"])
+        self.assertEqual(200, catalog.status_code, catalog.text)
+        self.assertEqual(expected_space, catalog.json()["items"][0]["space"])
+        self.assertEqual(200, detail.status_code, detail.text)
+        self.assertEqual(expected_space, detail.json()["space"])
+        self.assertEqual(200, preview.status_code, preview.text)
+        self.assertEqual(expected_space, preview.json()["space"])
+        canonical_payloads = (
+            inbox.json(),
+            catalog.json()["items"][0],
+            detail.json(),
+            preview.json(),
+        )
+        for payload in canonical_payloads:
+            self.assertNotIn("product_id", payload)
+            self.assertNotIn("product_name", payload)
+        formal_detail = json.loads(detail.json()["canonical_json"])
+        self.assertEqual(compatibility_id, formal_detail["product_id"])
+        self.assertEqual(compatibility_name, formal_detail["product_name"])
+        self.assertEqual(
+            compatibility_id, preview.json()["decisions"][0]["product_id"]
+        )
+
+        published = self.client.post(
+            f"/api/v1/web/publication-previews/"
+            f"{preview.json()['preview_id']}/publish",
+            json={"client_action_id": "web_action_shared-publish"},
+        )
+        history = self.client.get(
+            f"/api/v1/web/spaces/{space.decision_space_id}/publications"
+        )
+        publication = self.client.get(
+            f"/api/v1/web/publications/{published.json()['publication_id']}"
+        )
+        self.assertEqual(200, published.status_code, published.text)
+        self.assertEqual(expected_space, published.json()["space"])
+        self.assertEqual(200, history.status_code, history.text)
+        self.assertEqual(expected_space, history.json()["items"][0]["space"])
+        self.assertEqual(200, publication.status_code, publication.text)
+        self.assertEqual(expected_space, publication.json()["space"])
+        for payload in (
+            published.json(),
+            history.json()["items"][0],
+            publication.json(),
+        ):
+            self.assertNotIn("product_id", payload)
+            self.assertNotIn("product_name", payload)
 
     def test_decision_catalog_and_detail_are_complete_read_only_views(self) -> None:
         catalog = self.client.get(
@@ -852,10 +1076,14 @@ class CentralWebApiTest(unittest.TestCase):
             }.isdisjoint(published.json())
         )
         self.assertEqual(200, history.status_code, history.text)
-        self.assertEqual(history.json(), product_history.json())
         self.assertEqual(1, history.json()["total"])
         row = history.json()["items"][0]
-        self.assertEqual(PRODUCT_NAME, row["product_name"])
+        self.assertNotIn("product_name", row)
+        self.assertNotIn("product_id", row)
+        self.assertEqual(
+            PRODUCT_NAME,
+            product_history.json()["items"][0]["product_name"],
+        )
         self.assertEqual("user_demo", row["actor_id"])
         self.assertEqual("completed", row["state"])
         self.assertEqual([self.revision.family_id], [self.revision.family_id])

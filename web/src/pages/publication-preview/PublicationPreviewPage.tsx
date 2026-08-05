@@ -7,6 +7,7 @@ import type {
   PublicationFile,
   PublicationPreview,
 } from "../../api/types";
+import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
 import { AsyncState } from "../../shared/AsyncState";
 import { StatusBadge } from "../../shared/StatusBadge";
 
@@ -59,7 +60,6 @@ function DecisionPanel({ decision, index }: {
       </header>
       <dl className="preview-decision__fields">
         <div><dt>格式</dt><dd><code>{decision.format}</code><span>schema v{decision.schema_version}</span></dd></div>
-        <div><dt>产品身份</dt><dd>{decision.product_name}<code>{decision.product_id}</code></dd></div>
         <div><dt>Decision ID</dt><dd><code>{decision.decision_id}</code></dd></div>
         <div><dt>目标路径</dt><dd><code>{decision.path}</code></dd></div>
         <div><dt>后续行动</dt><dd>{decision.future_action}</dd></div>
@@ -159,7 +159,8 @@ export function PublicationPreviewPage() {
       <header className="page-header preview-page__header">
         <div>
           <p className="eyebrow">PUBLICATION / IMMUTABLE MANIFEST</p>
-          <h1>发布预览</h1>
+          <h1>{preview.space.display_name}</h1>
+          <DecisionSpaceContext space={preview.space} />
           <p className="page-header__lead">
             这是唯一确认页面。下列路径、摘要与 JSON 字节已冻结，页面不会改写 Registry。
           </p>
@@ -182,7 +183,7 @@ export function PublicationPreviewPage() {
       ) : null}
 
       <section className="preview-ledger" aria-label="预览身份与基线">
-        <div><span>PRODUCT</span><strong>{preview.product_name}</strong><code>{preview.product_id}</code></div>
+        <div><span>DECISION SPACE</span><strong>{preview.space.display_name}</strong><code>{preview.space.decision_space_id}</code></div>
         <div><span>BASE COMMIT</span><code>{preview.base_commit}</code></div>
         <div><span>CONTENT DIGEST</span><code>{preview.content_digest}</code></div>
         <div><span>CREATED</span><time>{preview.created_at}</time></div>

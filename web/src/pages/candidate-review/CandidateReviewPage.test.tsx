@@ -38,22 +38,18 @@ function inbox(options?: {
 }): CandidateInbox {
   const action = options?.action;
   return {
-    product_id: PRODUCT_ID,
-    product_name: "ZDecision",
     space: {
       decision_space_id: "dsp_" + "9".repeat(32),
-      kind: "product",
-      display_name: "ZDecision",
-      breadcrumb: ["ZDecision"],
-      source_root: ".",
-      package_name: null,
-      asset_type: null,
+      kind: "shared_unit",
+      display_name: "theme",
+      breadcrumb: ["Shared", "packages/shared", "theme"],
+      source_root: "packages/shared/theme",
+      package_name: "@zstack/theme",
+      asset_type: "library",
     },
     repositories: [
       {
         repository_id: REPOSITORY_ID,
-        product_id: PRODUCT_ID,
-        product_name: "ZDecision",
         enabled: true,
       },
     ],
@@ -167,6 +163,11 @@ it("refreshes one owned repository and restores a partial draft", async () => {
   render(<RouterProvider router={router} />);
 
   expect(await screen.findByDisplayValue("接受")).toBeVisible();
+  const heading = screen.getByRole("heading", { name: "theme" });
+  expect(heading).toBeVisible();
+  expect(screen.getByText("Shared / packages/shared / theme")).toBeVisible();
+  expect(within(heading.closest("header")!).queryByText("ZDecision"))
+    .not.toBeInTheDocument();
   expect(screen.getByText("zdecision")).toBeVisible();
   await user.click(screen.getByRole("button", { name: "更新候选决策" }));
 
@@ -258,8 +259,6 @@ it("does not let a resolved stale repository poll schedule more work", async () 
   const view = inbox();
   view.repositories.push({
     repository_id: secondRepository,
-    product_id: PRODUCT_ID,
-    product_name: "ZDecision",
     enabled: true,
   });
   localStorage.setItem(

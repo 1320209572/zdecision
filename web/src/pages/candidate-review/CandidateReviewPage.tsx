@@ -13,6 +13,7 @@ import type {
   ReviewSubmissionResult,
 } from "../../api/types";
 import { useCandidateRefresh } from "../../features/candidate-refresh/useCandidateRefresh";
+import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
 import { ReviewEditor } from "../../features/reviews/ReviewEditor";
 import { AsyncState } from "../../shared/AsyncState";
 
@@ -419,8 +420,11 @@ export function CandidateReviewPage() {
     <div className="page candidate-page">
       <header className="page-header candidate-page__header">
         <div>
-          <p className="eyebrow">PRODUCT / CANDIDATE INBOX</p>
-          <h1>{inbox.product_name}</h1>
+          <p className="eyebrow">
+            {inbox.space.kind === "product" ? "PRODUCT" : "SHARED UNIT"} / CANDIDATE INBOX
+          </p>
+          <h1>{inbox.space.display_name}</h1>
+          <DecisionSpaceContext space={inbox.space} />
           <p className="page-header__lead">
             审阅当前候选版本并保存私人草稿。保存不会提交审核或生成发布内容。
           </p>

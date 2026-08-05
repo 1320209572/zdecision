@@ -152,6 +152,7 @@ class DecisionRegistryUnavailable(DecisionReadError):
 @dataclass(frozen=True)
 class DecisionListItem:
     decision_space_id: str
+    space: DecisionSpaceRef
     product_id: str
     product_name: str
     decision_id: str
@@ -169,6 +170,7 @@ class DecisionListItem:
     def to_dict(self) -> dict[str, object]:
         return {
             "decision_space_id": self.decision_space_id,
+            "space": self.space.to_dict(),
             "product_id": self.product_id,
             "product_name": self.product_name,
             "decision_id": self.decision_id,
@@ -183,6 +185,12 @@ class DecisionListItem:
             "publication_id": self.publication_id,
             "commit_sha": self.commit_sha,
         }
+
+    def to_safe_dict(self) -> dict[str, object]:
+        value = self.to_dict()
+        value.pop("product_id")
+        value.pop("product_name")
+        return value
 
 
 @dataclass(frozen=True)
@@ -204,10 +212,17 @@ class DecisionListView:
             "total": self.total,
         }
 
+    def to_safe_dict(self) -> dict[str, object]:
+        value = self.to_dict()
+        if self.items is not None:
+            value["items"] = [item.to_safe_dict() for item in self.items]
+        return value
+
 
 @dataclass(frozen=True)
 class DecisionDetailView:
     decision_space_id: str
+    space: DecisionSpaceRef
     registry_commit: str
     decision: DecisionRevision
     publication_id: str | None
@@ -221,12 +236,19 @@ class DecisionDetailView:
         return {
             **self.decision.to_dict(),
             "decision_space_id": self.decision_space_id,
+            "space": self.space.to_dict(),
             "canonical_json": canonical,
             "registry_commit": self.registry_commit,
             "publication_id": self.publication_id,
             "published_at": self.published_at,
             "commit_sha": self.commit_sha,
         }
+
+    def to_safe_dict(self) -> dict[str, object]:
+        value = self.to_dict()
+        value.pop("product_id")
+        value.pop("product_name")
+        return value
 
 
 @dataclass(frozen=True)
@@ -297,13 +319,15 @@ class CentralWebQueries:
             selected_spaces = (selected,)
         else:
             selected_spaces = summaries
-        selected_products = {
-            self.decision_space(principal, space.decision_space_id).compatibility_product_id: (
-                self.decision_space(principal, space.decision_space_id).compatibility_product_name,
-                space.decision_space_id,
+        selected_products: dict[str, tuple[str, DecisionSpaceRef]] = {}
+        for summary in selected_spaces:
+            leaf = self.decision_space(principal, summary.decision_space_id)
+            if leaf is None:
+                raise DecisionNotFound("not_found")
+            selected_products[leaf.compatibility_product_id] = (
+                leaf.compatibility_product_name,
+                self._space_ref(leaf),
             )
-            for space in selected_spaces
-        }
         publications = self._decision_publications(
             principal, frozenset(selected_products)
         )
@@ -384,6 +408,7 @@ class CentralWebQueries:
         ).get((space.compatibility_product_id, decision_id, revision.publication_preview_id))
         return DecisionDetailView(
             decision_space_id=space.decision_space_id,
+            space=self._space_ref(space),
             registry_commit=snapshot.commit_sha,
             decision=revision,
             publication_id=(
@@ -475,6 +500,37 @@ class CentralWebQueries:
             asset_type=row["asset_type"],
             enabled=bool(row["enabled"]),
         )
+
+    def decision_space_ref(
+        self, principal: Principal, identifier: str
+    ) -> DecisionSpaceRef | None:
+        space = self.decision_space(principal, identifier)
+        if space is None and identifier.startswith("dsp_"):
+            self._require_user(principal)
+            row = self.connection.execute(
+                """SELECT * FROM decision_spaces
+                WHERE organization_id = ? AND decision_space_id = ?""",
+                (principal.organization_id, identifier),
+            ).fetchone()
+            if row is not None:
+                space = LeafDecisionSpace(
+                    decision_space_id=row["decision_space_id"],
+                    kind=row["kind"],
+                    display_name=row["display_name"],
+                    compatibility_product_id=row["compatibility_product_id"],
+                    compatibility_product_name=row[
+                        "compatibility_product_name"
+                    ],
+                    catalog_group_id=row["catalog_group_id"],
+                    catalog_breadcrumb=tuple(
+                        json.loads(row["catalog_breadcrumb_json"])
+                    ),
+                    source_root=row["source_root"],
+                    package_name=row["package_name"],
+                    asset_type=row["asset_type"],
+                    enabled=bool(row["enabled"]),
+                )
+        return self._space_ref(space) if space is not None else None
 
     def catalog_group_exists(
         self, principal: Principal, catalog_group_id: str
@@ -891,15 +947,7 @@ class CentralWebQueries:
             repositories,
             tuple(selected[offset : offset + limit]),
             draft,
-            DecisionSpaceRef(
-                space.decision_space_id,
-                space.kind,
-                space.display_name,
-                (*space.catalog_breadcrumb, space.display_name),
-                space.source_root,
-                space.package_name,
-                space.asset_type,
-            ),
+            self._space_ref(space),
         )
 
     def _capture_request_ids(
@@ -1283,10 +1331,11 @@ class CentralWebQueries:
     def _decision_list_item(
         revision: DecisionRevision,
         publication: _DecisionPublication | None,
-        decision_space_id: str,
+        space: DecisionSpaceRef,
     ) -> DecisionListItem:
         return DecisionListItem(
-            decision_space_id=decision_space_id,
+            decision_space_id=space.decision_space_id,
+            space=space,
             product_id=revision.product_id,
             product_name=revision.product_name,
             decision_id=revision.decision_id,
@@ -1306,6 +1355,18 @@ class CentralWebQueries:
             commit_sha=(
                 publication.commit_sha if publication is not None else None
             ),
+        )
+
+    @staticmethod
+    def _space_ref(space: LeafDecisionSpace) -> DecisionSpaceRef:
+        return DecisionSpaceRef(
+            space.decision_space_id,
+            space.kind,
+            space.display_name,
+            (*space.catalog_breadcrumb, space.display_name),
+            space.source_root,
+            space.package_name,
+            space.asset_type,
         )
 
     @classmethod

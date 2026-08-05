@@ -8,6 +8,7 @@ import type { PublicationPreview } from "../../api/types";
 
 
 const PRODUCT_ID = "prod_" + "1".repeat(32);
+const COMPATIBILITY_NAME = "Shared / packages/shared/theme";
 const SPACE_ID = "dsp_" + "0".repeat(32);
 const PREVIEW_ID = "pub_" + "2".repeat(32);
 const DECISION_ID = "dec_" + "3".repeat(32);
@@ -30,7 +31,7 @@ function preview(
     schema_version: 1 as const,
     decision_id: DECISION_ID,
     product_id: PRODUCT_ID,
-    product_name: "ZDecision",
+    product_name: COMPATIBILITY_NAME,
     revision: 1 as const,
     lifecycle: "active" as const,
     claim: CLAIM,
@@ -73,8 +74,15 @@ function preview(
     candidate_ids: ["cand_" + "9".repeat(32) + "_01"],
     decision_ids: [DECISION_ID],
     decision_space_id: SPACE_ID,
-    product_id: PRODUCT_ID,
-    product_name: "ZDecision",
+    space: {
+      decision_space_id: SPACE_ID,
+      kind: "shared_unit",
+      display_name: "theme",
+      breadcrumb: ["Shared", "packages/shared", "theme"],
+      source_root: "packages/shared/theme",
+      package_name: "@zstack/theme",
+      asset_type: "library",
+    },
     base_commit: "c".repeat(40),
     base_registry_digests: {
       [ROOT_PATH]: "d".repeat(64),
@@ -128,6 +136,10 @@ it("shows exact files and uses the preview page as the only confirmation", async
   expect(screen.getByText("产品 Registry")).toBeVisible();
   expect(screen.getByText("提交消息")).toBeVisible();
   expect(screen.getByText("user")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "theme" })).toBeVisible();
+  expect(screen.getByText("Shared / packages/shared / theme")).toBeVisible();
+  expect(screen.getByText("@zstack/theme · library")).toBeVisible();
+  expect(screen.queryByText(COMPATIBILITY_NAME)).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: "← 返回修改审核" })).toHaveAttribute(
     "href", `/spaces/${SPACE_ID}/candidates`,
   );
@@ -182,6 +194,8 @@ it("publishes once and shows pending push without claiming success", async () =>
   const publication = {
     publication_id: "plb_" + "a".repeat(32),
     preview_id: PREVIEW_ID,
+    decision_space_id: SPACE_ID,
+    space: value.space,
     product_id: PRODUCT_ID,
     product_name: "ZDecision",
     decision_count: 1,
@@ -240,6 +254,8 @@ it("resolves an ambiguous publish to detail without issuing a second publish", a
   const ambiguous = {
     publication_id: publicationId,
     preview_id: PREVIEW_ID,
+    decision_space_id: SPACE_ID,
+    space: initial.space,
     product_id: PRODUCT_ID,
     product_name: "ZDecision",
     decision_count: 1,

@@ -102,3 +102,107 @@ canonical links, Shared hierarchy, and repository-only navigation.
   available for product leaves. New UI routes are canonical and neutral.
 - Repository-space visibility depends on enabled current route heads; a leaf
   that exists only in the private registry catalog is deliberately hidden.
+
+## Fix Round 1: Canonical Decision-space identity
+
+### Summary
+
+- Added the exact safe `DecisionSpaceRef` to Candidate, Decision list/detail,
+  publication Preview, and publication history/detail views.
+- Canonical serializers omit top-level V1 compatibility `product_id` and
+  `product_name`; exact V1 Decision JSON and Preview documents retain their
+  unchanged bytes. Legacy `/products` responses retain compatibility fields.
+- Candidate, Preview, Decision catalog/detail, and publication history/detail
+  now render leaf display name, kind context, breadcrumb, source root, package,
+  and asset type instead of labeling a Shared compatibility partition as a
+  product.
+- Disabled leaves remain available as historical Preview identity metadata so
+  the established stale-preview recovery behavior is unchanged; active route
+  authorization remains enabled-only.
+
+### RED evidence
+
+Backend Shared canonical journey:
+
+```text
+.venv/bin/python -m unittest tests.test_central_web_api.CentralWebApiTest.test_shared_canonical_flows_expose_leaf_identity_not_v1_partition -v
+KeyError: 'space'
+Ran 1 test
+FAILED (errors=1)
+```
+
+After adding safe refs, the stricter envelope assertion proved compatibility
+identity still leaked at the canonical boundary:
+
+```text
+AssertionError: 'product_id' unexpectedly found in canonical Candidate payload
+Ran 1 test
+FAILED (failures=1)
+```
+
+React page regressions:
+
+```text
+Test Files  5 failed (5)
+Tests       5 failed | 23 passed (28)
+```
+
+Each failure showed that the page still rendered the compatibility name and
+could not find the Shared leaf heading `theme`.
+
+### GREEN evidence
+
+Focused Shared backend journey:
+
+```text
+Ran 1 test in 1.501s
+OK
+```
+
+Affected React pages:
+
+```text
+Test Files  5 passed (5)
+Tests       28 passed (28)
+```
+
+Task 5 exact backend suite:
+
+```text
+Ran 49 tests
+OK
+```
+
+Task 5 exact frontend suite and full frontend suite:
+
+```text
+Test Files  3 passed (3)
+Tests       3 passed (3)
+
+Test Files  8 passed (8)
+Tests       31 passed (31)
+```
+
+Task 4 Preview/publication/Registry regression suite:
+
+```text
+Ran 34 tests in 10.685s
+OK
+```
+
+`npm run typecheck`, Python compilation, and `git diff --check` all exited 0.
+The Python output contains only the existing FastAPI/TestClient `httpx`
+deprecation warning.
+
+### Self-review
+
+- The end-to-end backend regression exercises one real `shared_unit` through
+  canonical Candidate, Review, Preview, Decision, publish, history, and detail
+  routes, asserting the exact safe leaf reference at every read boundary.
+- Compatibility fields remain provable inside canonical V1 Decision bytes and
+  old product endpoints, but no canonical page presents them as user-facing
+  ownership.
+- Product leaf pages use the same safe reference and continue to display their
+  registered product display names.
+- No V1 Registry model, publication state machine, recovery action, or Task 6
+  batch interaction changed.

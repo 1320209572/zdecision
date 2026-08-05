@@ -9,6 +9,7 @@ import type { DecisionDetail } from "../../api/types";
 const PRODUCT_ID = "prod_" + "1".repeat(32);
 const DECISION_ID = "dec_" + "1".repeat(32);
 const PUBLICATION_ID = "plb_" + "3".repeat(32);
+const COMPATIBILITY_NAME = "Shared / packages/shared/theme";
 
 function detail(): DecisionDetail {
   const formal = {
@@ -16,7 +17,7 @@ function detail(): DecisionDetail {
     schema_version: 1 as const,
     decision_id: DECISION_ID,
     product_id: PRODUCT_ID,
-    product_name: "ZStack Cloud",
+    product_name: COMPATIBILITY_NAME,
     revision: 1 as const,
     lifecycle: "active" as const,
     claim: '<img src=x onerror="alert(1)">',
@@ -41,6 +42,15 @@ function detail(): DecisionDetail {
   return {
     ...formal,
     decision_space_id: "dsp_" + "9".repeat(32),
+    space: {
+      decision_space_id: "dsp_" + "9".repeat(32),
+      kind: "shared_unit" as const,
+      display_name: "theme",
+      breadcrumb: ["Shared", "packages/shared", "theme"],
+      source_root: "packages/shared/theme",
+      package_name: "@zstack/theme",
+      asset_type: "library",
+    },
     canonical_json: JSON.stringify(formal),
     registry_commit: "a".repeat(40),
     publication_id: PUBLICATION_ID,
@@ -74,6 +84,9 @@ it("renders Decision text inert and exposes no mutation controls", async () => {
   );
   expect(document.querySelector("img[src='x']")).toBeNull();
   expect(screen.getByText("产品归属发生变化")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "theme" })).toBeVisible();
+  expect(screen.getByText("Shared / packages/shared / theme")).toBeVisible();
+  expect(screen.queryByText(COMPATIBILITY_NAME)).not.toBeInTheDocument();
   expect(screen.getByText("opaque-thread")).toBeVisible();
   expect(screen.getByRole("link", { name: "查看发布凭据" })).toHaveAttribute(
     "href",

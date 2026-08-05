@@ -18,7 +18,11 @@ from typing import Literal
 from zdecision.capture.models import SourceCheckpoint
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
-from zdecision.central.web.contracts import CentralReviewBatch, CentralReviewItem
+from zdecision.central.web.contracts import (
+    CentralReviewBatch,
+    CentralReviewItem,
+    DecisionSpaceRef,
+)
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import (
     CentralWebStore,
@@ -85,6 +89,7 @@ class PublicationPreviewView:
     publishability: Publishability
     publication_id: str | None
     decision_space_id: str
+    space: DecisionSpaceRef
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, PublicationRecord):
@@ -123,6 +128,7 @@ class PublicationPreviewView:
                 "publishability": self.publishability,
                 "publication_id": self.publication_id,
                 "decision_space_id": self.decision_space_id,
+                "space": self.space.to_dict(),
                 "decisions": [
                     decisions_by_id[decision_id]
                     for decision_id in self.record.decision_ids
@@ -130,6 +136,12 @@ class PublicationPreviewView:
                 ],
             }
         )
+        return value
+
+    def to_safe_dict(self) -> dict[str, object]:
+        value = self.to_dict()
+        value.pop("product_id")
+        value.pop("product_name")
         return value
 
 
@@ -294,7 +306,11 @@ class CentralPreviewService:
         if stored is None:
             raise WebRecordCorrupt("preview_action_result")
         return PublicationPreviewView(
-            stored, "publishable", None, batch.decision_space_id
+            stored,
+            "publishable",
+            None,
+            batch.decision_space_id,
+            self._space_ref(principal, batch.decision_space_id),
         )
 
     def get(
@@ -315,6 +331,7 @@ class CentralPreviewService:
                 publication.publication_id if publication is not None else None
             ),
             decision_space_id=batch.decision_space_id,
+            space=self._space_ref(principal, batch.decision_space_id),
         )
 
     def check_publishability(
@@ -503,6 +520,14 @@ class CentralPreviewService:
         ):
             raise PreviewStale("preview_stale")
         return partition
+
+    def _space_ref(
+        self, principal: Principal, decision_space_id: str
+    ) -> DecisionSpaceRef:
+        space = self.queries.decision_space_ref(principal, decision_space_id)
+        if space is None:
+            raise PreviewNotFound("not_found")
+        return space
 
     @staticmethod
     def _accepted(

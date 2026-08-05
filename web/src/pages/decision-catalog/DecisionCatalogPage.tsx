@@ -3,6 +3,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { api, ApiError } from "../../api/client";
 import type { DecisionListView } from "../../api/types";
+import { DecisionSpaceContext } from "../../features/decision-spaces/DecisionSpaceContext";
 import { AsyncState } from "../../shared/AsyncState";
 import { StatusBadge } from "../../shared/StatusBadge";
 
@@ -98,15 +99,16 @@ export function DecisionCatalogPage() {
   if (!view) return <AsyncState kind="loading" title="正在验证 Registry 快照" />;
 
   const items = view.items ?? [];
-  const productName = decisionSpaceId && items.length ? items[0].product_name : null;
+  const routedSpace = decisionSpaceId && items.length ? items[0].space : null;
   return (
     <div className="page decision-catalog">
       <header className="page-header decision-catalog__header">
         <div>
           <p className="eyebrow">FORMAL / COMMIT-BOUND REGISTRY</p>
-          <h1>{productName ?? (decisionSpaceId ? "决策空间正式决策" : "正式决策目录")}</h1>
+          <h1>{routedSpace?.display_name ?? (decisionSpaceId ? "决策空间正式决策" : "正式决策目录")}</h1>
+          {routedSpace ? <DecisionSpaceContext space={routedSpace} /> : null}
           <p className="page-header__lead">
-            仅显示当前 Registry 提交中的 active V1 正式决策；产品归属由服务端登记关系确定。
+            仅显示当前 Registry 提交中的 active V1 正式决策；决策空间归属由服务端登记关系确定。
           </p>
         </div>
         <div className="decision-catalog__proof">
@@ -145,12 +147,15 @@ export function DecisionCatalogPage() {
       ) : (
         <section className="decision-list" aria-label="正式决策列表">
           {items.map((item, index) => (
-            <article className="decision-row" key={`${item.product_id}:${item.decision_id}`}>
+            <article className="decision-row" key={`${item.decision_space_id}:${item.decision_id}`}>
               <span className="decision-row__number">{String(index + 1).padStart(2, "0")}</span>
               <div className="decision-row__body">
                 <div className="decision-row__ownership">
-                  <strong>{item.product_name}</strong>
-                  <code>{item.product_id}</code>
+                  <strong>{item.space.display_name}</strong>
+                  {item.space.breadcrumb.join(" / ") !== item.space.display_name ? (
+                    <code>{item.space.breadcrumb.join(" / ")}</code>
+                  ) : null}
+                  <code>{item.space.source_root}</code>
                   <StatusBadge tone="success">R{item.revision} · {item.lifecycle}</StatusBadge>
                 </div>
                 <h2>{item.claim}</h2>

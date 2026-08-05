@@ -303,6 +303,8 @@
 .space-tree__actions a { padding: 7px 9px; border: 1px solid #bdccda; color: #15538f; background: #fbfdff; font-size: 10px; font-weight: 700; }
 .space-tree__meta { display: grid; grid-template-columns: minmax(210px,1fr) minmax(220px,1.2fr) minmax(170px,.8fr); gap: 16px; padding: 9px 20px 12px calc(51px + var(--space-depth) * 24px); border-bottom: 1px solid #dce5ed; color: #78899c; background: #fbfcfe; font-size: 9px; }
 .space-tree__meta code { color: #405d78; overflow-wrap: anywhere; }
+.decision-space-context { align-items: center; display: flex; flex-wrap: wrap; gap: .35rem .8rem; margin: .45rem 0 0; color: var(--ink-muted); font-size: .78rem; }
+.decision-space-context code { color: inherit; }
 .review-index__group { margin-bottom: 22px; border: 1px solid #cbd7e3; background: white; }
 .review-index__group > header { display: flex; justify-content: space-between; align-items: baseline; padding: 15px 19px; border-bottom: 1px solid #dce5ed; background: #f4f7fa; }
 .review-index__group h2 { margin: 0; color: #143b61; font-size: 16px; }

@@ -10,16 +10,26 @@ const CLOUD_PRODUCT_ID = "prod_" + "1".repeat(32);
 const CLOUD_DECISION_ID = "dec_" + "1".repeat(32);
 const ZMETIS_PRODUCT_ID = "prod_" + "2".repeat(32);
 const ZMETIS_DECISION_ID = "dec_" + "2".repeat(32);
+const SHARED_SPACE_ID = "dsp_" + "3".repeat(32);
+const SHARED_COMPATIBILITY_NAME = "Shared / packages/shared/theme";
 
 function decision(
   productId: string,
   productName: string,
   decisionId: string,
 ): DecisionListItem {
+  const decisionSpaceId = `dsp_${productId.slice(-32)}`;
   return {
-    decision_space_id: `dsp_${productId.slice(-32)}`,
-    product_id: productId,
-    product_name: productName,
+    decision_space_id: decisionSpaceId,
+    space: {
+      decision_space_id: decisionSpaceId,
+      kind: "product",
+      display_name: productName,
+      breadcrumb: [productName],
+      source_root: ".",
+      package_name: null,
+      asset_type: null,
+    },
     decision_id: decisionId,
     revision: 1,
     lifecycle: "active",
@@ -81,4 +91,37 @@ it("distinguishes Registry unavailability from an empty catalog", async () => {
 
   expect(await screen.findByText("正式决策仓库暂不可用")).toBeVisible();
   expect(screen.queryByText("暂无正式决策")).not.toBeInTheDocument();
+});
+
+it("presents a canonical Shared leaf instead of its V1 partition", async () => {
+  const item = {
+    ...decision(
+      "prod_" + "3".repeat(32),
+      SHARED_COMPATIBILITY_NAME,
+      "dec_" + "3".repeat(32),
+    ),
+    decision_space_id: SHARED_SPACE_ID,
+    space: {
+      decision_space_id: SHARED_SPACE_ID,
+      kind: "shared_unit" as const,
+      display_name: "theme",
+      breadcrumb: ["Shared", "packages/shared", "theme"],
+      source_root: "packages/shared/theme",
+      package_name: "@zstack/theme",
+      asset_type: "library",
+    },
+  };
+  respond({
+    registry_state: "available",
+    registry_commit: "a".repeat(40),
+    items: [item],
+    total: 1,
+  });
+  await router.navigate(`/spaces/${SHARED_SPACE_ID}/decisions`);
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByRole("heading", { name: "theme" })).toBeVisible();
+  expect(screen.getAllByText("Shared / packages/shared / theme").length)
+    .toBeGreaterThan(0);
+  expect(screen.queryByText(SHARED_COMPATIBILITY_NAME)).not.toBeInTheDocument();
 });

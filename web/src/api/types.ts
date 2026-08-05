@@ -55,6 +55,18 @@ export interface RepositorySpacesView {
 
 export interface PublicationSummary {
   decision_space_id: string;
+  space: DecisionSpaceRef;
+  publication_id: string;
+  preview_id: string;
+  decision_count: number;
+  actor_id: string;
+  approved_at: string;
+  state: PublicationState;
+  recovery_code: string | null;
+  commit_sha: string | null;
+}
+
+export interface DashboardPublicationSummary {
   publication_id: string;
   preview_id: string;
   product_id: string;
@@ -83,13 +95,12 @@ export interface Dashboard {
   registry: RegistryStatus;
   products: DecisionSpaceSummary[];
   shared_tree: CatalogNode | null;
-  recent_publications: PublicationSummary[];
+  recent_publications: DashboardPublicationSummary[];
 }
 
 export interface DecisionListItem {
   decision_space_id: string;
-  product_id: string;
-  product_name: string;
+  space: DecisionSpaceRef;
   decision_id: string;
   revision: number;
   lifecycle: "active";
@@ -112,11 +123,10 @@ export interface DecisionListView {
 
 export interface DecisionDetail {
   decision_space_id: string;
+  space: DecisionSpaceRef;
   format: "zdecision-decision/v1";
   schema_version: 1;
   decision_id: string;
-  product_id: string;
-  product_name: string;
   revision: 1;
   lifecycle: "active";
   claim: string;
@@ -221,10 +231,8 @@ export interface CandidateInboxItem {
 }
 
 export interface CandidateInbox {
-  product_id: string;
-  product_name: string;
   space: DecisionSpaceRef;
-  repositories: RepositoryView[];
+  repositories: Array<{ repository_id: string; enabled: boolean }>;
   items: CandidateInboxItem[];
   draft: ReviewDraft;
 }
@@ -304,8 +312,7 @@ export interface PublicationPreview {
   candidate_ids: string[];
   decision_ids: string[];
   decision_space_id: string;
-  product_id: string;
-  product_name: string;
+  space: DecisionSpaceRef;
   base_commit: string;
   base_registry_digests: Record<string, string>;
   display_documents: PublicationFile[];

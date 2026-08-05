@@ -10,7 +10,7 @@ from typing import Literal
 
 from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.auth import Principal
-from zdecision.central.web.contracts import CentralPublication
+from zdecision.central.web.contracts import CentralPublication, DecisionSpaceRef
 from zdecision.central.web.previews import (
     CentralPreviewService,
     PreviewStale,
@@ -58,6 +58,7 @@ class PublicationAmbiguous(CentralPublicationError):
 @dataclass(frozen=True)
 class PublicationView:
     decision_space_id: str
+    space: DecisionSpaceRef
     publication_id: str
     preview_id: str
     product_id: str
@@ -73,6 +74,7 @@ class PublicationView:
     def to_dict(self) -> dict[str, object]:
         return {
             "decision_space_id": self.decision_space_id,
+            "space": self.space.to_dict(),
             "publication_id": self.publication_id,
             "preview_id": self.preview_id,
             "product_id": self.product_id,
@@ -86,6 +88,12 @@ class PublicationView:
             "commit_sha": self.commit_sha,
         }
 
+    def to_safe_dict(self) -> dict[str, object]:
+        value = self.to_dict()
+        value.pop("product_id")
+        value.pop("product_name")
+        return value
+
 
 @dataclass(frozen=True)
 class PublicationHistory:
@@ -97,6 +105,14 @@ class PublicationHistory:
     def to_dict(self) -> dict[str, object]:
         return {
             "items": [item.to_dict() for item in self.items],
+            "total": self.total,
+            "limit": self.limit,
+            "offset": self.offset,
+        }
+
+    def to_safe_dict(self) -> dict[str, object]:
+        return {
+            "items": [item.to_safe_dict() for item in self.items],
             "total": self.total,
             "limit": self.limit,
             "offset": self.offset,
@@ -283,7 +299,7 @@ class CentralPublicationService:
             principal, publication.decision_space_id
         ) is None:
             raise PublicationNotFound("not_found")
-        return self._view(publication)
+        return self._view(principal, publication)
 
     def list(
         self,
@@ -323,7 +339,7 @@ class CentralPublicationService:
             )
         )
         return PublicationHistory(
-            tuple(self._view(publication) for publication in visible),
+            tuple(self._view(principal, publication) for publication in visible),
             len(visible) if product_id is None else total,
             limit,
             offset,
@@ -463,8 +479,15 @@ class CentralPublicationService:
         except KeyError:
             raise WebRecordCorrupt("publication_review") from None
 
-    def _view(self, publication: CentralPublication) -> PublicationView:
+    def _view(
+        self, principal: Principal, publication: CentralPublication
+    ) -> PublicationView:
         preview = self._preview(publication)
+        space = self.previews.queries.decision_space_ref(
+            principal, publication.decision_space_id
+        )
+        if space is None:
+            raise PublicationNotFound("not_found")
         state: PublicHistoryState = (
             "ambiguous"
             if publication.recovery_code == "ambiguous"
@@ -472,6 +495,7 @@ class CentralPublicationService:
         )
         return PublicationView(
             publication.decision_space_id,
+            space,
             publication.publication_id,
             publication.preview_id,
             publication.product_id,
