@@ -107,7 +107,7 @@ class CentralWebStore:
         self.connection = connection
 
     def get_draft(
-        self, organization_id: str, actor_id: str, product_id: str
+        self, organization_id: str, actor_id: str, decision_space_id: str
     ) -> ReviewDraft:
         organization = require_id(organization_id, "organization_id")
         actor = require_id(actor_id, "actor_id")
@@ -115,19 +115,19 @@ class CentralWebStore:
             """
             SELECT version, record_json, record_digest
             FROM web_review_drafts
-            WHERE organization_id = ? AND actor_id = ? AND product_id = ?
+            WHERE organization_id = ? AND actor_id = ? AND decision_space_id = ?
             """,
-            (organization, actor, product_id),
+            (organization, actor, decision_space_id),
         ).fetchone()
         if row is None:
-            return ReviewDraft(organization, actor, product_id, 0, (), None)
+            return ReviewDraft(organization, actor, decision_space_id, 0, (), None)
         draft = _read_record(
             row["record_json"], row["record_digest"], ReviewDraft, "review_draft"
         )
         if (
             draft.organization_id != organization
             or draft.actor_id != actor
-            or draft.product_id != product_id
+            or draft.decision_space_id != decision_space_id
             or draft.version != row["version"]
         ):
             raise WebRecordCorrupt("review_draft")
@@ -146,7 +146,7 @@ class CentralWebStore:
         replacement = ReviewDraft(
             expected.organization_id,
             expected.actor_id,
-            expected.product_id,
+            expected.decision_space_id,
             expected.version + 1,
             tuple(items),
             now,
@@ -154,7 +154,8 @@ class CentralWebStore:
         record_json, record_digest = _canonical_record(replacement.to_dict())
         with immediate(self.connection):
             current = self.get_draft(
-                expected.organization_id, expected.actor_id, expected.product_id
+                expected.organization_id, expected.actor_id,
+                expected.decision_space_id,
             )
             if current != expected:
                 raise DraftConflict("review_draft_conflict")
@@ -163,14 +164,14 @@ class CentralWebStore:
                     self.connection.execute(
                         """
                         INSERT INTO web_review_drafts(
-                            organization_id, actor_id, product_id, version,
+                            organization_id, actor_id, decision_space_id, version,
                             record_json, record_digest, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             replacement.organization_id,
                             replacement.actor_id,
-                            replacement.product_id,
+                            replacement.decision_space_id,
                             replacement.version,
                             record_json,
                             record_digest,
@@ -184,7 +185,7 @@ class CentralWebStore:
                     """
                     UPDATE web_review_drafts
                     SET version = ?, record_json = ?, record_digest = ?, updated_at = ?
-                    WHERE organization_id = ? AND actor_id = ? AND product_id = ?
+                    WHERE organization_id = ? AND actor_id = ? AND decision_space_id = ?
                       AND version = ?
                     """,
                     (
@@ -194,7 +195,7 @@ class CentralWebStore:
                         replacement.updated_at,
                         replacement.organization_id,
                         replacement.actor_id,
-                        replacement.product_id,
+                        replacement.decision_space_id,
                         expected.version,
                     ),
                 )
@@ -237,9 +238,9 @@ class CentralWebStore:
             row = self.connection.execute(
                 """
                 SELECT record_json, record_digest FROM web_review_batches
-                WHERE organization_id = ? AND product_id = ? AND review_batch_id = ?
+                WHERE organization_id = ? AND decision_space_id = ? AND review_batch_id = ?
                 """,
-                (batch.organization_id, batch.product_id, batch.review_batch_id),
+                (batch.organization_id, batch.decision_space_id, batch.review_batch_id),
             ).fetchone()
             action = self.connection.execute(
                 """
@@ -261,20 +262,25 @@ class CentralWebStore:
                 """
                 SELECT COALESCE(MAX(submission_order), 0) + 1
                 FROM web_review_batches
-                WHERE organization_id = ? AND product_id = ?
+                WHERE organization_id = ? AND decision_space_id = ?
                 """,
-                (batch.organization_id, batch.product_id),
+                (batch.organization_id, batch.decision_space_id),
             ).fetchone()[0]
             self.connection.execute(
                 """
                 INSERT INTO web_review_batches(
-                    organization_id, product_id, review_batch_id, actor_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, compatibility_product_name,
+                    review_batch_id, actor_id,
                     client_action_id, request_digest, record_json, record_digest,
                     created_at, submission_order
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    batch.organization_id, batch.product_id, batch.review_batch_id,
+                    batch.organization_id, batch.decision_space_id,
+                    batch.compatibility_product_id,
+                    batch.compatibility_product_name,
+                    batch.review_batch_id,
                     batch.actor_id, batch.client_action_id, batch.request_digest,
                     record_json, record_digest, batch.created_at,
                     submission_order,
@@ -290,14 +296,15 @@ class CentralWebStore:
                 self.connection.execute(
                     """
                     INSERT INTO web_review_items(
-                        organization_id, product_id, review_batch_id, item_order,
+                        organization_id, decision_space_id, review_batch_id, item_order,
                         review_id, family_id, publication_candidate_id, repository_id,
                         revision_id, revision, content_digest, action,
                         effective_content_json, effective_content_digest, note
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        batch.organization_id, batch.product_id, batch.review_batch_id,
+                        batch.organization_id, batch.decision_space_id,
+                        batch.review_batch_id,
                         order, item.review_id, item.family_id,
                         item.publication_candidate_id, item.repository_id,
                         item.revision_id, item.revision, item.content_digest,
@@ -307,15 +314,15 @@ class CentralWebStore:
         return batch
 
     def get_review_batch(
-        self, organization_id: str, product_id: str, review_batch_id: str
+        self, organization_id: str, decision_space_id: str, review_batch_id: str
     ) -> CentralReviewBatch | None:
         organization = require_id(organization_id, "organization_id")
         row = self.connection.execute(
             """
             SELECT record_json, record_digest FROM web_review_batches
-            WHERE organization_id = ? AND product_id = ? AND review_batch_id = ?
+            WHERE organization_id = ? AND decision_space_id = ? AND review_batch_id = ?
             """,
-            (organization, product_id, review_batch_id),
+            (organization, decision_space_id, review_batch_id),
         ).fetchone()
         if row is None:
             return None
@@ -324,7 +331,7 @@ class CentralWebStore:
         )
         if (
             batch.organization_id != organization
-            or batch.product_id != product_id
+            or batch.decision_space_id != decision_space_id
             or batch.review_batch_id != review_batch_id
         ):
             raise WebRecordCorrupt("review_batch")
@@ -336,7 +343,7 @@ class CentralWebStore:
         organization = require_id(organization_id, "organization_id")
         row = self.connection.execute(
             """
-            SELECT product_id, record_json, record_digest
+            SELECT decision_space_id, record_json, record_digest
             FROM web_review_batches
             WHERE organization_id = ? AND review_batch_id = ?
             """,
@@ -350,7 +357,7 @@ class CentralWebStore:
         )
         if (
             batch.organization_id != organization
-            or batch.product_id != row["product_id"]
+            or batch.decision_space_id != row["decision_space_id"]
             or batch.review_batch_id != review_batch_id
         ):
             raise WebRecordCorrupt("review_batch")
@@ -359,7 +366,7 @@ class CentralWebStore:
     def latest_review_ids(
         self,
         organization_id: str,
-        product_id: str,
+        decision_space_id: str,
         family_ids: Sequence[str],
     ) -> dict[str, str]:
         organization = require_id(organization_id, "organization_id")
@@ -378,15 +385,15 @@ class CentralWebStore:
                 FROM web_review_items AS item
                 JOIN web_review_batches AS batch
                   ON batch.organization_id = item.organization_id
-                 AND batch.product_id = item.product_id
+                 AND batch.decision_space_id = item.decision_space_id
                  AND batch.review_batch_id = item.review_batch_id
-                WHERE item.organization_id = ? AND item.product_id = ?
+                WHERE item.organization_id = ? AND item.decision_space_id = ?
                   AND item.family_id = ?
                 ORDER BY batch.submission_order DESC, batch.rowid DESC,
                          item.item_order DESC
                 LIMIT 1
                 """,
-                (organization, product_id, family_id),
+                (organization, decision_space_id, family_id),
             ).fetchone()
             if row is not None:
                 latest[family_id] = row["review_id"]
@@ -395,7 +402,7 @@ class CentralWebStore:
     def published_families(
         self,
         organization_id: str,
-        product_id: str,
+        decision_space_id: str,
         family_ids: Sequence[str],
     ) -> frozenset[str]:
         organization = require_id(organization_id, "organization_id")
@@ -410,9 +417,9 @@ class CentralWebStore:
             row = self.connection.execute(
                 """
                 SELECT 1 FROM web_candidate_receipts
-                WHERE organization_id = ? AND product_id = ? AND family_id = ?
+                WHERE organization_id = ? AND decision_space_id = ? AND family_id = ?
                 """,
-                (organization, product_id, family_id),
+                (organization, decision_space_id, family_id),
             ).fetchone()
             if row is not None:
                 published.add(family_id)
@@ -450,7 +457,7 @@ class CentralWebStore:
                 raise WebRecordConflict("review_submission_result_conflict")
             batch = self.get_review_batch(
                 result.organization_id,
-                result.product_id,
+                result.decision_space_id,
                 result.review_batch_id,
             )
             if batch is None or batch.actor_id != result.actor_id:
@@ -458,14 +465,14 @@ class CentralWebStore:
             self.connection.execute(
                 """
                 INSERT INTO web_review_submission_results(
-                    organization_id, actor_id, product_id, review_batch_id,
+                    organization_id, actor_id, decision_space_id, review_batch_id,
                     record_json, record_digest
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     result.organization_id,
                     result.actor_id,
-                    result.product_id,
+                    result.decision_space_id,
                     result.review_batch_id,
                     record_json,
                     record_digest,
@@ -477,7 +484,7 @@ class CentralWebStore:
         self,
         organization_id: str,
         actor_id: str,
-        product_id: str,
+        decision_space_id: str,
         review_batch_id: str,
     ) -> ReviewSubmissionSnapshot | None:
         organization = require_id(organization_id, "organization_id")
@@ -486,10 +493,10 @@ class CentralWebStore:
             """
             SELECT record_json, record_digest
             FROM web_review_submission_results
-            WHERE organization_id = ? AND actor_id = ? AND product_id = ?
+            WHERE organization_id = ? AND actor_id = ? AND decision_space_id = ?
               AND review_batch_id = ?
             """,
-            (organization, actor, product_id, review_batch_id),
+            (organization, actor, decision_space_id, review_batch_id),
         ).fetchone()
         if row is None:
             return None
@@ -502,36 +509,37 @@ class CentralWebStore:
         if (
             result.organization_id != organization
             or result.actor_id != actor
-            or result.product_id != product_id
+            or result.decision_space_id != decision_space_id
             or result.review_batch_id != review_batch_id
         ):
             raise WebRecordCorrupt("review_submission_result")
         return result
 
     def put_preview(
-        self, organization_id: str, product_id: str, record: PublicationRecord
+        self, organization_id: str, decision_space_id: str,
+        record: PublicationRecord
     ) -> PublicationRecord:
         """Persist one immutable pre-publication Preview artifact, never a Decision."""
 
         organization = require_id(organization_id, "organization_id")
         if not isinstance(record, PublicationRecord):
             raise TypeError("record must be a PublicationRecord")
-        if record.product_id != product_id or record.state != "previewed":
-            raise ValueError("preview product_id is invalid")
+        if record.state != "previewed":
+            raise ValueError("preview state is invalid")
         _require_product_owned_preview_paths(record)
         record_json, record_digest = _canonical_record(record.to_dict())
         with immediate(self.connection):
             review = self.get_review_batch(
-                organization, product_id, record.review_batch_id
+                organization, decision_space_id, record.review_batch_id
             )
             if review is None:
                 raise WebRecordConflict("publication_review_missing")
             row = self.connection.execute(
                 """
                 SELECT record_json, record_digest FROM web_publication_previews
-                WHERE organization_id = ? AND product_id = ? AND preview_id = ?
+                WHERE organization_id = ? AND decision_space_id = ? AND preview_id = ?
                 """,
-                (organization, product_id, record.preview_id),
+                (organization, decision_space_id, record.preview_id),
             ).fetchone()
             if row is not None:
                 existing = _read_record(
@@ -544,12 +552,14 @@ class CentralWebStore:
             self.connection.execute(
                 """
                 INSERT INTO web_publication_previews(
-                    organization_id, product_id, preview_id, review_batch_id,
+                    organization_id, decision_space_id,
+                    compatibility_product_id, preview_id, review_batch_id,
                     actor_id, record_json, record_digest, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    organization, product_id, record.preview_id,
+                    organization, decision_space_id, record.product_id,
+                    record.preview_id,
                     record.review_batch_id, review.actor_id, record_json, record_digest,
                     record.created_at,
                 ),
@@ -562,7 +572,7 @@ class CentralWebStore:
         organization = require_id(organization_id, "organization_id")
         row = self.connection.execute(
             """
-            SELECT product_id, record_json, record_digest
+            SELECT decision_space_id, record_json, record_digest
             FROM web_publication_previews
             WHERE organization_id = ? AND preview_id = ?
             """,
@@ -574,7 +584,14 @@ class CentralWebStore:
             row["record_json"], row["record_digest"], PublicationRecord,
             "publication_preview",
         )
-        if record.preview_id != preview_id or record.product_id != row["product_id"]:
+        batch = self.get_review_batch(
+            organization, row["decision_space_id"], record.review_batch_id
+        )
+        if (
+            record.preview_id != preview_id
+            or batch is None
+            or record.product_id != batch.compatibility_product_id
+        ):
             raise WebRecordCorrupt("publication_preview")
         return record
 
@@ -586,9 +603,13 @@ class CentralWebStore:
             row = self.connection.execute(
                 """
                 SELECT record_json, record_digest FROM web_publications
-                WHERE organization_id = ? AND product_id = ? AND publication_id = ?
+                WHERE organization_id = ? AND decision_space_id = ? AND publication_id = ?
                 """,
-                (publication.organization_id, publication.product_id, publication.publication_id),
+                (
+                    publication.organization_id,
+                    publication.decision_space_id,
+                    publication.publication_id,
+                ),
             ).fetchone()
             if row is not None:
                 existing = _read_record(
@@ -602,13 +623,16 @@ class CentralWebStore:
                 self.connection.execute(
                     """
                     INSERT INTO web_publications(
-                        organization_id, product_id, publication_id, preview_id,
+                        organization_id, decision_space_id,
+                        compatibility_product_id, publication_id, preview_id,
                         actor_id, state, recovery_code, commit_sha, record_json,
                         record_digest, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        publication.organization_id, publication.product_id,
+                        publication.organization_id,
+                        publication.decision_space_id,
+                        publication.compatibility_product_id,
                         publication.publication_id, publication.preview_id,
                         publication.actor_id, publication.state,
                         publication.recovery_code, publication.commit_sha,
@@ -643,7 +667,7 @@ class CentralWebStore:
         organization = require_id(organization_id, "organization_id")
         row = self.connection.execute(
             """
-            SELECT product_id, preview_id, record_json, record_digest
+            SELECT decision_space_id, preview_id, record_json, record_digest
             FROM web_publications
             WHERE organization_id = ? AND publication_id = ?
             """,
@@ -658,7 +682,7 @@ class CentralWebStore:
         if (
             publication.organization_id != organization
             or publication.publication_id != publication_id
-            or publication.product_id != row["product_id"]
+            or publication.decision_space_id != row["decision_space_id"]
             or publication.preview_id != row["preview_id"]
         ):
             raise WebRecordCorrupt("publication")
@@ -668,7 +692,7 @@ class CentralWebStore:
         self,
         organization_id: str,
         *,
-        product_id: str | None,
+        decision_space_id: str | None,
         state: str | None,
         limit: int,
         offset: int,
@@ -686,16 +710,16 @@ class CentralWebStore:
         clauses = [
             "publication.organization_id = ?",
             """EXISTS (
-                SELECT 1 FROM repository_mappings AS mapping
-                WHERE mapping.organization_id = publication.organization_id
-                  AND mapping.product_id = publication.product_id
-                  AND mapping.enabled = 1
+                SELECT 1 FROM decision_spaces AS space
+                WHERE space.organization_id = publication.organization_id
+                  AND space.decision_space_id = publication.decision_space_id
+                  AND space.enabled = 1
             )""",
         ]
         values: list[object] = [organization]
-        if product_id is not None:
-            clauses.append("publication.product_id = ?")
-            values.append(product_id)
+        if decision_space_id is not None:
+            clauses.append("publication.decision_space_id = ?")
+            values.append(decision_space_id)
         if state == "ambiguous":
             clauses.append("publication.recovery_code = 'ambiguous'")
         elif state is not None:
@@ -748,9 +772,13 @@ class CentralWebStore:
                 row = self.connection.execute(
                     """
                     SELECT publication_id FROM web_publication_families
-                    WHERE organization_id = ? AND product_id = ? AND family_id = ?
+                    WHERE organization_id = ? AND decision_space_id = ? AND family_id = ?
                     """,
-                    (publication.organization_id, publication.product_id, family_id),
+                    (
+                        publication.organization_id,
+                        publication.decision_space_id,
+                        family_id,
+                    ),
                 ).fetchone()
                 if row is not None:
                     if row["publication_id"] == publication.publication_id:
@@ -759,11 +787,12 @@ class CentralWebStore:
                 self.connection.execute(
                     """
                     INSERT INTO web_publication_families(
-                        organization_id, product_id, family_id, publication_id
+                        organization_id, decision_space_id, family_id, publication_id
                     ) VALUES (?, ?, ?, ?)
                     """,
                     (
-                        publication.organization_id, publication.product_id,
+                        publication.organization_id,
+                        publication.decision_space_id,
                         family_id, publication.publication_id,
                     ),
                 )
@@ -776,7 +805,9 @@ class CentralWebStore:
         if (
             expected.publication_id != replacement.publication_id
             or expected.organization_id != replacement.organization_id
-            or expected.product_id != replacement.product_id
+            or expected.decision_space_id != replacement.decision_space_id
+            or expected.compatibility_product_id
+            != replacement.compatibility_product_id
             or expected.preview_id != replacement.preview_id
         ):
             raise WebRecordConflict("publication_identity_conflict")
@@ -814,9 +845,13 @@ class CentralWebStore:
             row = self.connection.execute(
                 """
                 SELECT record_json, record_digest FROM web_publications
-                WHERE organization_id = ? AND product_id = ? AND publication_id = ?
+                WHERE organization_id = ? AND decision_space_id = ? AND publication_id = ?
                 """,
-                (expected.organization_id, expected.product_id, expected.publication_id),
+                (
+                    expected.organization_id,
+                    expected.decision_space_id,
+                    expected.publication_id,
+                ),
             ).fetchone()
             if row is None:
                 raise WebRecordConflict("publication_missing")
@@ -832,13 +867,13 @@ class CentralWebStore:
                 UPDATE web_publications
                 SET state = ?, recovery_code = ?, commit_sha = ?, record_json = ?,
                     record_digest = ?, updated_at = ?
-                WHERE organization_id = ? AND product_id = ? AND publication_id = ?
+                WHERE organization_id = ? AND decision_space_id = ? AND publication_id = ?
                 """,
                 (
                     replacement.state, replacement.recovery_code,
                     replacement.commit_sha, record_json, record_digest,
                     replacement.updated_at, replacement.organization_id,
-                    replacement.product_id, replacement.publication_id,
+                    replacement.decision_space_id, replacement.publication_id,
                 ),
             )
         return replacement
@@ -851,7 +886,10 @@ class CentralWebStore:
     ) -> None:
         if not isinstance(publication, CentralPublication) or not isinstance(preview, PublicationRecord):
             raise TypeError("publication and preview must be validated records")
-        if publication.preview_id != preview.preview_id or publication.product_id != preview.product_id:
+        if (
+            publication.preview_id != preview.preview_id
+            or publication.compatibility_product_id != preview.product_id
+        ):
             raise WebRecordConflict("publication_preview_conflict")
         with immediate(self.connection):
             stored_publication = self.get_publication_by_preview(
@@ -863,7 +901,8 @@ class CentralWebStore:
             if stored_publication != publication or stored_preview != preview:
                 raise WebRecordConflict("publication_preview_conflict")
             review = self.get_review_batch(
-                publication.organization_id, preview.product_id, preview.review_batch_id
+                publication.organization_id, publication.decision_space_id,
+                preview.review_batch_id
             )
             if review is None:
                 raise WebRecordConflict("publication_review_missing")
@@ -889,9 +928,13 @@ class CentralWebStore:
                     SELECT publication_candidate_id, decision_id, preview_id,
                            commit_sha, recorded_at
                     FROM web_candidate_receipts
-                    WHERE organization_id = ? AND product_id = ? AND family_id = ?
+                    WHERE organization_id = ? AND decision_space_id = ? AND family_id = ?
                     """,
-                    (publication.organization_id, preview.product_id, family_id),
+                    (
+                        publication.organization_id,
+                        publication.decision_space_id,
+                        family_id,
+                    ),
                 ).fetchone()
                 expected = (
                     receipt.candidate_id, receipt.decision_id, receipt.preview_id,
@@ -908,13 +951,17 @@ class CentralWebStore:
                 self.connection.execute(
                     """
                     INSERT INTO web_candidate_receipts(
-                        organization_id, product_id, family_id,
+                        organization_id, decision_space_id,
+                        compatibility_product_id, family_id,
                         publication_candidate_id, decision_id, preview_id,
                         commit_sha, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        publication.organization_id, preview.product_id, family_id,
+                        publication.organization_id,
+                        publication.decision_space_id,
+                        preview.product_id,
+                        family_id,
                         receipt.candidate_id, receipt.decision_id, receipt.preview_id,
                         receipt.commit_sha, receipt.recorded_at,
                     ),

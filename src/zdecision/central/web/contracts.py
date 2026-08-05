@@ -37,6 +37,7 @@ _FAMILY_ID = re.compile(r"^cfm_[0-9a-f]{32}$")
 _REPOSITORY_ID = re.compile(r"^repo_[0-9a-f]{32}$")
 _REVISION_ID = re.compile(r"^crv_[0-9a-f]{32}$")
 _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
+_DECISION_SPACE_ID = re.compile(r"^dsp_[0-9a-f]{32}$")
 _REVIEW_BATCH_ID = re.compile(r"^rvb_[0-9a-f]{32}$")
 _REVIEW_ID = re.compile(r"^rvi_[0-9a-f]{32}$")
 _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{32}_01$")
@@ -180,7 +181,7 @@ class DraftItem:
 class ReviewDraft:
     organization_id: str
     actor_id: str
-    product_id: str
+    decision_space_id: str
     version: int
     items: tuple[DraftItem, ...]
     updated_at: str | None
@@ -188,7 +189,7 @@ class ReviewDraft:
     def __post_init__(self) -> None:
         require_id(self.organization_id, "organization_id")
         require_id(self.actor_id, "actor_id")
-        _id(self.product_id, _PRODUCT_ID, "product_id")
+        _id(self.decision_space_id, _DECISION_SPACE_ID, "decision_space_id")
         if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 0:
             raise ValueError("version is invalid")
         if not isinstance(self.items, tuple):
@@ -204,7 +205,7 @@ class ReviewDraft:
         return {
             "organization_id": self.organization_id,
             "actor_id": self.actor_id,
-            "product_id": self.product_id,
+            "decision_space_id": self.decision_space_id,
             "version": self.version,
             "items": [item.to_dict() for item in self.items],
             "updated_at": self.updated_at,
@@ -213,7 +214,7 @@ class ReviewDraft:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "ReviewDraft":
         _require_fields(value, frozenset((
-            "organization_id", "actor_id", "product_id", "version", "items", "updated_at",
+            "organization_id", "actor_id", "decision_space_id", "version", "items", "updated_at",
         )), "ReviewDraft")
         raw_items = value["items"]
         if not isinstance(raw_items, list) or any(
@@ -223,7 +224,10 @@ class ReviewDraft:
         return cls(
             organization_id=require_id(value["organization_id"], "organization_id"),
             actor_id=require_id(value["actor_id"], "actor_id"),
-            product_id=_id(value["product_id"], _PRODUCT_ID, "product_id"),
+            decision_space_id=_id(
+                value["decision_space_id"], _DECISION_SPACE_ID,
+                "decision_space_id",
+            ),
             version=value["version"],
             items=tuple(DraftItem.from_dict(item) for item in raw_items),
             updated_at=(
@@ -317,8 +321,6 @@ class CandidateInboxView:
             raise ValueError("items are invalid")
         if not isinstance(self.draft, ReviewDraft):
             raise ValueError("draft is invalid")
-        if self.draft.product_id != self.product_id:
-            raise ValueError("draft product is invalid")
         if any(item.product_id != self.product_id for item in self.repositories):
             raise ValueError("repository product is invalid")
 
@@ -411,8 +413,9 @@ class CentralReviewBatch:
     review_batch_id: str
     organization_id: str
     actor_id: str
-    product_id: str
-    product_name: str
+    decision_space_id: str
+    compatibility_product_id: str
+    compatibility_product_name: str
     client_action_id: str
     request_digest: str
     approval: ApprovalRef
@@ -423,8 +426,17 @@ class CentralReviewBatch:
         _id(self.review_batch_id, _REVIEW_BATCH_ID, "review_batch_id")
         require_id(self.organization_id, "organization_id")
         require_id(self.actor_id, "actor_id")
-        _id(self.product_id, _PRODUCT_ID, "product_id")
-        if canonical_product_name(self.product_name) != self.product_name or derive_product_id(self.product_name) != self.product_id:
+        _id(self.decision_space_id, _DECISION_SPACE_ID, "decision_space_id")
+        _id(
+            self.compatibility_product_id, _PRODUCT_ID,
+            "compatibility_product_id",
+        )
+        if (
+            canonical_product_name(self.compatibility_product_name)
+            != self.compatibility_product_name
+            or derive_product_id(self.compatibility_product_name)
+            != self.compatibility_product_id
+        ):
             raise ValueError("product identity is invalid")
         _id(self.client_action_id, _WEB_ACTION_ID, "client_action_id")
         _id(self.request_digest, _DIGEST, "request_digest")
@@ -460,7 +472,7 @@ class CentralReviewBatch:
         if self.review_batch_id != central_review_batch_id(
             self.organization_id,
             self.actor_id,
-            self.product_id,
+            self.compatibility_product_id,
             self.client_action_id,
             identity_items,
         ):
@@ -473,8 +485,9 @@ class CentralReviewBatch:
             "review_batch_id": self.review_batch_id,
             "organization_id": self.organization_id,
             "actor_id": self.actor_id,
-            "product_id": self.product_id,
-            "product_name": self.product_name,
+            "decision_space_id": self.decision_space_id,
+            "compatibility_product_id": self.compatibility_product_id,
+            "compatibility_product_name": self.compatibility_product_name,
             "client_action_id": self.client_action_id,
             "request_digest": self.request_digest,
             "approval": self.approval.to_dict(),
@@ -485,8 +498,9 @@ class CentralReviewBatch:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "CentralReviewBatch":
         _require_fields(value, frozenset((
-            "review_batch_id", "organization_id", "actor_id", "product_id",
-            "product_name", "client_action_id", "request_digest", "approval",
+            "review_batch_id", "organization_id", "actor_id", "decision_space_id",
+            "compatibility_product_id", "compatibility_product_name",
+            "client_action_id", "request_digest", "approval",
             "items", "created_at",
         )), "CentralReviewBatch")
         items = value["items"]
@@ -498,8 +512,15 @@ class CentralReviewBatch:
             review_batch_id=_id(value["review_batch_id"], _REVIEW_BATCH_ID, "review_batch_id"),
             organization_id=require_id(value["organization_id"], "organization_id"),
             actor_id=require_id(value["actor_id"], "actor_id"),
-            product_id=_id(value["product_id"], _PRODUCT_ID, "product_id"),
-            product_name=value["product_name"],
+            decision_space_id=_id(
+                value["decision_space_id"], _DECISION_SPACE_ID,
+                "decision_space_id",
+            ),
+            compatibility_product_id=_id(
+                value["compatibility_product_id"], _PRODUCT_ID,
+                "compatibility_product_id",
+            ),
+            compatibility_product_name=value["compatibility_product_name"],
             client_action_id=_id(value["client_action_id"], _WEB_ACTION_ID, "client_action_id"),
             request_digest=_id(value["request_digest"], _DIGEST, "request_digest"),
             approval=ApprovalRef.from_dict(value["approval"]),
@@ -507,12 +528,20 @@ class CentralReviewBatch:
             created_at=_timestamp(value["created_at"], "created_at"),
         )
 
+    @property
+    def product_id(self) -> str:
+        return self.compatibility_product_id
+
+    @property
+    def product_name(self) -> str:
+        return self.compatibility_product_name
+
 
 @dataclass(frozen=True)
 class ReviewSubmissionSnapshot:
     organization_id: str
     actor_id: str
-    product_id: str
+    decision_space_id: str
     review_batch_id: str
     preview_eligible: bool
     remaining_pending: tuple[str, ...]
@@ -521,7 +550,7 @@ class ReviewSubmissionSnapshot:
     def __post_init__(self) -> None:
         require_id(self.organization_id, "organization_id")
         require_id(self.actor_id, "actor_id")
-        _id(self.product_id, _PRODUCT_ID, "product_id")
+        _id(self.decision_space_id, _DECISION_SPACE_ID, "decision_space_id")
         _id(self.review_batch_id, _REVIEW_BATCH_ID, "review_batch_id")
         if not isinstance(self.preview_eligible, bool):
             raise ValueError("preview_eligible is invalid")
@@ -545,7 +574,7 @@ class ReviewSubmissionSnapshot:
         return {
             "organization_id": self.organization_id,
             "actor_id": self.actor_id,
-            "product_id": self.product_id,
+            "decision_space_id": self.decision_space_id,
             "review_batch_id": self.review_batch_id,
             "preview_eligible": self.preview_eligible,
             "remaining_pending": list(self.remaining_pending),
@@ -557,7 +586,7 @@ class ReviewSubmissionSnapshot:
         cls, value: Mapping[str, object]
     ) -> "ReviewSubmissionSnapshot":
         _require_fields(value, frozenset((
-            "organization_id", "actor_id", "product_id", "review_batch_id",
+            "organization_id", "actor_id", "decision_space_id", "review_batch_id",
             "preview_eligible", "remaining_pending", "draft_version",
         )), "ReviewSubmissionSnapshot")
         pending = value["remaining_pending"]
@@ -568,7 +597,10 @@ class ReviewSubmissionSnapshot:
                 value["organization_id"], "organization_id"
             ),
             actor_id=require_id(value["actor_id"], "actor_id"),
-            product_id=_id(value["product_id"], _PRODUCT_ID, "product_id"),
+            decision_space_id=_id(
+                value["decision_space_id"], _DECISION_SPACE_ID,
+                "decision_space_id",
+            ),
             review_batch_id=_id(
                 value["review_batch_id"], _REVIEW_BATCH_ID, "review_batch_id"
             ),
@@ -583,7 +615,8 @@ class CentralPublication:
     publication_id: str
     organization_id: str
     actor_id: str
-    product_id: str
+    decision_space_id: str
+    compatibility_product_id: str
     preview_id: str
     confirm_action_id: str
     confirm_request_digest: str
@@ -601,7 +634,11 @@ class CentralPublication:
             raise ValueError("publication_id is invalid")
         require_id(self.organization_id, "organization_id")
         require_id(self.actor_id, "actor_id")
-        _id(self.product_id, _PRODUCT_ID, "product_id")
+        _id(self.decision_space_id, _DECISION_SPACE_ID, "decision_space_id")
+        _id(
+            self.compatibility_product_id, _PRODUCT_ID,
+            "compatibility_product_id",
+        )
         _id(self.confirm_action_id, _WEB_ACTION_ID, "confirm_action_id")
         _id(self.confirm_request_digest, _DIGEST, "confirm_request_digest")
         if self.state not in _PUBLICATION_STATES:
@@ -623,7 +660,8 @@ class CentralPublication:
             "publication_id": self.publication_id,
             "organization_id": self.organization_id,
             "actor_id": self.actor_id,
-            "product_id": self.product_id,
+            "decision_space_id": self.decision_space_id,
+            "compatibility_product_id": self.compatibility_product_id,
             "preview_id": self.preview_id,
             "confirm_action_id": self.confirm_action_id,
             "confirm_request_digest": self.confirm_request_digest,
@@ -638,7 +676,8 @@ class CentralPublication:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "CentralPublication":
         _require_fields(value, frozenset((
-            "publication_id", "organization_id", "actor_id", "product_id",
+            "publication_id", "organization_id", "actor_id", "decision_space_id",
+            "compatibility_product_id",
             "preview_id", "confirm_action_id", "confirm_request_digest", "state",
             "approval", "commit_sha", "recovery_code", "created_at", "updated_at",
         )), "CentralPublication")
@@ -648,7 +687,14 @@ class CentralPublication:
             publication_id=_id(value["publication_id"], _PUBLICATION_ID, "publication_id"),
             organization_id=require_id(value["organization_id"], "organization_id"),
             actor_id=require_id(value["actor_id"], "actor_id"),
-            product_id=_id(value["product_id"], _PRODUCT_ID, "product_id"),
+            decision_space_id=_id(
+                value["decision_space_id"], _DECISION_SPACE_ID,
+                "decision_space_id",
+            ),
+            compatibility_product_id=_id(
+                value["compatibility_product_id"], _PRODUCT_ID,
+                "compatibility_product_id",
+            ),
             preview_id=_id(value["preview_id"], _PREVIEW_ID, "preview_id"),
             confirm_action_id=_id(value["confirm_action_id"], _WEB_ACTION_ID, "confirm_action_id"),
             confirm_request_digest=_id(value["confirm_request_digest"], _DIGEST, "confirm_request_digest"),
@@ -665,6 +711,10 @@ class CentralPublication:
             created_at=_timestamp(value["created_at"], "created_at"),
             updated_at=_timestamp(value["updated_at"], "updated_at"),
         )
+
+    @property
+    def product_id(self) -> str:
+        return self.compatibility_product_id
 
 
 @dataclass(frozen=True)

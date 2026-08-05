@@ -11,6 +11,7 @@ from unittest.mock import patch
 from zdecision.capture.models import CandidateContent
 from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.store import CentralStore
 from zdecision.central.web.contracts import CentralReviewBatch, CentralReviewItem
 from zdecision.central.web.previews import (
@@ -24,8 +25,10 @@ from zdecision.central.web.store import CentralWebStore, WebActionConflict
 from zdecision.ids import (
     candidate_revision_id,
     central_review_batch_id,
+    decision_space_id,
     product_id,
     publication_candidate_id,
+    repository_route_id,
     review_item_id,
 )
 from zdecision.jsonio import canonical_json_bytes
@@ -33,7 +36,11 @@ from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter, RegistryOutOfSync
 from zdecision.registry.models import RootRegistry
 from zdecision.registry.query import RegistryQuery
-from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+from zdecision.sync.contracts import (
+    CandidateOwnershipSnapshot,
+    CandidateRevisionUpload,
+    RepositoryView,
+)
 
 
 NOW = "2026-08-04T08:00:00Z"
@@ -43,6 +50,7 @@ PRODUCT_ID = product_id(PRODUCT_NAME)
 REPOSITORY_ID = "repo_" + "1" * 32
 FAMILY_ID = "cfm_" + "a" * 32
 REJECTED_FAMILY_ID = "cfm_" + "b" * 32
+PRODUCT_SPACE_ID = decision_space_id("product", PRODUCT_ID)
 
 
 def content(claim: str) -> CandidateContent:
@@ -86,6 +94,22 @@ class CentralPreviewServiceTest(unittest.TestCase):
             "org_demo",
             RepositoryView(REPOSITORY_ID, PRODUCT_ID, PRODUCT_NAME, True),
         )
+        self.central.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                decision_space_id=PRODUCT_SPACE_ID,
+                kind="product",
+                display_name=PRODUCT_NAME,
+                compatibility_product_id=PRODUCT_ID,
+                compatibility_product_name=PRODUCT_NAME,
+                catalog_group_id=None,
+                catalog_breadcrumb=(),
+                source_root=".",
+                package_name=None,
+                asset_type=None,
+                enabled=True,
+            ),
+        )
         self.accepted_revision = self._insert_revision(
             FAMILY_ID, content("accepted claim")
         )
@@ -126,8 +150,15 @@ class CentralPreviewServiceTest(unittest.TestCase):
         ).stdout
 
     def _insert_revision(
-        self, family_id: str, candidate_content: CandidateContent
+        self,
+        family_id: str,
+        candidate_content: CandidateContent,
+        *,
+        space: LeafDecisionSpace | None = None,
     ) -> CandidateRevisionUpload:
+        owner = space or self.central.decision_space(
+            "org_demo", PRODUCT_SPACE_ID
+        )
         digest = hashlib.sha256(
             canonical_json_bytes(candidate_content.to_dict())
         ).hexdigest()
@@ -140,6 +171,22 @@ class CentralPreviewServiceTest(unittest.TestCase):
             evidence_digest="e" * 64,
         )
         payload = canonical_json_bytes(revision.to_dict())
+        ownership = CandidateOwnershipSnapshot(
+            repository_id=REPOSITORY_ID,
+            route_id=repository_route_id(
+                REPOSITORY_ID, owner.decision_space_id
+            ),
+            route_configuration_version=1,
+            decision_space_id=owner.decision_space_id,
+            decision_space_kind=owner.kind,
+            display_name=owner.display_name,
+            catalog_breadcrumb=owner.catalog_breadcrumb,
+            source_root=owner.source_root,
+            compatibility_product_id=owner.compatibility_product_id,
+            compatibility_product_name=owner.compatibility_product_name,
+            source_boundary_digest="9" * 64,
+        )
+        ownership_payload = canonical_json_bytes(ownership.to_dict())
         with self.central.connection:
             self.central.connection.execute(
                 """
@@ -165,13 +212,35 @@ class CentralPreviewServiceTest(unittest.TestCase):
                 """,
                 (REPOSITORY_ID, family_id, revision.revision_id),
             )
+            self.central.connection.execute(
+                """
+                INSERT INTO candidate_revision_ownership(
+                    organization_id, repository_id, family_id, revision,
+                    decision_space_id, route_id, route_configuration_version,
+                    ownership_json, ownership_digest
+                ) VALUES ('org_demo', ?, ?, 1, ?, ?, 1, ?, ?)
+                """,
+                (
+                    REPOSITORY_ID,
+                    family_id,
+                    owner.decision_space_id,
+                    ownership.route_id,
+                    ownership_payload.decode("utf-8"),
+                    hashlib.sha256(ownership_payload).hexdigest(),
+                ),
+            )
         return revision
 
     def _review_batch(
         self,
         action_id: str,
         selected: tuple[tuple[CandidateRevisionUpload, str], ...],
+        *,
+        space: LeafDecisionSpace | None = None,
     ) -> CentralReviewBatch:
+        owner = space or self.central.decision_space(
+            "org_demo", PRODUCT_SPACE_ID
+        )
         identity_items = tuple(
             {
                 "family_id": revision.family_id,
@@ -186,7 +255,8 @@ class CentralPreviewServiceTest(unittest.TestCase):
             for revision, action in selected
         )
         batch_id = central_review_batch_id(
-            "org_demo", "user_demo", PRODUCT_ID, action_id, identity_items
+            "org_demo", "user_demo", owner.compatibility_product_id,
+            action_id, identity_items
         )
         items = tuple(
             CentralReviewItem(
@@ -213,8 +283,9 @@ class CentralPreviewServiceTest(unittest.TestCase):
             review_batch_id=batch_id,
             organization_id="org_demo",
             actor_id="user_demo",
-            product_id=PRODUCT_ID,
-            product_name=PRODUCT_NAME,
+            decision_space_id=owner.decision_space_id,
+            compatibility_product_id=owner.compatibility_product_id,
+            compatibility_product_name=owner.compatibility_product_name,
             client_action_id=action_id,
             request_digest=hashlib.sha256(action_id.encode()).hexdigest(),
             approval=ApprovalRef("user", "web_review", action_id, NOW),
@@ -251,7 +322,16 @@ class CentralPreviewServiceTest(unittest.TestCase):
         self.assertEqual("publishable", view.publishability)
         self.assertIsNone(view.publication_id)
 
-    def test_repository_remap_after_review_prevents_preview_creation(self) -> None:
+        for document in view.record.display_documents:
+            if not document.path.endswith(".json"):
+                continue
+            decoded = document.content
+            self.assertNotIn("decision_space_id", decoded)
+            self.assertNotIn("catalog_breadcrumb", decoded)
+            self.assertNotIn("source_root", decoded)
+            self.assertNotIn("asset_type", decoded)
+
+    def test_repository_remap_after_review_keeps_frozen_v1_partition(self) -> None:
         remapped_name = "Other Product"
         self.central.put_repository_mapping(
             "org_demo",
@@ -263,24 +343,23 @@ class CentralPreviewServiceTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaises(PreviewStale):
-            self.service.create(
+        try:
+            view = self.service.create(
                 self.user,
                 self.batch.review_batch_id,
                 "web_action_preview-remapped",
                 NOW,
             )
+        except PreviewStale:
+            self.fail("preview ignored the frozen candidate ownership")
 
-        self.assertEqual(
-            (0, 0),
-            (
-                self.central.connection.execute(
-                    "SELECT COUNT(*) FROM web_publication_previews"
-                ).fetchone()[0],
-                self.central.connection.execute(
-                    "SELECT COUNT(*) FROM web_action_results WHERE action_kind='preview'"
-                ).fetchone()[0],
-            ),
+        self.assertEqual(PRODUCT_ID, view.record.product_id)
+        self.assertEqual(PRODUCT_NAME, view.record.product_name)
+        self.assertTrue(
+            any(
+                f"decision-registry/products/{PRODUCT_ID}/" in item.path
+                for item in view.record.changed_files
+            )
         )
 
     def test_preview_replay_is_exact_and_action_conflict_is_rejected(self) -> None:
@@ -502,6 +581,21 @@ class CentralPreviewServiceTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM web_action_results WHERE action_kind='preview'"
             ).fetchone()[0],
         )
+
+    def test_shared_catalog_root_cannot_create_a_preview(self) -> None:
+        before = self._registry_tree_bytes()
+
+        with self.assertRaisesRegex(
+            NoAcceptedItems, "decision_space_not_leaf"
+        ):
+            self.service.create(
+                self.user,
+                "dsg_" + "f" * 32,
+                "web_action_preview-shared-root",
+                NOW,
+            )
+
+        self.assertEqual(before, self._registry_tree_bytes())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.web.contracts import (
     CandidateInboxView,
     CentralReviewBatch,
@@ -45,12 +46,16 @@ class CentralReviewError(Exception):
     code = "review_error"
 
 
-class ProductNotFound(CentralReviewError):
+class DecisionSpaceNotFound(CentralReviewError):
     code = "not_found"
 
 
-class ProductOwnershipConflict(CentralReviewError):
-    code = "product_ownership_conflict"
+class DecisionSpaceOwnershipConflict(CentralReviewError):
+    code = "decision_space_ownership_conflict"
+
+
+ProductNotFound = DecisionSpaceNotFound
+ProductOwnershipConflict = DecisionSpaceOwnershipConflict
 
 
 class ReviewStale(CentralReviewError):
@@ -104,7 +109,7 @@ class CentralReviewService:
     def list_candidates(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         *,
         search: str = "",
         repository_id: str | None = None,
@@ -114,7 +119,7 @@ class CentralReviewService:
         offset: int = 0,
     ) -> CandidateInboxView:
         self._require_user(principal)
-        self._require_product(principal, product_id)
+        space = self._require_space(principal, decision_space_id)
         if not isinstance(search, str) or len(search.encode("utf-8")) > 200:
             raise ValueError("search is invalid")
         if state not in _STATES:
@@ -132,25 +137,16 @@ class CentralReviewService:
         ):
             raise ValueError("offset is invalid")
         if repository_id is not None:
-            self._require_repository(principal, product_id, repository_id)
-        if capture_request_id is not None:
-            route = self.queries.capture_request_route(
-                principal, capture_request_id
-            )
-            if route is None:
-                raise ProductNotFound()
-            request_repository_id, request_product_id = route
-            if request_product_id != product_id:
-                raise ProductOwnershipConflict()
             self._require_repository(
-                principal, product_id, request_repository_id
+                principal, space.decision_space_id, repository_id
             )
         draft = self.store.get_draft(
-            principal.organization_id, principal.actor_id, product_id
+            principal.organization_id, principal.actor_id,
+            space.decision_space_id,
         )
         return self.queries.candidate_inbox(
             principal,
-            product_id,
+            space.decision_space_id,
             draft,
             search=search,
             repository_id=repository_id,
@@ -161,24 +157,25 @@ class CentralReviewService:
         )
 
     def get_draft(
-        self, principal: Principal, product_id: str
+        self, principal: Principal, decision_space_id: str
     ) -> ReviewDraft:
         self._require_user(principal)
-        self._require_product(principal, product_id)
+        space = self._require_space(principal, decision_space_id)
         return self.store.get_draft(
-            principal.organization_id, principal.actor_id, product_id
+            principal.organization_id, principal.actor_id,
+            space.decision_space_id,
         )
 
     def save_draft(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         expected_version: int,
         items: Sequence[DraftItem],
         now: str | datetime,
     ) -> ReviewDraft:
         self._require_user(principal)
-        self._require_product(principal, product_id)
+        space = self._require_space(principal, decision_space_id)
         if (
             not isinstance(expected_version, int)
             or isinstance(expected_version, bool)
@@ -193,12 +190,13 @@ class CentralReviewService:
         ):
             raise ValueError("items are invalid")
         current = self.store.get_draft(
-            principal.organization_id, principal.actor_id, product_id
+            principal.organization_id, principal.actor_id,
+            space.decision_space_id,
         )
         if current.version != expected_version:
             raise DraftConflict("review_draft_conflict")
         for item in draft_items:
-            self._validate_draft_item(principal, product_id, item)
+            self._validate_draft_item(principal, space, item)
         return self.store.replace_draft(
             current, draft_items, self._timestamp(now)
         )
@@ -206,14 +204,14 @@ class CentralReviewService:
     def submit(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         client_action_id: str,
         expected_draft_version: int,
         items: Sequence[DraftItem],
         now: str | datetime,
     ) -> ReviewSubmissionResult:
         self._require_user(principal)
-        self._require_product(principal, product_id)
+        space = self._require_space(principal, decision_space_id)
         if (
             not isinstance(expected_draft_version, int)
             or isinstance(expected_draft_version, bool)
@@ -235,7 +233,7 @@ class CentralReviewService:
                 {
                     "draft_version": expected_draft_version,
                     "items": [item.to_dict() for item in ordered],
-                    "product_id": product_id,
+                    "decision_space_id": space.decision_space_id,
                 }
             )
         ).hexdigest()
@@ -251,14 +249,15 @@ class CentralReviewService:
                 if replay.request_digest != request_digest:
                     raise WebActionConflict("web_action_conflict")
                 batch = self.store.get_review_batch(
-                    principal.organization_id, product_id, replay.result_id
+                    principal.organization_id, space.decision_space_id,
+                    replay.result_id,
                 )
                 if batch is None:
                     raise WebRecordCorrupt("review_action_result")
                 snapshot = self.store.get_review_submission_result(
                     principal.organization_id,
                     principal.actor_id,
-                    product_id,
+                    space.decision_space_id,
                     batch.review_batch_id,
                 )
                 if snapshot is None:
@@ -271,7 +270,8 @@ class CentralReviewService:
                 )
 
             draft = self.store.get_draft(
-                principal.organization_id, principal.actor_id, product_id
+                principal.organization_id, principal.actor_id,
+                space.decision_space_id,
             )
             if draft.version != expected_draft_version:
                 raise DraftConflict("review_draft_conflict")
@@ -281,18 +281,9 @@ class CentralReviewService:
             ):
                 raise DraftConflict("review_draft_conflict")
 
-            repositories = self.queries.product_repositories(
-                principal, product_id
-            )
-            product_name = repositories[0].product_name
-            if any(item.product_name != product_name for item in repositories):
-                raise WebRecordCorrupt("repository_mapping")
             current_items: list[tuple[DraftItem, CandidateRevisionUpload]] = []
             stale_families: list[str] = []
             for item in ordered:
-                self._require_repository(
-                    principal, product_id, item.repository_id
-                )
                 current = self.queries.current_candidate_revision(
                     principal, item.repository_id, item.family_id
                 )
@@ -303,7 +294,7 @@ class CentralReviewService:
                 ):
                     stale_families.append(item.family_id)
                     continue
-                self._validate_draft_item(principal, product_id, item)
+                self._validate_draft_item(principal, space, item)
                 current_items.append((item, current))
             if stale_families:
                 raise ReviewStale(stale_families)
@@ -312,7 +303,7 @@ class CentralReviewService:
             batch_id = central_review_batch_id(
                 principal.organization_id,
                 principal.actor_id,
-                product_id,
+                space.compatibility_product_id,
                 client_action_id,
                 identity_items,
             )
@@ -324,8 +315,9 @@ class CentralReviewService:
                 review_batch_id=batch_id,
                 organization_id=principal.organization_id,
                 actor_id=principal.actor_id,
-                product_id=product_id,
-                product_name=product_name,
+                decision_space_id=space.decision_space_id,
+                compatibility_product_id=space.compatibility_product_id,
+                compatibility_product_name=space.compatibility_product_name,
                 client_action_id=client_action_id,
                 request_digest=request_digest,
                 approval=ApprovalRef(
@@ -348,7 +340,7 @@ class CentralReviewService:
                 ReviewSubmissionSnapshot(
                     organization_id=principal.organization_id,
                     actor_id=principal.actor_id,
-                    product_id=product_id,
+                    decision_space_id=space.decision_space_id,
                     review_batch_id=batch.review_batch_id,
                     preview_eligible=result.preview_eligible,
                     remaining_pending=result.remaining_pending,
@@ -403,7 +395,7 @@ class CentralReviewService:
         while True:
             page = self.list_candidates(
                 principal,
-                batch.product_id,
+                batch.decision_space_id,
                 state="pending",
                 limit=100,
                 offset=offset,
@@ -418,7 +410,7 @@ class CentralReviewService:
             else self.store.get_draft(
                 principal.organization_id,
                 principal.actor_id,
-                batch.product_id,
+                batch.decision_space_id,
             ).version
         )
         return ReviewSubmissionResult(
@@ -432,9 +424,11 @@ class CentralReviewService:
         )
 
     def _validate_draft_item(
-        self, principal: Principal, product_id: str, item: DraftItem
+        self, principal: Principal, space: LeafDecisionSpace, item: DraftItem
     ) -> None:
-        self._require_repository(principal, product_id, item.repository_id)
+        self._require_repository(
+            principal, space.decision_space_id, item.repository_id
+        )
         candidate = self.queries.candidate_revision(
             principal,
             item.repository_id,
@@ -442,7 +436,22 @@ class CentralReviewService:
             item.revision_id,
         )
         if candidate is None:
-            raise ProductOwnershipConflict()
+            raise DecisionSpaceOwnershipConflict()
+        ownership = self.queries.candidate_revision_ownership(
+            principal,
+            item.repository_id,
+            item.family_id,
+            item.revision,
+        )
+        if ownership is None or (
+            ownership.decision_space_id != space.decision_space_id
+            or ownership.repository_id != item.repository_id
+            or ownership.compatibility_product_id
+            != space.compatibility_product_id
+            or ownership.compatibility_product_name
+            != space.compatibility_product_name
+        ):
+            raise DecisionSpaceOwnershipConflict()
         if (
             item.revision != candidate.revision
             or item.content_digest != candidate.content_digest
@@ -451,7 +460,7 @@ class CentralReviewService:
                 item.family_id, item.revision, item.content_digest
             )
         ):
-            raise ProductOwnershipConflict()
+            raise DecisionSpaceOwnershipConflict()
         if item.note is not None and len(item.note.encode("utf-8")) > 1000:
             raise ValueError("note is invalid")
         if item.action != "edit_accept":
@@ -483,20 +492,25 @@ class CentralReviewService:
         ):
             raise ValueError("effective_content is invalid")
 
-    def _require_product(
-        self, principal: Principal, product_id: str
-    ) -> None:
-        if not self.queries.product_repositories(principal, product_id):
-            raise ProductNotFound()
+    def _require_space(
+        self, principal: Principal, identifier: str
+    ) -> LeafDecisionSpace:
+        space = self.queries.decision_space(principal, identifier)
+        if space is None or not space.enabled:
+            raise DecisionSpaceNotFound()
+        return space
 
     def _require_repository(
-        self, principal: Principal, product_id: str, repository_id: str
+        self, principal: Principal, decision_space_id: str,
+        repository_id: str
     ) -> None:
-        mapping = self.queries.repository_mapping(principal, repository_id)
-        if mapping is None or not mapping.enabled:
-            raise ProductNotFound()
-        if mapping.product_id != product_id:
-            raise ProductOwnershipConflict()
+        repositories = self.queries.decision_space_repositories(
+            principal, decision_space_id
+        )
+        if repository_id not in {
+            item.repository_id for item in repositories
+        }:
+            raise DecisionSpaceOwnershipConflict()
 
     @staticmethod
     def _require_user(principal: Principal) -> None:

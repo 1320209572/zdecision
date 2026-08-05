@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,13 +11,14 @@ from pathlib import Path
 from zdecision.capture.models import CandidateContent
 from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.store import CentralStore
-from zdecision.ids import candidate_revision_id, product_id
+from zdecision.ids import candidate_revision_id, decision_space_id, product_id
 
 from zdecision.central.web.contracts import (
     CentralPublication,
     CentralReviewBatch,
     CentralReviewItem,
     DraftItem,
+    ReviewDraft,
 )
 from zdecision.central.web.store import (
     CentralWebStore,
@@ -23,6 +26,7 @@ from zdecision.central.web.store import (
     WebActionConflict,
     WebRecordConflict,
 )
+from zdecision.central.web.schema import _migrate_leaf_owned_web_tables
 from zdecision.ids import (
     central_publication_id,
     central_review_batch_id,
@@ -31,6 +35,7 @@ from zdecision.ids import (
     publication_preview_id,
     review_item_id,
 )
+from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.publication import (
     PublicationFile,
     PublicationRecord,
@@ -39,6 +44,7 @@ from zdecision.registry.publication import (
 
 
 PRODUCT_ID = product_id("ZDecision")
+DECISION_SPACE_ID = decision_space_id("product", PRODUCT_ID)
 NOW = "2026-08-04T01:02:03Z"
 FAMILY_ID = "cfm_" + "a" * 32
 REPOSITORY_ID = "repo_" + "b" * 32
@@ -107,8 +113,9 @@ class CentralWebStoreTest(unittest.TestCase):
             review_batch_id=batch_id,
             organization_id="org_demo",
             actor_id="user_demo",
-            product_id=PRODUCT_ID,
-            product_name="ZDecision",
+            decision_space_id=DECISION_SPACE_ID,
+            compatibility_product_id=PRODUCT_ID,
+            compatibility_product_name="ZDecision",
             client_action_id=action_id,
             request_digest=hashlib.sha256(b"review").hexdigest(),
             approval=ApprovalRef("user", "web_review", action_id, NOW),
@@ -214,8 +221,119 @@ class CentralWebStoreTest(unittest.TestCase):
         self.assertIn("decision_space_id", columns)
         self.assertIn("ownership_json", columns)
 
+    def test_private_web_records_are_owned_by_decision_space(self) -> None:
+        for table in (
+            "web_review_drafts",
+            "web_review_batches",
+            "web_review_items",
+            "web_review_submission_results",
+            "web_publication_previews",
+            "web_publications",
+            "web_publication_families",
+            "web_candidate_receipts",
+        ):
+            columns = {
+                row["name"]
+                for row in self.store.connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            self.assertIn("decision_space_id", columns, table)
+            self.assertNotIn("product_id", columns, table)
+
+    def test_legacy_product_owned_draft_migrates_to_leaf_owner(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE decision_spaces (
+              organization_id TEXT NOT NULL,
+              decision_space_id TEXT NOT NULL,
+              compatibility_product_id TEXT NOT NULL
+            );
+            CREATE TABLE web_review_drafts (
+              organization_id TEXT, actor_id TEXT, product_id TEXT,
+              version INTEGER, record_json TEXT, record_digest TEXT,
+              updated_at TEXT
+            );
+            CREATE TABLE web_review_batches (
+              organization_id TEXT, product_id TEXT, record_json TEXT,
+              record_digest TEXT
+            );
+            CREATE TABLE web_review_items (
+              organization_id TEXT, product_id TEXT
+            );
+            CREATE TABLE web_review_submission_results (
+              organization_id TEXT, product_id TEXT, record_json TEXT,
+              record_digest TEXT
+            );
+            CREATE TABLE web_publication_previews (
+              organization_id TEXT, product_id TEXT, record_json TEXT
+            );
+            CREATE TABLE web_publications (
+              organization_id TEXT, product_id TEXT, preview_id TEXT,
+              record_json TEXT, record_digest TEXT
+            );
+            CREATE TABLE web_publication_families (
+              organization_id TEXT, product_id TEXT
+            );
+            CREATE TABLE web_candidate_receipts (
+              organization_id TEXT, product_id TEXT, preview_id TEXT
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO decision_spaces VALUES (?, ?, ?)",
+            ("org_demo", DECISION_SPACE_ID, PRODUCT_ID),
+        )
+        legacy = {
+            "organization_id": "org_demo",
+            "actor_id": "user_demo",
+            "product_id": PRODUCT_ID,
+            "version": 0,
+            "items": [],
+            "updated_at": None,
+        }
+        encoded = canonical_json_bytes(legacy)
+        connection.execute(
+            "INSERT INTO web_review_drafts VALUES (?, ?, ?, 0, ?, ?, ?)",
+            (
+                "org_demo",
+                "user_demo",
+                PRODUCT_ID,
+                encoded.decode("utf-8"),
+                hashlib.sha256(encoded).hexdigest(),
+                NOW,
+            ),
+        )
+        connection.commit()
+
+        _migrate_leaf_owned_web_tables(connection)
+
+        columns = {
+            item["name"]
+            for item in connection.execute(
+                "PRAGMA table_info(web_review_drafts)"
+            ).fetchall()
+        }
+        self.assertIn("decision_space_id", columns)
+        row = connection.execute(
+            """SELECT decision_space_id, record_json, record_digest
+               FROM web_review_drafts"""
+        ).fetchone()
+        migrated = ReviewDraft.from_dict(json.loads(row["record_json"]))
+        self.assertEqual(DECISION_SPACE_ID, row["decision_space_id"])
+        self.assertEqual(DECISION_SPACE_ID, migrated.decision_space_id)
+        self.assertEqual(
+            hashlib.sha256(row["record_json"].encode("utf-8")).hexdigest(),
+            row["record_digest"],
+        )
+
     def test_draft_compare_and_swap_survives_reopen(self) -> None:
-        empty = self.web_store.get_draft("org_demo", "user_demo", PRODUCT_ID)
+        empty = self.web_store.get_draft(
+            "org_demo", "user_demo", DECISION_SPACE_ID
+        )
         saved = self.web_store.replace_draft(empty, (draft_item(),), NOW)
         self.assertEqual(1, saved.version)
         self.store.close()
@@ -223,11 +341,15 @@ class CentralWebStoreTest(unittest.TestCase):
         self.web_store = CentralWebStore(self.store.connection)
         self.assertEqual(
             saved,
-            self.web_store.get_draft("org_demo", "user_demo", PRODUCT_ID),
+            self.web_store.get_draft(
+                "org_demo", "user_demo", DECISION_SPACE_ID
+            ),
         )
 
     def test_draft_compare_and_swap_rejects_stale_version(self) -> None:
-        empty = self.web_store.get_draft("org_demo", "user_demo", PRODUCT_ID)
+        empty = self.web_store.get_draft(
+            "org_demo", "user_demo", DECISION_SPACE_ID
+        )
         self.web_store.replace_draft(empty, (draft_item(),), NOW)
         with self.assertRaises(DraftConflict):
             self.web_store.replace_draft(empty, (), NOW)
@@ -251,7 +373,7 @@ class CentralWebStoreTest(unittest.TestCase):
         self.assertEqual(
             batch,
             self.web_store.get_review_batch(
-                "org_demo", PRODUCT_ID, batch.review_batch_id
+                "org_demo", DECISION_SPACE_ID, batch.review_batch_id
             ),
         )
 
@@ -259,12 +381,13 @@ class CentralWebStoreTest(unittest.TestCase):
         batch = self.review_batch()
         self.web_store.put_review_batch(batch)
         preview = self.preview(batch)
-        self.web_store.put_preview("org_demo", PRODUCT_ID, preview)
+        self.web_store.put_preview("org_demo", DECISION_SPACE_ID, preview)
         confirmed = CentralPublication(
             publication_id=central_publication_id(preview.preview_id),
             organization_id="org_demo",
             actor_id="user_demo",
-            product_id=PRODUCT_ID,
+            decision_space_id=DECISION_SPACE_ID,
+            compatibility_product_id=PRODUCT_ID,
             preview_id=preview.preview_id,
             confirm_action_id="web_action_publish-1",
             confirm_request_digest="f" * 64,
@@ -291,7 +414,8 @@ class CentralWebStoreTest(unittest.TestCase):
             publication_id=central_publication_id(preview.preview_id),
             organization_id="org_demo",
             actor_id="user_demo",
-            product_id=PRODUCT_ID,
+            decision_space_id=DECISION_SPACE_ID,
+            compatibility_product_id=PRODUCT_ID,
             preview_id=preview.preview_id,
             confirm_action_id="web_action_publish-2",
             confirm_request_digest="f" * 64,

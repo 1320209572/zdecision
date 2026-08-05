@@ -17,6 +17,7 @@ from typing import Literal
 
 from zdecision.capture.models import SourceCheckpoint
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.web.contracts import CentralReviewBatch, CentralReviewItem
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import (
@@ -67,6 +68,15 @@ class PreviewStale(CentralPreviewError):
 
 class RegistryUnavailable(CentralPreviewError):
     code = "registry_unavailable"
+
+
+def registry_partition(space: LeafDecisionSpace) -> tuple[str, str]:
+    if space.kind not in ("product", "shared_unit") or not space.enabled:
+        raise ValueError("decision_space_not_publishable")
+    return (
+        space.compatibility_product_id,
+        space.compatibility_product_name,
+    )
 
 
 @dataclass(frozen=True)
@@ -168,12 +178,18 @@ class CentralPreviewService:
                 raise WebActionConflict("web_action_conflict")
             return self.get(principal, replay.result_id)
 
+        if review_batch_id.startswith("dsg_"):
+            raise NoAcceptedItems("decision_space_not_leaf")
         batch = self._owned_batch(principal, review_batch_id)
+        product_id, product_name = self._partition(principal, batch)
         accepted = self._accepted(batch)
         if not accepted:
             raise NoAcceptedItems("no_accepted_items")
         self._require_latest_and_unpublished(principal, batch, accepted)
-        seeds = tuple(self._seed(batch, item) for item in accepted)
+        seeds = tuple(
+            self._seed(batch, item, product_id, product_name)
+            for item in accepted
+        )
         try:
             base_commit = self.git.fetch_and_require_exact_main()
             self.git.require_clean_registry()
@@ -219,14 +235,14 @@ class CentralPreviewService:
                 item.publication_candidate_id for item in accepted
             ),
             decision_ids=plan.decision_ids,
-            product_id=batch.product_id,
-            product_name=batch.product_name,
+            product_id=product_id,
+            product_name=product_name,
             base_commit=base_commit,
             base_registry_digests=plan.base_registry_digests,
             display_documents=display_files,
             changed_files=changed_files,
             commit_message=(
-                f"decision({batch.product_id}): publish {len(accepted)} decisions\n\n"
+                f"decision({product_id}): publish {len(accepted)} decisions\n\n"
                 f"ZDecision-Preview: {preview_id}\n"
             ),
         )
@@ -260,7 +276,7 @@ class CentralPreviewService:
                 if existing is not None:
                     record = replace(record, created_at=existing.created_at)
                 stored = self.store.put_preview(
-                    principal.organization_id, batch.product_id, record
+                    principal.organization_id, batch.decision_space_id, record
                 )
                 self.store.record_action(
                     principal.organization_id,
@@ -378,7 +394,11 @@ class CentralPreviewService:
         if not accepted:
             raise PreviewStale("preview_stale")
         self._require_latest_and_unpublished(principal, batch, accepted)
-        seeds = tuple(self._seed(batch, item) for item in accepted)
+        product_id, product_name = self._partition(principal, batch)
+        seeds = tuple(
+            self._seed(batch, item, product_id, product_name)
+            for item in accepted
+        )
         self.git.fetch_and_require_exact_main(record.base_commit)
         self.git.require_clean_registry()
         with self._committed_catalog(record.base_commit) as catalog:
@@ -406,22 +426,38 @@ class CentralPreviewService:
     ) -> None:
         families = tuple(item.family_id for item in accepted)
         latest = self.store.latest_review_ids(
-            principal.organization_id, batch.product_id, families
+            principal.organization_id, batch.decision_space_id, families
         )
         if any(latest.get(item.family_id) != item.review_id for item in accepted):
             raise PreviewStale("preview_stale")
         if self.store.published_families(
-            principal.organization_id, batch.product_id, families
+            principal.organization_id, batch.decision_space_id, families
         ):
             raise PreviewStale("preview_stale")
         for item in accepted:
-            mapping = self.queries.repository_mapping(
-                principal, item.repository_id
+            ownership = self.queries.candidate_revision_ownership(
+                principal,
+                item.repository_id,
+                item.family_id,
+                item.revision,
             )
-            if mapping is None or (
-                not mapping.enabled
-                or mapping.product_id != batch.product_id
-                or mapping.product_name != batch.product_name
+            space = self.queries.decision_space(
+                principal, batch.decision_space_id
+            )
+            if ownership is None or space is None or (
+                ownership.decision_space_id != batch.decision_space_id
+                or ownership.decision_space_kind != space.kind
+                or ownership.display_name != space.display_name
+                or ownership.catalog_breadcrumb != space.catalog_breadcrumb
+                or ownership.source_root != space.source_root
+                or ownership.compatibility_product_id
+                != batch.compatibility_product_id
+                or ownership.compatibility_product_name
+                != batch.compatibility_product_name
+                or ownership.compatibility_product_id
+                != space.compatibility_product_id
+                or ownership.compatibility_product_name
+                != space.compatibility_product_name
             ):
                 raise PreviewStale("preview_stale")
             current = self.queries.current_candidate_revision(
@@ -444,6 +480,25 @@ class CentralPreviewService:
             raise PreviewNotFound("not_found")
         return batch
 
+    def _partition(
+        self, principal: Principal, batch: CentralReviewBatch
+    ) -> tuple[str, str]:
+        space = self.queries.decision_space(
+            principal, batch.decision_space_id
+        )
+        if space is None:
+            raise NoAcceptedItems("decision_space_not_leaf")
+        try:
+            partition = registry_partition(space)
+        except ValueError:
+            raise NoAcceptedItems("decision_space_not_leaf") from None
+        if partition != (
+            batch.compatibility_product_id,
+            batch.compatibility_product_name,
+        ):
+            raise PreviewStale("preview_stale")
+        return partition
+
     @staticmethod
     def _accepted(
         batch: CentralReviewBatch,
@@ -456,7 +511,10 @@ class CentralPreviewService:
 
     @staticmethod
     def _seed(
-        batch: CentralReviewBatch, item: CentralReviewItem
+        batch: CentralReviewBatch,
+        item: CentralReviewItem,
+        product_id: str,
+        product_name: str,
     ) -> DecisionSeed:
         if item.action not in ("accept", "edit_accept"):
             raise ValueError("Review item is not accepted")
@@ -465,9 +523,9 @@ class CentralPreviewService:
         candidate_id = item.publication_candidate_id
         return DecisionSeed(
             candidate_id=candidate_id,
-            decision_id=decision_id(candidate_id, batch.product_id),
-            product_id=batch.product_id,
-            product_name=batch.product_name,
+            decision_id=decision_id(candidate_id, product_id),
+            product_id=product_id,
+            product_name=product_name,
             content=item.effective_content,
             source=SourceCheckpoint(
                 thread_id=(

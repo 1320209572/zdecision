@@ -1,4 +1,4 @@
-"""Product-owned SQLite schema for central Decision Web persistence."""
+"""Decision-space-owned SQLite schema for central Decision Web persistence."""
 
 from __future__ import annotations
 
@@ -8,18 +8,24 @@ import sqlite3
 
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import CandidateBatchUpload
+from zdecision.central.web.contracts import (
+    CentralPublication,
+    CentralReviewBatch,
+    ReviewDraft,
+    ReviewSubmissionSnapshot,
+)
 
 
 WEB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS web_review_drafts (
   organization_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
   version INTEGER NOT NULL CHECK(version >= 0),
   record_json TEXT NOT NULL,
   record_digest TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY(organization_id, actor_id, product_id)
+  PRIMARY KEY(organization_id, actor_id, decision_space_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_candidate_revision_batches (
@@ -36,7 +42,9 @@ CREATE TABLE IF NOT EXISTS web_candidate_revision_batches (
 
 CREATE TABLE IF NOT EXISTS web_review_batches (
   organization_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
+  compatibility_product_id TEXT NOT NULL,
+  compatibility_product_name TEXT NOT NULL,
   review_batch_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
   client_action_id TEXT NOT NULL,
@@ -45,13 +53,13 @@ CREATE TABLE IF NOT EXISTS web_review_batches (
   record_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
   submission_order INTEGER CHECK(submission_order > 0),
-  PRIMARY KEY(organization_id, product_id, review_batch_id),
+  PRIMARY KEY(organization_id, decision_space_id, review_batch_id),
   UNIQUE(organization_id, actor_id, client_action_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_review_items (
   organization_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
   review_batch_id TEXT NOT NULL,
   item_order INTEGER NOT NULL CHECK(item_order >= 0),
   review_id TEXT NOT NULL,
@@ -65,22 +73,22 @@ CREATE TABLE IF NOT EXISTS web_review_items (
   effective_content_json TEXT,
   effective_content_digest TEXT,
   note TEXT,
-  PRIMARY KEY(organization_id, product_id, review_batch_id, item_order),
-  UNIQUE(organization_id, product_id, review_id),
-  FOREIGN KEY(organization_id, product_id, review_batch_id)
-    REFERENCES web_review_batches(organization_id, product_id, review_batch_id)
+  PRIMARY KEY(organization_id, decision_space_id, review_batch_id, item_order),
+  UNIQUE(organization_id, decision_space_id, review_id),
+  FOREIGN KEY(organization_id, decision_space_id, review_batch_id)
+    REFERENCES web_review_batches(organization_id, decision_space_id, review_batch_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_review_submission_results (
   organization_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
   review_batch_id TEXT NOT NULL,
   record_json TEXT NOT NULL,
   record_digest TEXT NOT NULL,
   PRIMARY KEY(organization_id, actor_id, review_batch_id),
-  FOREIGN KEY(organization_id, product_id, review_batch_id)
-    REFERENCES web_review_batches(organization_id, product_id, review_batch_id)
+  FOREIGN KEY(organization_id, decision_space_id, review_batch_id)
+    REFERENCES web_review_batches(organization_id, decision_space_id, review_batch_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_action_results (
@@ -96,21 +104,23 @@ CREATE TABLE IF NOT EXISTS web_action_results (
 
 CREATE TABLE IF NOT EXISTS web_publication_previews (
   organization_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
+  compatibility_product_id TEXT NOT NULL,
   preview_id TEXT NOT NULL,
   review_batch_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
   record_json TEXT NOT NULL,
   record_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  PRIMARY KEY(organization_id, product_id, preview_id),
-  FOREIGN KEY(organization_id, product_id, review_batch_id)
-    REFERENCES web_review_batches(organization_id, product_id, review_batch_id)
+  PRIMARY KEY(organization_id, decision_space_id, preview_id),
+  FOREIGN KEY(organization_id, decision_space_id, review_batch_id)
+    REFERENCES web_review_batches(organization_id, decision_space_id, review_batch_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_publications (
   organization_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
+  compatibility_product_id TEXT NOT NULL,
   publication_id TEXT NOT NULL,
   preview_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
@@ -121,49 +131,50 @@ CREATE TABLE IF NOT EXISTS web_publications (
   record_digest TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY(organization_id, product_id, publication_id),
-  UNIQUE(organization_id, product_id, preview_id),
-  FOREIGN KEY(organization_id, product_id, preview_id)
-    REFERENCES web_publication_previews(organization_id, product_id, preview_id)
+  PRIMARY KEY(organization_id, decision_space_id, publication_id),
+  UNIQUE(organization_id, decision_space_id, preview_id),
+  FOREIGN KEY(organization_id, decision_space_id, preview_id)
+    REFERENCES web_publication_previews(organization_id, decision_space_id, preview_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_publication_families (
   organization_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
   family_id TEXT NOT NULL,
   publication_id TEXT NOT NULL,
-  PRIMARY KEY(organization_id, product_id, family_id),
-  FOREIGN KEY(organization_id, product_id, publication_id)
-    REFERENCES web_publications(organization_id, product_id, publication_id)
+  PRIMARY KEY(organization_id, decision_space_id, family_id),
+  FOREIGN KEY(organization_id, decision_space_id, publication_id)
+    REFERENCES web_publications(organization_id, decision_space_id, publication_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_candidate_receipts (
   organization_id TEXT NOT NULL,
-  product_id TEXT NOT NULL,
+  decision_space_id TEXT NOT NULL,
+  compatibility_product_id TEXT NOT NULL,
   family_id TEXT NOT NULL,
   publication_candidate_id TEXT NOT NULL,
   decision_id TEXT NOT NULL,
   preview_id TEXT NOT NULL,
   commit_sha TEXT NOT NULL,
   recorded_at TEXT NOT NULL,
-  PRIMARY KEY(organization_id, product_id, family_id),
-  UNIQUE(organization_id, product_id, decision_id)
+  PRIMARY KEY(organization_id, decision_space_id, family_id),
+  UNIQUE(organization_id, decision_space_id, decision_id)
 );
 
 CREATE INDEX IF NOT EXISTS web_candidate_revision_batches_filter
 ON web_candidate_revision_batches(organization_id, request_id, revision_id);
 
 CREATE INDEX IF NOT EXISTS web_review_batches_history
-ON web_review_batches(organization_id, product_id, created_at, review_batch_id);
+ON web_review_batches(organization_id, decision_space_id, created_at, review_batch_id);
 
 CREATE INDEX IF NOT EXISTS web_review_items_family
-ON web_review_items(organization_id, product_id, family_id, review_batch_id);
+ON web_review_items(organization_id, decision_space_id, family_id, review_batch_id);
 
 CREATE INDEX IF NOT EXISTS web_publications_history
-ON web_publications(organization_id, product_id, created_at);
+ON web_publications(organization_id, decision_space_id, created_at);
 
 CREATE INDEX IF NOT EXISTS web_candidate_receipts_decision
-ON web_candidate_receipts(organization_id, product_id, decision_id);
+ON web_candidate_receipts(organization_id, decision_space_id, decision_id);
 """
 
 
@@ -175,10 +186,204 @@ class CentralCandidateStateCorrupt(ValueError):
 def initialize_web_schema(connection: sqlite3.Connection) -> None:
     """Create Web tables and recover their immutable Candidate associations."""
 
+    _migrate_leaf_owned_web_tables(connection)
     connection.executescript(WEB_SCHEMA)
     _ensure_candidate_ownership_columns(connection)
     _ensure_review_submission_order(connection)
     _backfill_candidate_revision_batches(connection)
+
+
+def _migrate_leaf_owned_web_tables(connection: sqlite3.Connection) -> None:
+    """Project the V1 product owner key onto its immutable leaf identity."""
+
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(web_review_drafts)"
+        ).fetchall()
+    }
+    if not columns or "decision_space_id" in columns:
+        return
+    if "product_id" not in columns:
+        raise CentralCandidateStateCorrupt()
+
+    owner_tables = (
+        "web_review_drafts",
+        "web_review_batches",
+        "web_review_items",
+        "web_review_submission_results",
+        "web_publication_previews",
+        "web_publications",
+        "web_publication_families",
+        "web_candidate_receipts",
+    )
+    owns_transaction = not connection.in_transaction
+    try:
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        for table in owner_tables:
+            connection.execute(
+                f"ALTER TABLE {table} RENAME COLUMN product_id "
+                "TO decision_space_id"
+            )
+        for table, additions in (
+            (
+                "web_review_batches",
+                (
+                    "compatibility_product_id TEXT NOT NULL DEFAULT ''",
+                    "compatibility_product_name TEXT NOT NULL DEFAULT ''",
+                ),
+            ),
+            (
+                "web_publication_previews",
+                ("compatibility_product_id TEXT NOT NULL DEFAULT ''",),
+            ),
+            (
+                "web_publications",
+                ("compatibility_product_id TEXT NOT NULL DEFAULT ''",),
+            ),
+            (
+                "web_candidate_receipts",
+                ("compatibility_product_id TEXT NOT NULL DEFAULT ''",),
+            ),
+        ):
+            for addition in additions:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {addition}"
+                )
+
+        mappings = {
+            (row["organization_id"], row["compatibility_product_id"]): row[
+                "decision_space_id"
+            ]
+            for row in connection.execute(
+                """SELECT organization_id, decision_space_id,
+                          compatibility_product_id
+                   FROM decision_spaces"""
+            ).fetchall()
+        }
+        owners = {
+            (row["organization_id"], row["decision_space_id"])
+            for table in owner_tables
+            for row in connection.execute(
+                f"SELECT DISTINCT organization_id, decision_space_id "
+                f"FROM {table}"
+            ).fetchall()
+        }
+        if any(owner not in mappings for owner in owners):
+            raise CentralCandidateStateCorrupt()
+
+        def rewrite(
+            table: str,
+            record_type: type[object],
+            transform,
+        ) -> None:
+            rows = connection.execute(
+                f"SELECT rowid, organization_id, decision_space_id, "
+                f"record_json FROM {table}"
+            ).fetchall()
+            for row in rows:
+                product = row["decision_space_id"]
+                space = mappings[(row["organization_id"], product)]
+                raw = json.loads(row["record_json"])
+                record = record_type.from_dict(transform(raw, space, product))
+                encoded = canonical_json_bytes(record.to_dict())
+                connection.execute(
+                    f"UPDATE {table} SET decision_space_id = ?, "
+                    "record_json = ?, record_digest = ? WHERE rowid = ?",
+                    (
+                        space,
+                        encoded.decode("utf-8"),
+                        hashlib.sha256(encoded).hexdigest(),
+                        row["rowid"],
+                    ),
+                )
+
+        rewrite(
+            "web_review_drafts",
+            ReviewDraft,
+            lambda raw, space, _product: {
+                **{key: value for key, value in raw.items() if key != "product_id"},
+                "decision_space_id": space,
+            },
+        )
+        rewrite(
+            "web_review_batches",
+            CentralReviewBatch,
+            lambda raw, space, product: {
+                **{
+                    key: value
+                    for key, value in raw.items()
+                    if key not in ("product_id", "product_name")
+                },
+                "decision_space_id": space,
+                "compatibility_product_id": product,
+                "compatibility_product_name": raw["product_name"],
+            },
+        )
+        rewrite(
+            "web_review_submission_results",
+            ReviewSubmissionSnapshot,
+            lambda raw, space, _product: {
+                **{key: value for key, value in raw.items() if key != "product_id"},
+                "decision_space_id": space,
+            },
+        )
+        rewrite(
+            "web_publications",
+            CentralPublication,
+            lambda raw, space, product: {
+                **{key: value for key, value in raw.items() if key != "product_id"},
+                "decision_space_id": space,
+                "compatibility_product_id": product,
+            },
+        )
+
+        for table in owner_tables:
+            connection.executemany(
+                f"UPDATE {table} SET decision_space_id = ? "
+                "WHERE organization_id = ? AND decision_space_id = ?",
+                (
+                    (space, organization, product)
+                    for (organization, product), space in mappings.items()
+                ),
+            )
+        connection.execute(
+            """UPDATE web_review_batches
+               SET compatibility_product_id = json_extract(
+                       record_json, '$.compatibility_product_id'),
+                   compatibility_product_name = json_extract(
+                       record_json, '$.compatibility_product_name')"""
+        )
+        connection.execute(
+            """UPDATE web_publication_previews
+               SET compatibility_product_id = json_extract(
+                       record_json, '$.product_id')"""
+        )
+        connection.execute(
+            """UPDATE web_publications
+               SET compatibility_product_id = json_extract(
+                       record_json, '$.compatibility_product_id')"""
+        )
+        connection.execute(
+            """UPDATE web_candidate_receipts
+               SET compatibility_product_id = (
+                   SELECT publication.compatibility_product_id
+                   FROM web_publications AS publication
+                   WHERE publication.organization_id =
+                         web_candidate_receipts.organization_id
+                     AND publication.decision_space_id =
+                         web_candidate_receipts.decision_space_id
+                     AND publication.preview_id =
+                         web_candidate_receipts.preview_id
+               )"""
+        )
+        if owns_transaction:
+            connection.commit()
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        if owns_transaction:
+            connection.rollback()
+        raise CentralCandidateStateCorrupt() from None
 
 
 def _ensure_candidate_ownership_columns(connection: sqlite3.Connection) -> None:
@@ -254,26 +459,26 @@ def _ensure_review_submission_order(connection: sqlite3.Connection) -> None:
             "ALTER TABLE web_review_batches ADD COLUMN submission_order INTEGER"
         )
     maxima = {
-        (row["organization_id"], row["product_id"]): int(row["maximum"])
+        (row["organization_id"], row["decision_space_id"]): int(row["maximum"])
         for row in connection.execute(
             """
-            SELECT organization_id, product_id,
+            SELECT organization_id, decision_space_id,
                    COALESCE(MAX(submission_order), 0) AS maximum
             FROM web_review_batches
-            GROUP BY organization_id, product_id
+            GROUP BY organization_id, decision_space_id
             """
         ).fetchall()
     }
     rows = connection.execute(
         """
-        SELECT rowid, organization_id, product_id
+        SELECT rowid, organization_id, decision_space_id
         FROM web_review_batches
         WHERE submission_order IS NULL
-        ORDER BY organization_id, product_id, rowid
+        ORDER BY organization_id, decision_space_id, rowid
         """
     ).fetchall()
     for row in rows:
-        key = (row["organization_id"], row["product_id"])
+        key = (row["organization_id"], row["decision_space_id"])
         order = maxima.get(key, 0) + 1
         connection.execute(
             "UPDATE web_review_batches SET submission_order = ? WHERE rowid = ?",
@@ -283,7 +488,7 @@ def _ensure_review_submission_order(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS web_review_batches_submission_order
-        ON web_review_batches(organization_id, product_id, submission_order)
+        ON web_review_batches(organization_id, decision_space_id, submission_order)
         """
     )
 

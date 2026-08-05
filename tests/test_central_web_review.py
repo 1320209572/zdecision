@@ -9,10 +9,12 @@ from pathlib import Path
 
 from zdecision.capture.models import CandidateContent
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.store import CentralStore
 from zdecision.central.web.contracts import DraftItem
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.reviews import (
+    CentralReviewError,
     CentralReviewService,
     ProductNotFound,
     ProductOwnershipConflict,
@@ -24,11 +26,15 @@ from zdecision.central.web.store import (
     WebActionConflict,
     WebRecordCorrupt,
 )
-from zdecision.ids import candidate_revision_id, product_id
+from zdecision.ids import candidate_revision_id, decision_space_id, product_id, repository_route_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.models import ProductMetadata, ProductRegistry
 from zdecision.registry.query import RegistrySnapshot
-from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+from zdecision.sync.contracts import (
+    CandidateOwnershipSnapshot,
+    CandidateRevisionUpload,
+    RepositoryView,
+)
 
 
 NOW = "2026-08-04T08:00:00Z"
@@ -43,6 +49,8 @@ OTHER_REPOSITORY_ID = "repo_" + "2" * 32
 OTHER_FAMILY_ID = "cfm_" + "b" * 32
 FAMILY_B = "cfm_" + "c" * 32
 FAMILY_C = "cfm_" + "d" * 32
+PRODUCT_SPACE_ID = decision_space_id("product", PRODUCT_ID)
+OTHER_SPACE_ID = decision_space_id("product", OTHER_PRODUCT_ID)
 
 
 class _RegistryQuery:
@@ -96,6 +104,8 @@ class CentralWebReviewTest(unittest.TestCase):
             "org_demo",
             RepositoryView(REPOSITORY_ID, PRODUCT_ID, PRODUCT_NAME, True),
         )
+        self._put_space(PRODUCT_SPACE_ID, PRODUCT_ID, PRODUCT_NAME)
+        self._put_space(OTHER_SPACE_ID, OTHER_PRODUCT_ID, OTHER_PRODUCT_NAME)
         self.store.put_repository_mapping(
             "org_demo",
             RepositoryView(
@@ -114,17 +124,30 @@ class CentralWebReviewTest(unittest.TestCase):
         )
         with self.store.connection:
             self._insert_request(CAPTURE_REQUEST_ID, REPOSITORY_ID, PRODUCT_ID)
-            self._insert_revision("org_demo", REPOSITORY_ID, self.older, False)
-            self._insert_revision("org_demo", REPOSITORY_ID, self.current, True)
             self._insert_revision(
-                "org_demo", OTHER_REPOSITORY_ID, self.other, True
+                "org_demo", REPOSITORY_ID, self.older, False,
+                decision_space=PRODUCT_SPACE_ID,
+                compatibility_product=PRODUCT_ID,
+                compatibility_name=PRODUCT_NAME,
+            )
+            self._insert_revision(
+                "org_demo", REPOSITORY_ID, self.current, True,
+                decision_space=PRODUCT_SPACE_ID,
+                compatibility_product=PRODUCT_ID,
+                compatibility_name=PRODUCT_NAME,
+            )
+            self._insert_revision(
+                "org_demo", OTHER_REPOSITORY_ID, self.other, True,
+                decision_space=OTHER_SPACE_ID,
+                compatibility_product=OTHER_PRODUCT_ID,
+                compatibility_name=OTHER_PRODUCT_NAME,
             )
             self.store.connection.execute(
                 """
                 INSERT INTO web_candidate_revision_batches(
                     organization_id, repository_id, family_id, revision_id,
-                    request_id, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    request_id, decision_space_id, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "org_demo",
@@ -132,12 +155,33 @@ class CentralWebReviewTest(unittest.TestCase):
                     FAMILY_ID,
                     self.current.revision_id,
                     CAPTURE_REQUEST_ID,
+                    PRODUCT_SPACE_ID,
                     NOW,
                 ),
             )
         queries = CentralWebQueries(self.store.connection, _RegistryQuery())
         self.service = CentralReviewService(
             store=CentralWebStore(self.store.connection), queries=queries
+        )
+
+    def _put_space(
+        self, space_id: str, compatibility_id: str, compatibility_name: str
+    ) -> None:
+        self.store.put_decision_space(
+            "org_demo",
+            LeafDecisionSpace(
+                decision_space_id=space_id,
+                kind="product",
+                display_name=compatibility_name,
+                compatibility_product_id=compatibility_id,
+                compatibility_product_name=compatibility_name,
+                catalog_group_id=None,
+                catalog_breadcrumb=(),
+                source_root=".",
+                package_name=None,
+                asset_type=None,
+                enabled=True,
+            ),
         )
 
     def _insert_request(
@@ -166,6 +210,10 @@ class CentralWebReviewTest(unittest.TestCase):
         repository_id: str,
         item: CandidateRevisionUpload,
         is_head: bool,
+        *,
+        decision_space: str = PRODUCT_SPACE_ID,
+        compatibility_product: str = PRODUCT_ID,
+        compatibility_name: str = PRODUCT_NAME,
     ) -> None:
         payload = canonical_json_bytes(item.to_dict())
         self.store.connection.execute(
@@ -183,6 +231,40 @@ class CentralWebReviewTest(unittest.TestCase):
                 item.revision_id,
                 payload.decode("utf-8"),
                 hashlib.sha256(payload).hexdigest(),
+            ),
+        )
+        ownership = CandidateOwnershipSnapshot(
+            repository_id=repository_id,
+            route_id=repository_route_id(repository_id, decision_space),
+            route_configuration_version=1,
+            decision_space_id=decision_space,
+            decision_space_kind="product",
+            display_name=compatibility_name,
+            catalog_breadcrumb=(),
+            source_root=".",
+            compatibility_product_id=compatibility_product,
+            compatibility_product_name=compatibility_name,
+            source_boundary_digest="9" * 64,
+        )
+        ownership_bytes = canonical_json_bytes(ownership.to_dict())
+        self.store.connection.execute(
+            """
+            INSERT INTO candidate_revision_ownership(
+                organization_id, repository_id, family_id, revision,
+                decision_space_id, route_id, route_configuration_version,
+                ownership_json, ownership_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                organization_id,
+                repository_id,
+                item.family_id,
+                item.revision,
+                ownership.decision_space_id,
+                ownership.route_id,
+                ownership.route_configuration_version,
+                ownership_bytes.decode("utf-8"),
+                hashlib.sha256(ownership_bytes).hexdigest(),
             ),
         )
         if is_head:
@@ -276,6 +358,57 @@ class CentralWebReviewTest(unittest.TestCase):
                 (self.draft_item(self.other, OTHER_REPOSITORY_ID),),
                 NOW,
             )
+
+    def test_review_rejects_items_from_another_leaf_even_when_mapping_matches(
+        self,
+    ) -> None:
+        family = self.add_current(FAMILY_B, "belongs to another leaf")
+        other_ownership = CandidateOwnershipSnapshot(
+            repository_id=REPOSITORY_ID,
+            route_id=repository_route_id(REPOSITORY_ID, OTHER_SPACE_ID),
+            route_configuration_version=1,
+            decision_space_id=OTHER_SPACE_ID,
+            decision_space_kind="product",
+            display_name=OTHER_PRODUCT_NAME,
+            catalog_breadcrumb=(),
+            source_root=".",
+            compatibility_product_id=OTHER_PRODUCT_ID,
+            compatibility_product_name=OTHER_PRODUCT_NAME,
+            source_boundary_digest="8" * 64,
+        )
+        payload = canonical_json_bytes(other_ownership.to_dict())
+        with self.store.connection:
+            self.store.connection.execute(
+                """
+                UPDATE candidate_revision_ownership
+                SET decision_space_id = ?, route_id = ?, ownership_json = ?,
+                    ownership_digest = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ? AND revision = ?
+                """,
+                (
+                    OTHER_SPACE_ID,
+                    other_ownership.route_id,
+                    payload.decode("utf-8"),
+                    hashlib.sha256(payload).hexdigest(),
+                    REPOSITORY_ID,
+                    family.family_id,
+                    family.revision,
+                ),
+            )
+
+        with self.assertRaises(CentralReviewError) as raised:
+            self.service.save_draft(
+                self.user,
+                PRODUCT_ID,
+                0,
+                (self.draft_item(family, REPOSITORY_ID),),
+                NOW,
+            )
+
+        self.assertEqual(
+            "decision_space_ownership_conflict", raised.exception.code
+        )
 
     def test_capture_batch_filter_uses_safe_request_association(self) -> None:
         view = self.service.list_candidates(

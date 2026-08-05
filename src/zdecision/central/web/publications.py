@@ -169,11 +169,17 @@ class CentralPublicationService:
         if view.publishability == "registry_unavailable":
             raise RegistryUnavailable("registry_unavailable")
         preview = view.record
+        batch = self.store.get_review_batch_by_id(
+            principal.organization_id, preview.review_batch_id
+        )
+        if batch is None or batch.actor_id != principal.actor_id:
+            raise WebRecordCorrupt("publication_review")
         publication = CentralPublication(
             publication_id=central_publication_id(preview_id),
             organization_id=principal.organization_id,
             actor_id=principal.actor_id,
-            product_id=preview.product_id,
+            decision_space_id=batch.decision_space_id,
+            compatibility_product_id=preview.product_id,
             preview_id=preview_id,
             confirm_action_id=client_action_id,
             confirm_request_digest=request_digest,
@@ -271,9 +277,9 @@ class CentralPublicationService:
         )
         if publication is None:
             raise PublicationNotFound("not_found")
-        if not self.previews.queries.product_repositories(
-            principal, publication.product_id
-        ):
+        if self.previews.queries.decision_space(
+            principal, publication.decision_space_id
+        ) is None:
             raise PublicationNotFound("not_found")
         return self._view(publication)
 
@@ -289,13 +295,15 @@ class CentralPublicationService:
         self._require_user(principal)
         if not 1 <= limit <= 100 or offset < 0:
             raise ValueError("publication pagination is invalid")
-        if product_id is not None and not self.previews.queries.product_repositories(
-            principal, product_id
-        ):
+        space = (
+            self.previews.queries.decision_space(principal, product_id)
+            if product_id is not None else None
+        )
+        if product_id is not None and space is None:
             raise PublicationNotFound("not_found")
         publications, total = self.store.list_publications(
             principal.organization_id,
-            product_id=product_id,
+            decision_space_id=(space.decision_space_id if space else None),
             state=state,
             limit=limit,
             offset=offset,
@@ -410,7 +418,17 @@ class CentralPublicationService:
         preview = self.store.get_preview(
             publication.organization_id, publication.preview_id
         )
-        if preview is None or preview.product_id != publication.product_id:
+        if (
+            preview is None
+            or preview.product_id != publication.compatibility_product_id
+        ):
+            raise WebRecordCorrupt("publication_preview")
+        batch = self.store.get_review_batch(
+            publication.organization_id,
+            publication.decision_space_id,
+            preview.review_batch_id,
+        )
+        if batch is None:
             raise WebRecordCorrupt("publication_preview")
         return preview
 
@@ -418,7 +436,7 @@ class CentralPublicationService:
         self, publication: CentralPublication, preview: PublicationRecord
     ) -> tuple[str, ...]:
         batch = self.store.get_review_batch(
-            publication.organization_id, preview.product_id,
+            publication.organization_id, publication.decision_space_id,
             preview.review_batch_id,
         )
         if batch is None or batch.actor_id != publication.actor_id:
@@ -452,13 +470,17 @@ class CentralPublicationService:
             publication.commit_sha,
         )
 
-    @staticmethod
     def _require_same_preview(
-        publication: CentralPublication, preview: PublicationRecord
+        self, publication: CentralPublication, preview: PublicationRecord
     ) -> None:
+        batch = self.store.get_review_batch_by_id(
+            publication.organization_id, preview.review_batch_id
+        )
         if (
             publication.preview_id != preview.preview_id
-            or publication.product_id != preview.product_id
+            or publication.compatibility_product_id != preview.product_id
+            or batch is None
+            or publication.decision_space_id != batch.decision_space_id
         ):
             raise WebRecordConflict("publication_preview_conflict")
 

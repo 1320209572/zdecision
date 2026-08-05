@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from tests import test_central_web_preview as preview_fixtures
+from zdecision.central.decision_spaces import CatalogGroup, LeafDecisionSpace
 from zdecision.central.web.previews import PreviewStale
 from zdecision.central.web.publications import (
     CandidateAlreadyPublishing,
@@ -12,11 +15,16 @@ from zdecision.central.web.publications import (
     PublicationAmbiguous,
 )
 from zdecision.central.web.store import WebActionConflict, WebRecordConflict
-from zdecision.ids import candidate_revision_id, central_publication_id
+from zdecision.ids import (
+    candidate_revision_id,
+    central_publication_id,
+    decision_space_id,
+    product_id,
+)
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter, RegistryPushFailed
-from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+from zdecision.sync.contracts import CandidateRevisionUpload
 
 
 class InjectedCrash(Exception):
@@ -166,18 +174,17 @@ class CentralPublicationServiceTest(unittest.TestCase):
         )
         self.assertEqual(1, self.commit_count())
 
-    def test_disabled_repository_makes_preview_stale_and_blocks_confirmation(
+    def test_disabled_leaf_makes_preview_stale_and_blocks_confirmation(
         self,
     ) -> None:
-        self.fixture.central.put_repository_mapping(
-            "org_demo",
-            RepositoryView(
-                preview_fixtures.REPOSITORY_ID,
-                preview_fixtures.PRODUCT_ID,
-                preview_fixtures.PRODUCT_NAME,
-                False,
-            ),
-        )
+        with self.fixture.central.connection:
+            self.fixture.central.connection.execute(
+                """
+                UPDATE decision_spaces SET enabled = 0
+                WHERE organization_id = 'org_demo' AND decision_space_id = ?
+                """,
+                (preview_fixtures.PRODUCT_SPACE_ID,),
+            )
 
         view = self.fixture.service.get(
             self.fixture.user, self.preview.preview_id
@@ -361,6 +368,110 @@ class CentralPublicationServiceTest(unittest.TestCase):
                 self.confirm()
 
         self.assertIsNone(self.stored())
+
+    def test_two_shared_leaves_write_two_v1_partitions(self) -> None:
+        def shared_space(name: str, source_root: str) -> LeafDecisionSpace:
+            compatibility_name = f"Shared / {source_root}"
+            compatibility_id = product_id(compatibility_name)
+            return LeafDecisionSpace(
+                decision_space_id=decision_space_id(
+                    "shared_unit", compatibility_id
+                ),
+                kind="shared_unit",
+                display_name=name,
+                compatibility_product_id=compatibility_id,
+                compatibility_product_name=compatibility_name,
+                catalog_group_id="dsg_" + "7" * 32,
+                catalog_breadcrumb=("Shared",),
+                source_root=source_root,
+                package_name=f"@zstack/{name.lower()}",
+                asset_type="library",
+                enabled=True,
+            )
+
+        theme = shared_space("Theme", "packages/shared/theme")
+        design = shared_space("Design", "packages/shared/design")
+        theme_family = "cfm_" + "8" * 32
+        design_family = "cfm_" + "9" * 32
+        self.fixture.central.put_catalog_group(
+            "org_demo",
+            CatalogGroup(
+                "dsg_" + "7" * 32,
+                None,
+                "Shared",
+                ("Shared",),
+                "packages/shared",
+                0,
+            ),
+        )
+        for space in (theme, design):
+            self.fixture.central.put_decision_space("org_demo", space)
+        theme_revision = self.fixture._insert_revision(
+            theme_family,
+            replace(
+                preview_fixtures.content("theme leaf decision"),
+                product=theme.compatibility_product_name,
+            ),
+            space=theme,
+        )
+        design_revision = self.fixture._insert_revision(
+            design_family,
+            replace(
+                preview_fixtures.content("design leaf decision"),
+                product=design.compatibility_product_name,
+            ),
+            space=design,
+        )
+
+        for index, (space, revision) in enumerate(
+            ((theme, theme_revision), (design, design_revision)), start=1
+        ):
+            batch = self.fixture._review_batch(
+                f"web_action_review-shared-{index}",
+                ((revision, "accept"),),
+                space=space,
+            )
+            self.fixture.store.put_review_batch(batch)
+            preview = self.fixture.service.create(
+                self.fixture.user,
+                batch.review_batch_id,
+                f"web_action_preview-shared-{index}",
+                preview_fixtures.NOW,
+            ).record
+            completed = self.service.confirm(
+                self.fixture.user,
+                preview.preview_id,
+                f"web_action_publish-shared-{index}",
+                preview_fixtures.NOW,
+            )
+            self.assertEqual("completed", completed.state)
+
+        theme_registry = (
+            self.fixture.repository / "decision-registry" / "products"
+            / theme.compatibility_product_id / "registry.json"
+        )
+        design_registry = (
+            self.fixture.repository / "decision-registry" / "products"
+            / design.compatibility_product_id / "registry.json"
+        )
+        self.assertTrue(theme_registry.is_file())
+        self.assertTrue(design_registry.is_file())
+        self.assertNotEqual(
+            theme.compatibility_product_id,
+            design.compatibility_product_id,
+        )
+        for path in (
+            self.fixture.repository / "decision-registry" / "products"
+        ).glob("*/decisions/*.json"):
+            decision = json.loads(path.read_text("utf-8"))
+            self.assertTrue(
+                {
+                    "decision_space_id",
+                    "catalog_breadcrumb",
+                    "source_root",
+                    "asset_type",
+                }.isdisjoint(decision)
+            )
 
 
 if __name__ == "__main__":

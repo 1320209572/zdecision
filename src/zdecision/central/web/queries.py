@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
 from zdecision.central.auth import Principal
+from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.web.contracts import (
     CandidateInboxItem,
     CandidateInboxView,
@@ -23,7 +24,11 @@ from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.publication import PublicationRecord
 from zdecision.registry.models import DecisionRevision
 from zdecision.registry.query import RegistryQueryUnavailable, RegistrySnapshot
-from zdecision.sync.contracts import CandidateRevisionUpload, RepositoryView
+from zdecision.sync.contracts import (
+    CandidateOwnershipSnapshot,
+    CandidateRevisionUpload,
+    RepositoryView,
+)
 
 
 _RFC3339 = re.compile(
@@ -394,6 +399,113 @@ class CentralWebQueries:
             for row in rows
         )
 
+    def decision_space(
+        self, principal: Principal, identifier: str
+    ) -> LeafDecisionSpace | None:
+        """Resolve an enabled leaf by canonical ID or its V1 product alias."""
+
+        self._require_user(principal)
+        row = self.connection.execute(
+            """
+            SELECT * FROM decision_spaces
+            WHERE organization_id = ? AND enabled = 1
+              AND (decision_space_id = ? OR compatibility_product_id = ?)
+            """,
+            (principal.organization_id, identifier, identifier),
+        ).fetchone()
+        if row is None:
+            return None
+        return LeafDecisionSpace(
+            decision_space_id=row["decision_space_id"],
+            kind=row["kind"],
+            display_name=row["display_name"],
+            compatibility_product_id=row["compatibility_product_id"],
+            compatibility_product_name=row["compatibility_product_name"],
+            catalog_group_id=row["catalog_group_id"],
+            catalog_breadcrumb=tuple(
+                json.loads(row["catalog_breadcrumb_json"])
+            ),
+            source_root=row["source_root"],
+            package_name=row["package_name"],
+            asset_type=row["asset_type"],
+            enabled=bool(row["enabled"]),
+        )
+
+    def decision_space_repositories(
+        self, principal: Principal, decision_space_id: str
+    ) -> tuple[RepositoryView, ...]:
+        self._require_user(principal)
+        space = self.decision_space(principal, decision_space_id)
+        if space is None or space.decision_space_id != decision_space_id:
+            return ()
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT repository_id FROM (
+              SELECT ownership.repository_id AS repository_id
+              FROM candidate_revision_ownership AS ownership
+              WHERE ownership.organization_id = ?
+                AND ownership.decision_space_id = ?
+              UNION
+              SELECT version.repository_id AS repository_id
+              FROM repository_route_heads AS head
+              JOIN repository_route_versions AS version
+                ON version.organization_id = head.organization_id
+               AND version.route_id = head.route_id
+               AND version.configuration_version = head.configuration_version
+              WHERE head.organization_id = ?
+                AND version.decision_space_id = ? AND version.enabled = 1
+            )
+            ORDER BY repository_id
+            """,
+            (
+                principal.organization_id,
+                decision_space_id,
+                principal.organization_id,
+                decision_space_id,
+            ),
+        ).fetchall()
+        return tuple(
+            RepositoryView(
+                row["repository_id"],
+                space.compatibility_product_id,
+                space.compatibility_product_name,
+                True,
+            )
+            for row in rows
+        )
+
+    def candidate_revision_ownership(
+        self,
+        principal: Principal,
+        repository_id: str,
+        family_id: str,
+        revision: int,
+    ) -> CandidateOwnershipSnapshot | None:
+        self._require_user(principal)
+        row = self.connection.execute(
+            """
+            SELECT ownership_json, ownership_digest
+            FROM candidate_revision_ownership
+            WHERE organization_id = ? AND repository_id = ?
+              AND family_id = ? AND revision = ?
+            """,
+            (
+                principal.organization_id,
+                repository_id,
+                family_id,
+                revision,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        return cast(
+            CandidateOwnershipSnapshot,
+            self._read_record(
+                row["ownership_json"], row["ownership_digest"],
+                CandidateOwnershipSnapshot, "candidate_ownership",
+            ),
+        )
+
     def repository_mapping(
         self, principal: Principal, repository_id: str
     ) -> RepositoryView | None:
@@ -525,7 +637,7 @@ class CentralWebQueries:
     def candidate_inbox(
         self,
         principal: Principal,
-        product_id: str,
+        decision_space_id: str,
         draft: ReviewDraft,
         *,
         search: str = "",
@@ -536,23 +648,24 @@ class CentralWebQueries:
         offset: int = 0,
     ) -> CandidateInboxView:
         self._require_user(principal)
-        repositories = self.product_repositories(principal, product_id)
-        if not repositories:
-            raise ValueError("product is unavailable")
-        product_name = repositories[0].product_name
-        if any(item.product_name != product_name for item in repositories):
-            raise WebRecordCorrupt("repository_mapping")
-        if draft.product_id != product_id:
-            raise ValueError("draft product is invalid")
+        space = self.decision_space(principal, decision_space_id)
+        if space is None or space.decision_space_id != decision_space_id:
+            raise ValueError("decision space is unavailable")
+        repositories = self.decision_space_repositories(
+            principal, decision_space_id
+        )
+        if draft.decision_space_id != decision_space_id:
+            raise ValueError("draft decision space is invalid")
 
-        parameters: list[object] = [principal.organization_id, product_id]
+        parameters: list[object] = [
+            principal.organization_id, decision_space_id
+        ]
         conditions = [
-            "mapping.organization_id = ?",
-            "mapping.product_id = ?",
-            "mapping.enabled = 1",
+            "head.organization_id = ?",
+            "ownership.decision_space_id = ?",
         ]
         if repository_id is not None:
-            conditions.append("mapping.repository_id = ?")
+            conditions.append("head.repository_id = ?")
             parameters.append(repository_id)
         if capture_request_id is not None:
             conditions.append(
@@ -568,27 +681,28 @@ class CentralWebQueries:
                       AND association.family_id = head.family_id
                       AND association.revision_id = head.revision_id
                       AND association.request_id = ?
-                      AND request.product_id = mapping.product_id
                 )"""
             )
             parameters.append(capture_request_id)
         rows = self.connection.execute(
             f"""
-            SELECT mapping.repository_id,
+            SELECT head.repository_id,
                    head.family_id, head.revision, head.revision_id,
                    revision.record_json, revision.record_digest
-            FROM repository_mappings AS mapping
-            JOIN candidate_family_heads AS head
-              ON head.organization_id = mapping.organization_id
-             AND head.repository_id = mapping.repository_id
+            FROM candidate_family_heads AS head
             JOIN candidate_revisions AS revision
               ON revision.organization_id = head.organization_id
              AND revision.repository_id = head.repository_id
              AND revision.family_id = head.family_id
              AND revision.revision = head.revision
              AND revision.revision_id = head.revision_id
+            JOIN candidate_revision_ownership AS ownership
+              ON ownership.organization_id = head.organization_id
+             AND ownership.repository_id = head.repository_id
+             AND ownership.family_id = head.family_id
+             AND ownership.revision = head.revision
             WHERE {' AND '.join(conditions)}
-            ORDER BY head.family_id, mapping.repository_id
+            ORDER BY head.family_id, head.repository_id
             """,
             tuple(parameters),
         ).fetchall()
@@ -618,7 +732,7 @@ class CentralWebQueries:
                 continue
             review_state = self._candidate_review_state(
                 principal.organization_id,
-                product_id,
+                decision_space_id,
                 row["repository_id"],
                 candidate,
             )
@@ -631,7 +745,7 @@ class CentralWebQueries:
                     repository_id=row["repository_id"],
                     capture_request_ids=self._capture_request_ids(
                         principal.organization_id,
-                        product_id,
+                        decision_space_id,
                         row["repository_id"],
                         candidate,
                     ),
@@ -648,8 +762,8 @@ class CentralWebQueries:
                 )
             )
         return CandidateInboxView(
-            product_id,
-            product_name,
+            space.compatibility_product_id,
+            space.compatibility_product_name,
             repositories,
             tuple(selected[offset : offset + limit]),
             draft,
@@ -658,7 +772,7 @@ class CentralWebQueries:
     def _capture_request_ids(
         self,
         organization_id: str,
-        product_id: str,
+        decision_space_id: str,
         repository_id: str,
         candidate: CandidateRevisionUpload,
     ) -> tuple[str, ...]:
@@ -674,7 +788,7 @@ class CentralWebQueries:
               AND association.repository_id = ?
               AND association.family_id = ?
               AND association.revision_id = ?
-              AND request.product_id = ?
+              AND association.decision_space_id = ?
             ORDER BY association.request_id
             """,
             (
@@ -682,7 +796,7 @@ class CentralWebQueries:
                 repository_id,
                 candidate.family_id,
                 candidate.revision_id,
-                product_id,
+                decision_space_id,
             ),
         ).fetchall()
         return tuple(row["request_id"] for row in rows)
@@ -690,16 +804,16 @@ class CentralWebQueries:
     def _candidate_review_state(
         self,
         organization_id: str,
-        product_id: str,
+        decision_space_id: str,
         repository_id: str,
         candidate: CandidateRevisionUpload,
     ) -> CandidateReviewState:
         receipt = self.connection.execute(
             """
             SELECT 1 FROM web_candidate_receipts
-            WHERE organization_id = ? AND product_id = ? AND family_id = ?
+            WHERE organization_id = ? AND decision_space_id = ? AND family_id = ?
             """,
-            (organization_id, product_id, candidate.family_id),
+            (organization_id, decision_space_id, candidate.family_id),
         ).fetchone()
         if receipt is not None:
             return "published"
@@ -709,9 +823,9 @@ class CentralWebQueries:
             FROM web_review_items AS item
             JOIN web_review_batches AS batch
               ON batch.organization_id = item.organization_id
-             AND batch.product_id = item.product_id
+             AND batch.decision_space_id = item.decision_space_id
              AND batch.review_batch_id = item.review_batch_id
-            WHERE item.organization_id = ? AND item.product_id = ?
+            WHERE item.organization_id = ? AND item.decision_space_id = ?
               AND item.repository_id = ? AND item.family_id = ?
               AND item.revision_id = ?
             ORDER BY batch.submission_order DESC, batch.rowid DESC,
@@ -720,7 +834,7 @@ class CentralWebQueries:
             """,
             (
                 organization_id,
-                product_id,
+                decision_space_id,
                 repository_id,
                 candidate.family_id,
                 candidate.revision_id,
@@ -811,7 +925,8 @@ class CentralWebQueries:
         placeholders = ", ".join("?" for _ in product_ids)
         rows = self.connection.execute(
             f"""
-            SELECT publication.product_id, publication.publication_id,
+            SELECT publication.compatibility_product_id AS product_id,
+                   publication.publication_id,
                    publication.preview_id, publication.commit_sha,
                    publication.updated_at, publication.record_json,
                    publication.record_digest, receipt.decision_id,
@@ -820,12 +935,14 @@ class CentralWebQueries:
             FROM web_publications AS publication
             JOIN web_candidate_receipts AS receipt
               ON receipt.organization_id = publication.organization_id
-             AND receipt.product_id = publication.product_id
+             AND receipt.decision_space_id = publication.decision_space_id
+             AND receipt.compatibility_product_id =
+                 publication.compatibility_product_id
              AND receipt.preview_id = publication.preview_id
              AND receipt.commit_sha = publication.commit_sha
             WHERE publication.organization_id = ?
               AND publication.state = 'completed'
-              AND publication.product_id IN ({placeholders})
+              AND publication.compatibility_product_id IN ({placeholders})
             ORDER BY publication.updated_at DESC,
                      publication.publication_id DESC,
                      receipt.decision_id
@@ -988,7 +1105,7 @@ class CentralWebQueries:
              AND mapping.enabled = 1
             LEFT JOIN web_candidate_receipts AS receipt
               ON receipt.organization_id = head.organization_id
-             AND receipt.product_id = mapping.product_id
+             AND receipt.compatibility_product_id = mapping.product_id
              AND receipt.family_id = head.family_id
             WHERE head.organization_id = ?
               AND mapping.product_id = ?
@@ -998,10 +1115,10 @@ class CentralWebQueries:
                 FROM web_review_items AS item
                 JOIN web_review_batches AS batch
                   ON batch.organization_id = item.organization_id
-                 AND batch.product_id = item.product_id
+                 AND batch.decision_space_id = item.decision_space_id
                  AND batch.review_batch_id = item.review_batch_id
                 WHERE item.organization_id = head.organization_id
-                  AND item.product_id = mapping.product_id
+                  AND batch.compatibility_product_id = mapping.product_id
                   AND item.repository_id = head.repository_id
                   AND item.family_id = head.family_id
                   AND item.revision_id = head.revision_id
@@ -1036,7 +1153,7 @@ class CentralWebQueries:
               SELECT publication.updated_at AS activity_at
               FROM web_publications AS publication
               WHERE publication.organization_id = ?
-                AND publication.product_id = ?
+                AND publication.compatibility_product_id = ?
             )
             """,
             (
@@ -1059,20 +1176,16 @@ class CentralWebQueries:
                    publication.record_digest AS publication_digest,
                    preview.record_json AS preview_json,
                    preview.record_digest AS preview_digest,
-                   mapping.product_name AS product_name
+                   space.compatibility_product_name AS product_name
             FROM web_publications AS publication
             JOIN web_publication_previews AS preview
               ON preview.organization_id = publication.organization_id
-             AND preview.product_id = publication.product_id
+             AND preview.decision_space_id = publication.decision_space_id
              AND preview.preview_id = publication.preview_id
-            JOIN (
-              SELECT organization_id, product_id, MIN(product_name) AS product_name
-              FROM repository_mappings
-              WHERE enabled = 1
-              GROUP BY organization_id, product_id
-            ) AS mapping
-              ON mapping.organization_id = publication.organization_id
-             AND mapping.product_id = publication.product_id
+            JOIN decision_spaces AS space
+              ON space.organization_id = publication.organization_id
+             AND space.decision_space_id = publication.decision_space_id
+             AND space.enabled = 1
             WHERE publication.organization_id = ?
             ORDER BY publication.updated_at DESC, publication.publication_id DESC
             LIMIT 20
@@ -1132,10 +1245,10 @@ class CentralWebQueries:
               AND publication.state = 'completed'
               AND publication.updated_at >= ?
               AND EXISTS (
-                SELECT 1 FROM repository_mappings AS mapping
-                WHERE mapping.organization_id = publication.organization_id
-                  AND mapping.product_id = publication.product_id
-                  AND mapping.enabled = 1
+                SELECT 1 FROM decision_spaces AS space
+                WHERE space.organization_id = publication.organization_id
+                  AND space.decision_space_id = publication.decision_space_id
+                  AND space.enabled = 1
               )
             """,
             (
