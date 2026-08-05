@@ -707,15 +707,7 @@ class CentralWebStore:
             raise ValueError("publication limit is invalid")
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             raise ValueError("publication offset is invalid")
-        clauses = [
-            "publication.organization_id = ?",
-            """EXISTS (
-                SELECT 1 FROM decision_spaces AS space
-                WHERE space.organization_id = publication.organization_id
-                  AND space.decision_space_id = publication.decision_space_id
-                  AND space.enabled = 1
-            )""",
-        ]
+        clauses = ["publication.organization_id = ?"]
         values: list[object] = [organization]
         if decision_space_id is not None:
             clauses.append("publication.decision_space_id = ?")

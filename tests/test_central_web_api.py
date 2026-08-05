@@ -673,6 +673,98 @@ class CentralWebApiTest(unittest.TestCase):
             self.assertNotIn("product_id", payload)
             self.assertNotIn("product_name", payload)
 
+        self.store.replace_trusted_route_heads(
+            "org_demo",
+            REPOSITORY_ID,
+            (replace(route, enabled=False, configuration_version=2),),
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                """UPDATE decision_spaces SET enabled = 0
+                WHERE organization_id = 'org_demo'
+                  AND decision_space_id = ?""",
+                (space.decision_space_id,),
+            )
+
+        disabled_history = self.client.get(
+            f"/api/v1/web/spaces/{space.decision_space_id}/publications"
+        )
+        disabled_publication = self.client.get(
+            f"/api/v1/web/publications/{published.json()['publication_id']}"
+        )
+        all_history = self.client.get("/api/v1/web/publications")
+        disabled_candidate = self.client.get(
+            f"/api/v1/web/spaces/{space.decision_space_id}/candidates"
+        )
+        disabled_review = self.client.post(
+            f"/api/v1/web/spaces/{space.decision_space_id}/reviews",
+            json={
+                "client_action_id": "web_action_disabled-review",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        )
+
+        self.assertEqual(200, disabled_history.status_code, disabled_history.text)
+        self.assertEqual(1, disabled_history.json()["total"])
+        self.assertEqual(
+            expected_space, disabled_history.json()["items"][0]["space"]
+        )
+        self.assertEqual(
+            200, disabled_publication.status_code, disabled_publication.text
+        )
+        self.assertEqual(expected_space, disabled_publication.json()["space"])
+        self.assertEqual(200, all_history.status_code, all_history.text)
+        self.assertEqual(expected_space, all_history.json()["items"][0]["space"])
+        for payload in (
+            disabled_history.json()["items"][0],
+            disabled_publication.json(),
+            all_history.json()["items"][0],
+        ):
+            self.assertNotIn("product_id", payload)
+            self.assertNotIn("product_name", payload)
+        self.assertEqual(404, disabled_candidate.status_code)
+        self.assertEqual({"error": "not_found"}, disabled_candidate.json())
+        self.assertEqual(404, disabled_review.status_code)
+        self.assertEqual({"error": "not_found"}, disabled_review.json())
+
+    def test_disabled_leaf_rejects_preview_creation(self) -> None:
+        draft_response = self.client.put(
+            f"/api/v1/web/spaces/{PRODUCT_SPACE_ID}/review-draft",
+            json=self.draft_body(action="accept"),
+        )
+        self.assertEqual(200, draft_response.status_code, draft_response.text)
+        draft = draft_response.json()
+        review_response = self.client.post(
+            f"/api/v1/web/spaces/{PRODUCT_SPACE_ID}/reviews",
+            json={
+                "client_action_id": "web_action_before-disable",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        )
+        self.assertEqual(200, review_response.status_code, review_response.text)
+        review = review_response.json()
+        self.assertTrue(review["preview_eligible"])
+        with self.store.connection:
+            self.store.connection.execute(
+                """UPDATE decision_spaces SET enabled = 0
+                WHERE organization_id = 'org_demo'
+                  AND decision_space_id = ?""",
+                (PRODUCT_SPACE_ID,),
+            )
+
+        response = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json={"client_action_id": "web_action_after-disable"},
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            {"error": "no_accepted_items"},
+            response.json(),
+        )
+
     def test_decision_catalog_and_detail_are_complete_read_only_views(self) -> None:
         catalog = self.client.get(
             "/api/v1/web/decisions", params={"search": "explicit Review"}

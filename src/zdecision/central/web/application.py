@@ -239,6 +239,7 @@ class CentralWebApplication:
         principal: Principal,
         *,
         product_id: str | None,
+        decision_space_id: str | None,
         state: PublicHistoryState | None,
         limit: int,
         offset: int,
@@ -246,6 +247,7 @@ class CentralWebApplication:
         return self._publication_service().list(
             principal,
             product_id=product_id,
+            decision_space_id=decision_space_id,
             state=state,
             limit=limit,
             offset=offset,

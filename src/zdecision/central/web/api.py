@@ -368,6 +368,7 @@ async def publications(
     view = _application(request).list_publications(
         identity_provider.browser_principal(),
         product_id=product_id,
+        decision_space_id=None,
         state=state,
         limit=limit,
         offset=offset,
@@ -396,12 +397,10 @@ async def space_publications(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
     identity_provider = request.app.state.identity_provider
-    _application(request).require_canonical_leaf(
-        identity_provider.browser_principal(), decision_space_id
-    )
     return _application(request).list_publications(
         identity_provider.browser_principal(),
-        product_id=decision_space_id,
+        product_id=None,
+        decision_space_id=decision_space_id,
         state=state,
         limit=limit,
         offset=offset,

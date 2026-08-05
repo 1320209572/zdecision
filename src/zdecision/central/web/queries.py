@@ -505,32 +505,41 @@ class CentralWebQueries:
         self, principal: Principal, identifier: str
     ) -> DecisionSpaceRef | None:
         space = self.decision_space(principal, identifier)
-        if space is None and identifier.startswith("dsp_"):
-            self._require_user(principal)
-            row = self.connection.execute(
-                """SELECT * FROM decision_spaces
-                WHERE organization_id = ? AND decision_space_id = ?""",
-                (principal.organization_id, identifier),
-            ).fetchone()
-            if row is not None:
-                space = LeafDecisionSpace(
-                    decision_space_id=row["decision_space_id"],
-                    kind=row["kind"],
-                    display_name=row["display_name"],
-                    compatibility_product_id=row["compatibility_product_id"],
-                    compatibility_product_name=row[
-                        "compatibility_product_name"
-                    ],
-                    catalog_group_id=row["catalog_group_id"],
-                    catalog_breadcrumb=tuple(
-                        json.loads(row["catalog_breadcrumb_json"])
-                    ),
-                    source_root=row["source_root"],
-                    package_name=row["package_name"],
-                    asset_type=row["asset_type"],
-                    enabled=bool(row["enabled"]),
-                )
-        return self._space_ref(space) if space is not None else None
+        if space is not None:
+            return self._space_ref(space)
+        return self.historical_decision_space_ref(principal, identifier)
+
+    def historical_decision_space_ref(
+        self, principal: Principal, decision_space_id: str
+    ) -> DecisionSpaceRef | None:
+        """Resolve one exact canonical leaf, including disabled history."""
+
+        self._require_user(principal)
+        if not decision_space_id.startswith("dsp_"):
+            return None
+        row = self.connection.execute(
+            """SELECT * FROM decision_spaces
+            WHERE organization_id = ? AND decision_space_id = ?""",
+            (principal.organization_id, decision_space_id),
+        ).fetchone()
+        if row is None:
+            return None
+        space = LeafDecisionSpace(
+            decision_space_id=row["decision_space_id"],
+            kind=row["kind"],
+            display_name=row["display_name"],
+            compatibility_product_id=row["compatibility_product_id"],
+            compatibility_product_name=row["compatibility_product_name"],
+            catalog_group_id=row["catalog_group_id"],
+            catalog_breadcrumb=tuple(
+                json.loads(row["catalog_breadcrumb_json"])
+            ),
+            source_root=row["source_root"],
+            package_name=row["package_name"],
+            asset_type=row["asset_type"],
+            enabled=bool(row["enabled"]),
+        )
+        return self._space_ref(space)
 
     def catalog_group_exists(
         self, principal: Principal, catalog_group_id: str

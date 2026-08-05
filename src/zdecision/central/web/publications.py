@@ -295,7 +295,7 @@ class CentralPublicationService:
         )
         if publication is None:
             raise PublicationNotFound("not_found")
-        if self.previews.queries.decision_space(
+        if self.previews.queries.historical_decision_space_ref(
             principal, publication.decision_space_id
         ) is None:
             raise PublicationNotFound("not_found")
@@ -306,6 +306,7 @@ class CentralPublicationService:
         principal: Principal,
         *,
         product_id: str | None = None,
+        decision_space_id: str | None = None,
         state: PublicHistoryState | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -313,20 +314,31 @@ class CentralPublicationService:
         self._require_user(principal)
         if not 1 <= limit <= 100 or offset < 0:
             raise ValueError("publication pagination is invalid")
-        space = (
-            self.previews.queries.decision_space(principal, product_id)
-            if product_id is not None else None
-        )
-        if product_id is not None and (
-            space is None
-            or not self.previews.queries.decision_space_repositories(
-                principal, space.decision_space_id
+        if product_id is not None and decision_space_id is not None:
+            raise ValueError("publication scope is ambiguous")
+        scoped_decision_space_id: str | None = None
+        if decision_space_id is not None:
+            historical_space = (
+                self.previews.queries.historical_decision_space_ref(
+                    principal, decision_space_id
+                )
             )
-        ):
-            raise PublicationNotFound("not_found")
+            if historical_space is None:
+                raise PublicationNotFound("not_found")
+            scoped_decision_space_id = historical_space.decision_space_id
+        elif product_id is not None:
+            space = self.previews.queries.decision_space(principal, product_id)
+            if (
+                space is None
+                or not self.previews.queries.decision_space_repositories(
+                    principal, space.decision_space_id
+                )
+            ):
+                raise PublicationNotFound("not_found")
+            scoped_decision_space_id = space.decision_space_id
         publications, total = self.store.list_publications(
             principal.organization_id,
-            decision_space_id=(space.decision_space_id if space else None),
+            decision_space_id=scoped_decision_space_id,
             state=state,
             limit=limit,
             offset=offset,
@@ -334,13 +346,13 @@ class CentralPublicationService:
         visible = tuple(
             publication
             for publication in publications
-            if self.previews.queries.decision_space_repositories(
+            if self.previews.queries.historical_decision_space_ref(
                 principal, publication.decision_space_id
-            )
+            ) is not None
         )
         return PublicationHistory(
             tuple(self._view(principal, publication) for publication in visible),
-            len(visible) if product_id is None else total,
+            len(visible) if scoped_decision_space_id is None else total,
             limit,
             offset,
         )
@@ -483,7 +495,7 @@ class CentralPublicationService:
         self, principal: Principal, publication: CentralPublication
     ) -> PublicationView:
         preview = self._preview(publication)
-        space = self.previews.queries.decision_space_ref(
+        space = self.previews.queries.historical_decision_space_ref(
             principal, publication.decision_space_id
         )
         if space is None:
