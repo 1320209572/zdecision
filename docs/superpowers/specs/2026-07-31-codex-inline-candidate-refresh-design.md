@@ -75,7 +75,8 @@ Rendering the card is not Capture authorization and performs no model-based
 extraction. The user must still choose one of its two actions. If proactive
 rendering does not occur, the user may say **更新候选决策** in the same Codex
 task. The Skill first rejects delegated/cross-task input and checks registered,
-enabled, and active-Session status before it invokes the render tool.
+enabled repository status before it invokes the render tool. CWD-level Session
+ambiguity is diagnostic only; the render Hook owns exact Session/Turn proof.
 
 The Plugin does not render the card at Session start, after every Turn, or for
 non-code work in this slice. Duplicate render attempts are harmless and do not

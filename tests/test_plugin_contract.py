@@ -150,6 +150,9 @@ class PluginContractTests(unittest.TestCase):
             "`repository_registered`",
             "`repository_enabled`",
             "`active_session_bound`",
+            "Use only `repository_registered` and `repository_enabled` as the early gate",
+            "`active_session_bound` is diagnostic only",
+            "must not grant or deny presentation",
             "must not call any ZDecision tool",
             "<codex_delegation>",
             "send_message_to_thread",
@@ -168,6 +171,10 @@ class PluginContractTests(unittest.TestCase):
                 self.assertIn(required, text)
         self.assertNotIn(
             "render `show_zdecision_update` immediately",
+            text,
+        )
+        self.assertNotIn(
+            "`repository_enabled`, and `active_session_bound` are all exactly true",
             text,
         )
 

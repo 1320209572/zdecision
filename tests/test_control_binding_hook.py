@@ -254,6 +254,24 @@ class ControlBindingHookTests(unittest.TestCase):
         self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)
         self.assertIsNone(self.control_store.get(CONTROL_ID))
 
+    def test_cwd_ambiguity_does_not_block_the_exact_observed_turn(self) -> None:
+        self._observe_prompt(session_id="session_a", turn_id="turn_a")
+        self._observe_prompt(session_id="session_b", turn_id="turn_b")
+        self.assertIsNone(
+            self.database.latest_open_boundary(str(self.repository))
+        )
+
+        response = self._handle(self._raw())
+
+        self.assertEqual(
+            "allow",
+            response.output["hookSpecificOutput"]["permissionDecision"],
+        )
+        self.assertEqual(
+            CONTROL_ID,
+            response.output["hookSpecificOutput"]["updatedInput"]["control_id"],
+        )
+
     def test_wrong_or_superseded_turn_is_denied(self) -> None:
         self._observe_prompt(turn_id="turn_old")
         self.assertEqual(DENIED_OUTPUT, self._handle(self._raw()).output)

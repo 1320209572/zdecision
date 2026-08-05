@@ -535,11 +535,13 @@ identity locally, but neither kind of Hook runs a model or starts Capture.
 report do not independently start Capture.
 
 The inline card is presented only inside the same enabled-repository task. An
-exact native refresh phrase first passes repository and active-Session status
-gates; delegation, task steering, copied text, and an ineligible task render no
-card. The `PreToolUse` Hook then proves the exact already-observed Session,
-current Turn, and CWD or blocks the render tool. `所有有效 Session` performs
-read-only same-repository selection and never sends or steers a source task.
+exact native refresh phrase first passes registered-and-enabled repository
+status gates; delegation, task steering, copied text, and an ineligible task
+render no card. CWD-level Session ambiguity is diagnostic and cannot deny
+presentation. The `PreToolUse` Hook then proves the exact already-observed
+Session, current Turn, and CWD or blocks the render tool. `所有有效 Session`
+performs read-only same-repository selection and never sends or steers a source
+task.
 
 The user does not provide Session IDs, open a compression conversation, run a
 CLI command, or merge Session results. The page action selects every changed

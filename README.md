@@ -10,7 +10,8 @@ The implemented pre-Demo **Packet 1** is user-triggered:
    repositories.
 2. After a completed and verified code-development boundary, Codex renders an
    inline card once. The exact native same-task phrase **更新候选决策** is a
-   fallback only after repository and active-Session status gates pass.
+   fallback only after the registered-and-enabled repository status gate
+   passes; the render Hook then proves the exact current Session and Turn.
 3. The user clicks **当前 Session** or **所有有效 Session** on that card, or
    clicks **更新候选决策** for the repository on the central page.
 4. The local Agent selects the authorized changed Sessions, runs two-stage decision

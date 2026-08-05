@@ -40,13 +40,12 @@ request.
 ### 2. Eligibility is checked before presentation
 
 For an explicit native refresh phrase, the Skill first calls
-`zdecision_status`. It may call `show_zdecision_update` only when all three
-authoritative values are true:
+`zdecision_status`. It may call `show_zdecision_update` only when both
+repository values are true:
 
 ```text
 repository_registered
 repository_enabled
-active_session_bound
 ```
 
 Otherwise it returns a bounded unavailable result without rendering the card,
@@ -55,6 +54,11 @@ ID, filesystem path, repository identity, or detailed failure reason.
 
 This status check is only an early rejection filter. It cannot grant a control;
 the host-identity Hook check below remains authoritative.
+
+`active_session_bound` remains a bounded diagnostic field, but it is derived
+from CWD-level observations and has no host-owned current Session/Turn identity.
+It must not grant or deny presentation. Multiple idle or concurrent Sessions
+in one registered repository therefore cannot create a false rejection.
 
 The existing automatic presentation after a completed and verified code
 boundary remains restricted to an enabled repository and an active local
@@ -89,7 +93,7 @@ fork/turn path; source tasks remain untouched and may continue normally.
 ```text
 native user Turn in current task
   -> zdecision_status
-  -> registered + enabled + active binding?
+  -> registered + enabled?
        no  -> bounded unavailable response; no card
        yes -> show_zdecision_update
               -> PreToolUse revalidates host task + repository
@@ -123,8 +127,9 @@ does not alter the receiving task's goal.
 
 Automated tests must prove:
 
-1. the Skill rejects delegated/cross-task refresh triggers and requires the
-   three status gates before rendering;
+1. the Skill rejects delegated/cross-task refresh triggers, requires both
+   repository status gates, and treats CWD-level Session ambiguity as
+   diagnostic only;
 2. unresolved, unregistered, disabled, mismatched, ended, unobserved,
    wrong-Turn, and subagent Hook inputs are denied and create no control
    binding;
