@@ -204,6 +204,16 @@ class CentralWebStoreTest(unittest.TestCase):
             publication_candidate_id("cfm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         )
 
+    def test_candidate_web_association_can_reference_a_capture_group(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.store.connection.execute(
+                "PRAGMA table_info(web_candidate_revision_batches)"
+            ).fetchall()
+        }
+        self.assertIn("decision_space_id", columns)
+        self.assertIn("ownership_json", columns)
+
     def test_draft_compare_and_swap_survives_reopen(self) -> None:
         empty = self.web_store.get_draft("org_demo", "user_demo", PRODUCT_ID)
         saved = self.web_store.replace_draft(empty, (draft_item(),), NOW)

@@ -12,9 +12,20 @@ from zdecision.sync.contracts import (
     CandidateContent,
     CandidateRevisionUpload,
     CaptureRequestCreate,
+    CaptureGroupCreate,
     RepositoryView,
 )
-from zdecision.ids import candidate_family_id, candidate_revision_id
+from zdecision.central.decision_spaces import (
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
+from zdecision.ids import (
+    candidate_family_id,
+    candidate_revision_id,
+    decision_space_id,
+    repository_route_id,
+)
 from zdecision.jsonio import canonical_json_bytes
 
 try:
@@ -121,6 +132,40 @@ class CentralRequestServiceTest(unittest.TestCase):
                 enabled=True,
             ),
         )
+        self.store.put_repository(
+            "org_demo", EnabledRepository(REPOSITORY_ID, True)
+        )
+        space = LeafDecisionSpace(
+            decision_space_id=decision_space_id("product", PRODUCT_ID),
+            kind="product",
+            display_name="ZDecision",
+            compatibility_product_id=PRODUCT_ID,
+            compatibility_product_name="ZDecision",
+            catalog_group_id=None,
+            catalog_breadcrumb=(),
+            source_root=".",
+            package_name=None,
+            asset_type=None,
+            enabled=True,
+        )
+        self.store.put_decision_space("org_demo", space)
+        self.store.replace_trusted_route_heads(
+            "org_demo",
+            REPOSITORY_ID,
+            (
+                RepositoryDecisionRoute(
+                    route_id=repository_route_id(
+                        REPOSITORY_ID, space.decision_space_id
+                    ),
+                    repository_id=REPOSITORY_ID,
+                    decision_space_id=space.decision_space_id,
+                    path_prefixes=(".",),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=1,
+                ),
+            ),
+        )
         self.service = CaptureRequestService(self.store)
 
     def tearDown(self) -> None:
@@ -181,6 +226,36 @@ class CentralRequestServiceTest(unittest.TestCase):
             ("org_demo", "user_demo", PRODUCT_ID),
             (stored.organization_id, stored.actor_id, stored.product_id),
         )
+
+    def test_new_group_creation_never_writes_the_legacy_request_table(self) -> None:
+        self.store.put_repository(
+            "org_demo",
+            EnabledRepository(REPOSITORY_ID, True),
+        )
+        created = self.service.create_group(
+            USER,
+            CaptureGroupCreate(
+                repository_id=REPOSITORY_ID,
+                template_id="business",
+                capture_scope="all_valid_sessions",
+                client_action_id="web_action_group_only",
+            ),
+            NOW,
+        )
+
+        self.assertEqual(
+            (1, 0),
+            (
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM capture_groups WHERE request_id = ?",
+                    (created.request_id,),
+                ).fetchone()[0],
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM capture_requests WHERE request_id = ?",
+                    (created.request_id,),
+                ).fetchone()[0],
+            ),
+        )
         self.assertEqual("queued", created.state)
         self.assertEqual(1, created.last_sequence)
         self.assertEqual(
@@ -192,6 +267,9 @@ class CentralRequestServiceTest(unittest.TestCase):
         )
 
     def test_disabled_or_cross_organization_repository_is_rejected(self) -> None:
+        self.store.put_repository(
+            "org_demo", EnabledRepository(REPOSITORY_ID, False)
+        )
         self.store.put_repository_mapping(
             "org_demo",
             RepositoryView(
@@ -238,7 +316,7 @@ class CentralRequestServiceTest(unittest.TestCase):
         with self.assertRaisesRegex(RequestConflict, "repository_capture_busy"):
             self.create("web_action_002")
         action_count = self.store.connection.execute(
-            "SELECT COUNT(*) FROM capture_request_actions"
+            "SELECT COUNT(*) FROM capture_group_actions"
         ).fetchone()[0]
         self.assertEqual(1, action_count)
         for changed in (

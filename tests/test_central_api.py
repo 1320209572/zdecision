@@ -25,6 +25,7 @@ from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
     CaptureRequestView,
+    RouteSelection,
     CandidateRevisionUpload,
     RepositoryView,
 )
@@ -287,6 +288,40 @@ class CentralApiTest(unittest.TestCase):
             [item["sequence"] for item in response.json()["events"]],
         )
 
+    def test_public_update_uses_group_slice_endpoints_only(self) -> None:
+        request_id = self.create_request("web_action_group_api")
+        claimed = self.client.post(
+            "/api/v1/agent/capture-requests/claim",
+            headers=self.authorization,
+            json={},
+        ).json()
+        route = claimed["route_snapshot"][0]
+        selection = RouteSelection(
+            route_id=route["route_id"],
+            configuration_version=route["configuration_version"],
+            matched_path_digest="1" * 64,
+            source_boundary_digest="2" * 64,
+        )
+
+        planned = self.client.post(
+            f"/api/v1/agent/capture-requests/{request_id}/slices",
+            headers=self.authorization,
+            json={
+                "lease_token": claimed["lease_token"],
+                "selections": [selection.to_dict()],
+            },
+        )
+
+        self.assertEqual(200, planned.status_code, planned.text)
+        self.assertEqual(1, len(planned.json()["slices"]))
+        self.assertEqual(
+            0,
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM capture_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()[0],
+        )
+
     def test_device_endpoint_requires_configured_bearer_token(self) -> None:
         missing = self.client.post(
             "/api/v1/agent/capture-requests/claim", json={}
@@ -317,7 +352,11 @@ class CentralApiTest(unittest.TestCase):
         self.assertEqual(200, response.status_code, response.text)
         request_id = response.json()["request_id"]
         self.assertEqual(
-            "user_demo", self.store.get_request_record(request_id).actor_id
+            "user_demo",
+            self.store.connection.execute(
+                "SELECT actor_id FROM capture_groups WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()["actor_id"],
         )
 
         for headers in ({}, {"Authorization": "Bearer wrong-token"}):

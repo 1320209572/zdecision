@@ -51,7 +51,9 @@ from zdecision.central.web.publications import (
 from zdecision.sync.contracts import (
     CAPTURE_REQUEST_LEASE_SECONDS,
     CandidateBatchUpload,
-    CaptureRequestCreate,
+    CandidateSliceBatchUpload,
+    CaptureGroupCreate,
+    RouteSelection,
 )
 
 
@@ -79,10 +81,19 @@ class _ProgressBody(_LeaseBody):
 
 
 class _CompleteBody(_LeaseBody):
-    batch_digest: str = Field(min_length=64, max_length=64)
+    batch_digest: str | None = Field(default=None, min_length=64, max_length=64)
+    receipt_digest: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class _CandidateBatchBody(_LeaseBody):
+    batch: dict[str, object]
+
+
+class _SlicePlanBody(_LeaseBody):
+    selections: list[dict[str, object]]
+
+
+class _SliceBatchBody(_LeaseBody):
     batch: dict[str, object]
 
 
@@ -314,31 +325,32 @@ def create_app(
     async def create_capture_request(
         body: _CaptureRequestBody,
     ) -> dict[str, object]:
-        command = CaptureRequestCreate.from_dict(body.model_dump())
-        result = service.create_request(browser(), command, current_time())
-        return {**result.to_dict(), "capture_scope": command.capture_scope}
+        command = CaptureGroupCreate.from_dict(body.model_dump())
+        result = service.create_group(browser(), command, current_time())
+        compatible = service.group_request_view(browser(), result.request_id)
+        return {**compatible.to_dict(), "capture_scope": command.capture_scope}
 
     @app.get("/api/v1/capture-requests/{request_id}")
     async def get_capture_request(request_id: str) -> dict[str, object]:
-        return service.get_request(browser(), request_id).to_dict()
+        return service.group_request_view(browser(), request_id).to_dict()
 
     @app.post("/api/v1/plugin/capture-requests")
     async def create_plugin_capture_request(
         body: _CaptureRequestBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        command = CaptureRequestCreate.from_dict(body.model_dump())
-        result = service.create_request(
+        command = CaptureGroupCreate.from_dict(body.model_dump())
+        result = service.create_group(
             plugin(authorization), command, current_time()
         )
-        return result.to_dict()
+        return service.group_request_view(plugin(authorization), result.request_id).to_dict()
 
     @app.get("/api/v1/plugin/capture-requests/{request_id}")
     async def get_plugin_capture_request(
         request_id: str,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        return service.get_request(plugin(authorization), request_id).to_dict()
+        return service.group_request_view(plugin(authorization), request_id).to_dict()
 
     @app.get("/api/v1/capture-requests/{request_id}/events")
     async def capture_request_events(
@@ -348,7 +360,7 @@ def create_app(
         return {
             "events": [
                 item.to_dict()
-                for item in service.events_after(
+                for item in service.group_events_after(
                     browser(), request_id, after_sequence
                 )
             ]
@@ -359,7 +371,7 @@ def create_app(
         body: _EmptyBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> Response:
-        claimed = service.claim_next(
+        claimed = service.claim_next_group(
             device(authorization),
             current_time(),
             lease_seconds=CAPTURE_REQUEST_LEASE_SECONDS,
@@ -374,7 +386,7 @@ def create_app(
         body: _LeaseBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        return service.start(
+        return service.start_group(
             device(authorization),
             request_id,
             body.lease_token,
@@ -387,7 +399,7 @@ def create_app(
         body: _LeaseBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> Response:
-        service.heartbeat(
+        service.heartbeat_group(
             device(authorization),
             request_id,
             body.lease_token,
@@ -402,7 +414,7 @@ def create_app(
         body: _ProgressBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        return service.record_progress(
+        return service.record_group_progress(
             device(authorization),
             request_id,
             body.lease_token,
@@ -421,11 +433,45 @@ def create_app(
         batch = CandidateBatchUpload.from_dict(body.batch)
         if batch.request_id != request_id:
             raise ValueError("Candidate batch request conflicts")
-        return service.accept_candidate_batch(
-            device(authorization),
-            body.lease_token,
-            batch,
-            current_time(),
+        receipt = service.accept_legacy_root_batch(
+            device(authorization), body.lease_token, batch, current_time()
+        )
+        return {
+            "request_id": receipt.request_id,
+            "batch_digest": batch.batch_digest,
+            "acknowledged_at": current_time().astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        }
+
+    @app.post("/api/v1/agent/capture-requests/{request_id}/slices")
+    async def plan_capture_slices(
+        request_id: str,
+        body: _SlicePlanBody,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        selections = tuple(RouteSelection.from_dict(item) for item in body.selections)
+        return {
+            "slices": [
+                item.to_dict()
+                for item in service.plan_slices(
+                    device(authorization), request_id, body.lease_token,
+                    selections, current_time()
+                )
+            ]
+        }
+
+    @app.put(
+        "/api/v1/agent/capture-requests/{request_id}/slices/{slice_id}/batch"
+    )
+    async def accept_capture_slice_batch(
+        request_id: str,
+        slice_id: str,
+        body: _SliceBatchBody,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        batch = CandidateSliceBatchUpload.from_dict(body.batch)
+        return service.accept_slice_batch(
+            device(authorization), request_id, slice_id, body.lease_token,
+            batch, current_time()
         ).to_dict()
 
     @app.post("/api/v1/agent/capture-requests/{request_id}/complete")
@@ -434,13 +480,19 @@ def create_app(
         body: _CompleteBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        return service.complete(
-            device(authorization),
-            request_id,
-            body.lease_token,
-            body.batch_digest,
-            current_time(),
-        ).to_dict()
+        if (body.batch_digest is None) == (body.receipt_digest is None):
+            raise ValueError("exactly one completion digest is required")
+        if body.receipt_digest is not None:
+            result = service.complete_group(
+                device(authorization), request_id, body.lease_token,
+                body.receipt_digest, current_time()
+            )
+        else:
+            result = service.complete_legacy_root_group(
+                device(authorization), request_id, body.lease_token,
+                body.batch_digest, current_time()
+            )
+        return service.group_request_view(browser(), result.request_id).to_dict()
 
     @app.post("/api/v1/agent/capture-requests/{request_id}/fail")
     async def fail_capture_request(
@@ -448,14 +500,15 @@ def create_app(
         body: _FailBody,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        return service.fail(
+        result = service.fail_group(
             device(authorization),
             request_id,
             body.lease_token,
             body.code,
             body.retryable,
             current_time(),
-        ).to_dict()
+        )
+        return service.group_request_view(browser(), result.request_id).to_dict()
 
     if web_application is not None:
 

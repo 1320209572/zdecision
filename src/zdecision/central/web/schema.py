@@ -28,9 +28,10 @@ CREATE TABLE IF NOT EXISTS web_candidate_revision_batches (
   family_id TEXT NOT NULL,
   revision_id TEXT NOT NULL,
   request_id TEXT NOT NULL,
+  decision_space_id TEXT,
+  ownership_json TEXT,
   observed_at TEXT NOT NULL,
-  PRIMARY KEY(organization_id, repository_id, family_id, revision_id, request_id),
-  FOREIGN KEY(request_id) REFERENCES capture_requests(request_id)
+  PRIMARY KEY(organization_id, repository_id, family_id, revision_id, request_id)
 );
 
 CREATE TABLE IF NOT EXISTS web_review_batches (
@@ -175,8 +176,68 @@ def initialize_web_schema(connection: sqlite3.Connection) -> None:
     """Create Web tables and recover their immutable Candidate associations."""
 
     connection.executescript(WEB_SCHEMA)
+    _ensure_candidate_ownership_columns(connection)
     _ensure_review_submission_order(connection)
     _backfill_candidate_revision_batches(connection)
+
+
+def _ensure_candidate_ownership_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(web_candidate_revision_batches)"
+        ).fetchall()
+    }
+    foreign_keys = connection.execute(
+        "PRAGMA foreign_key_list(web_candidate_revision_batches)"
+    ).fetchall()
+    if any(row["table"] == "capture_requests" for row in foreign_keys):
+        decision_projection = (
+            "decision_space_id" if "decision_space_id" in columns else "NULL"
+        )
+        ownership_projection = (
+            "ownership_json" if "ownership_json" in columns else "NULL"
+        )
+        connection.executescript(
+            f"""
+            CREATE TABLE web_candidate_revision_batches_v2 (
+              organization_id TEXT NOT NULL,
+              repository_id TEXT NOT NULL,
+              family_id TEXT NOT NULL,
+              revision_id TEXT NOT NULL,
+              request_id TEXT NOT NULL,
+              decision_space_id TEXT,
+              ownership_json TEXT,
+              observed_at TEXT NOT NULL,
+              PRIMARY KEY(
+                organization_id, repository_id, family_id, revision_id, request_id
+              )
+            );
+            INSERT INTO web_candidate_revision_batches_v2(
+              organization_id, repository_id, family_id, revision_id,
+              request_id, decision_space_id, ownership_json, observed_at
+            )
+            SELECT organization_id, repository_id, family_id, revision_id,
+              request_id, {decision_projection}, {ownership_projection}, observed_at
+            FROM web_candidate_revision_batches;
+            DROP TABLE web_candidate_revision_batches;
+            ALTER TABLE web_candidate_revision_batches_v2
+              RENAME TO web_candidate_revision_batches;
+            CREATE INDEX IF NOT EXISTS web_candidate_revision_batches_filter
+            ON web_candidate_revision_batches(
+              organization_id, request_id, revision_id
+            );
+            """
+        )
+        columns = {"organization_id", "repository_id", "family_id", "revision_id", "request_id", "decision_space_id", "ownership_json", "observed_at"}
+    if "decision_space_id" not in columns:
+        connection.execute(
+            "ALTER TABLE web_candidate_revision_batches ADD COLUMN decision_space_id TEXT"
+        )
+    if "ownership_json" not in columns:
+        connection.execute(
+            "ALTER TABLE web_candidate_revision_batches ADD COLUMN ownership_json TEXT"
+        )
 
 
 def _ensure_review_submission_order(connection: sqlite3.Connection) -> None:
@@ -234,15 +295,20 @@ def record_candidate_revision_batch(
     request_id: str,
     revision: object,
     observed_at: str,
+    ownership: object | None = None,
 ) -> None:
     """Bind one accepted immutable revision to its Capture request."""
 
     connection.execute(
         """
-        INSERT OR IGNORE INTO web_candidate_revision_batches(
+        INSERT INTO web_candidate_revision_batches(
             organization_id, repository_id, family_id, revision_id,
-            request_id, observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            request_id, decision_space_id, ownership_json, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(organization_id, repository_id, family_id, revision_id, request_id)
+        DO UPDATE SET
+            decision_space_id = COALESCE(excluded.decision_space_id, decision_space_id),
+            ownership_json = COALESCE(excluded.ownership_json, ownership_json)
         """,
         (
             organization_id,
@@ -250,6 +316,8 @@ def record_candidate_revision_batch(
             revision.family_id,
             revision.revision_id,
             request_id,
+            None if ownership is None else ownership.decision_space_id,
+            None if ownership is None else canonical_json_bytes(ownership.to_dict()).decode("utf-8"),
             observed_at,
         ),
     )

@@ -26,6 +26,7 @@ _PRODUCT_ID = re.compile(r"^prod_[0-9a-f]{32}$")
 _DECISION_SPACE_ID = re.compile(r"^dsp_[0-9a-f]{32}$")
 _CATALOG_GROUP_ID = re.compile(r"^dsg_[0-9a-f]{32}$")
 _REPOSITORY_ROUTE_ID = re.compile(r"^drr_[0-9a-f]{32}$")
+_CAPTURE_REQUEST_ID = re.compile(r"^crq_[0-9a-f]{32}$")
 _REVIEW_BATCH_ID = re.compile(r"^rvb_[0-9a-f]{32}$")
 _DECISION_ID = re.compile(r"^dec_[0-9a-f]{32}$")
 _REVIEW_ID = re.compile(r"^rvi_[0-9a-f]{32}$")
@@ -185,6 +186,34 @@ def capture_request_id(
             "template_id": template,
         },
     )
+
+
+def capture_slice_id(
+    request_id: str,
+    route_id: str,
+    configuration_version: int,
+) -> str:
+    """Return the deterministic identity for one frozen Capture leaf slice."""
+
+    if not isinstance(request_id, str) or _CAPTURE_REQUEST_ID.fullmatch(
+        request_id
+    ) is None:
+        raise ValueError("request_id is invalid")
+    if not isinstance(route_id, str) or _REPOSITORY_ROUTE_ID.fullmatch(
+        route_id
+    ) is None:
+        raise ValueError("route_id is invalid")
+    if (
+        not isinstance(configuration_version, int)
+        or isinstance(configuration_version, bool)
+        or configuration_version < 1
+    ):
+        raise ValueError("configuration_version is invalid")
+    return _stable_id("csl", {
+        "request_id": request_id,
+        "route_id": route_id,
+        "configuration_version": configuration_version,
+    })
 
 
 def candidate_family_id(

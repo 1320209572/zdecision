@@ -20,6 +20,7 @@ from zdecision.central.web.schema import initialize_web_schema
 from zdecision.ids import capture_request_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import RepositoryView
+from zdecision.sync.contracts import CandidateOwnershipSnapshot
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,90 @@ class CentralStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS capture_groups (
+                    request_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    template_id TEXT NOT NULL,
+                    capture_scope TEXT NOT NULL,
+                    client_action_id TEXT NOT NULL,
+                    route_snapshot_json TEXT NOT NULL,
+                    route_snapshot_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    claimed_device_id TEXT,
+                    lease_token_digest TEXT,
+                    lease_expires_at TEXT,
+                    retry_at TEXT,
+                    result_receipt_digest TEXT,
+                    result_candidate_count INTEGER,
+                    last_sequence INTEGER NOT NULL,
+                    terminal_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS capture_group_actions (
+                    organization_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    client_action_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL REFERENCES capture_groups(request_id),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(organization_id, actor_id, client_action_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS capture_group_events (
+                    request_id TEXT NOT NULL REFERENCES capture_groups(request_id),
+                    sequence INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    PRIMARY KEY(request_id, sequence)
+                );
+
+                CREATE TABLE IF NOT EXISTS capture_slices (
+                    request_id TEXT NOT NULL REFERENCES capture_groups(request_id),
+                    slice_id TEXT NOT NULL,
+                    slice_order INTEGER NOT NULL,
+                    route_id TEXT NOT NULL,
+                    route_configuration_version INTEGER NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    ownership_json TEXT NOT NULL,
+                    ownership_digest TEXT NOT NULL,
+                    matched_path_digest TEXT NOT NULL,
+                    source_boundary_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    batch_json TEXT,
+                    batch_record_digest TEXT,
+                    receipt_json TEXT,
+                    receipt_digest TEXT,
+                    PRIMARY KEY(request_id, slice_id),
+                    UNIQUE(request_id, route_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_revision_ownership (
+                    organization_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    decision_space_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    route_configuration_version INTEGER NOT NULL,
+                    ownership_json TEXT NOT NULL,
+                    ownership_digest TEXT NOT NULL,
+                    PRIMARY KEY(organization_id, repository_id, family_id, revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_family_archives (
+                    organization_id TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    family_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    archived_at TEXT NOT NULL,
+                    PRIMARY KEY(organization_id, repository_id, family_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS capture_request_actions (
                     organization_id TEXT NOT NULL,
                     actor_id TEXT NOT NULL,
@@ -219,11 +304,13 @@ class CentralStore:
                 CREATE TABLE IF NOT EXISTS candidate_family_heads (
                     organization_id TEXT NOT NULL,
                     repository_id TEXT NOT NULL,
+                    decision_space_id TEXT NOT NULL DEFAULT 'legacy_unassigned',
                     family_id TEXT NOT NULL,
                     revision INTEGER NOT NULL CHECK(revision > 0),
                     revision_id TEXT NOT NULL,
                     PRIMARY KEY(
-                        organization_id, repository_id, family_id
+                        organization_id, repository_id, decision_space_id,
+                        family_id
                     )
                 );
 
@@ -242,9 +329,20 @@ class CentralStore:
                 ON capture_requests(
                     organization_id, state, retry_at, created_at, request_id
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    one_active_capture_group_per_repository
+                ON capture_groups(organization_id, repository_id)
+                WHERE state IN ('queued','claimed','running','failed_retryable');
+
+                CREATE INDEX IF NOT EXISTS capture_groups_claim_order
+                ON capture_groups(
+                    organization_id, state, retry_at, created_at, request_id
+                );
                 """
             )
             _migrate_capture_requests(connection)
+            _migrate_candidate_family_heads(connection)
             initialize_web_schema(connection)
         return cls(database_path, connection)
 
@@ -503,6 +601,48 @@ class CentralStore:
             tuple(sorted(routes, key=lambda item: item.route_id)), shared_tree,
         )
 
+    def list_enabled_routes(
+        self, organization_id: str, repository_id: str
+    ) -> tuple[RepositoryDecisionRoute, ...]:
+        """Return the validated current leaf route heads for a repository."""
+
+        return self.repository_catalog(organization_id, repository_id).routes
+
+    def decision_space(
+        self, organization_id: str, decision_space_id: str
+    ) -> LeafDecisionSpace:
+        organization = require_id(organization_id, "organization_id")
+        row = self.connection.execute(
+            """SELECT * FROM decision_spaces
+            WHERE organization_id = ? AND decision_space_id = ?""",
+            (organization, decision_space_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("decision_space_not_found")
+        return _space_from_row(row)
+
+    def candidate_ownership(
+        self,
+        organization_id: str,
+        repository_id: str,
+        family_id: str,
+        revision: int,
+    ) -> CandidateOwnershipSnapshot:
+        organization = require_id(organization_id, "organization_id")
+        row = self.connection.execute(
+            """SELECT ownership_json, ownership_digest
+            FROM candidate_revision_ownership
+            WHERE organization_id = ? AND repository_id = ?
+              AND family_id = ? AND revision = ?""",
+            (organization, repository_id, family_id, revision),
+        ).fetchone()
+        if row is None:
+            raise ValueError("candidate_ownership_not_found")
+        payload = row["ownership_json"]
+        if hashlib.sha256(payload.encode("utf-8")).hexdigest() != row["ownership_digest"]:
+            raise ValueError("candidate_ownership_corrupt")
+        return CandidateOwnershipSnapshot.from_dict(json.loads(payload))
+
     def _validate_route_target(
         self, organization: str, route: RepositoryDecisionRoute
     ) -> None:
@@ -594,9 +734,42 @@ class CentralStore:
             "SELECT * FROM capture_requests WHERE request_id = ?",
             (request_id,),
         ).fetchone()
-        if row is None:
+        if row is not None:
+            return request_record_from_row(row)
+        group = self.connection.execute(
+            "SELECT * FROM capture_groups WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if group is None:
             return None
-        return request_record_from_row(row)
+        mapping = self.connection.execute(
+            """SELECT product_id, product_name FROM repository_mappings
+            WHERE organization_id = ? AND repository_id = ?""",
+            (group["organization_id"], group["repository_id"]),
+        ).fetchone()
+        return CaptureRequestRecord(
+            request_id=group["request_id"],
+            organization_id=group["organization_id"],
+            actor_id=group["actor_id"],
+            repository_id=group["repository_id"],
+            product_id=mapping["product_id"],
+            product_name=mapping["product_name"],
+            template_id=group["template_id"],
+            capture_scope=group["capture_scope"],
+            client_action_id=group["client_action_id"],
+            state=group["state"],
+            attempt_count=group["attempt_count"],
+            claimed_device_id=group["claimed_device_id"],
+            lease_token_digest=group["lease_token_digest"],
+            lease_expires_at=group["lease_expires_at"],
+            retry_at=group["retry_at"],
+            result_batch_digest=group["result_receipt_digest"],
+            result_candidate_count=group["result_candidate_count"],
+            terminal_code=group["terminal_code"],
+            last_sequence=group["last_sequence"],
+            created_at=group["created_at"],
+            updated_at=group["updated_at"],
+        )
 
 
 def request_record_from_row(row: sqlite3.Row) -> CaptureRequestRecord:
@@ -818,3 +991,35 @@ def _migrate_capture_requests(connection: sqlite3.Connection) -> None:
             WHERE state IN ('succeeded', 'succeeded_no_candidates')
             """
         )
+
+
+def _migrate_candidate_family_heads(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(candidate_family_heads)"
+        ).fetchall()
+    }
+    if "decision_space_id" in columns:
+        return
+    connection.executescript(
+        """
+        ALTER TABLE candidate_family_heads RENAME TO legacy_candidate_family_heads;
+        CREATE TABLE candidate_family_heads (
+            organization_id TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            decision_space_id TEXT NOT NULL DEFAULT 'legacy_unassigned',
+            family_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            revision_id TEXT NOT NULL,
+            PRIMARY KEY(
+                organization_id, repository_id, decision_space_id, family_id
+            )
+        );
+        INSERT INTO candidate_family_heads(
+            organization_id, repository_id, family_id, revision, revision_id
+        ) SELECT organization_id, repository_id, family_id, revision, revision_id
+          FROM legacy_candidate_family_heads;
+        DROP TABLE legacy_candidate_family_heads;
+        """
+    )
