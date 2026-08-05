@@ -19,6 +19,7 @@ from zdecision.central.web.contracts import (
     CentralReviewItem,
     DraftItem,
     ReviewDraft,
+    ReviewSubmissionSnapshot,
 )
 from zdecision.central.web.store import (
     CentralWebStore,
@@ -241,45 +242,136 @@ class CentralWebStoreTest(unittest.TestCase):
             self.assertIn("decision_space_id", columns, table)
             self.assertNotIn("product_id", columns, table)
 
-    def test_legacy_product_owned_draft_migrates_to_leaf_owner(self) -> None:
+    def test_legacy_publication_history_migrates_with_foreign_keys_enabled(
+        self,
+    ) -> None:
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.executescript(
             """
             CREATE TABLE decision_spaces (
               organization_id TEXT NOT NULL,
               decision_space_id TEXT NOT NULL,
-              compatibility_product_id TEXT NOT NULL
+              compatibility_product_id TEXT NOT NULL,
+              PRIMARY KEY(organization_id, decision_space_id)
             );
             CREATE TABLE web_review_drafts (
-              organization_id TEXT, actor_id TEXT, product_id TEXT,
-              version INTEGER, record_json TEXT, record_digest TEXT,
-              updated_at TEXT
+              organization_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              record_json TEXT NOT NULL,
+              record_digest TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(organization_id, actor_id, product_id)
             );
             CREATE TABLE web_review_batches (
-              organization_id TEXT, product_id TEXT, record_json TEXT,
-              record_digest TEXT
+              organization_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              review_batch_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              client_action_id TEXT NOT NULL,
+              request_digest TEXT NOT NULL,
+              record_json TEXT NOT NULL,
+              record_digest TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              submission_order INTEGER NOT NULL,
+              PRIMARY KEY(organization_id, product_id, review_batch_id)
             );
             CREATE TABLE web_review_items (
-              organization_id TEXT, product_id TEXT
+              organization_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              review_batch_id TEXT NOT NULL,
+              item_order INTEGER NOT NULL,
+              review_id TEXT NOT NULL,
+              family_id TEXT NOT NULL,
+              publication_candidate_id TEXT NOT NULL,
+              repository_id TEXT NOT NULL,
+              revision_id TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              content_digest TEXT NOT NULL,
+              action TEXT NOT NULL,
+              effective_content_json TEXT,
+              effective_content_digest TEXT,
+              note TEXT,
+              PRIMARY KEY(
+                organization_id, product_id, review_batch_id, item_order
+              ),
+              FOREIGN KEY(organization_id, product_id, review_batch_id)
+                REFERENCES web_review_batches(
+                  organization_id, product_id, review_batch_id
+                )
             );
             CREATE TABLE web_review_submission_results (
-              organization_id TEXT, product_id TEXT, record_json TEXT,
-              record_digest TEXT
+              organization_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              review_batch_id TEXT NOT NULL,
+              record_json TEXT NOT NULL,
+              record_digest TEXT NOT NULL,
+              PRIMARY KEY(organization_id, actor_id, review_batch_id),
+              FOREIGN KEY(organization_id, product_id, review_batch_id)
+                REFERENCES web_review_batches(
+                  organization_id, product_id, review_batch_id
+                )
             );
             CREATE TABLE web_publication_previews (
-              organization_id TEXT, product_id TEXT, record_json TEXT
+              organization_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              preview_id TEXT NOT NULL,
+              review_batch_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              record_json TEXT NOT NULL,
+              record_digest TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(organization_id, product_id, preview_id),
+              FOREIGN KEY(organization_id, product_id, review_batch_id)
+                REFERENCES web_review_batches(
+                  organization_id, product_id, review_batch_id
+                )
             );
             CREATE TABLE web_publications (
-              organization_id TEXT, product_id TEXT, preview_id TEXT,
-              record_json TEXT, record_digest TEXT
+              organization_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              publication_id TEXT NOT NULL,
+              preview_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              recovery_code TEXT,
+              commit_sha TEXT,
+              record_json TEXT NOT NULL,
+              record_digest TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(organization_id, product_id, publication_id),
+              FOREIGN KEY(organization_id, product_id, preview_id)
+                REFERENCES web_publication_previews(
+                  organization_id, product_id, preview_id
+                )
             );
             CREATE TABLE web_publication_families (
-              organization_id TEXT, product_id TEXT
+              organization_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              family_id TEXT NOT NULL,
+              publication_id TEXT NOT NULL,
+              PRIMARY KEY(organization_id, product_id, family_id),
+              FOREIGN KEY(organization_id, product_id, publication_id)
+                REFERENCES web_publications(
+                  organization_id, product_id, publication_id
+                )
             );
             CREATE TABLE web_candidate_receipts (
-              organization_id TEXT, product_id TEXT, preview_id TEXT
+              organization_id TEXT NOT NULL,
+              product_id TEXT NOT NULL,
+              family_id TEXT NOT NULL,
+              publication_candidate_id TEXT NOT NULL,
+              decision_id TEXT NOT NULL,
+              preview_id TEXT NOT NULL,
+              commit_sha TEXT NOT NULL,
+              recorded_at TEXT NOT NULL,
+              PRIMARY KEY(organization_id, product_id, family_id)
             );
             """
         )
@@ -287,47 +379,224 @@ class CentralWebStoreTest(unittest.TestCase):
             "INSERT INTO decision_spaces VALUES (?, ?, ?)",
             ("org_demo", DECISION_SPACE_ID, PRODUCT_ID),
         )
-        legacy = {
-            "organization_id": "org_demo",
-            "actor_id": "user_demo",
-            "product_id": PRODUCT_ID,
-            "version": 0,
-            "items": [],
-            "updated_at": None,
-        }
-        encoded = canonical_json_bytes(legacy)
+        batch = self.review_batch()
+        preview = self.preview(batch)
+        publication = CentralPublication(
+            publication_id=central_publication_id(preview.preview_id),
+            organization_id="org_demo",
+            actor_id="user_demo",
+            decision_space_id=DECISION_SPACE_ID,
+            compatibility_product_id=PRODUCT_ID,
+            preview_id=preview.preview_id,
+            confirm_action_id="web_action_publish-migration",
+            confirm_request_digest="f" * 64,
+            state="completed",
+            approval=ApprovalRef(
+                "user", "web_publication",
+                "web_action_publish-migration", NOW,
+            ),
+            commit_sha="1" * 40,
+            recovery_code=None,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        draft = ReviewDraft(
+            "org_demo", "user_demo", DECISION_SPACE_ID, 1,
+            (draft_item(),), NOW,
+        )
+        snapshot = ReviewSubmissionSnapshot(
+            "org_demo", "user_demo", DECISION_SPACE_ID,
+            batch.review_batch_id, True, (), 2,
+        )
+
+        def legacy_record(value: object, kind: str) -> tuple[str, str]:
+            raw = value.to_dict()
+            if kind == "batch":
+                raw = {
+                    **{
+                        key: member
+                        for key, member in raw.items()
+                        if key not in (
+                            "decision_space_id",
+                            "compatibility_product_id",
+                            "compatibility_product_name",
+                        )
+                    },
+                    "product_id": PRODUCT_ID,
+                    "product_name": "ZDecision",
+                }
+            elif kind == "publication":
+                raw = {
+                    **{
+                        key: member
+                        for key, member in raw.items()
+                        if key not in (
+                            "decision_space_id",
+                            "compatibility_product_id",
+                        )
+                    },
+                    "product_id": PRODUCT_ID,
+                }
+            else:
+                raw = {
+                    **{
+                        key: member
+                        for key, member in raw.items()
+                        if key != "decision_space_id"
+                    },
+                    "product_id": PRODUCT_ID,
+                }
+            encoded = canonical_json_bytes(raw)
+            return (
+                encoded.decode("utf-8"),
+                hashlib.sha256(encoded).hexdigest(),
+            )
+
+        draft_json, draft_digest = legacy_record(draft, "draft")
         connection.execute(
-            "INSERT INTO web_review_drafts VALUES (?, ?, ?, 0, ?, ?, ?)",
+            "INSERT INTO web_review_drafts VALUES (?, ?, ?, 1, ?, ?, ?)",
             (
                 "org_demo",
                 "user_demo",
                 PRODUCT_ID,
-                encoded.decode("utf-8"),
-                hashlib.sha256(encoded).hexdigest(),
+                draft_json,
+                draft_digest,
                 NOW,
             ),
         )
+        batch_json, batch_digest = legacy_record(batch, "batch")
+        connection.execute(
+            """INSERT INTO web_review_batches
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+            (
+                "org_demo", PRODUCT_ID, batch.review_batch_id,
+                "user_demo", batch.client_action_id, batch.request_digest,
+                batch_json, batch_digest, NOW,
+            ),
+        )
+        item = batch.items[0]
+        content_json = canonical_json_bytes(
+            item.effective_content.to_dict()
+        )
+        connection.execute(
+            """INSERT INTO web_review_items
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "org_demo", PRODUCT_ID, batch.review_batch_id,
+                item.review_id, item.family_id,
+                item.publication_candidate_id, item.repository_id,
+                item.revision_id, item.revision, item.content_digest,
+                item.action, content_json.decode("utf-8"),
+                hashlib.sha256(content_json).hexdigest(), item.note,
+            ),
+        )
+        snapshot_json, snapshot_digest = legacy_record(snapshot, "snapshot")
+        connection.execute(
+            """INSERT INTO web_review_submission_results
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                "org_demo", "user_demo", PRODUCT_ID,
+                batch.review_batch_id, snapshot_json, snapshot_digest,
+            ),
+        )
+        preview_json = canonical_json_bytes(preview.to_dict())
+        connection.execute(
+            """INSERT INTO web_publication_previews
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "org_demo", PRODUCT_ID, preview.preview_id,
+                batch.review_batch_id, "user_demo",
+                preview_json.decode("utf-8"),
+                hashlib.sha256(preview_json).hexdigest(), NOW,
+            ),
+        )
+        publication_json, publication_digest = legacy_record(
+            publication, "publication"
+        )
+        connection.execute(
+            """INSERT INTO web_publications
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)""",
+            (
+                "org_demo", PRODUCT_ID, publication.publication_id,
+                preview.preview_id, "user_demo", "completed",
+                publication.commit_sha, publication_json,
+                publication_digest, NOW, NOW,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO web_publication_families VALUES (?, ?, ?, ?)",
+            (
+                "org_demo", PRODUCT_ID, item.family_id,
+                publication.publication_id,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO web_candidate_receipts
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "org_demo", PRODUCT_ID, item.family_id,
+                item.publication_candidate_id, preview.decision_ids[0],
+                preview.preview_id, publication.commit_sha, NOW,
+            ),
+        )
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+
+        try:
+            _migrate_leaf_owned_web_tables(connection)
+        except ValueError as error:
+            self.fail(f"valid publication history did not migrate: {error}")
+        self.assertEqual(
+            0,
+            connection.execute("PRAGMA defer_foreign_keys").fetchone()[0],
+        )
         connection.commit()
 
-        _migrate_leaf_owned_web_tables(connection)
-
-        columns = {
-            item["name"]
-            for item in connection.execute(
-                "PRAGMA table_info(web_review_drafts)"
-            ).fetchall()
-        }
-        self.assertIn("decision_space_id", columns)
-        row = connection.execute(
-            """SELECT decision_space_id, record_json, record_digest
-               FROM web_review_drafts"""
-        ).fetchone()
-        migrated = ReviewDraft.from_dict(json.loads(row["record_json"]))
-        self.assertEqual(DECISION_SPACE_ID, row["decision_space_id"])
-        self.assertEqual(DECISION_SPACE_ID, migrated.decision_space_id)
+        self.assertEqual(1, connection.execute("PRAGMA foreign_keys").fetchone()[0])
         self.assertEqual(
-            hashlib.sha256(row["record_json"].encode("utf-8")).hexdigest(),
-            row["record_digest"],
+            0,
+            connection.execute("PRAGMA defer_foreign_keys").fetchone()[0],
+        )
+        self.assertEqual([], connection.execute("PRAGMA foreign_key_check").fetchall())
+        for table in (
+            "web_review_drafts",
+            "web_review_batches",
+            "web_review_items",
+            "web_review_submission_results",
+            "web_publication_previews",
+            "web_publications",
+            "web_publication_families",
+            "web_candidate_receipts",
+        ):
+            self.assertEqual(
+                {DECISION_SPACE_ID},
+                {
+                    row["decision_space_id"]
+                    for row in connection.execute(
+                        f"SELECT decision_space_id FROM {table}"
+                    ).fetchall()
+                },
+                table,
+            )
+        web_store = CentralWebStore(connection)
+        self.assertEqual(
+            batch,
+            web_store.get_review_batch(
+                "org_demo", DECISION_SPACE_ID, batch.review_batch_id
+            ),
+        )
+        self.assertEqual(
+            snapshot,
+            web_store.get_review_submission_result(
+                "org_demo", "user_demo", DECISION_SPACE_ID,
+                batch.review_batch_id,
+            ),
+        )
+        self.assertEqual(
+            publication,
+            web_store.get_publication(
+                "org_demo", publication.publication_id
+            ),
         )
 
     def test_draft_compare_and_swap_survives_reopen(self) -> None:

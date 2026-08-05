@@ -218,9 +218,23 @@ def _migrate_leaf_owned_web_tables(connection: sqlite3.Connection) -> None:
         "web_candidate_receipts",
     )
     owns_transaction = not connection.in_transaction
+    savepoint = "leaf_owned_web_migration"
+    savepoint_started = False
+    deferred_by_migration = False
     try:
         if owns_transaction:
             connection.execute("BEGIN IMMEDIATE")
+        else:
+            connection.execute(f"SAVEPOINT {savepoint}")
+            savepoint_started = True
+        if (
+            bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+            and not bool(
+                connection.execute("PRAGMA defer_foreign_keys").fetchone()[0]
+            )
+        ):
+            connection.execute("PRAGMA defer_foreign_keys = ON")
+            deferred_by_migration = True
         for table in owner_tables:
             connection.execute(
                 f"ALTER TABLE {table} RENAME COLUMN product_id "
@@ -252,16 +266,17 @@ def _migrate_leaf_owned_web_tables(connection: sqlite3.Connection) -> None:
                     f"ALTER TABLE {table} ADD COLUMN {addition}"
                 )
 
-        mappings = {
-            (row["organization_id"], row["compatibility_product_id"]): row[
-                "decision_space_id"
-            ]
-            for row in connection.execute(
-                """SELECT organization_id, decision_space_id,
-                          compatibility_product_id
-                   FROM decision_spaces"""
-            ).fetchall()
-        }
+        mappings: dict[tuple[str, str], str] = {}
+        for row in connection.execute(
+            """SELECT organization_id, decision_space_id,
+                      compatibility_product_id
+               FROM decision_spaces"""
+        ).fetchall():
+            key = (row["organization_id"], row["compatibility_product_id"])
+            existing = mappings.get(key)
+            if existing is not None and existing != row["decision_space_id"]:
+                raise CentralCandidateStateCorrupt()
+            mappings[key] = row["decision_space_id"]
         owners = {
             (row["organization_id"], row["decision_space_id"])
             for table in owner_tables
@@ -378,12 +393,23 @@ def _migrate_leaf_owned_web_tables(connection: sqlite3.Connection) -> None:
                          web_candidate_receipts.preview_id
                )"""
         )
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise CentralCandidateStateCorrupt()
         if owns_transaction:
             connection.commit()
+        else:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            savepoint_started = False
     except (KeyError, TypeError, ValueError, sqlite3.Error):
         if owns_transaction:
             connection.rollback()
+        elif savepoint_started:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise CentralCandidateStateCorrupt() from None
+    finally:
+        if deferred_by_migration:
+            connection.execute("PRAGMA defer_foreign_keys = OFF")
 
 
 def _ensure_candidate_ownership_columns(connection: sqlite3.Connection) -> None:
