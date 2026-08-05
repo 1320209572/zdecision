@@ -458,12 +458,16 @@ class CaptureRequestService:
                 if archived is not None:
                     raise RequestConflict("candidate_family_archived")
                 family_ownership = connection.execute(
-                    """SELECT ownership_digest FROM candidate_revision_ownership
+                    """SELECT decision_space_id FROM candidate_revision_ownership
                     WHERE organization_id = ? AND repository_id = ? AND family_id = ?
                     LIMIT 1""",
                     (principal.organization_id, ownership.repository_id, item.family_id),
                 ).fetchone()
-                if family_ownership is not None and family_ownership["ownership_digest"] != slice_row["ownership_digest"]:
+                if (
+                    family_ownership is not None
+                    and family_ownership["decision_space_id"]
+                    != ownership.decision_space_id
+                ):
                     raise RequestConflict("candidate_family_ownership_conflict")
                 _save_candidate_revision(connection, principal.organization_id,
                                          ownership.repository_id, request_id, item,

@@ -142,21 +142,45 @@ def migrate_legacy_repository_candidates(
         ORDER BY family_id, revision""",
         (organization_id, repository_id),
     ).fetchall()
+    existing_ownership = connection.execute(
+        """SELECT family_id, revision, ownership_json, ownership_digest
+        FROM candidate_revision_ownership
+        WHERE organization_id = ? AND repository_id = ?
+        ORDER BY family_id, revision""",
+        (organization_id, repository_id),
+    ).fetchall()
+    for row in existing_ownership:
+        try:
+            encoded = row["ownership_json"].encode("utf-8")
+            existing = CandidateOwnershipSnapshot.from_dict(
+                json.loads(row["ownership_json"])
+            )
+        except (AttributeError, TypeError, json.JSONDecodeError, ValueError):
+            raise ValueError("legacy_candidate_ownership_conflict") from None
+        if (
+            hashlib.sha256(encoded).hexdigest() != row["ownership_digest"]
+            or existing != ownership
+        ):
+            raise ValueError("legacy_candidate_ownership_conflict")
     with connection:
-        connection.executemany(
-            """INSERT OR IGNORE INTO candidate_revision_ownership(
-            organization_id, repository_id, family_id, revision,
-            decision_space_id, route_id, route_configuration_version,
-            ownership_json, ownership_digest
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
+        for row in revisions:
+            result = connection.execute(
+                """INSERT INTO candidate_revision_ownership(
+                organization_id, repository_id, family_id, revision,
+                decision_space_id, route_id, route_configuration_version,
+                ownership_json, ownership_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, repository_id, family_id, revision)
+                DO UPDATE SET ownership_digest = excluded.ownership_digest
+                WHERE candidate_revision_ownership.ownership_digest = excluded.ownership_digest
+                  AND candidate_revision_ownership.ownership_json = excluded.ownership_json""",
                 (organization_id, repository_id, row["family_id"], row["revision"],
                  ownership.decision_space_id, ownership.route_id,
                  ownership.route_configuration_version, ownership_json,
-                 ownership_digest)
-                for row in revisions
-            ],
-        )
+                 ownership_digest),
+            )
+            if result.rowcount != 1:
+                raise ValueError("legacy_candidate_ownership_conflict")
         connection.execute(
             """UPDATE candidate_family_heads SET decision_space_id = ?
             WHERE organization_id = ? AND repository_id = ?

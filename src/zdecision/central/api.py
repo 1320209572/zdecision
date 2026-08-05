@@ -332,7 +332,7 @@ def create_app(
 
     @app.get("/api/v1/capture-requests/{request_id}")
     async def get_capture_request(request_id: str) -> dict[str, object]:
-        return service.group_request_view(browser(), request_id).to_dict()
+        return service.get_request(browser(), request_id).to_dict()
 
     @app.post("/api/v1/plugin/capture-requests")
     async def create_plugin_capture_request(
@@ -350,7 +350,7 @@ def create_app(
         request_id: str,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        return service.group_request_view(plugin(authorization), request_id).to_dict()
+        return service.get_request(plugin(authorization), request_id).to_dict()
 
     @app.get("/api/v1/capture-requests/{request_id}/events")
     async def capture_request_events(
@@ -360,7 +360,7 @@ def create_app(
         return {
             "events": [
                 item.to_dict()
-                for item in service.group_events_after(
+                for item in service.events_after(
                     browser(), request_id, after_sequence
                 )
             ]

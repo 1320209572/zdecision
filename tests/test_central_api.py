@@ -18,6 +18,7 @@ from zdecision.central.store import CentralStore
 from zdecision.ids import (
     candidate_family_id,
     candidate_revision_id,
+    capture_request_id,
     decision_space_id,
     repository_route_id,
 )
@@ -286,6 +287,63 @@ class CentralApiTest(unittest.TestCase):
         self.assertEqual(
             [2],
             [item["sequence"] for item in response.json()["events"]],
+        )
+
+    def test_public_request_reads_include_legacy_capture_evidence(self) -> None:
+        action_id = "web_action_legacy_read"
+        request_id = capture_request_id(
+            "org_demo", REPOSITORY_ID, "business", action_id
+        )
+        timestamp = "2026-07-31T02:00:00Z"
+        with self.store.connection:
+            self.store.connection.execute(
+                """INSERT INTO capture_requests(
+                request_id, organization_id, actor_id, repository_id,
+                product_id, product_name, template_id, capture_scope,
+                client_action_id, state, attempt_count, claimed_device_id,
+                lease_token_digest, lease_expires_at, retry_at,
+                result_batch_digest, result_candidate_count, terminal_code,
+                last_sequence, created_at, updated_at
+                ) VALUES (?, 'org_demo', 'user_demo', ?, ?, 'ZDecision',
+                'business', 'all_valid_sessions', ?, 'succeeded_no_candidates',
+                1, NULL, NULL, NULL, NULL, ?, 0,
+                'capture_succeeded_no_candidates', 1, ?, ?)""",
+                (
+                    request_id,
+                    REPOSITORY_ID,
+                    PRODUCT_ID,
+                    action_id,
+                    EMPTY_BATCH_DIGEST,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.store.connection.execute(
+                """INSERT INTO capture_request_events(
+                request_id, sequence, state, code, occurred_at
+                ) VALUES (?, 1, 'succeeded_no_candidates',
+                'capture_succeeded_no_candidates', ?)""",
+                (request_id, timestamp),
+            )
+
+        browser_read = self.client.get(
+            f"/api/v1/capture-requests/{request_id}"
+        )
+        plugin_read = self.client.get(
+            f"/api/v1/plugin/capture-requests/{request_id}",
+            headers=self.authorization,
+        )
+        events = self.client.get(
+            f"/api/v1/capture-requests/{request_id}/events"
+        )
+
+        self.assertEqual(200, browser_read.status_code, browser_read.text)
+        self.assertEqual(200, plugin_read.status_code, plugin_read.text)
+        self.assertEqual(200, events.status_code, events.text)
+        self.assertEqual("succeeded_no_candidates", browser_read.json()["state"])
+        self.assertEqual(
+            ["capture_succeeded_no_candidates"],
+            [item["code"] for item in events.json()["events"]],
         )
 
     def test_public_update_uses_group_slice_endpoints_only(self) -> None:

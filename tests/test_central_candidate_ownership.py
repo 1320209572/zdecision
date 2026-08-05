@@ -15,7 +15,11 @@ from zdecision.central.decision_spaces import (
     LeafDecisionSpace,
     RepositoryDecisionRoute,
 )
-from zdecision.central.service import CaptureRequestService, RequestConflict
+from zdecision.central.service import (
+    CaptureRequestService,
+    InvalidTransition,
+    RequestConflict,
+)
 from zdecision.central.store import CentralStore
 from zdecision.ids import (
     candidate_family_id,
@@ -144,10 +148,18 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
         )
         return slices[0], claimed.lease_token
 
-    def batch(self, slice_view, *, decision_space_id: str | None = None):
+    def batch(
+        self,
+        slice_view,
+        *,
+        decision_space_id: str | None = None,
+        family_id: str | None = None,
+        revision: int = 1,
+        claim: str = "Frozen ownership survives later route changes.",
+    ):
         content = CandidateContent(
             product=slice_view.ownership.compatibility_product_name,
-            claim="Frozen ownership survives later route changes.",
+            claim=claim,
             future_action="Review this Candidate under its captured leaf.",
             scope_summary="Task 2 ownership boundary",
             repositories=(REPOSITORY_ID,),
@@ -157,13 +169,15 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
         content_digest = hashlib.sha256(
             canonical_json_bytes(content.to_dict())
         ).hexdigest()
-        family_id = candidate_family_id(
+        selected_family_id = family_id or candidate_family_id(
             REPOSITORY_ID, "cand_" + "5" * 32 + "_01"
         )
         item = CandidateRevisionUpload(
-            family_id=family_id,
-            revision_id=candidate_revision_id(family_id, 1, content_digest),
-            revision=1,
+            family_id=selected_family_id,
+            revision_id=candidate_revision_id(
+                selected_family_id, revision, content_digest
+            ),
+            revision=revision,
             content=content,
             content_digest=content_digest,
             evidence_digest="e" * 64,
@@ -182,6 +196,16 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
             batch_digest=hashlib.sha256(
                 canonical_json_bytes({"items": [item.to_dict()]})
             ).hexdigest(),
+        )
+
+    def complete_group(self, request_id: str, lease_token: str, receipts) -> None:
+        receipt_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {"receipts": [receipt.to_dict() for receipt in receipts]}
+            )
+        ).hexdigest()
+        self.service.complete_group(
+            self.device, request_id, lease_token, receipt_digest, NOW
         )
 
     def test_one_action_plans_three_frozen_leaf_slices(self) -> None:
@@ -273,6 +297,182 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
                 (REPOSITORY_ID, batch.items[0].family_id),
             ).fetchone()["decision_space_id"],
         )
+
+    def test_later_route_version_keeps_family_in_same_decision_space(self) -> None:
+        first_group = self.service.create_group(
+            self.user, self.command("web_action_first_revision"), NOW
+        )
+        first_claim = self.service.claim_next_group(self.device, NOW)
+        first_slice = self.service.plan_slices(
+            self.device,
+            first_group.request_id,
+            first_claim.lease_token,
+            (self.selection(self.routes[2], "3"),),
+            NOW,
+        )[0]
+        first_batch = self.batch(first_slice)
+        first_receipt = self.service.accept_slice_batch(
+            self.device,
+            first_group.request_id,
+            first_slice.slice_id,
+            first_claim.lease_token,
+            first_batch,
+            NOW,
+        )
+        self.complete_group(
+            first_group.request_id, first_claim.lease_token, (first_receipt,)
+        )
+        second_route = replace(self.routes[2], configuration_version=2)
+        self.store.put_route_version("org_demo", second_route)
+        second_group = self.service.create_group(
+            self.user, self.command("web_action_second_revision"), NOW
+        )
+        second_claim = self.service.claim_next_group(self.device, NOW)
+        second_slice = self.service.plan_slices(
+            self.device,
+            second_group.request_id,
+            second_claim.lease_token,
+            (self.selection(second_route, "7"),),
+            NOW,
+        )[0]
+        second_batch = self.batch(
+            second_slice,
+            family_id=first_batch.items[0].family_id,
+            revision=2,
+            claim="The same leaf has a newer routed revision.",
+        )
+
+        self.service.accept_slice_batch(
+            self.device,
+            second_group.request_id,
+            second_slice.slice_id,
+            second_claim.lease_token,
+            second_batch,
+            NOW,
+        )
+
+        first_ownership = self.store.candidate_ownership(
+            "org_demo", REPOSITORY_ID, first_batch.items[0].family_id, 1
+        )
+        second_ownership = self.store.candidate_ownership(
+            "org_demo", REPOSITORY_ID, first_batch.items[0].family_id, 2
+        )
+        self.assertEqual(
+            (self.theme.decision_space_id, self.theme.decision_space_id),
+            (
+                first_ownership.decision_space_id,
+                second_ownership.decision_space_id,
+            ),
+        )
+        self.assertEqual((1, 2), (
+            first_ownership.route_configuration_version,
+            second_ownership.route_configuration_version,
+        ))
+
+    def test_duplicate_route_selection_is_rejected(self) -> None:
+        group = self.service.create_group(self.user, self.command(), NOW)
+        claimed = self.service.claim_next_group(self.device, NOW)
+        selection = self.selection(self.routes[0], "1")
+        with self.assertRaisesRegex(RequestConflict, "slice_route_repeated"):
+            self.service.plan_slices(
+                self.device, group.request_id, claimed.lease_token,
+                (selection, selection), NOW,
+            )
+
+    def test_stale_and_missing_route_selections_are_rejected(self) -> None:
+        group = self.service.create_group(self.user, self.command(), NOW)
+        claimed = self.service.claim_next_group(self.device, NOW)
+        cases = (
+            RouteSelection(
+                self.routes[0].route_id, 2, "1" * 64, "4" * 64
+            ),
+            RouteSelection("drr_" + "f" * 32, 1, "1" * 64, "4" * 64),
+        )
+        for selection in cases:
+            with self.subTest(route_id=selection.route_id):
+                with self.assertRaisesRegex(
+                    RequestConflict, "slice_route_not_in_snapshot"
+                ):
+                    self.service.plan_slices(
+                        self.device, group.request_id, claimed.lease_token,
+                        (selection,), NOW,
+                    )
+
+    def test_group_target_selection_is_rejected(self) -> None:
+        group = self.service.create_group(self.user, self.command(), NOW)
+        claimed = self.service.claim_next_group(self.device, NOW)
+        group_route = replace(
+            self.routes[0], decision_space_id=catalog_group_id(("Shared",))
+        )
+        snapshot = canonical_json_bytes(
+            {"routes": [group_route.to_dict()]}
+        ).decode("utf-8")
+        with self.store.connection:
+            self.store.connection.execute(
+                """UPDATE capture_groups SET route_snapshot_json = ?,
+                route_snapshot_digest = ? WHERE request_id = ?""",
+                (
+                    snapshot,
+                    hashlib.sha256(snapshot.encode("utf-8")).hexdigest(),
+                    group.request_id,
+                ),
+            )
+        with self.assertRaisesRegex(RequestConflict, "slice_target_not_leaf"):
+            self.service.plan_slices(
+                self.device, group.request_id, claimed.lease_token,
+                (self.selection(group_route, "1"),), NOW,
+            )
+
+    def test_disabled_leaf_selection_is_rejected(self) -> None:
+        group = self.service.create_group(self.user, self.command(), NOW)
+        claimed = self.service.claim_next_group(self.device, NOW)
+        self.store.put_decision_space(
+            "org_demo", replace(self.theme, enabled=False)
+        )
+        with self.assertRaisesRegex(RequestConflict, "slice_target_disabled"):
+            self.service.plan_slices(
+                self.device, group.request_id, claimed.lease_token,
+                (self.selection(self.routes[2], "3"),), NOW,
+            )
+
+    def test_changed_slice_plan_replay_is_rejected(self) -> None:
+        group = self.service.create_group(self.user, self.command(), NOW)
+        claimed = self.service.claim_next_group(self.device, NOW)
+        original = self.selection(self.routes[2], "3")
+        self.service.plan_slices(
+            self.device, group.request_id, claimed.lease_token,
+            (original,), NOW,
+        )
+        changed = replace(original, matched_path_digest="9" * 64)
+        with self.assertRaisesRegex(RequestConflict, "slice_plan_conflict"):
+            self.service.plan_slices(
+                self.device, group.request_id, claimed.lease_token,
+                (changed,), NOW,
+            )
+
+    def test_partial_slice_completion_is_rejected(self) -> None:
+        group = self.service.create_group(self.user, self.command(), NOW)
+        claimed = self.service.claim_next_group(self.device, NOW)
+        slices = self.service.plan_slices(
+            self.device, group.request_id, claimed.lease_token,
+            (
+                self.selection(self.routes[0], "1"),
+                self.selection(self.routes[2], "3"),
+            ),
+            NOW,
+        )
+        receipt = self.service.accept_slice_batch(
+            self.device, group.request_id, slices[0].slice_id,
+            claimed.lease_token, self.batch(slices[0]), NOW,
+        )
+        partial_digest = hashlib.sha256(
+            canonical_json_bytes({"receipts": [receipt.to_dict()]})
+        ).hexdigest()
+        with self.assertRaisesRegex(InvalidTransition, "slice_receipts_required"):
+            self.service.complete_group(
+                self.device, group.request_id, claimed.lease_token,
+                partial_digest, NOW,
+            )
 
     def test_empty_route_selection_is_a_successful_terminal_result(self) -> None:
         group = self.service.create_group(self.user, self.command(), NOW)
