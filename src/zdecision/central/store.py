@@ -328,12 +328,16 @@ class CentralStore:
         if not isinstance(space, LeafDecisionSpace):
             raise TypeError("space must be a LeafDecisionSpace")
         with self.connection:
-            if space.catalog_group_id is not None and self.connection.execute(
-                """SELECT 1 FROM catalog_groups
-                WHERE organization_id = ? AND catalog_group_id = ?""",
-                (organization, space.catalog_group_id),
-            ).fetchone() is None:
-                raise ValueError("catalog_group_not_found")
+            if space.catalog_group_id is not None:
+                group = self.connection.execute(
+                    """SELECT breadcrumb_json FROM catalog_groups
+                    WHERE organization_id = ? AND catalog_group_id = ?""",
+                    (organization, space.catalog_group_id),
+                ).fetchone()
+                if group is None:
+                    raise ValueError("catalog_group_not_found")
+                if tuple(json.loads(group["breadcrumb_json"])) != space.catalog_breadcrumb:
+                    raise ValueError("catalog_breadcrumb_invalid")
             self.connection.execute(
                 """
                 INSERT INTO decision_spaces(
@@ -476,7 +480,10 @@ class CentralStore:
         ).fetchone()
         if repository is None or not bool(repository["enabled"]):
             raise ValueError("repository_unavailable")
-        routes = self._head_routes(organization, repository_id)
+        routes = tuple(
+            route for route in self._head_routes(organization, repository_id)
+            if route.enabled
+        )
         spaces = self._spaces_for_ids(organization, routes)
         if any(not space.enabled for space in spaces.values()):
             raise ValueError("route_target_disabled")
@@ -486,6 +493,7 @@ class CentralStore:
         )
         groups = self._catalog_groups(organization)
         _validate_catalog_cycles(groups)
+        _validate_space_catalog_breadcrumbs(spaces.values(), groups)
         shared_tree = next(
             (group for group in groups.values() if group.parent_group_id is None and group.display_name == "Shared"),
             None,
@@ -676,6 +684,20 @@ def _validate_catalog_cycles(groups: dict[str, CatalogGroup]) -> None:
             if parent is None:
                 raise ValueError("catalog_parent_not_found")
             current = parent
+
+
+def _validate_space_catalog_breadcrumbs(
+    spaces: object,
+    groups: dict[str, CatalogGroup],
+) -> None:
+    for space in spaces:
+        if not isinstance(space, LeafDecisionSpace):
+            raise TypeError("spaces must contain LeafDecisionSpace values")
+        if space.catalog_group_id is None:
+            continue
+        group = groups.get(space.catalog_group_id)
+        if group is None or group.breadcrumb != space.catalog_breadcrumb:
+            raise ValueError("catalog_breadcrumb_invalid")
 
 
 def _validate_route_set(

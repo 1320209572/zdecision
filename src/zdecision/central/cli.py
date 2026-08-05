@@ -23,7 +23,7 @@ from zdecision.central.decision_spaces import (
     RepositoryDecisionRoute,
 )
 from zdecision.central.service import CaptureRequestService
-from zdecision.central.store import CentralStore
+from zdecision.central.store import CentralStore, _validate_route_set
 from zdecision.central.web.application import CentralWebApplication
 from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import CentralWebStore
@@ -375,16 +375,11 @@ def _validate_trusted_catalog(
             raise ValueError("route target is invalid")
         route_ids.add(route.route_id)
     for repository_id in repository_ids:
-        enabled = tuple(
+        repository_routes = tuple(
             item for item in routes
-            if item.repository_id == repository_id and item.enabled
+            if item.repository_id == repository_id
         )
-        roots = tuple(item for item in enabled if "." in item.path_prefixes)
-        if roots and (
-            len(enabled) != 1
-            or space_by_id[roots[0].decision_space_id].kind != "product"
-        ):
-            raise ValueError("root route is invalid")
+        _validate_route_set(repository_routes, space_by_id)
 
 
 def _demo_catalog(

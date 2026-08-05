@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from zdecision.central.auth import Principal
@@ -151,6 +152,37 @@ class CentralDecisionSpacesTest(unittest.TestCase):
             {item.display_name for item in routes.spaces},
         )
         self.assertEqual("Shared", routes.shared_tree.display_name)
+
+    def test_repository_catalog_omits_disabled_route_heads_and_spaces(self) -> None:
+        self.store.replace_trusted_route_heads(
+            "org_demo",
+            REPOSITORY_ID,
+            (
+                self.route(self.cloud, "packages/products/cloud"),
+                self.route(self.audit, "packages/products/shared/zcf-audit"),
+                replace(
+                    self.route(self.theme, "packages/shared/theme"),
+                    enabled=False,
+                    configuration_version=2,
+                ),
+                self.route(self.design, "packages/design"),
+            ),
+        )
+
+        catalog = self.store.repository_catalog("org_demo", REPOSITORY_ID)
+
+        self.assertNotIn("theme", {item.display_name for item in catalog.spaces})
+        self.assertNotIn(
+            self.theme.decision_space_id,
+            {item.decision_space_id for item in catalog.routes},
+        )
+
+    def test_rejects_leaf_with_catalog_breadcrumb_unlike_its_group(self) -> None:
+        with self.assertRaisesRegex(ValueError, "catalog_breadcrumb_invalid"):
+            self.store.put_decision_space(
+                "org_demo",
+                replace(self.audit, catalog_breadcrumb=("Incorrect Shared",)),
+            )
 
     def test_route_version_append_does_not_overwrite_v1(self) -> None:
         first = self.route(self.theme, "packages/shared/theme", version=1)

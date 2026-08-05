@@ -13,7 +13,7 @@ from pathlib import Path
 from zdecision.agent.repository import RepositoryResolver
 
 try:
-    from zdecision.central.cli import main
+    from zdecision.central.cli import CentralCliError, _load_central_config, main
 except ModuleNotFoundError as error:
     CONFIG_IMPORT_ERROR: ModuleNotFoundError | None = error
 else:
@@ -127,6 +127,34 @@ class DemoConfigTest(unittest.TestCase):
         self.assertEqual("keep\n", marker.read_text("utf-8"))
         self.assertFalse((output_directory / "central.json").exists())
         self.assertFalse((output_directory / "agent.json").exists())
+
+    def test_trusted_config_rejects_overlapping_enabled_routes(self) -> None:
+        output_directory = self.root / "demo-config"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(
+                0,
+                main(
+                    [
+                        "demo-config",
+                        "init",
+                        "--repository-cwd",
+                        str(self.repository),
+                        "--product-name",
+                        "Cloud",
+                        "--output-dir",
+                        str(output_directory),
+                    ]
+                ),
+            )
+        central_path = output_directory / "central.json"
+        central = json.loads(central_path.read_text("utf-8"))
+        central["repository_routes"][0]["path_prefixes"] = ["packages"]
+        central_path.write_text(json.dumps(central), "utf-8")
+
+        with self.assertRaisesRegex(CentralCliError, "central_config_invalid"):
+            _load_central_config(central_path)
 
     def test_run_refuses_a_non_loopback_bind_before_opening_files(self) -> None:
         stdout = io.StringIO()
