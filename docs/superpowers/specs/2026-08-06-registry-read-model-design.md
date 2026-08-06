@@ -1,6 +1,6 @@
 # Registry Read Model Design
 
-**Status:** Proposed for final user review.
+**Status:** Approved for implementation planning.
 
 **Scope:** Keep the Git Decision Registry as the only authoritative formal
 Decision source while projecting its verified contents into Central SQLite
@@ -117,7 +117,13 @@ One row per organization:
 - `desired_tree_oid` — Registry tree being installed or requiring recovery;
 - `verified_at` — time the desired commit was proven against Git;
 - `updated_at` — last projection state change; and
-- `error_code` — bounded internal synchronization classification or null.
+- `error_code` — bounded internal synchronization classification or null;
+- `product_count` and `decision_count` — expected active row counts; and
+- `projection_digest` — SHA-256 of the ordered product/Decision identity and
+  canonical-document-digest manifest.
+
+The last three integrity fields distinguish a valid empty Registry from a
+missing or partially deleted projection without consulting Git on a Web read.
 
 ### 5.2 `registry_product_projection`
 
