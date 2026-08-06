@@ -161,6 +161,86 @@ CREATE TABLE IF NOT EXISTS web_candidate_receipts (
   UNIQUE(organization_id, decision_space_id, decision_id)
 );
 
+CREATE TABLE IF NOT EXISTS registry_projection_state (
+  organization_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK(state IN ('available','syncing','unavailable')),
+  active_commit TEXT,
+  active_tree_oid TEXT,
+  desired_commit TEXT,
+  desired_tree_oid TEXT,
+  verified_at TEXT,
+  updated_at TEXT NOT NULL,
+  product_count INTEGER CHECK(product_count IS NULL OR product_count >= 0),
+  decision_count INTEGER CHECK(decision_count IS NULL OR decision_count >= 0),
+  projection_digest TEXT,
+  error_code TEXT CHECK(
+    error_code IS NULL OR error_code IN (
+      'git_proof_failed','registry_invalid','projection_install_failed'
+    )
+  ),
+  CHECK(
+    state != 'available' OR (
+      active_commit IS NOT NULL AND active_tree_oid IS NOT NULL
+      AND verified_at IS NOT NULL AND product_count IS NOT NULL
+      AND decision_count IS NOT NULL AND projection_digest IS NOT NULL
+      AND error_code IS NULL
+    )
+  )
+);
+
+CREATE TABLE IF NOT EXISTS registry_product_projection (
+  organization_id TEXT NOT NULL,
+  registry_tree_oid TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  product_name TEXT NOT NULL,
+  product_path TEXT NOT NULL,
+  registry_path TEXT NOT NULL,
+  product_json TEXT NOT NULL,
+  product_digest TEXT NOT NULL,
+  PRIMARY KEY(organization_id, registry_tree_oid, product_id)
+);
+
+CREATE TABLE IF NOT EXISTS registry_decision_projection (
+  organization_id TEXT NOT NULL,
+  registry_tree_oid TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  lifecycle TEXT NOT NULL CHECK(lifecycle = 'active'),
+  head_path TEXT NOT NULL,
+  claim TEXT NOT NULL,
+  future_action TEXT NOT NULL,
+  scope_summary TEXT NOT NULL,
+  repositories_json TEXT NOT NULL,
+  paths_json TEXT NOT NULL,
+  invalidation_conditions_json TEXT NOT NULL,
+  publication_preview_id TEXT NOT NULL,
+  decision_json TEXT NOT NULL,
+  decision_digest TEXT NOT NULL,
+  PRIMARY KEY(
+    organization_id, registry_tree_oid, product_id, decision_id, revision
+  ),
+  FOREIGN KEY(organization_id, registry_tree_oid, product_id)
+    REFERENCES registry_product_projection(
+      organization_id, registry_tree_oid, product_id
+    )
+);
+
+CREATE INDEX IF NOT EXISTS registry_product_projection_name
+ON registry_product_projection(
+  organization_id, registry_tree_oid, product_name, product_id
+);
+
+CREATE INDEX IF NOT EXISTS registry_decision_projection_lifecycle
+ON registry_decision_projection(
+  organization_id, registry_tree_oid, lifecycle, product_id
+);
+
+CREATE INDEX IF NOT EXISTS registry_decision_projection_identity
+ON registry_decision_projection(
+  organization_id, registry_tree_oid, product_id, decision_id, revision
+);
+
 CREATE INDEX IF NOT EXISTS web_candidate_revision_batches_filter
 ON web_candidate_revision_batches(organization_id, request_id, revision_id);
 

@@ -222,6 +222,22 @@ class CentralWebStoreTest(unittest.TestCase):
         self.assertIn("decision_space_id", columns)
         self.assertIn("ownership_json", columns)
 
+    def test_registry_projection_schema_is_initialized_with_web_schema(self) -> None:
+        tables = {
+            row["name"]
+            for row in self.store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+        self.assertTrue(
+            {
+                "registry_projection_state",
+                "registry_product_projection",
+                "registry_decision_projection",
+            }.issubset(tables)
+        )
+
     def test_private_web_records_are_owned_by_decision_space(self) -> None:
         for table in (
             "web_review_drafts",
