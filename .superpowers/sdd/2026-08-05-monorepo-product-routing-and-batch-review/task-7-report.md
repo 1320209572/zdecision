@@ -16,11 +16,11 @@ The seven primary stage commits are:
 
 1. Task 1: `3499757c9b82daa11cc32fdc62c22173382553b6` — `feat: add decision space catalog routes`
 2. Task 2: `8e6364f6aef656d9228489c52b8a3f44716b3eb8` — `feat: freeze capture slice ownership`
-3. Task 3: `501f3ad` — `feat: capture candidates by decision space`
-4. Task 4: `4424e36` — `feat: publish leaf decision spaces`
-5. Task 5: `a636ff9` — `feat: browse decision spaces/shared packages`
-6. Task 6: `0688e7e` — `feat: add batch candidate review`
-7. Task 7: this report's commit — `test: prove monorepo decision workflow`
+3. Task 3: `501f3add972910893203149349e5c4246dbc9711` — `feat: capture candidates by decision space`
+4. Task 4: `4424e363116b6cdc90a5d2d5f6438b07388ffbc4` — `feat: publish leaf decision spaces`
+5. Task 5: `a636ff9136000147e1e34a1add89032d074980c3` — `feat: browse decision spaces/shared packages`
+6. Task 6: `0688e7eb17ae4b5945409aac4c25ebdcb0d2809c` — `feat: add batch candidate review`
+7. Task 7: `b9d9438ec5366349f1888777166a1bb648081982` — `test: prove monorepo decision workflow`
 
 The bounded repair commits retained in the stage history are `c15fc6e`,
 `56d11e5`, `847bc3a`, `ecf1775`, `2f70df5`, `4d62c92`, and `2f6d1eb`.
@@ -165,3 +165,22 @@ credentials, and local absolute paths remain on the device.
 - automatic Decision recall.
 
 No push or additional architecture/review loop was performed.
+
+## Fix Round 1: Complete handoff metadata
+
+The original Task 7 report abbreviated the Task 3–6 primary commit IDs and
+described the Task 7 commit indirectly. The stage list above now records all
+seven primary commits as complete 40-character SHAs, including the Task 7
+primary commit.
+
+Immediately before this metadata-only correction, `git status --porcelain`
+was empty and `git rev-list --left-right --count origin/main...main` reported
+`0 30`: local `main` was clean and 30 commits ahead of `origin/main`, with no
+remote-only commits. After committing this correction, the same checks verify
+a clean working tree and `0 31`, so local `main` is 31 commits ahead. The
+metadata-fix commit SHA is reported in the external final handoff to avoid a
+self-referential commit ID in this file.
+
+No production code, tests, Skill contract, or user-facing documentation was
+changed in this round. No tests were run because the correction changes only
+this acceptance-report metadata. No push or review was performed.
