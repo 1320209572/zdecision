@@ -652,9 +652,10 @@ Uncertainty also pauses only the affected portion and asks one focused question.
 A user override is bound to
 `(session_id, intent_epoch, decision_id, revision, digest)`. It permits this
 Intent Epoch to proceed without that revision. It expires on Intent Epoch
-change, Decision revision/digest change, signed invalidation, or Session end;
-the new situation must be evaluated again. It cannot silently override every
-Decision. Session-wide bypass is a separate explicit action.
+change, Decision revision/digest change, removal from a newer signed complete
+active-head set, or Session end; the new situation must be evaluated again. It
+cannot silently override every Decision. Session-wide bypass is a separate
+explicit action.
 
 The override emits a typed marker naming the excluded revision so earlier
 envelope text is no longer treated as active within that epoch.
@@ -866,23 +867,40 @@ Before retrieval implementation, prove in real Codex Desktop:
 Failure stops Packet 3 and redesigns only host integration. Do not build the
 model stack or distribution path around an unproven assumption.
 
-### Gate 2: Trusted local data and model loop
+### Gate 2: Trusted distribution and local data
 
-- A clean device performs real onboarding prefetch without seeded cache.
+- A clean device prefetches the real signed catalog, manifest, and complete
+  Decision snapshots without seeded cache.
 - Signature, canonical bytes, complete snapshot, high-water, clock rollback,
   LKG, expiry, and invalidation cases pass.
 - Missing/partial/corrupt/rollback states never activate.
-- Model artifacts and complete indexes validate before atomic activation.
-- Failed upgrades preserve the old valid profile.
+- Retrieval-profile manifests and content-addressed artifact bytes can be
+  staged and integrity-checked through a runtime-neutral contract. A tracked
+  deterministic fixture proves atomic pointer mechanics, but Gate 2 does not
+  select or claim a production model.
 - Publication advances generation only after the verified projection contains
   its exact Registry tree.
-- newly published Decisions wait for the next Intent Epoch, while removal from
+- Newly published Decisions wait for the next Intent Epoch, while removal from
   a newer signed complete active-head set immediately ends authority;
-- the future ordinary-revision branch is type-tested but is not claimed as a
+- The future ordinary-revision branch is type-tested but is not claimed as a
   current V1 producer capability.
 
-### Gate 3: Offline retrieval quality
+Gate 2 ends in `trusted_data_ready`, not `recall_ready`. No production ML
+dependency, model slug, default threshold, or model-backed index may enter the
+runtime before Gate 3 selects them on the frozen benchmark.
 
+### Gate 3: Local model, index, and offline retrieval quality
+
+- Compare at least two embedding candidates and two reranker candidates on the
+  same private bilingual benchmark and target Mac profile.
+- Freeze the one winning runtime, immutable model revisions/artifact digests,
+  tokenizer digests, dimensions, tuning, and thresholds; only then add its
+  minimal production dependencies.
+- A clean device downloads and validates the selected model pack, builds every
+  complete enabled-leaf index, passes coverage/query smoke checks, and atomically
+  advances from `trusted_data_ready` to `recall_ready`.
+- A failed model or index upgrade preserves the previous independently valid
+  active profile and generation.
 - Run the frozen benchmark without Codex UI.
 - Prove independent BM25, dense, and path channels.
 - Prove bounded union, deduplication, reranking, thresholds, and complete-item
