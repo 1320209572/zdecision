@@ -1,6 +1,6 @@
 # Session-Opt-In Intelligent Decision Recall Design
 
-**Status:** Draft for written review.
+**Status:** Approved for implementation planning on 2026-08-06.
 
 **Scope:** Packet 3 of the installed ZDecision Plugin. A user explicitly enables
 formal Decision recall in any Turn of one Codex development Session; ZDecision
