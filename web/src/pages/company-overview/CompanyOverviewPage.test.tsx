@@ -18,7 +18,11 @@ function mockDashboard(
       active_decision_count: 14,
       completed_this_week: 2,
     },
-    registry: { state: "available", commit_sha: "a".repeat(40) },
+    registry: {
+      state: "available",
+      commit_sha: "a".repeat(40),
+      verified_at: "2026-08-06T10:00:00Z",
+    },
     products: [
       {
         ...product,
@@ -46,6 +50,7 @@ function mockDashboard(
       }),
     ),
   );
+  return dashboard;
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -71,4 +76,35 @@ it("renders server products and routes without hard-coded product pages", async 
     `/spaces/${"dsp_" + "9".repeat(32)}/publications`,
   );
   expect(screen.queryByText(/session_id/i)).not.toBeInTheDocument();
+});
+
+it("shows a verified Registry proof instead of a synchronization claim", async () => {
+  const dashboard = mockDashboard({ display_name: "ZStack Cloud" });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            ...dashboard,
+            registry: {
+              state: "available",
+              commit_sha: "a".repeat(40),
+              verified_at: "2026-08-06T10:00:00Z",
+            },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      ),
+    ),
+  );
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByText(/Registry 已验证/)).toBeVisible();
+  expect(screen.queryByText(/Registry 已同步/)).not.toBeInTheDocument();
+  expect(screen.getByText(/08\/06/)).toBeVisible();
 });

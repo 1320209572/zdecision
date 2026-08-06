@@ -15,6 +15,7 @@ export interface DashboardMetrics {
 export interface RegistryStatus {
   state: RegistryState;
   commit_sha: string | null;
+  verified_at: string | null;
 }
 
 export type DecisionSpaceKind = "product" | "shared_unit";

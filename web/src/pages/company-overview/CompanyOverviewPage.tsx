@@ -72,7 +72,9 @@ export function CompanyOverviewPage() {
         <StatusBadge
           tone={dashboard.registry.state === "available" ? "success" : "danger"}
         >
-          Registry {dashboard.registry.state === "available" ? "已同步" : "不可用"}
+          Registry {dashboard.registry.state === "available"
+            ? `已验证 · ${formatDate(dashboard.registry.verified_at)}`
+            : "不可用"}
         </StatusBadge>
       </header>
 
