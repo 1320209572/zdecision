@@ -543,6 +543,8 @@ it("exposes safe Inbox filters and sends every approved filter", async () => {
     name: "搜索候选决策",
   });
   expect(search).toHaveValue("explicit");
+  const more = screen.getByRole("button", { name: "更多筛选 2" });
+  await user.click(more);
   expect(screen.getByLabelText("筛选仓库")).toHaveValue(REPOSITORY_ID);
   expect(screen.getByLabelText("Capture Request ID")).toHaveValue(REQUEST_ID);
   const state = screen.getByLabelText("审核状态");
@@ -564,6 +566,59 @@ it("exposes safe Inbox filters and sends every approved filter", async () => {
     capture_request_id: REQUEST_ID,
     state: "published",
   });
+});
+
+it("keeps diagnostic filters behind a disclosure without hiding active values", async () => {
+  vi.stubGlobal("fetch", vi.fn(() => json(inbox())));
+  await router.navigate(
+    `/spaces/${SPACE_ID}/candidates?repository_id=${REPOSITORY_ID}` +
+      `&capture_request_id=${REQUEST_ID}&state=pending`,
+  );
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  const more = await screen.findByRole("button", { name: "更多筛选 2" });
+  expect(more).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByLabelText("筛选仓库")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Capture Request ID")).not.toBeInTheDocument();
+  const activeFilters = screen.getByLabelText("已启用的高级筛选");
+  expect(within(activeFilters).getByText(REPOSITORY_ID, { selector: "code" }))
+    .toBeVisible();
+  expect(within(activeFilters).getByText(REQUEST_ID, { selector: "code" }))
+    .toBeVisible();
+
+  await user.click(more);
+  expect(more).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByLabelText("筛选仓库")).toHaveValue(REPOSITORY_ID);
+  expect(screen.getByLabelText("Capture Request ID")).toHaveValue(REQUEST_ID);
+});
+
+it("clears one summarized advanced filter without applying the form", async () => {
+  const candidateUrls: string[] = [];
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/candidates")) {
+      candidateUrls.push(url);
+      return json(inbox());
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  }));
+  await router.navigate(
+    `/spaces/${SPACE_ID}/candidates?repository_id=${REPOSITORY_ID}` +
+      `&capture_request_id=${REQUEST_ID}&state=pending`,
+  );
+  const user = userEvent.setup();
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("button", { name: "更多筛选 2" });
+  await user.click(screen.getByRole("button", { name: "清除请求筛选" }));
+
+  expect(screen.getByRole("button", { name: "更多筛选 1" })).toBeVisible();
+  expect(screen.queryByText(REQUEST_ID, { selector: "code" }))
+    .not.toBeInTheDocument();
+  expect(candidateUrls).toHaveLength(1);
+  await user.click(screen.getByRole("button", { name: "更多筛选 1" }));
+  expect(screen.getByLabelText("Capture Request ID")).toHaveValue("");
 });
 
 it("never executes Candidate markup and preserves exact provenance", async () => {
@@ -628,7 +683,7 @@ it("does not let a resolved stale repository poll schedule more work", async () 
   );
   await router.navigate(`/spaces/${SPACE_ID}/candidates`);
   render(<RouterProvider router={router} />);
-  const repository = await screen.findByLabelText("登记仓库");
+  const repository = await screen.findByLabelText("更新仓库");
   await waitFor(() => expect(eventUrls).toHaveLength(1));
 
   fireEvent.change(repository, { target: { value: secondRepository } });

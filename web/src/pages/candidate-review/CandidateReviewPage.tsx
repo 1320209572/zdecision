@@ -141,6 +141,9 @@ export function CandidateReviewPage() {
   const [filterState, setFilterState] = useState<CandidateStateFilter>(
     routedState,
   );
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
+  const activeAdvancedFilterCount =
+    Number(Boolean(filterRepository)) + Number(Boolean(filterCaptureRequest));
   const [draftVersion, setDraftVersion] = useState(0);
   const [draftByFamily, setDraftByFamily] = useState(
     () => new Map<string, ReviewDraftItem>(),
@@ -662,7 +665,7 @@ export function CandidateReviewPage() {
   return (
     <div className="page candidate-page">
       <header className="page-header candidate-page__header">
-        <div>
+        <div className="candidate-page__identity">
           <p className="eyebrow">
             {inbox.space.kind === "product" ? "PRODUCT" : "SHARED UNIT"} / CANDIDATE INBOX
           </p>
@@ -674,9 +677,9 @@ export function CandidateReviewPage() {
         </div>
         <div className="refresh-console">
           <label>
-            <span>登记仓库</span>
+            <span>更新仓库</span>
             <select
-              aria-label="登记仓库"
+              aria-label="更新仓库"
               value={selectedRepository}
               onChange={(event) => setSelectedRepository(event.target.value)}
             >
@@ -708,59 +711,97 @@ export function CandidateReviewPage() {
       </header>
 
       <form className="candidate-filters" onSubmit={applyFilters}>
-        <label className="candidate-filters__search">
-          <span>搜索候选决策</span>
-          <input
-            type="search"
-            aria-label="搜索候选决策"
-            maxLength={200}
-            value={filterSearch}
-            onChange={(event) => setFilterSearch(event.target.value)}
-          />
-        </label>
-        <label>
-          <span>筛选仓库</span>
-          <select
-            aria-label="筛选仓库"
-            value={filterRepository}
-            onChange={(event) => setFilterRepository(event.target.value)}
+        <div className="candidate-filters__primary">
+          <label className="candidate-filters__search">
+            <span>搜索候选决策</span>
+            <input
+              type="search"
+              aria-label="搜索候选决策"
+              maxLength={200}
+              value={filterSearch}
+              onChange={(event) => setFilterSearch(event.target.value)}
+            />
+          </label>
+          <label className="candidate-filters__state">
+            <span>审核状态</span>
+            <select
+              aria-label="审核状态"
+              value={filterState}
+              onChange={(event) =>
+                setFilterState(event.target.value as CandidateStateFilter)
+              }
+            >
+              <option value="pending">待审核</option>
+              <option value="accepted">已接受</option>
+              <option value="rejected">已拒绝</option>
+              <option value="published">已发布</option>
+              <option value="all">全部</option>
+            </select>
+          </label>
+          <button
+            className="candidate-filters__more"
+            type="button"
+            aria-expanded={advancedFiltersOpen}
+            aria-controls="candidate-advanced-filters"
+            onClick={() => setAdvancedFiltersOpen((open) => !open)}
           >
-            <option value="">全部仓库</option>
-            {inbox.repositories.map((repository) => (
-              <option
-                value={repository.repository_id}
-                key={repository.repository_id}
+            更多筛选{activeAdvancedFilterCount ? ` ${activeAdvancedFilterCount}` : ""}
+          </button>
+          <button className="filter-button" type="submit">应用筛选</button>
+        </div>
+
+        {!advancedFiltersOpen && activeAdvancedFilterCount ? (
+          <div className="candidate-filters__active" aria-label="已启用的高级筛选">
+            {filterRepository ? (
+              <span>
+                仓库 <code>{filterRepository}</code>
+                <button
+                  type="button"
+                  aria-label="清除仓库筛选"
+                  onClick={() => setFilterRepository("")}
+                >×</button>
+              </span>
+            ) : null}
+            {filterCaptureRequest ? (
+              <span>
+                请求 <code>{filterCaptureRequest}</code>
+                <button
+                  type="button"
+                  aria-label="清除请求筛选"
+                  onClick={() => setFilterCaptureRequest("")}
+                >×</button>
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+
+        {advancedFiltersOpen ? (
+          <div className="candidate-filters__advanced" id="candidate-advanced-filters">
+            <label>
+              <span>筛选仓库</span>
+              <select
+                aria-label="筛选仓库"
+                value={filterRepository}
+                onChange={(event) => setFilterRepository(event.target.value)}
               >
-                {repository.repository_id}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Capture Request ID</span>
-          <input
-            aria-label="Capture Request ID"
-            value={filterCaptureRequest}
-            onChange={(event) => setFilterCaptureRequest(event.target.value)}
-          />
-        </label>
-        <label>
-          <span>审核状态</span>
-          <select
-            aria-label="审核状态"
-            value={filterState}
-            onChange={(event) =>
-              setFilterState(event.target.value as CandidateStateFilter)
-            }
-          >
-            <option value="pending">待审核</option>
-            <option value="accepted">已接受</option>
-            <option value="rejected">已拒绝</option>
-            <option value="published">已发布</option>
-            <option value="all">全部</option>
-          </select>
-        </label>
-        <button className="filter-button" type="submit">应用筛选</button>
+                <option value="">全部仓库</option>
+                {inbox.repositories.map((repository) => (
+                  <option value={repository.repository_id} key={repository.repository_id}>
+                    {repository.repository_id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Capture Request ID</span>
+              <input
+                aria-label="Capture Request ID"
+                value={filterCaptureRequest}
+                onChange={(event) => setFilterCaptureRequest(event.target.value)}
+              />
+            </label>
+          </div>
+        ) : null}
       </form>
 
       <div className="candidate-review-console">
