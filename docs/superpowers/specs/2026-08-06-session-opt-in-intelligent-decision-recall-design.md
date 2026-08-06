@@ -234,13 +234,22 @@ mentions the installed ZDecision Plugin. The activation tool is guarded by
 host-owned Session and Turn identity using the same trust principle as the
 inline Candidate control.
 
+Gate 1 proves native selection from the exact app-server Turn's structured
+`skill` or `mention` user-input item. Matching ordinary Prompt text, observing
+that the model called an activation tool, or enabling implicit Skill invocation
+does not establish authority. If the in-progress Turn cannot be read and bound
+before the affected answer, activation fails the Host Gate.
+
 Quoted text, summaries, tool output, Decision text, assistant initiative,
 delegated messages, steering, and cross-task envelopes cannot activate recall.
 Model-supplied Session IDs are rejected.
 
-The local key is the trusted native `session_id`. Repository/CWD and Decision
-space are evidence within an Intent Epoch, not substitutes for Session identity;
-two tasks in one repository remain independent.
+The local key is the trusted per-task Thread identity carried by the Hook as
+`session_id`, after Gate 1 proves it equals app-server `Thread.id`. App-server
+`Thread.sessionId` is session-tree provenance shared by Forks and must never be
+used as the authorization key. Repository/CWD and Decision space are evidence
+within an Intent Epoch, not substitutes for Thread identity; two tasks in one
+repository remain independent.
 
 ### 6.2 States and first-answer barrier
 
@@ -445,17 +454,21 @@ A signed current manifest contains at least:
       decision_version
       snapshot_digest
       active-head manifest digest/count
-      invalidated-revision manifest digest/count
     retrieval-profile manifest digest
     key_id
     issued_at
     expires_at
 
-The referenced data contains complete canonical formal Decision revisions,
+The referenced data contains the complete canonical formal active-head set,
 document digests, ownership, lifecycle, and counts for each included leaf.
-Active heads are available for new retrieval. Signed invalidation metadata
-distinguishes an ordinary newer revision from retirement, supersession, or
-another lifecycle event that must immediately remove Session authority.
+Active heads are available for new retrieval. Because the current V1 Registry
+can produce only `revision: 1` and `lifecycle: active`, Packet 3 does not invent
+revision, retirement, supersession, or invalidation records outside Git. When
+an exact previously active `(decision_id, revision, digest)` is absent from a
+newer signed complete active-head set, that signed removal immediately ends its
+Session authority. The distribution and local transition types remain capable
+of representing a future ordinary newer revision, but the Demo does not claim
+that current V1 can produce or distinguish one.
 
 A complete replacement snapshot is the correctness boundary. Cursor events and
 notifications are wakeup hints only.
@@ -481,11 +494,11 @@ boundary.
 
 ### 10.2 Trust root and canonical bytes
 
-The Demo installs an owner-readable trust root during onboarding. The manifest
-names its `key_id` and signs bytes produced by the repository's existing
-canonical JSON contract. Snapshot and model artifact digests use SHA-256.
-Automatic signing-key rotation is deferred, but an unknown key fails closed;
-there is no “accept first seen key” path.
+The Demo installs an owner-readable Ed25519 public trust root during onboarding.
+The manifest names its `key_id` and signs bytes produced by the repository's
+existing canonical JSON contract. Snapshot and model artifact digests use
+SHA-256. Automatic signing-key rotation is deferred, but an unknown key fails
+closed; there is no “accept first seen key” path.
 
 Central may sign or extend a manifest only while its Registry projection is
 `available` and bound to the verified Registry tree. A `syncing` or
@@ -522,18 +535,18 @@ last-known-good. Arbitrary history and partial builds are ineligible.
 
 Local immutable Decision blobs referenced by active Sessions are retained by
 `(decision_id, revision, digest, source_generation)` even after the global
-cache pointer advances. This permits the approved Session rule: an ordinary
-new revision waits until the next Intent Epoch, while an explicit signed
-retirement/supersession/invalidation removes authority on the next Prompt.
-Garbage collection waits until no Session, LKG, or recovery record references
-the blob.
+cache pointer advances. A newly published Decision waits until the next Intent
+Epoch. An exact active revision removed from the newer signed complete set loses
+authority on the next Prompt. Future Registry formats may add an ordinary newer
+revision branch, but V1 does not simulate it. Garbage collection waits until no
+Session, LKG, or recovery record references the blob.
 
 When the exact same `(decision_id, revision, digest)` remains active in a newer
 generation, the Agent may rebind that active item to the newer signed lease
-without reinjection. A replacement revision never extends the displaced
-revision's lease; that pinned old revision remains bounded by its original
-source generation and expires if the Session does not cross an Intent Epoch in
-time.
+without reinjection. A removed revision cannot be rebound. If a future Registry
+format supplies a non-invalidating replacement revision, the displaced pinned
+revision remains bounded by its original source generation until the next
+Intent Epoch; this future-compatible branch is not a V1 Demo claim.
 
 ### 10.5 Freshness and clock safety
 
@@ -571,8 +584,8 @@ local generation metadata; it does not synchronously fetch Central each Turn.
 |---|---|
 | Exact ID/revision/digest remains active | Rebind to the newer lease without reinjection. |
 | Ordinary new Decision | Record pending generation; retrieve at the next Intent Epoch or explicit recheck. |
-| Non-invalidating newer revision | Keep the pinned revision within its original lease; retrieve at the next Intent Epoch or explicit recheck. |
-| Signed retirement, supersession, or invalidation | Remove on the first Prompt after the Agent activates that generation and display the change. |
+| Exact active revision is absent from the newer signed complete set | Remove on the first Prompt after the Agent activates that generation and display the change. |
+| Future non-invalidating newer revision | Keep the pinned revision within its original lease and retrieve at the next Intent Epoch; not emitted by V1. |
 | New generation cannot activate | Keep only an independently valid LKG until its own expiry; do not claim a revocation was seen. |
 | Pinned source generation expires first | Remove its authority and pause affected work even if the Session intent did not change. |
 
@@ -686,10 +699,13 @@ adds ZDecision again and freshness, routing, and applicability are revalidated.
 
 The preferred host mechanism places Decision envelopes in a non-inherited
 additional-context layer. When the host copies that layer, trusted
-`SessionStart(source=fork)` handling inserts a developer-level invalidation
-envelope that names the inherited receipt IDs and child Session, while the
-local gate and all receipt/application tools reject those IDs as inactive for
-the child. A marker in ordinary assistant text is not sufficient.
+app-server parent/child task metadata or another supported host-owned fork fact
+must identify the child; `SessionStart.source` cannot do so because its current
+values are only `startup`, `resume`, `clear`, and `compact`. Once the relation
+is proven, Session-start handling inserts a developer-level invalidation
+envelope naming the inherited receipt IDs and child Session, while the local
+gate and every receipt/application tool reject those IDs as inactive for the
+child. A marker in ordinary assistant text is not sufficient.
 
 The Host Gate must inspect the actual child context and prove that inherited
 items cannot obtain an active receipt or govern a conflicting child task before
@@ -714,6 +730,10 @@ The first successful application in an epoch shows one expandable receipt:
 Expanded content includes titles, revisions, leaf name, short match reasons,
 source generation, and freshness. It excludes scores, vectors, local paths,
 Session IDs, and private source evidence.
+
+V1 has no separate Decision `title` field. Packet 3 uses the canonical
+`scope_summary` as `display_title`; it does not alter formal Registry bytes to
+manufacture one.
 
 Same-intent reuse shows no repeated receipt. A new receipt appears only when:
 
@@ -834,9 +854,13 @@ Before retrieval implementation, prove in real Codex Desktop:
    or a command-executing/code-mutating tool, while an invalid/replayed gate
    fails closed;
 5. compact/clear restores typed context idempotently;
-6. a Fork is a new authorization boundary and inherited content stays
-   inactive through host context inspection and receipt/tool rejection; and
-7. Capture forks remain recall-disabled and exclude inherited Decision
+6. the Hook `session_id` equals exact app-server `Thread.id`, never the shared
+   tree-level `Thread.sessionId`, and structured active-Turn input proves the
+   native ZDecision selection;
+7. supported app-server/host facts identify a Fork without inventing a
+   `SessionStart` source, and inherited content stays inactive through context
+   inspection plus receipt/tool rejection; and
+8. Capture forks remain recall-disabled and exclude inherited Decision
    envelopes as confirmation.
 
 Failure stops Packet 3 and redesigns only host integration. Do not build the
@@ -852,8 +876,10 @@ model stack or distribution path around an unproven assumption.
 - Failed upgrades preserve the old valid profile.
 - Publication advances generation only after the verified projection contains
   its exact Registry tree.
-- Session-pinned ordinary revisions and immediate signed invalidations follow
-  their distinct transition rules.
+- newly published Decisions wait for the next Intent Epoch, while removal from
+  a newer signed complete active-head set immediately ends authority;
+- the future ordinary-revision branch is type-tested but is not claimed as a
+  current V1 producer capability.
 
 ### Gate 3: Offline retrieval quality
 
@@ -878,7 +904,7 @@ Acceptance covers:
 6. same-intent reuse and intent-change replacement;
 7. conflict, uncertainty, per-Decision override, and Session bypass;
 8. empty “继续” followed by one compact restoration;
-9. ordinary revision deferral versus immediate signed invalidation;
+9. new-Decision deferral versus immediate signed active-head removal;
 10. normal SessionEnd followed by native resume preserves activation but
     revalidates freshness;
 11. valid offline LKG, expiry, corruption, and clock rollback;
