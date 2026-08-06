@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         "init", help="create one central and local Agent configuration pair"
     )
     initialize.add_argument("--repository-cwd", required=True)
-    initialize.add_argument("--product-name", required=True)
+    initialize.add_argument("--product-name")
     initialize.add_argument("--output-dir", required=True)
 
     run = commands.add_parser("run", help="run the loopback central service")
@@ -100,10 +100,11 @@ def _initialize_demo_config(arguments: argparse.Namespace) -> int:
     snapshot = RepositoryResolver(timeout_seconds=2.0).resolve(repository_cwd)
     if snapshot is None:
         raise CentralCliError("repository_not_resolved")
-    try:
-        product_name = canonical_product_name(arguments.product_name)
-    except ValueError as error:
-        raise CentralCliError("product_name_invalid") from error
+    if arguments.product_name is not None:
+        try:
+            canonical_product_name(arguments.product_name)
+        except ValueError as error:
+            raise CentralCliError("product_name_invalid") from error
 
     output_directory = Path(arguments.output_dir).expanduser()
     if not output_directory.is_absolute():
@@ -129,9 +130,7 @@ def _initialize_demo_config(arguments: argparse.Namespace) -> int:
     device_token_digest = hashlib.sha256(
         device_token.encode("utf-8")
     ).hexdigest()
-    catalog_groups, spaces, routes = _demo_catalog(
-        snapshot.repository_id, product_name
-    )
+    catalog_groups, spaces, routes = _demo_catalog(snapshot.repository_id)
     repository = EnabledRepository(snapshot.repository_id, True).to_dict()
     central = {
         "organization_id": organization_id,
@@ -382,9 +381,7 @@ def _validate_trusted_catalog(
         _validate_route_set(repository_routes, space_by_id)
 
 
-def _demo_catalog(
-    repository_id: str, product_name: str
-) -> tuple[
+def _demo_catalog(repository_id: str) -> tuple[
     tuple[CatalogGroup, ...],
     tuple[LeafDecisionSpace, ...],
     tuple[RepositoryDecisionRoute, ...],
@@ -412,28 +409,41 @@ def _demo_catalog(
             ("packages", "packages", 30),
         )
     )
-    product_compatibility_id = product_id(product_name)
-    product_root = "packages/products/" + product_name.casefold().replace(" ", "-")
-    product = LeafDecisionSpace(
-        decision_space_id=decision_space_id("product", product_compatibility_id),
-        kind="product",
-        display_name=product_name,
-        compatibility_product_id=product_compatibility_id,
-        compatibility_product_name=product_name,
-        catalog_group_id=None,
-        catalog_breadcrumb=(),
-        source_root=product_root,
-        package_name=None,
-        asset_type=None,
-        enabled=True,
+    product_specs = (
+        "cloud",
+        "idp",
+        "lifecycle",
+        "portal",
+        "redis",
+        "third-party-services",
+        "zcf-installer",
+        "ziam",
+        "zmetis",
+        "zns",
+        "zstack-ai-studio",
+        "zstone",
+        "zsv",
+    )
+    product_spaces = tuple(
+        LeafDecisionSpace(
+            decision_space_id=decision_space_id("product", product_id(name)),
+            kind="product",
+            display_name=name,
+            compatibility_product_id=product_id(name),
+            compatibility_product_name=name,
+            catalog_group_id=None,
+            catalog_breadcrumb=(),
+            source_root=f"packages/products/{name}",
+            package_name=None,
+            asset_type=None,
+            enabled=True,
+        )
+        for name in product_specs
     )
     group_by_prefix = {group.source_prefix: group for group in shared_groups}
     shared_specs = (
-        ("audit-nest", "packages/products/shared/audit-nest", "@zstack/audit-nest", "cross_product_module"),
-        ("zcf-alert", "packages/products/shared/zcf-alert", "@zstack/zcf-alert", "cross_product_module"),
         ("zcf-audit", "packages/products/shared/zcf-audit", "@zstack/zcf-audit", "cross_product_module"),
         ("zcf-license", "packages/products/shared/zcf-license", "@zstack/zcf-license", "cross_product_module"),
-        ("zcf-region-management", "packages/products/shared/zcf-region-management", "@zstack/zcf-region-management", "cross_product_module"),
         ("design-x", "packages/shared/design-x", "@zstack/design-x", "library"),
         ("theme", "packages/shared/theme", "@zstack/theme", "library"),
         ("design", "packages/design", "@zstack/design", "component_library"),
@@ -468,7 +478,7 @@ def _demo_catalog(
                 enabled=True,
             )
         )
-    spaces = (product, *shared_spaces)
+    spaces = (*product_spaces, *shared_spaces)
     routes = tuple(
         RepositoryDecisionRoute(
             route_id=repository_route_id(repository_id, space.decision_space_id),

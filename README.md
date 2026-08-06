@@ -1,35 +1,45 @@
 # ZDecision
 
-ZDecision turns decisions from normal Codex development into small, reviewed
-project memory, then recalls the relevant formal Decisions in later work
-without copying the source conversation.
+ZDecision turns decisions from ordinary Codex development into small, reviewed
+project memory without copying the source conversation into shared storage.
 
-The implemented pre-Demo **Packet 1** is user-triggered:
+The implemented monorepo workflow is:
 
-1. The installed Plugin observes Codex activity only in company-enabled Git
-   repositories.
-2. After a completed and verified code-development boundary, Codex renders an
-   inline card once. The exact native same-task phrase **更新候选决策** is a
-   fallback only after the registered-and-enabled repository status gate
-   passes; the render Hook then proves the exact current Session and Turn.
-3. The user clicks **当前 Session** or **所有有效 Session** on that card, or
-   clicks **更新候选决策** for the repository on the central page.
-4. The local Agent selects the authorized changed Sessions, runs two-stage decision
-   extraction, and uploads only structured Candidate decisions.
-5. Current Candidate revisions appear in the product-isolated Candidate Inbox.
+```text
+Update action
+  -> one repository Capture group
+  -> trusted local Git route plan
+  -> product and concrete Shared leaf slices
+  -> local extraction and reconciliation
+  -> frozen leaf Candidate ownership
+  -> leaf Candidate Inbox
+  -> Review
+  -> read-only Preview
+  -> separate explicit publish
+  -> isolated V1 Registry compatibility partition
+```
 
-No Session ID, separate compression conversation, or CLI command is part of
-the Plugin product flow. Rendering the card does not authorize Capture; only a
-scope button or the central page action does. Packet 1 ends at the Candidate Inbox. Web
-Review/publication is Packet 2, and automatic Decision recall is Packet 3; they
-are deliberately not simulated by the Packet 1 page.
+After a completed and verified code-development boundary, the installed Plugin
+may render **更新候选决策**. The exact same-task phrase is also available after
+the registered-and-enabled repository gate. The card keeps exactly two Update
+scopes: **当前 Session** and **所有有效 Session**. It never asks the user to pick
+a product or Shared package; the local Agent routes frozen repository-relative
+Git paths through the trusted catalog after repository and Session
+authorization.
 
-For the local technical-loop operator, the internal startup boundary is:
+No Session ID, product selector, separate compression conversation, or Capture
+CLI is part of the Plugin flow. Rendering the card does not authorize Capture;
+only one of its scope buttons or the repository page Update action does.
+Packet 1 ends at the Candidate Inbox. Web Review/publication is Packet 2, and
+automatic Decision recall is Packet 3.
+
+## Technical Demo startup
+
+Create a new private configuration directory for the registered monorepo:
 
 ```bash
 zdecision-central demo-config init \
-  --repository-cwd /absolute/path/to/repository \
-  --product-name PRODUCT \
+  --repository-cwd /absolute/path/to/zstack-ui-next \
   --output-dir /absolute/path/to/new-config-directory
 
 zdecision-central run \
@@ -43,40 +53,47 @@ zdecision-agent service run \
   --config /absolute/path/to/new-config-directory/agent.json
 ```
 
-The generated config files are private onboarding artifacts. The browser opens
-`http://127.0.0.1:8765`; a central-page update click or an inline card scope
-click authorizes model-based Candidate generation.
+The generated `central.json` owns the complete trusted catalog and route
+versions. `agent.json` contains only the enabled repository identity and device
+credentials. The Demo registers these independent product roots:
 
-V1 selects templates by stable ID. A template's title is display metadata, not
-an alias. To add one, copy a template directory, assign its stable ID, title,
-and revision, then edit its two policy files. The repository currently bundles
-the high-precision `business` revision 2 template, titled
-**业务决策压缩模板**; `architecture` above is only an example of a template the
-user might install. The bundled template keeps durable product choices and
-business boundaries, not rediscoverable API details or ordinary implementation
-correctness. Separate technical-contract templates can be added later for those
-facts. When several signals express one underlying product principle,
-`business` keeps one complete representative instead of publishing each
-implementation fragment.
+```text
+packages/products/{cloud,idp,lifecycle,portal,redis,third-party-services,
+zcf-installer,ziam,zmetis,zns,zstack-ai-studio,zstone,zsv}
+```
 
-The product authority is [docs/architecture.md](docs/architecture.md). The
-active Plugin contract is the
-[on-demand Candidate refresh design](docs/superpowers/specs/2026-07-30-on-demand-candidate-refresh-design.md),
-as amended by the
-[Codex inline Candidate refresh design](docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md)
-and its
-[repository-bound presentation guard](docs/superpowers/specs/2026-08-05-repository-bound-refresh-guard-design.md).
-Repository instructions for Codex are in [AGENTS.md](AGENTS.md).
+It also registers only these concrete Shared leaves:
 
-## V1 storage
+```text
+packages/products/shared/{zcf-audit,zcf-license}
+packages/shared/{design-x,theme}
+packages/{design,form,table,hooks,auth,i18n,utils,zephyr}
+```
 
-Source code and formal decisions share this repository and its `main` branch.
-Formal decisions are isolated under `decision-registry/`. Raw conversations,
-candidate decisions, and private review state never enter that subtree.
+`Shared` and its directory groups are navigation nodes. They aggregate counts
+and expand to the listed leaves, but they cannot own Capture output, Review,
+Preview, publication, or Registry files. Browser links use canonical
+`/spaces/{decision_space_id}/...` routes.
 
-Each product has its own formal partition. The root index points to product
-metadata and that product's Decision index; every Decision remains an
-independent revision document:
+## Templates and privacy
+
+Templates are selected by stable ID; a template title is display metadata, not
+an alias. To install another template, copy a template directory, assign its
+stable ID, title, and revision, then edit its two policy files. The repository
+bundles the high-precision `business` revision 2 template titled
+**业务决策压缩模板**; `architecture` is only an example of another template a
+user might install. extractor-v1 completed records remain display-only.
+
+Raw Sessions, Prompts, model context, tool output, source, diffs, credentials,
+and local absolute paths never leave the device. Central persistence receives
+only typed request metadata, route/path digests, frozen leaf ownership,
+Candidate revisions, and later Review/publication records.
+
+## V1 Registry compatibility
+
+Only reviewed formal Decisions enter Git. Each product or concrete Shared leaf
+has a distinct internal `prod_<stable-id>` compatibility partition; the Shared
+root has none:
 
 ```text
 decision-registry/
@@ -90,10 +107,7 @@ decision-registry/
                 └── r0001.json
 ```
 
-The proven Review and publication domain remains private and batched. Preview
-is read-only and shows the exact formal documents and paths; acceptance does
-not publish. Wiring that domain to the Plugin page belongs to Packet 2.
-
-The implementation lives under `src/zdecision/`. Legacy execution paths are
-not retained; extractor-v1 completed records remain display-only so existing
-private Candidates can still be reviewed.
+The product authority is [docs/architecture.md](docs/architecture.md), and the
+bounded operator acceptance is
+[docs/demo-central-web.md](docs/demo-central-web.md). Repository instructions
+for Codex are in [AGENTS.md](AGENTS.md).

@@ -6,8 +6,14 @@ import unittest
 from pathlib import Path
 
 from zdecision.central.auth import DemoIdentityProvider
+from zdecision.central.decision_spaces import (
+    EnabledRepository,
+    LeafDecisionSpace,
+    RepositoryDecisionRoute,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
+from zdecision.ids import decision_space_id, repository_route_id
 from zdecision.sync.contracts import RepositoryView
 
 try:
@@ -29,13 +35,49 @@ class UpdateCandidatesPageTest(unittest.TestCase):
         self.store = CentralStore.open(
             Path(self.temporary_directory.name) / "central.sqlite3"
         )
+        repository_id = "repo_" + "1" * 32
+        product_id = "prod_4d7b16e1616dd4cd1aeb2411836fd687"
         self.store.put_repository_mapping(
             "org_demo",
             RepositoryView(
-                repository_id="repo_" + "1" * 32,
-                product_id="prod_4d7b16e1616dd4cd1aeb2411836fd687",
+                repository_id=repository_id,
+                product_id=product_id,
                 product_name="ZDecision",
                 enabled=True,
+            ),
+        )
+        self.store.put_repository(
+            "org_demo", EnabledRepository(repository_id, True)
+        )
+        space = LeafDecisionSpace(
+            decision_space_id=decision_space_id("product", product_id),
+            kind="product",
+            display_name="ZDecision",
+            compatibility_product_id=product_id,
+            compatibility_product_name="ZDecision",
+            catalog_group_id=None,
+            catalog_breadcrumb=(),
+            source_root=".",
+            package_name=None,
+            asset_type=None,
+            enabled=True,
+        )
+        self.store.put_decision_space("org_demo", space)
+        self.store.replace_trusted_route_heads(
+            "org_demo",
+            repository_id,
+            (
+                RepositoryDecisionRoute(
+                    route_id=repository_route_id(
+                        repository_id, space.decision_space_id
+                    ),
+                    repository_id=repository_id,
+                    decision_space_id=space.decision_space_id,
+                    path_prefixes=(".",),
+                    excluded_prefixes=(),
+                    enabled=True,
+                    configuration_version=1,
+                ),
             ),
         )
         identity = DemoIdentityProvider(

@@ -15,6 +15,7 @@ from zdecision.capture.models import CandidateContent
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
 from zdecision.central.decision_spaces import (
+    CatalogGroup,
     EnabledRepository,
     LeafDecisionSpace,
     RepositoryDecisionRoute,
@@ -26,6 +27,7 @@ from zdecision.central.web.queries import CentralWebQueries
 from zdecision.central.web.store import CentralWebStore
 from zdecision.ids import (
     candidate_revision_id,
+    catalog_group_id,
     decision_space_id,
     product_id,
     repository_route_id,
@@ -36,14 +38,17 @@ from zdecision.registry.git import GitRegistryAdapter
 from zdecision.registry.models import RootRegistry
 from zdecision.registry.query import RegistryQuery
 from zdecision.sync.contracts import (
-    CandidateBatchUpload,
     CandidateRevisionUpload,
+    CandidateSliceBatchUpload,
     RepositoryView,
+    RouteSelection,
 )
 
 
-PRODUCT_NAME = "ZDecision Vertical"
+PRODUCT_NAME = "Shared / packages/shared/theme"
 PRODUCT_ID = product_id(PRODUCT_NAME)
+DECISION_SPACE_ID = decision_space_id("shared_unit", PRODUCT_ID)
+SHARED_GROUP_ID = catalog_group_id(("Shared",))
 REPOSITORY_ID = "repo_" + "8" * 32
 DEVICE_TOKEN = "vertical-device-token"
 NOW = datetime(2026, 8, 4, 8, 0, tzinfo=UTC)
@@ -106,20 +111,30 @@ class CentralWebVerticalTest(unittest.TestCase):
         initial.put_repository(
             "org_demo", EnabledRepository(REPOSITORY_ID, True)
         )
-        leaf_id = decision_space_id("product", PRODUCT_ID)
+        initial.put_catalog_group(
+            "org_demo",
+            CatalogGroup(
+                catalog_group_id=SHARED_GROUP_ID,
+                parent_group_id=None,
+                display_name="Shared",
+                breadcrumb=("Shared",),
+                source_prefix=None,
+                sort_order=20,
+            ),
+        )
         initial.put_decision_space(
             "org_demo",
             LeafDecisionSpace(
-                decision_space_id=leaf_id,
-                kind="product",
-                display_name=PRODUCT_NAME,
+                decision_space_id=DECISION_SPACE_ID,
+                kind="shared_unit",
+                display_name="theme",
                 compatibility_product_id=PRODUCT_ID,
                 compatibility_product_name=PRODUCT_NAME,
-                catalog_group_id=None,
-                catalog_breadcrumb=(),
-                source_root=".",
-                package_name=None,
-                asset_type=None,
+                catalog_group_id=SHARED_GROUP_ID,
+                catalog_breadcrumb=("Shared",),
+                source_root="packages/shared/theme",
+                package_name="@zstack/theme",
+                asset_type="library",
                 enabled=True,
             ),
         )
@@ -128,10 +143,12 @@ class CentralWebVerticalTest(unittest.TestCase):
             REPOSITORY_ID,
             (
                 RepositoryDecisionRoute(
-                    route_id=repository_route_id(REPOSITORY_ID, leaf_id),
+                    route_id=repository_route_id(
+                        REPOSITORY_ID, DECISION_SPACE_ID
+                    ),
                     repository_id=REPOSITORY_ID,
-                    decision_space_id=leaf_id,
-                    path_prefixes=(".",),
+                    decision_space_id=DECISION_SPACE_ID,
+                    path_prefixes=("packages/shared/theme",),
                     excluded_prefixes=(),
                     enabled=True,
                     configuration_version=1,
@@ -219,7 +236,7 @@ class CentralWebVerticalTest(unittest.TestCase):
             future_action="Keep the explicit Review and publication boundary.",
             scope_summary="Central Web vertical acceptance",
             repositories=("disposable-zdecision",),
-            paths=("src/zdecision/central/web/",),
+            paths=("packages/shared/theme/",),
             invalidation_conditions=("The Central Web contract changes.",),
         )
         content_digest = hashlib.sha256(
@@ -271,20 +288,43 @@ class CentralWebVerticalTest(unittest.TestCase):
             )
         )
         self.assertEqual(200, started.status_code, started.text)
+        route = claimed.json()["route_snapshot"][0]
+        selection = RouteSelection(
+            route_id=route["route_id"],
+            configuration_version=route["configuration_version"],
+            matched_path_digest="1" * 64,
+            source_boundary_digest="2" * 64,
+        )
+        planned = self._record(
+            self.active_client.post(
+                f"/api/v1/agent/capture-requests/{request_id}/slices",
+                headers=self.authorization,
+                json={
+                    "lease_token": lease_token,
+                    "selections": [selection.to_dict()],
+                },
+            )
+        )
+        self.assertEqual(200, planned.status_code, planned.text)
+        slice_view = planned.json()["slices"][0]
         batch_digest = hashlib.sha256(
             canonical_json_bytes(
                 {"items": [item.to_dict() for item in candidates]}
             )
         ).hexdigest()
-        batch = CandidateBatchUpload(
+        batch = CandidateSliceBatchUpload(
             request_id=request_id,
-            repository_id=REPOSITORY_ID,
+            slice_id=slice_view["slice_id"],
+            route_id=route["route_id"],
+            route_configuration_version=route["configuration_version"],
+            decision_space_id=DECISION_SPACE_ID,
             items=candidates,
             batch_digest=batch_digest,
         )
         uploaded = self._record(
-            self.active_client.post(
-                f"/api/v1/agent/capture-requests/{request_id}/candidates",
+            self.active_client.put(
+                f"/api/v1/agent/capture-requests/{request_id}"
+                f"/slices/{slice_view['slice_id']}/batch",
                 headers=self.authorization,
                 json={"lease_token": lease_token, "batch": batch.to_dict()},
             )
@@ -296,7 +336,11 @@ class CentralWebVerticalTest(unittest.TestCase):
                 headers=self.authorization,
                 json={
                     "lease_token": lease_token,
-                    "batch_digest": batch.batch_digest,
+                    "receipt_digest": hashlib.sha256(
+                        canonical_json_bytes(
+                            {"receipts": [uploaded.json()]}
+                        )
+                    ).hexdigest(),
                 },
             )
         )
@@ -328,7 +372,7 @@ class CentralWebVerticalTest(unittest.TestCase):
     ) -> dict[str, object]:
         response = self._record(
             self.active_client.put(
-                f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/review-draft",
                 json={
                     "expected_version": draft["version"],
                     "items": self.draft_items(draft),
@@ -343,7 +387,7 @@ class CentralWebVerticalTest(unittest.TestCase):
     ) -> dict[str, object]:
         response = self._record(
             self.active_client.post(
-                f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/reviews",
                 json={
                     "client_action_id": "web_action_review_vertical",
                     "expected_draft_version": saved["version"],
@@ -456,7 +500,9 @@ class CentralWebVerticalTest(unittest.TestCase):
                 blobs.append(self._git("cat-file", "blob", object_id))
         return b"\n".join(blobs)
 
-    def test_candidate_to_product_registry_decision_and_history(self) -> None:
+    def test_theme_review_preview_and_explicit_publish_use_v1_partition(
+        self,
+    ) -> None:
         self.assert_forbidden_fields_rejected(
             "POST",
             "/api/v1/capture-requests",
@@ -479,14 +525,14 @@ class CentralWebVerticalTest(unittest.TestCase):
 
         draft_response = self._record(
             self.active_client.get(
-                f"/api/v1/web/products/{PRODUCT_ID}/review-draft"
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/review-draft"
             )
         )
         self.assertEqual(200, draft_response.status_code, draft_response.text)
         draft = draft_response.json()
         inbox = self._record(
             self.active_client.get(
-                f"/api/v1/web/products/{PRODUCT_ID}/candidates"
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/candidates"
             )
         )
         self.assertEqual(200, inbox.status_code, inbox.text)
@@ -497,7 +543,7 @@ class CentralWebVerticalTest(unittest.TestCase):
         }
         self.assert_forbidden_fields_rejected(
             "PUT",
-            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            f"/api/v1/web/spaces/{DECISION_SPACE_ID}/review-draft",
             valid_draft_body,
         )
         saved = self.save_accept_draft(draft)
@@ -505,7 +551,7 @@ class CentralWebVerticalTest(unittest.TestCase):
         self.restart_central_service()
         restored_response = self._record(
             self.active_client.get(
-                f"/api/v1/web/products/{PRODUCT_ID}/review-draft"
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/review-draft"
             )
         )
         self.assertEqual(200, restored_response.status_code, restored_response.text)
@@ -526,7 +572,7 @@ class CentralWebVerticalTest(unittest.TestCase):
         }
         self.assert_forbidden_fields_rejected(
             "POST",
-            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            f"/api/v1/web/spaces/{DECISION_SPACE_ID}/reviews",
             review_body,
         )
         review = self.submit_review(saved)
@@ -566,7 +612,7 @@ class CentralWebVerticalTest(unittest.TestCase):
         )
         history = self._record(
             self.active_client.get(
-                "/api/v1/web/publications", params={"product_id": PRODUCT_ID}
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/publications"
             )
         )
         self.assertEqual(200, history.status_code, history.text)
@@ -583,11 +629,12 @@ class CentralWebVerticalTest(unittest.TestCase):
         decision_id = published["decision_ids"][0]
         detail = self._record(
             self.active_client.get(
-                f"/api/v1/web/products/{PRODUCT_ID}/decisions/{decision_id}"
+                f"/api/v1/web/spaces/{DECISION_SPACE_ID}/decisions/{decision_id}"
             )
         )
         self.assertEqual(200, detail.status_code, detail.text)
-        self.assertEqual(PRODUCT_ID, detail.json()["product_id"])
+        self.assertEqual(DECISION_SPACE_ID, detail.json()["space"]["decision_space_id"])
+        self.assertNotIn("product_id", detail.json())
         unreferenced_commit = self.create_unreferenced_remote_commit()
         self.assertTrue(
             subprocess.run(
@@ -642,6 +689,14 @@ class CentralWebVerticalTest(unittest.TestCase):
             / "r0001.json"
         )
         self.assertTrue(registry_path.is_file())
+        self.assertFalse(
+            (
+                self.repository
+                / "decision-registry"
+                / "products"
+                / product_id("Shared")
+            ).exists()
+        )
 
         self.active_store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         sqlite_bytes = self.database_path.read_bytes()

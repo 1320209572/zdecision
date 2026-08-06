@@ -9,6 +9,8 @@ the approved Codex inline amendment in
 `docs/superpowers/specs/2026-07-31-codex-inline-candidate-refresh-design.md`,
 as tightened by the repository-bound presentation guard in
 `docs/superpowers/specs/2026-08-05-repository-bound-refresh-guard-design.md`.
+The current monorepo catalog, routing, leaf Review, and batch UI contract is
+`docs/superpowers/specs/2026-08-05-monorepo-product-routing-and-batch-review-design.md`.
 
 Where the historical manual interaction and the Plugin interaction differ,
 section 12 governs new product implementation. Existing Capture, Review,
@@ -93,7 +95,7 @@ private Candidate decisions
         v
 decision-registry/ on main
         |
-        | query by product and current task scope
+        | query by leaf Decision space and current task scope
         v
 bounded Context Pack
         |
@@ -108,9 +110,10 @@ Capture identifies one completed Turn in the source task and treats it as a
 stable boundary. Extraction runs in a fork or dedicated turn so the source task
 does not need to be rewritten or blocked.
 
-Capture produces zero or more Candidates. A Candidate contains a concise claim,
-the future action it implies, its product/scope, invalidation conditions, and
-minimal source references. Raw conversation text remains private.
+Capture produces zero or more Candidates. Each Candidate is frozen to one
+trusted leaf Decision space and contains a concise claim, the future action it
+implies, its scope, invalidation conditions, and minimal source references.
+Raw conversation text remains private.
 
 Zero Candidates is a valid result.
 
@@ -152,8 +155,8 @@ or skip each Candidate. One user Review Turn may classify multiple numbered
 Candidates; ZDecision still records one result per Candidate inside an atomic,
 append-only private Review batch.
 
-The Capture-selected product is immutable during V1 Review; an incorrect
-product requires a new Capture. Candidate text, Review content, and Registry
+The Capture-selected leaf Decision space is immutable during V1 Review; an
+incorrect leaf requires a new Capture. Candidate text, Review content, and Registry
 text are untrusted data, never executable instructions. Only the latest native
 user Turn may authorize its Review, and only the latest native user Turn after
 the displayed preview may authorize publication.
@@ -262,10 +265,13 @@ relations, and minimal provenance. Its V1 adapter reads and writes only
 `decision-registry/` in the canonical repository on `main`. Git is the storage
 adapter and audit history; commit hashes are not Decision identity.
 
-Registry storage is partitioned by a path-safe, deterministic product ID. The
-root index lists products only; each product owns its metadata, Decision index,
-and independently versioned Decision directories. Human product names never
-become raw path components.
+Registry V1 storage is partitioned by a path-safe, deterministic product ID.
+Every product leaf and concrete Shared leaf owns a distinct internal
+compatibility product ID, metadata file, Decision index, and independently
+versioned Decision directories. `Shared` and intermediate catalog groups have
+no compatibility partition. Human display names never become raw path
+components, and user-facing Web routes use `decision_space_id`, not this V1
+storage identity.
 
 ### 5.7 Applicability Engine
 
@@ -311,6 +317,7 @@ Coordinator above these services.
 | Capture Stage Turn IDs | Capture / Private Store | Native Turn identities for the successful inventory (Stage 1) and extraction (Stage 2) Turns in one fresh Capture fork. |
 | Capture Output Digests | Capture / Private Store | Digests of successful Stage 1 and Stage 2 outputs, retained for reconciliation without storing invalid payloads verbatim. |
 | Candidate | Capture / Private Store | Private and editable during review; never formal project memory. |
+| Candidate Ownership | Capture / Private Store | Immutable repository, route version, and leaf Decision-space snapshot for one Candidate revision. |
 | Candidate Review | Review / Private Store | Append-only record of the user's accept, edit, reject, or skip action. |
 | Decision Identity | Decision Registry | Stable for the life of the Decision. |
 | Decision Revision | Decision Registry | Immutable once published; later changes create a new revision. |
@@ -505,89 +512,84 @@ third-party implementation may be copied or adapted only when it fits the
 owning component, has a bounded dependency closure, retains required
 attribution, and passes ZDecision's stricter privacy and durability tests.
 
-## 12. Plugin on-demand Candidate refresh
+## 12. Plugin monorepo Candidate workflow
 
-The Plugin is delivered in three vertical packets. Packet 1 is the current
-executable boundary:
+The implemented vertical is:
 
 ```text
-Packet 1 (page path implemented; inline entry approved for implementation)
-  Plugin observes enabled repositories locally
-  -> user clicks the page update control or an inline Codex scope control
-  -> central service creates a durable Capture Request
-  -> persistent local Agent claims it
-  -> app-server Capture runs for the trusted current Session
-     or all changed eligible Sessions
-  -> structured Candidate revisions reach the Candidate Inbox
-
-Packet 2 (next)
-  Candidate Inbox -> explicit Review -> explicit publication -> Registry
-
-Packet 3 (after Packet 2)
-  signed Decision cache -> local relevance match -> bounded Codex injection
+Update action -> Capture group -> trusted Git route plan -> leaf slices
+leaf slice -> local extraction/reconciliation -> frozen Candidate ownership
+leaf Candidate Inbox -> Review -> Preview -> explicit publish -> V1 partition
 ```
 
-An explicit page or inline-card click, not a guessed feature-completion signal,
-starts Candidate generation. Hooks record bounded local facts and Session
-checkpoints; the narrow inline `PreToolUse` Hook may also bind host-owned task
-identity locally, but neither kind of Hook runs a model or starts Capture.
-`Stop`, `SessionEnd`, silence, tests, commits, pushes, and a model's work-state
-report do not independently start Capture.
+### 12.1 Authorization and grouping
 
-The inline card is presented only inside the same enabled-repository task. An
-exact native refresh phrase first passes registered-and-enabled repository
-status gates; delegation, task steering, copied text, and an ineligible task
-render no card. CWD-level Session ambiguity is diagnostic and cannot deny
-presentation. The `PreToolUse` Hook then proves the exact already-observed
-Session, current Turn, and CWD or blocks the render tool. `所有有效 Session`
-performs read-only same-repository selection and never sends or steers a source
-task.
+An explicit repository-page Update or an inline-card click starts Candidate
+generation. The card exposes only **当前 Session** and **所有有效 Session**. The
+user never supplies a Session ID and never selects a product or Shared package.
+The exact native refresh phrase first passes the registered-and-enabled
+repository gates; the host Hook then binds the current Session, Turn, and CWD.
+Delegation, steering, copied text, lifecycle Hooks, commits, and model status
+reports do not authorize Capture.
 
-The user does not provide Session IDs, open a compression conversation, run a
-CLI command, or merge Session results. The page action selects every changed
-eligible Session for the repository. The inline card selects either the
-host-bound current Session or that same all-valid set. The local Agent freezes
-durable upper checkpoints, runs the existing two-stage Capture contract, and
-reconciles `same`, `refine`, `replace`, and unrelated Candidate families. Zero
-Candidates is a successful request result.
+One click creates one repository-scoped Capture group. `当前 Session` freezes
+the host-bound source; `所有有效 Session` performs read-only selection of all
+changed eligible interactive Sessions already bound to that repository. It
+never sends or steers a source Session.
 
-Each frozen source is a durable business operation with disposable native
-execution generations. An unknown `thread/fork` or `turn/start` result abandons
-that generation and reruns both Capture stages in a fresh persisted read-only
-fork. Native execution may therefore duplicate, but only the active generation
-can win the local operation CAS. Reconciliation is fenced the same way, and
-its result, Candidate-family heads, and immutable outbox batch commit in one
-transaction. `threadSource` and `clientUserMessageId` are not correctness
-mechanisms and are not sent by Packet 1.
+### 12.2 Trusted routing and local execution
 
-Because source conversations remain local while the page and inline card use
-central request state, the installed Agent owns an authenticated persistent
-request channel. A queued request survives page/card closure, Agent outage, and
-central restart. The Agent advances a Session's handled checkpoint only after
-the complete structured result receives an idempotent central acknowledgement.
+The central trusted configuration owns catalog groups, leaf Decision spaces,
+repository routes, route versions, package metadata, and V1 compatibility
+partitions. The Agent freezes normalized repository-relative tracked Git paths
+and a source-boundary digest locally, matches only the server-issued route
+snapshot, and creates one deterministic slice per matched leaf. Model text,
+Candidate paths, the browser, and upload payloads cannot choose ownership.
 
-Only Candidate and operational request metadata cross the device boundary.
-Raw Sessions, Prompts, model context, tool output, code, and diffs remain local.
-The central service derives identity and product; browser and Agent payloads
-cannot select organization, actor, or an unregistered product.
+The Demo catalog exposes independent `packages/products/*` product roots and
+selected concrete leaves beneath `packages/products/shared`,
+`packages/shared`, and `packages`. `Shared` and its intermediate directory
+groups are navigation/aggregate nodes only. A generic Shared fallback route is
+invalid; groups cannot own Capture output, Candidate state, Review, Preview,
+publication, or Registry documents.
 
-Packet 1 stops at the product-isolated Candidate Inbox. Its page intentionally
-has no accept, reject, or publish control. Packet 2 connects the proven Review,
-preview, publication, and Registry contracts. Packet 3 adds automatic Decision
-recall: the local signed cache ranks Prompts locally, suppresses repeat
-injection through `active_injected_set`, and restores that set once after a
-Codex context compact or clear event.
+Each slice runs the two-stage extraction and Candidate-family reconciliation
+locally. Its immutable ownership snapshot contains the repository, exact route
+version, leaf Decision space, source root, compatibility partition, and source
+boundary digest. Slice outboxes and upload receipts are durable. After restart,
+an existing receipt suppresses another upload of the same batch; the group is
+acknowledged only after all planned leaf receipts exist.
 
-The technical-loop operator may start the central service and persistent Agent
-with `zdecision-central run` and `zdecision-agent service run`; those commands
-are deployment diagnostics, not end-user Capture UX. No internal command
-accepts a Session ID to authorize Candidate generation.
+### 12.3 Leaf Review and publication
 
-The detailed component contracts, DeepTutor reuse boundary, migration impact,
-and base acceptance Gates are defined in the on-demand Candidate refresh
-design. The trusted Codex binding, two inline scopes, card progress, and their
-additional Gates are defined in the approved Codex inline amendment. Native
-same-task authority and repository-bound presentation follow its approved
-2026-08-05 guard amendment.
-The superseded automatic feasibility specification and its implementation
-plans are historical evidence and must not drive new work.
+The central Web renders products and the expandable Shared tree. Only leaves
+have actions, and canonical browser/API paths use
+`/spaces/{decision_space_id}/...`. Repository-only links show all routed spaces
+instead of guessing one product.
+
+Candidate selection is transient and does not approve content. Direct or batch
+Review records `accept`, `reject`, or `edit_accept` for current revisions inside
+one leaf; Undo restores the immediately preceding batch state. A classified
+subset is submitted explicitly, with the 20-item boundary enforced before any
+silent truncation. Review submission, read-only Preview creation, and explicit
+publication remain three separate actions.
+
+Publication resolves the frozen leaf to its isolated V1 compatibility
+`product_id` and writes the unchanged Registry V1 bytes under
+`decision-registry/products/prod_<stable-id>/`. A Shared leaf such as `theme`
+has its own partition; `Shared` has none.
+
+### 12.4 Privacy and current boundary
+
+Raw Sessions, Prompts, model context, tool output, source, diffs, credentials,
+and local absolute paths remain on the device. Central HTTP and persistence
+contain only typed request state, route/path digests, frozen ownership,
+Candidate revisions, and Review/publication records. Formal reviewed Decisions
+are the only workflow output written to Git.
+
+The technical operator commands `zdecision-central run` and
+`zdecision-agent service run` are deployment diagnostics, not end-user Capture
+UX. Automatic Decision recall remains a later packet. The separately excluded
+Dashboard Git-fetch optimization, Registry V2, SSO, Git-role authorization,
+route-administration UI, comments, and notifications are not part of this
+vertical.

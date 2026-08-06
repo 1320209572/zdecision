@@ -30,6 +30,10 @@ Those observations never authorize Candidate generation.
   control binding.
 - Rendering the card is not Capture authorization. Only the user's later click
   on **当前 Session** or **所有有效 Session** authorizes a scoped request.
+- The card exposes exactly these two Update scopes. ZDecision must not ask the user to choose
+  a product or Shared package. After repository and Session
+  authorization, the local Agent routes trusted local Git path evidence to
+  the configured leaf Decision spaces.
 - Do not proactively render at Session start, during intermediate Turns, after
   incomplete or failed validation, or for non-code work.
 - Duplicate renders have no domain side effect. The render tool never starts

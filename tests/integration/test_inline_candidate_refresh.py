@@ -99,6 +99,14 @@ class InlineCandidateRefreshIntegrationTest(unittest.TestCase):
                 {"actions_enabled": True, "safe_state": "ready"},
                 rendered.structuredContent,
             )
+            self.assertNotIn(
+                "product",
+                json.dumps(rendered.structuredContent, sort_keys=True).lower(),
+            )
+            self.assertNotIn(
+                "shared",
+                json.dumps(rendered.structuredContent, sort_keys=True).lower(),
+            )
 
             started_current = tools.start_zdecision_candidate_refresh(
                 current_control, "current_session"

@@ -7,6 +7,9 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = REPOSITORY_ROOT / ".agents" / "skills" / "zdecision"
+PLUGIN_SKILL = (
+    REPOSITORY_ROOT / "plugins" / "zdecision" / "skills" / "zdecision" / "SKILL.md"
+)
 
 
 class ZDecisionSkillContractTests(unittest.TestCase):
@@ -17,6 +20,16 @@ class ZDecisionSkillContractTests(unittest.TestCase):
         return (SKILL_ROOT / "references" / "review-publish.md").read_text(
             "utf-8"
         )
+
+    def test_installed_plugin_keeps_two_neutral_update_scopes(self) -> None:
+        text = PLUGIN_SKILL.read_text("utf-8")
+
+        self.assertEqual(1, text.count("**当前 Session**"))
+        self.assertEqual(2, text.count("**所有有效 Session**"))
+        self.assertIn("exactly these two Update scopes", text)
+        self.assertIn("must not ask the user to choose", text)
+        self.assertIn("product or Shared package", text)
+        self.assertIn("trusted local Git path evidence", text)
 
     def test_root_skill_routes_templates_without_exposing_cli_as_user_ux(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")

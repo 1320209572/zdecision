@@ -47,6 +47,7 @@ from zdecision.capture.templates import TemplateCatalog
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
 from zdecision.central.decision_spaces import (
+    CatalogGroup,
     EnabledRepository,
     LeafDecisionSpace,
     RepositoryDecisionRoute,
@@ -54,6 +55,7 @@ from zdecision.central.decision_spaces import (
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
 from zdecision.ids import (
+    catalog_group_id,
     decision_space_id,
     product_id,
     repository_route_id,
@@ -325,7 +327,10 @@ class FakeAppServerGateway:
             output = copy.deepcopy(VALID_INVENTORY)
         elif "candidates" in properties:
             stage = "extraction"
-            output = self._extraction_output(thread_id)
+            product = properties["candidates"]["items"]["properties"][
+                "product"
+            ]["enum"][0]
+            output = self._extraction_output(thread_id, product)
         elif "results" in properties:
             stage = "reconciliation"
             output = self._reconciliation_output(prompt)
@@ -354,7 +359,9 @@ class FakeAppServerGateway:
     def archive_thread(self, thread_id: str) -> None:
         self.archived_threads.append(thread_id)
 
-    def _extraction_output(self, thread_id: str) -> dict[str, object]:
+    def _extraction_output(
+        self, thread_id: str, product: str
+    ) -> dict[str, object]:
         if self.zero_candidates:
             return {"candidates": []}
         source_context = self.source_context_by_fork.get(thread_id)
@@ -368,14 +375,16 @@ class FakeAppServerGateway:
                 (source, turn), self.version_by_session[source]
             )
         )
-        return self.candidate_output(version)
+        return self.candidate_output(version, product)
 
     @staticmethod
-    def candidate_output(version: str) -> dict[str, object]:
+    def candidate_output(
+        version: str, product: str = PRODUCT_NAME
+    ) -> dict[str, object]:
         return {
             "candidates": [
                 {
-                    "product": PRODUCT_NAME,
+                    "product": product,
                     "claim": f"页面请求产生候选决策：{version}",
                     "future_action": "只处理页面请求冻结的本地开发边界。",
                     "scope": {
@@ -515,27 +524,68 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         )
         self._assert_central_has_no_raw_source()
 
-    def test_one_action_routes_three_changed_leaves_to_three_slices(self) -> None:
-        prefixes = (
-            "packages/products/cloud/apps/core-shell",
-            "packages/products/shared/zcf-license",
-            "packages/shared/theme",
+    def test_one_update_routes_cloud_zns_audit_and_theme_without_generic_shared(
+        self,
+    ) -> None:
+        shared_group = CatalogGroup(
+            catalog_group_id=catalog_group_id(("Shared",)),
+            parent_group_id=None,
+            display_name="Shared",
+            breadcrumb=("Shared",),
+            source_prefix=None,
+            sort_order=20,
+        )
+        self.central_store.put_catalog_group("org_demo", shared_group)
+        specifications = (
+            (
+                "Cloud",
+                "product",
+                "packages/products/cloud",
+                "packages/products/cloud/apps/core-shell/src/app.tsx",
+            ),
+            (
+                "zns",
+                "product",
+                "packages/products/zns",
+                "packages/products/zns/src/app.tsx",
+            ),
+            (
+                "zcf-audit",
+                "shared_unit",
+                "packages/products/shared/zcf-audit",
+                "packages/products/shared/zcf-audit/src/App.tsx",
+            ),
+            (
+                "theme",
+                "shared_unit",
+                "packages/shared/theme",
+                "packages/shared/theme/src/index.ts",
+            ),
         )
         routes: list[RepositoryDecisionRoute] = []
-        for index, prefix in enumerate(prefixes, start=1):
-            compatibility_id = product_id(f"ZDecision leaf {index}")
-            leaf_id = decision_space_id("product", compatibility_id)
+        expected_space_ids: set[str] = set()
+        for display_name, kind, source_root, changed_path in specifications:
+            compatibility_name = (
+                display_name
+                if kind == "product"
+                else f"Shared / {source_root}"
+            )
+            compatibility_id = product_id(compatibility_name)
+            leaf_id = decision_space_id(kind, compatibility_id)
+            expected_space_ids.add(leaf_id)
             self.central_store.put_decision_space(
                 "org_demo",
                 LeafDecisionSpace(
                     decision_space_id=leaf_id,
-                    kind="product",
-                    display_name=f"Leaf {index}",
+                    kind=kind,
+                    display_name=display_name,
                     compatibility_product_id=compatibility_id,
-                    compatibility_product_name=PRODUCT_NAME,
-                    catalog_group_id=None,
-                    catalog_breadcrumb=(),
-                    source_root=prefix,
+                    compatibility_product_name=compatibility_name,
+                    catalog_group_id=(
+                        None if kind == "product" else shared_group.catalog_group_id
+                    ),
+                    catalog_breadcrumb=() if kind == "product" else ("Shared",),
+                    source_root=source_root,
                     package_name=None,
                     asset_type=None,
                     enabled=True,
@@ -548,13 +598,13 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
                     ),
                     repository_id=self.repository_id,
                     decision_space_id=leaf_id,
-                    path_prefixes=(prefix,),
+                    path_prefixes=(source_root,),
                     excluded_prefixes=(),
                     enabled=True,
                     configuration_version=1,
                 )
             )
-            changed = self.registered_repository / prefix / "changed.ts"
+            changed = self.registered_repository / changed_path
             changed.parent.mkdir(parents=True, exist_ok=True)
             changed.write_text("private local source\n", "utf-8")
         self.central_store.replace_trusted_route_heads(
@@ -563,25 +613,79 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self._observe(SESSION_A, TURN_A1, self.registered_repository)
         self._drain_hooks()
 
-        request_id = self._click("web_action_three_slices")
-        self.assertTrue(self._run_agent_once())
+        action_id = "web_action_real_monorepo"
+        request_id = self._click(action_id)
+        original_mark_uploaded = self.request_state.mark_slice_uploaded
+        receipts_seen = 0
+
+        def mark_first_receipt_then_crash(receipt) -> None:
+            nonlocal receipts_seen
+            original_mark_uploaded(receipt)
+            receipts_seen += 1
+            if receipts_seen == 1:
+                raise RuntimeError("restart after first slice receipt")
+
+        with patch.object(
+            self.request_state,
+            "mark_slice_uploaded",
+            side_effect=mark_first_receipt_then_crash,
+        ):
+            self.assertTrue(self._run_agent_once())
+        self.assertEqual("failed_retryable", self._request(request_id)["state"])
+        first_slice = self.central_store.connection.execute(
+            "SELECT slice_id FROM capture_slices "
+            "WHERE request_id = ? AND receipt_json IS NOT NULL",
+            (request_id,),
+        ).fetchone()
+        self.assertIsNotNone(first_slice)
+        first_upload_path = (
+            f"/api/v1/agent/capture-requests/{request_id}"
+            f"/slices/{first_slice['slice_id']}/batch"
+        )
+        self.assertEqual(
+            1,
+            sum(path == first_upload_path for path, _, _ in self.bridge.records),
+        )
+
+        self._restart_local()
+        self._retry_request()
 
         slices = self.central_store.connection.execute(
-            "SELECT state, decision_space_id FROM capture_slices "
+            "SELECT state, decision_space_id, ownership_json FROM capture_slices "
             "WHERE request_id = ? ORDER BY slice_order",
             (request_id,),
         ).fetchall()
-        self.assertEqual(3, len(slices))
+        self.assertEqual(4, len(slices))
         self.assertEqual({"accepted"}, {item["state"] for item in slices})
         self.assertEqual(
-            {route.decision_space_id for route in routes},
+            expected_space_ids,
             {item["decision_space_id"] for item in slices},
         )
-        self.assertEqual(3, len(self._candidates()))
+        self.assertNotIn(
+            "Shared",
+            {
+                json.loads(item["ownership_json"])["display_name"]
+                for item in slices
+            },
+        )
         self.assertEqual(
-            {"inventory": 3, "extraction": 3, "reconciliation": 3},
+            1,
+            self.central_store.connection.execute(
+                "SELECT COUNT(*) FROM capture_groups "
+                "WHERE client_action_id = ?",
+                (action_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            sum(path == first_upload_path for path, _, _ in self.bridge.records),
+        )
+        self.assertEqual(4, len(self._candidates()))
+        self.assertEqual(
+            {"inventory": 4, "extraction": 4, "reconciliation": 4},
             self.gateway.structured_turn_creates,
         )
+        self._assert_central_has_no_raw_source()
 
     def test_no_routable_path_finishes_without_model_and_acknowledges(self) -> None:
         self.central_store.replace_trusted_route_heads(

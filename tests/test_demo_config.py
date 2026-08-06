@@ -87,7 +87,7 @@ class DemoConfigTest(unittest.TestCase):
         }
         self.assertEqual([expected_repository], central["repositories"])
         self.assertEqual([expected_repository], agent["repositories"])
-        self.assertEqual("Cloud", central["decision_spaces"][0]["display_name"])
+        self.assertEqual("cloud", central["decision_spaces"][0]["display_name"])
         self.assertEqual("Shared", central["catalog_groups"][0]["display_name"])
         self.assertTrue(central["repository_routes"])
         self.assertEqual(central["organization_id"], agent["organization_id"])
@@ -100,6 +100,88 @@ class DemoConfigTest(unittest.TestCase):
         captured = stdout.getvalue() + stderr.getvalue()
         self.assertNotIn(raw_token, captured)
         self.assertNotIn(digest, captured)
+
+    def test_init_registers_the_real_monorepo_leaf_catalog(self) -> None:
+        output_directory = self.root / "demo-config"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(
+                0,
+                main(
+                    [
+                        "demo-config",
+                        "init",
+                        "--repository-cwd",
+                        str(self.repository),
+                        "--output-dir",
+                        str(output_directory),
+                    ]
+                ),
+            )
+
+        central = json.loads(
+            (output_directory / "central.json").read_text("utf-8")
+        )
+        spaces_by_root = {
+            item["source_root"]: item for item in central["decision_spaces"]
+        }
+        product_roots = {
+            f"packages/products/{name}"
+            for name in (
+                "cloud",
+                "idp",
+                "lifecycle",
+                "portal",
+                "redis",
+                "third-party-services",
+                "zcf-installer",
+                "ziam",
+                "zmetis",
+                "zns",
+                "zstack-ai-studio",
+                "zstone",
+                "zsv",
+            )
+        }
+        shared_roots = {
+            "packages/products/shared/zcf-audit",
+            "packages/products/shared/zcf-license",
+            "packages/shared/design-x",
+            "packages/shared/theme",
+            "packages/design",
+            "packages/form",
+            "packages/table",
+            "packages/hooks",
+            "packages/auth",
+            "packages/i18n",
+            "packages/utils",
+            "packages/zephyr",
+        }
+        self.assertEqual(product_roots | shared_roots, set(spaces_by_root))
+        self.assertEqual(
+            product_roots,
+            {
+                root
+                for root, item in spaces_by_root.items()
+                if item["kind"] == "product"
+            },
+        )
+        self.assertEqual(
+            shared_roots,
+            {
+                root
+                for root, item in spaces_by_root.items()
+                if item["kind"] == "shared_unit"
+            },
+        )
+        self.assertEqual(
+            set(spaces_by_root),
+            {
+                route["path_prefixes"][0]
+                for route in central["repository_routes"]
+            },
+        )
 
     def test_init_refuses_a_nonempty_output_directory(self) -> None:
         output_directory = self.root / "existing"
