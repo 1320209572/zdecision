@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
@@ -247,6 +248,20 @@ class RegistryQueryTest(unittest.TestCase):
             snapshot.decisions[
                 (PRODUCT_ID, self.formal_decision_id)
             ].claim,
+        )
+
+    def test_snapshot_at_commit_parses_without_remote_verification(self) -> None:
+        commit = self.query.git.fetch_and_require_exact_main()
+        with mock.patch.object(
+            self.query.git,
+            "fetch_and_require_exact_main",
+            side_effect=AssertionError("unexpected fetch"),
+        ):
+            snapshot = self.query.snapshot_at_commit(commit)
+        self.assertEqual(commit, snapshot.commit_sha)
+        self.assertEqual(
+            "committed formal decision",
+            next(iter(snapshot.decisions.values())).claim,
         )
 
     def test_snapshot_reads_commit_when_index_assumes_worktree_is_unchanged(

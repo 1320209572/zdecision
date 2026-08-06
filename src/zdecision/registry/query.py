@@ -71,62 +71,68 @@ class RegistryQuery:
     def snapshot(self) -> RegistrySnapshot:
         try:
             commit_sha = self.git.fetch_and_require_exact_main()
-            root = RootRegistry.from_dict(self._read(commit_sha, ROOT_PATH))
-            products: dict[str, ProductMetadata] = {}
-            registries: dict[str, ProductRegistry] = {}
-            decisions: dict[tuple[str, str], DecisionRevision] = {}
-            for product_id, entry in root.products.items():
-                metadata = ProductMetadata.from_dict(
-                    self._read(
-                        commit_sha,
-                        f"decision-registry/{entry.product_path}",
-                    )
-                )
-                registry = ProductRegistry.from_dict(
-                    self._read(
-                        commit_sha,
-                        f"decision-registry/{entry.registry_path}",
-                    )
-                )
-                if (
-                    metadata.product_id != product_id
-                    or metadata.name != entry.name
-                    or registry.product_id != product_id
-                ):
-                    raise ValueError("Registry product ownership mismatch")
-                products[product_id] = metadata
-                registries[product_id] = registry
-                for decision_id, head in registry.decisions.items():
-                    relative = (
-                        f"decision-registry/products/{product_id}/"
-                        f"{head.head_path}"
-                    )
-                    revision = DecisionRevision.from_dict(
-                        self._read(commit_sha, relative)
-                    )
-                    if (
-                        revision.product_id != product_id
-                        or revision.product_name != metadata.name
-                        or revision.decision_id != decision_id
-                        or revision.revision != head.head_revision
-                        or revision.lifecycle != head.lifecycle
-                    ):
-                        raise ValueError("Registry Decision ownership mismatch")
-                    decisions[(product_id, decision_id)] = revision
-            if (
-                self.git.fetch_and_require_exact_main(
-                    expected_base=commit_sha
-                )
-                != commit_sha
-            ):
-                raise ValueError("Registry commit changed during the read")
-            return RegistrySnapshot(
-                commit_sha, products, registries, decisions
-            )
+            snapshot = self.snapshot_at_commit(commit_sha)
+            self.git.fetch_and_require_exact_main(expected_base=commit_sha)
+            return snapshot
         except RegistryQueryUnavailable:
             raise
         except (GitRegistryError, OSError, UnicodeError, TypeError, ValueError):
             raise RegistryQueryUnavailable("registry_unavailable") from None
+
+    def snapshot_at_commit(self, commit_sha: str) -> RegistrySnapshot:
+        try:
+            if not isinstance(commit_sha, str) or _COMMIT.fullmatch(commit_sha) is None:
+                raise ValueError("Registry commit is invalid")
+            return self._parse_snapshot(commit_sha)
+        except RegistryQueryUnavailable:
+            raise
+        except (GitRegistryError, OSError, UnicodeError, TypeError, ValueError):
+            raise RegistryQueryUnavailable("registry_unavailable") from None
+
+    def _parse_snapshot(self, commit_sha: str) -> RegistrySnapshot:
+        root = RootRegistry.from_dict(self._read(commit_sha, ROOT_PATH))
+        products: dict[str, ProductMetadata] = {}
+        registries: dict[str, ProductRegistry] = {}
+        decisions: dict[tuple[str, str], DecisionRevision] = {}
+        for product_id, entry in root.products.items():
+            metadata = ProductMetadata.from_dict(
+                self._read(
+                    commit_sha,
+                    f"decision-registry/{entry.product_path}",
+                )
+            )
+            registry = ProductRegistry.from_dict(
+                self._read(
+                    commit_sha,
+                    f"decision-registry/{entry.registry_path}",
+                )
+            )
+            if (
+                metadata.product_id != product_id
+                or metadata.name != entry.name
+                or registry.product_id != product_id
+            ):
+                raise ValueError("Registry product ownership mismatch")
+            products[product_id] = metadata
+            registries[product_id] = registry
+            for decision_id, head in registry.decisions.items():
+                relative = (
+                    f"decision-registry/products/{product_id}/"
+                    f"{head.head_path}"
+                )
+                revision = DecisionRevision.from_dict(
+                    self._read(commit_sha, relative)
+                )
+                if (
+                    revision.product_id != product_id
+                    or revision.product_name != metadata.name
+                    or revision.decision_id != decision_id
+                    or revision.revision != head.head_revision
+                    or revision.lifecycle != head.lifecycle
+                ):
+                    raise ValueError("Registry Decision ownership mismatch")
+                decisions[(product_id, decision_id)] = revision
+        return RegistrySnapshot(commit_sha, products, registries, decisions)
 
     def _read(
         self, commit_sha: str, relative_path: str

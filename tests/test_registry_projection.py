@@ -4,12 +4,17 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from zdecision.capture.models import CandidateContent, SourceCheckpoint
 from zdecision.capture.reviews import ApprovalRef
-from zdecision.central.registry_projection import RegistryProjectionStore
+from zdecision.central.registry_projection import (
+    RegistryProjectionStore,
+    RegistryProjectionSynchronizer,
+)
 from zdecision.central.store import CentralStore
 from zdecision.ids import decision_id, product_id
+from zdecision.registry.git import RegistryOutOfSync
 from zdecision.registry.models import (
     DecisionHead,
     DecisionRevision,
@@ -17,7 +22,7 @@ from zdecision.registry.models import (
     ProductMetadata,
     ProductRegistry,
 )
-from zdecision.registry.query import RegistrySnapshot
+from zdecision.registry.query import RegistryQueryUnavailable, RegistrySnapshot
 
 
 PRODUCT_NAME = "ZDecision"
@@ -87,6 +92,28 @@ def _snapshot_with_decision(
         },
         decisions={(PRODUCT_ID, DECISION_ID): revision},
     )
+
+
+class _VerifiedGit:
+    def __init__(self, tree_oid: str = TREE_A) -> None:
+        self.tree_oid = tree_oid
+        self.fetch_count = 0
+
+    def require_exact_main(self, expected_commit: str) -> str:
+        return expected_commit
+
+    def registry_tree_oid(self, commit_sha: str) -> str:
+        return self.tree_oid
+
+
+class _CommitQuery:
+    def __init__(self, snapshot: RegistrySnapshot) -> None:
+        self.snapshot = snapshot
+        self.calls: list[str] = []
+
+    def snapshot_at_commit(self, commit_sha: str) -> RegistrySnapshot:
+        self.calls.append(commit_sha)
+        return self.snapshot
 
 
 class RegistryProjectionStoreTest(unittest.TestCase):
@@ -324,3 +351,95 @@ class RegistryProjectionStoreTest(unittest.TestCase):
         assert state is not None
         self.assertEqual(0, state.product_count)
         self.assertEqual(0, state.decision_count)
+
+    def test_synchronize_installs_then_reuses_same_tree_without_rewriting_rows(
+        self,
+    ) -> None:
+        git = _VerifiedGit()
+        query = _CommitQuery(_snapshot())
+        synchronizer = RegistryProjectionSynchronizer(
+            git=git, query=query, store=self.projection,
+            clock=lambda: "2026-08-06T10:00:01Z",
+        )
+
+        first = synchronizer.synchronize("org_demo", COMMIT_A, VERIFIED_AT)
+        before = self.central.connection.execute(
+            "SELECT rowid, * FROM registry_product_projection"
+        ).fetchall()
+        query.snapshot = _snapshot(COMMIT_B)
+        second = synchronizer.synchronize(
+            "org_demo", COMMIT_B, "2026-08-06T11:00:00Z"
+        )
+        after = self.central.connection.execute(
+            "SELECT rowid, * FROM registry_product_projection"
+        ).fetchall()
+
+        self.assertEqual("available", first.state)
+        self.assertEqual(COMMIT_B, second.active_commit)
+        self.assertEqual(before, after)
+        self.assertEqual([COMMIT_A, COMMIT_B], query.calls)
+
+    def test_parse_failure_marks_projection_unavailable_without_serving_old_rows(
+        self,
+    ) -> None:
+        synchronizer = RegistryProjectionSynchronizer(
+            git=_VerifiedGit(), query=_CommitQuery(_snapshot()),
+            store=self.projection, clock=lambda: VERIFIED_AT,
+        )
+        synchronizer.synchronize("org_demo", COMMIT_A, VERIFIED_AT)
+        synchronizer.query.snapshot_at_commit = mock.Mock(
+            side_effect=RegistryQueryUnavailable("registry_unavailable")
+        )
+
+        state = synchronizer.synchronize("org_demo", COMMIT_A, VERIFIED_AT)
+
+        self.assertEqual("unavailable", state.state)
+        self.assertEqual("registry_invalid", state.error_code)
+        self.assertIsNone(self.projection.load_active("org_demo"))
+
+    def test_install_failure_keeps_old_tree_rows_but_serves_no_active_snapshot(
+        self,
+    ) -> None:
+        git = _VerifiedGit()
+        query = _CommitQuery(_snapshot())
+        synchronizer = RegistryProjectionSynchronizer(
+            git=git, query=query, store=self.projection,
+            clock=lambda: VERIFIED_AT,
+        )
+        synchronizer.synchronize("org_demo", COMMIT_A, VERIFIED_AT)
+        git.tree_oid = TREE_B
+        query.snapshot = _snapshot(COMMIT_B)
+        self.central.connection.execute(
+            f"""CREATE TRIGGER reject_tree_b BEFORE INSERT
+                ON registry_product_projection
+                WHEN NEW.registry_tree_oid = '{TREE_B}'
+                BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END"""
+        )
+
+        state = synchronizer.synchronize("org_demo", COMMIT_B, VERIFIED_AT)
+
+        rows = self.central.connection.execute(
+            "SELECT DISTINCT registry_tree_oid FROM registry_product_projection"
+        ).fetchall()
+        self.assertEqual("unavailable", state.state)
+        self.assertEqual("projection_install_failed", state.error_code)
+        self.assertEqual([TREE_A], [row[0] for row in rows])
+        self.assertIsNone(self.projection.load_active("org_demo"))
+
+    def test_mismatched_exact_main_marks_git_proof_failed(self) -> None:
+        git = _VerifiedGit()
+        git.require_exact_main = mock.Mock(
+            side_effect=RegistryOutOfSync("mismatched exact main")
+        )
+        query = _CommitQuery(_snapshot())
+        synchronizer = RegistryProjectionSynchronizer(
+            git=git, query=query, store=self.projection,
+            clock=lambda: VERIFIED_AT,
+        )
+
+        state = synchronizer.synchronize("org_demo", COMMIT_A, VERIFIED_AT)
+
+        self.assertEqual("unavailable", state.state)
+        self.assertEqual("git_proof_failed", state.error_code)
+        self.assertEqual([], query.calls)
+        self.assertIsNone(self.projection.load_active("org_demo"))

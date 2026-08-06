@@ -19,7 +19,11 @@ from zdecision.registry.models import (
     ProductMetadata,
     ProductRegistry,
 )
-from zdecision.registry.query import RegistrySnapshot
+from zdecision.registry.git import GitRegistryError
+from zdecision.registry.query import (
+    RegistryQueryUnavailable,
+    RegistrySnapshot,
+)
 
 
 ProjectionState = Literal["available", "syncing", "unavailable"]
@@ -579,3 +583,61 @@ class RegistryProjectionStore:
             ValueError,
         ):
             return None
+
+
+class RegistryProjectionError(Exception):
+    code = "registry_projection_error"
+
+
+class RegistryProjectionSynchronizer:
+    def __init__(self, *, git, query, store, clock=None) -> None:
+        if not callable(getattr(git, "require_exact_main", None)):
+            raise TypeError("git must expose require_exact_main()")
+        if not callable(getattr(git, "registry_tree_oid", None)):
+            raise TypeError("git must expose registry_tree_oid()")
+        if not callable(getattr(query, "snapshot_at_commit", None)):
+            raise TypeError("query must expose snapshot_at_commit()")
+        if not isinstance(store, RegistryProjectionStore):
+            raise TypeError("store must be a RegistryProjectionStore")
+        self.git = git
+        self.query = query
+        self.store = store
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    def synchronize(
+        self, organization_id: str, verified_commit: str, verified_at: str,
+    ) -> RegistryProjectionState:
+        desired_tree_oid: str | None = None
+        updated_at = _timestamp(self.clock())
+        try:
+            self.git.require_exact_main(verified_commit)
+            desired_tree_oid = self.git.registry_tree_oid(verified_commit)
+            self.store.mark_syncing(
+                organization_id, verified_commit, desired_tree_oid,
+                verified_at, updated_at,
+            )
+            snapshot = self.query.snapshot_at_commit(verified_commit)
+            if snapshot.commit_sha != verified_commit:
+                raise RegistryQueryUnavailable("registry_unavailable")
+            if self.store.matches(organization_id, desired_tree_oid, snapshot):
+                return self.store.update_provenance(
+                    organization_id, verified_commit, desired_tree_oid,
+                    verified_at, updated_at,
+                )
+            return self.store.install(
+                organization_id, desired_tree_oid, snapshot,
+                verified_at, updated_at,
+            )
+        except GitRegistryError:
+            error_code = "git_proof_failed"
+        except RegistryQueryUnavailable:
+            error_code = "registry_invalid"
+        except (RegistryProjectionConflict, sqlite3.Error, ValueError):
+            error_code = "projection_install_failed"
+        try:
+            return self.store.mark_unavailable(
+                organization_id, verified_commit, desired_tree_oid,
+                verified_at, updated_at, error_code,
+            )
+        except (sqlite3.Error, ValueError) as error:
+            raise RegistryProjectionError("registry_projection_error") from error

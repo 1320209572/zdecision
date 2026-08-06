@@ -53,7 +53,16 @@ class GitRegistryAdapter:
         self.expected_origin = expected_origin
 
     def fetch_and_require_exact_main(self, expected_base: str | None = None) -> str:
-        self._require_origin_and_main(fetch=True)
+        return self._require_exact_main(expected_base=expected_base, fetch=True)
+
+    def require_exact_main(self, expected_commit: str) -> str:
+        self._validated_commit(expected_commit, "Expected commit")
+        return self._require_exact_main(expected_base=expected_commit, fetch=False)
+
+    def _require_exact_main(
+        self, *, expected_base: str | None, fetch: bool,
+    ) -> str:
+        self._require_origin_and_main(fetch=fetch)
         head = self._revision("HEAD", RegistryOutOfSync)
         local_main = self._revision("refs/heads/main", RegistryOutOfSync)
         remote_main = self._revision(
@@ -62,11 +71,33 @@ class GitRegistryAdapter:
         )
         if head != local_main or head != remote_main:
             raise RegistryOutOfSync("Local main is not exactly synchronized")
-        if expected_base is not None:
-            self._validated_commit(expected_base, "Expected base")
-            if head != expected_base:
-                raise RegistryOutOfSync("Local main no longer matches the preview base")
+        if expected_base is not None and head != expected_base:
+            raise RegistryOutOfSync(
+                "Local main no longer matches the expected commit"
+            )
         return head
+
+    def registry_tree_oid(self, commit_sha: str) -> str:
+        self._validated_commit(commit_sha, "Registry commit")
+        result = self._run(
+            (
+                "git",
+                "rev-parse",
+                "--verify",
+                f"{commit_sha}:decision-registry",
+            ),
+            error_type=RegistryOutOfSync,
+        )
+        tree_oid = result.stdout.decode("ascii", errors="replace").strip()
+        if _COMMIT.fullmatch(tree_oid) is None:
+            raise RegistryOutOfSync("Registry tree identity is invalid")
+        object_type = self._run(
+            ("git", "cat-file", "-t", tree_oid),
+            error_type=RegistryOutOfSync,
+        ).stdout.decode("ascii", errors="replace").strip()
+        if object_type != "tree":
+            raise RegistryOutOfSync("Registry object is not a tree")
+        return tree_oid
 
     def require_clean_registry(
         self,

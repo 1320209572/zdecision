@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 from zdecision.capture.models import CandidateContent, SourceCheckpoint
@@ -151,6 +152,22 @@ class GitRegistryAdapterTests(unittest.TestCase):
         self.git("git", "checkout", "--detach", "HEAD", cwd=self.local)
         with self.assertRaises(RegistryOutOfSync):
             self.adapter.fetch_and_require_exact_main()
+
+    def test_require_exact_main_and_tree_oid_do_not_fetch(self) -> None:
+        commit = self.adapter.fetch_and_require_exact_main()
+        with mock.patch.object(
+            self.adapter, "_fetch_main", side_effect=AssertionError("unexpected fetch")
+        ):
+            self.assertEqual(commit, self.adapter.require_exact_main(commit))
+            tree_oid = self.adapter.registry_tree_oid(commit)
+        self.assertRegex(tree_oid, r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            self.git(
+                "git", "rev-parse", f"{commit}:decision-registry",
+                cwd=self.local,
+            ).stdout.decode("ascii").strip(),
+            tree_oid,
+        )
 
     def test_wrong_origin_is_sanitized_before_any_fetch_or_push(self) -> None:
         secret_origin = "https://user:top-secret@example.invalid/repo.git"
