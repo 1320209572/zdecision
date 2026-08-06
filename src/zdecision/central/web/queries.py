@@ -12,6 +12,10 @@ from typing import Literal, cast
 
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
+from zdecision.central.registry_projection import (
+    ActiveRegistryProjection,
+    RegistryProjectionStore,
+)
 from zdecision.central.web.contracts import (
     CatalogNode,
     CandidateInboxItem,
@@ -26,7 +30,7 @@ from zdecision.central.web.store import WebRecordCorrupt
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.registry.publication import PublicationRecord
 from zdecision.registry.models import DecisionRevision
-from zdecision.registry.query import RegistryQueryUnavailable, RegistrySnapshot
+from zdecision.registry.query import RegistrySnapshot
 from zdecision.sync.contracts import (
     CandidateOwnershipSnapshot,
     CandidateRevisionUpload,
@@ -80,9 +84,14 @@ class DashboardMetrics:
 class RegistryStatus:
     state: Literal["available", "unavailable"]
     commit_sha: str | None
+    verified_at: str | None
 
     def to_dict(self) -> dict[str, object]:
-        return {"state": self.state, "commit_sha": self.commit_sha}
+        return {
+            "state": self.state,
+            "commit_sha": self.commit_sha,
+            "verified_at": self.verified_at,
+        }
 
 
 @dataclass(frozen=True)
@@ -272,17 +281,24 @@ class RepositorySpacesView:
 
 
 class CentralWebQueries:
-    def __init__(self, connection: sqlite3.Connection, registry_query: object) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        registry_projection: RegistryProjectionStore,
+    ) -> None:
         if not isinstance(connection, sqlite3.Connection):
             raise TypeError("connection must be a sqlite3.Connection")
-        if not callable(getattr(registry_query, "snapshot", None)):
-            raise TypeError("registry_query must expose snapshot()")
+        if not isinstance(registry_projection, RegistryProjectionStore):
+            raise TypeError(
+                "registry_projection must be a RegistryProjectionStore"
+            )
         self.connection = connection
-        self.registry_query = registry_query
+        self.registry_projection = registry_projection
 
     def list_products(self, principal: Principal) -> tuple[ProductSummary, ...]:
         self._require_user(principal)
-        snapshot = self._registry_snapshot()
+        active = self._active_registry(principal.organization_id)
+        snapshot = active.snapshot if active is not None else None
         return self._list_products(principal, snapshot)
 
     def list_decisions(
@@ -301,9 +317,10 @@ class CentralWebQueries:
         self._validate_decision_filters(
             search, repository, published_after, limit, offset
         )
-        snapshot = self._registry_snapshot()
-        if snapshot is None:
+        active = self._active_registry(principal.organization_id)
+        if active is None:
             return DecisionListView("unavailable", None, None, None)
+        snapshot = active.snapshot
         summaries = self._space_summaries(principal, snapshot)
         by_id = {space.decision_space_id: space for space in summaries}
         if decision_space_id is not None:
@@ -377,7 +394,7 @@ class CentralWebQueries:
         total = len(items)
         return DecisionListView(
             "available",
-            snapshot.commit_sha,
+            active.commit_sha,
             tuple(items[offset : offset + limit]),
             total,
         )
@@ -391,9 +408,10 @@ class CentralWebQueries:
             raise DecisionNotFound("not_found")
         if decision_space_id.startswith("prod_") and space.kind != "product":
             raise DecisionNotFound("not_found")
-        snapshot = self._registry_snapshot()
-        if snapshot is None:
+        active = self._active_registry(principal.organization_id)
+        if active is None:
             raise DecisionRegistryUnavailable("registry_unavailable")
+        snapshot = active.snapshot
         revision = snapshot.decisions.get(
             (space.compatibility_product_id, decision_id)
         )
@@ -409,7 +427,7 @@ class CentralWebQueries:
         return DecisionDetailView(
             decision_space_id=space.decision_space_id,
             space=self._space_ref(space),
-            registry_commit=snapshot.commit_sha,
+            registry_commit=active.commit_sha,
             decision=revision,
             publication_id=(
                 publication.publication_id if publication is not None else None
@@ -593,7 +611,10 @@ class CentralWebQueries:
             product = self.decision_space(principal, mapping.product_id)
             if product is not None and product.kind == "product":
                 identifiers.add(product.decision_space_id)
-        summaries = self._space_summaries(principal, self._registry_snapshot())
+        active = self._active_registry(principal.organization_id)
+        summaries = self._space_summaries(
+            principal, active.snapshot if active is not None else None
+        )
         return RepositorySpacesView(
             repository_id,
             tuple(
@@ -1053,13 +1074,15 @@ class CentralWebQueries:
 
     def dashboard(self, principal: Principal) -> DashboardView:
         self._require_user(principal)
-        snapshot = self._registry_snapshot()
+        active = self._active_registry(principal.organization_id)
+        snapshot = active.snapshot if active is not None else None
         spaces = self._space_summaries(principal, snapshot)
         products = tuple(space for space in spaces if space.kind == "product")
         shared_tree = self._shared_tree(principal, spaces)
         registry = RegistryStatus(
-            "available" if snapshot is not None else "unavailable",
-            snapshot.commit_sha if snapshot is not None else None,
+            "available" if active is not None else "unavailable",
+            active.commit_sha if active is not None else None,
+            active.verified_at if active is not None else None,
         )
         active_count = (
             sum(item.active_decision_count or 0 for item in products)
@@ -1693,14 +1716,10 @@ class CentralWebQueries:
         ).fetchone()
         return int(row["count"])
 
-    def _registry_snapshot(self) -> RegistrySnapshot | None:
-        try:
-            snapshot = self.registry_query.snapshot()
-        except RegistryQueryUnavailable:
-            return None
-        if not isinstance(snapshot, RegistrySnapshot):
-            raise TypeError("registry_query returned an invalid snapshot")
-        return snapshot
+    def _active_registry(
+        self, organization_id: str,
+    ) -> ActiveRegistryProjection | None:
+        return self.registry_projection.load_active(organization_id)
 
     @staticmethod
     def _require_user(principal: Principal) -> None:

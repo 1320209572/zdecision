@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest import mock
 
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
+from zdecision.central.registry_projection import RegistryProjectionStore
 from zdecision.central.store import CentralStore
 from zdecision.central.web.contracts import CentralPublication
 from zdecision.central.web.queries import CentralWebQueries, DecisionNotFound
@@ -33,7 +35,6 @@ from zdecision.registry.git import GitRegistryAdapter
 from zdecision.jsonio import atomic_write_json, canonical_json_bytes
 from zdecision.registry.query import (
     RegistryQuery,
-    RegistryQueryUnavailable,
     RegistrySnapshot,
 )
 from zdecision.sync.contracts import RepositoryView
@@ -84,53 +85,60 @@ def _decision(
     return DecisionRevision.from_seed(seed, "pub_" + candidate_ordinal * 32)
 
 
-class _RegistryQuery:
-    def __init__(
-        self,
-        *,
-        unavailable: bool = False,
-        decisions: tuple[DecisionRevision, ...] = (),
-    ) -> None:
-        self.unavailable = unavailable
-        self.decisions = decisions
-        self.snapshot_count = 0
-
-    def snapshot(self) -> RegistrySnapshot:
-        self.snapshot_count += 1
-        if self.unavailable:
-            raise RegistryQueryUnavailable("registry_unavailable")
-        product_decisions: dict[str, dict[str, DecisionHead]] = {
-            PRODUCT_ID: {},
-            OTHER_PRODUCT_ID: {},
-        }
-        indexed: dict[tuple[str, str], DecisionRevision] = {}
-        for revision in self.decisions:
-            indexed[(revision.product_id, revision.decision_id)] = revision
-            product_decisions[revision.product_id][revision.decision_id] = (
-                DecisionHead(
-                    revision.revision,
-                    revision.lifecycle,
-                    f"decisions/{revision.decision_id}/r0001.json",
-                )
-            )
-        return RegistrySnapshot(
-            commit_sha=COMMIT_SHA,
-            products={
-                PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME),
-                OTHER_PRODUCT_ID: ProductMetadata(
-                    OTHER_PRODUCT_ID, OTHER_PRODUCT_NAME
-                ),
-            },
-            registries={
-                PRODUCT_ID: ProductRegistry(
-                    PRODUCT_ID, product_decisions[PRODUCT_ID]
-                ),
-                OTHER_PRODUCT_ID: ProductRegistry(
-                    OTHER_PRODUCT_ID, product_decisions[OTHER_PRODUCT_ID]
-                ),
-            },
-            decisions=indexed,
+def _registry_snapshot(
+    decisions: tuple[DecisionRevision, ...] = (),
+) -> RegistrySnapshot:
+    product_decisions: dict[str, dict[str, DecisionHead]] = {
+        PRODUCT_ID: {},
+        OTHER_PRODUCT_ID: {},
+    }
+    indexed: dict[tuple[str, str], DecisionRevision] = {}
+    for revision in decisions:
+        indexed[(revision.product_id, revision.decision_id)] = revision
+        product_decisions[revision.product_id][revision.decision_id] = DecisionHead(
+            revision.revision,
+            revision.lifecycle,
+            f"decisions/{revision.decision_id}/r0001.json",
         )
+    return RegistrySnapshot(
+        commit_sha=COMMIT_SHA,
+        products={
+            PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME),
+            OTHER_PRODUCT_ID: ProductMetadata(OTHER_PRODUCT_ID, OTHER_PRODUCT_NAME),
+        },
+        registries={
+            PRODUCT_ID: ProductRegistry(PRODUCT_ID, product_decisions[PRODUCT_ID]),
+            OTHER_PRODUCT_ID: ProductRegistry(
+                OTHER_PRODUCT_ID, product_decisions[OTHER_PRODUCT_ID]
+            ),
+        },
+        decisions=indexed,
+    )
+
+
+def _projection(
+    connection: sqlite3.Connection,
+    *,
+    decisions: tuple[DecisionRevision, ...] = (),
+    available: bool = True,
+) -> RegistryProjectionStore:
+    store = RegistryProjectionStore(connection)
+    if not available:
+        store.mark_unavailable(
+            "org_demo", None, None, None,
+            "2026-08-06T10:00:00Z", "git_proof_failed",
+        )
+        return store
+    snapshot = _registry_snapshot(decisions)
+    store.mark_syncing(
+        "org_demo", COMMIT_SHA, "1" * 40,
+        "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+    )
+    store.install(
+        "org_demo", "1" * 40, snapshot,
+        "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+    )
+    return store
 
 
 class RegistryQueryTest(unittest.TestCase):
@@ -371,13 +379,15 @@ class CentralWebQueriesTest(unittest.TestCase):
                 ),
             )
         self.queries = CentralWebQueries(
-            self.store.connection, _RegistryQuery()
+            self.store.connection, _projection(self.store.connection)
         )
 
     def test_global_and_product_catalog_return_same_owned_revision(self) -> None:
         revision = _decision()
-        registry = _RegistryQuery(decisions=(revision,))
-        queries = CentralWebQueries(self.store.connection, registry)
+        queries = CentralWebQueries(
+            self.store.connection,
+            _projection(self.store.connection, decisions=(revision,)),
+        )
 
         global_items = queries.list_decisions(
             self.user, product_id=None, search="隔离"
@@ -388,7 +398,29 @@ class CentralWebQueriesTest(unittest.TestCase):
 
         self.assertEqual(global_items.items, product_items.items)
         self.assertEqual(PRODUCT_ID, global_items.items[0].product_id)
-        self.assertEqual(2, registry.snapshot_count)
+
+    def test_dashboard_catalog_detail_and_repository_spaces_never_spawn_git(self) -> None:
+        revision = _decision()
+        projection = _projection(self.store.connection, decisions=(revision,))
+        queries = CentralWebQueries(self.store.connection, projection)
+
+        with mock.patch(
+            "subprocess.run", side_effect=AssertionError("Git entered Web read path")
+        ):
+            dashboard = queries.dashboard(self.user)
+            catalog = queries.list_decisions(self.user)
+            detail = queries.get_decision(
+                self.user, PRODUCT_SPACE_ID, revision.decision_id
+            )
+            spaces = queries.repository_spaces(self.user, PRODUCT_REPOSITORY_ID)
+
+        self.assertEqual(COMMIT_SHA, dashboard.registry.commit_sha)
+        self.assertEqual("2026-08-06T10:00:00Z", dashboard.registry.verified_at)
+        self.assertEqual(1, catalog.total)
+        self.assertEqual(revision.decision_id, detail.decision.decision_id)
+        self.assertEqual((PRODUCT_SPACE_ID,), tuple(
+            item.decision_space_id for item in spaces.spaces
+        ))
 
     def test_product_detail_rejects_decision_owned_by_another_product(self) -> None:
         revision = _decision()
@@ -402,7 +434,8 @@ class CentralWebQueriesTest(unittest.TestCase):
             ),
         )
         queries = CentralWebQueries(
-            self.store.connection, _RegistryQuery(decisions=(revision,))
+            self.store.connection,
+            _projection(self.store.connection, decisions=(revision,)),
         )
 
         with self.assertRaises(DecisionNotFound) as raised:
@@ -413,7 +446,8 @@ class CentralWebQueriesTest(unittest.TestCase):
 
     def test_invalid_registry_is_unavailable_not_empty(self) -> None:
         result = CentralWebQueries(
-            self.store.connection, _RegistryQuery(unavailable=True)
+            self.store.connection,
+            _projection(self.store.connection, available=False),
         ).list_decisions(self.user)
 
         self.assertEqual("unavailable", result.registry_state)
@@ -496,8 +530,10 @@ class CentralWebQueriesTest(unittest.TestCase):
                 ),
             )
         self.store.connection.execute("PRAGMA foreign_keys = ON")
-        registry = _RegistryQuery(decisions=(revision,))
-        queries = CentralWebQueries(self.store.connection, registry)
+        queries = CentralWebQueries(
+            self.store.connection,
+            _projection(self.store.connection, decisions=(revision,)),
+        )
 
         result = queries.list_decisions(
             self.user,
@@ -517,7 +553,6 @@ class CentralWebQueriesTest(unittest.TestCase):
             canonical_json_bytes(revision.to_dict()).decode("utf-8"),
             detail.to_dict()["canonical_json"],
         )
-        self.assertEqual(2, registry.snapshot_count)
 
         invalid_arguments = (
             {"search": "界" * 67},
@@ -538,7 +573,8 @@ class CentralWebQueriesTest(unittest.TestCase):
             revision.decision_id, mismatched_preview, "8"
         )
         queries = CentralWebQueries(
-            self.store.connection, _RegistryQuery(decisions=(revision,))
+            self.store.connection,
+            _projection(self.store.connection, decisions=(revision,)),
         )
 
         catalog = queries.list_decisions(self.user)
@@ -588,7 +624,8 @@ class CentralWebQueriesTest(unittest.TestCase):
             ),
         )
         queries = CentralWebQueries(
-            self.store.connection, _RegistryQuery(decisions=(revision,))
+            self.store.connection,
+            _projection(self.store.connection, decisions=(revision,)),
         )
 
         dashboard = queries.dashboard(self.user)
@@ -630,7 +667,8 @@ class CentralWebQueriesTest(unittest.TestCase):
         self,
     ) -> None:
         dashboard = CentralWebQueries(
-            self.store.connection, _RegistryQuery(unavailable=True)
+            self.store.connection,
+            _projection(self.store.connection, available=False),
         ).dashboard(self.user)
 
         self.assertEqual("unavailable", dashboard.registry.state)

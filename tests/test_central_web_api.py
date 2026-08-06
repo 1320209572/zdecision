@@ -19,6 +19,7 @@ from zdecision.central.decision_spaces import (
     LeafDecisionSpace,
     RepositoryDecisionRoute,
 )
+from zdecision.central.registry_projection import RegistryProjectionStore
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
 from zdecision.central.web.application import CentralWebApplication
@@ -45,10 +46,7 @@ from zdecision.registry.models import (
     ProductRegistry,
     RootRegistry,
 )
-from zdecision.registry.query import (
-    RegistryQueryUnavailable,
-    RegistrySnapshot,
-)
+from zdecision.registry.query import RegistrySnapshot
 from zdecision.sync.contracts import (
     CandidateOwnershipSnapshot,
     CandidateRevisionUpload,
@@ -63,36 +61,26 @@ REPOSITORY_ID = "repo_" + "1" * 32
 COMMIT_SHA = "b" * 40
 
 
-class _RegistryQuery:
-    def __init__(self, decision: DecisionRevision) -> None:
-        self.decision = decision
-        self.unavailable = False
-
-    def snapshot(self) -> RegistrySnapshot:
-        if self.unavailable:
-            raise RegistryQueryUnavailable("registry_unavailable")
-        product_id = self.decision.product_id
-        product_name = self.decision.product_name
-        return RegistrySnapshot(
-            COMMIT_SHA,
-            {product_id: ProductMetadata(product_id, product_name)},
-            {
-                product_id: ProductRegistry(
-                    product_id,
-                    {
-                        self.decision.decision_id: DecisionHead(
-                            1,
-                            "active",
-                            (
-                                f"decisions/{self.decision.decision_id}/"
-                                "r0001.json"
-                            ),
-                        )
-                    },
-                )
-            },
-            {(product_id, self.decision.decision_id): self.decision},
-        )
+def _registry_snapshot(decision: DecisionRevision) -> RegistrySnapshot:
+    product_id = decision.product_id
+    product_name = decision.product_name
+    return RegistrySnapshot(
+        COMMIT_SHA,
+        {product_id: ProductMetadata(product_id, product_name)},
+        {
+            product_id: ProductRegistry(
+                product_id,
+                {
+                    decision.decision_id: DecisionHead(
+                        1,
+                        "active",
+                        f"decisions/{decision.decision_id}/r0001.json",
+                    )
+                },
+            )
+        },
+        {(product_id, decision.decision_id): decision},
+    )
 
 
 class CentralWebApiTest(unittest.TestCase):
@@ -276,11 +264,12 @@ class CentralWebApiTest(unittest.TestCase):
         git = GitRegistryAdapter(
             repository, expected_origin=str(remote.resolve())
         )
-        self.registry_query = _RegistryQuery(self.formal_decision)
+        self.registry_projection = RegistryProjectionStore(self.store.connection)
+        self._install_registry_projection()
         web = CentralWebApplication(
             store=CentralWebStore(self.store.connection),
             queries=CentralWebQueries(
-                self.store.connection, self.registry_query
+                self.store.connection, self.registry_projection
             ),
             catalog=RegistryCatalog(repository),
             git=git,
@@ -294,6 +283,17 @@ class CentralWebApiTest(unittest.TestCase):
             )
         )
         self.addCleanup(self.client.close)
+
+    def _install_registry_projection(self) -> None:
+        snapshot = _registry_snapshot(self.formal_decision)
+        self.registry_projection.mark_syncing(
+            "org_demo", COMMIT_SHA, "1" * 40,
+            "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+        )
+        self.registry_projection.install(
+            "org_demo", "1" * 40, snapshot,
+            "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+        )
 
     def test_dashboard_is_serialized_by_the_web_transport(self) -> None:
         response = self.client.get("/api/v1/web/dashboard")
@@ -310,6 +310,7 @@ class CentralWebApiTest(unittest.TestCase):
                 "registry": {
                     "state": "available",
                     "commit_sha": COMMIT_SHA,
+                    "verified_at": "2026-08-06T10:00:00Z",
                 },
                 "products": [
                     {
@@ -586,7 +587,7 @@ class CentralWebApiTest(unittest.TestCase):
             ),
             "pub_" + "7" * 32,
         )
-        self.registry_query.decision = self.formal_decision
+        self._install_registry_projection()
         expected_space = {
             "decision_space_id": space.decision_space_id,
             "kind": "shared_unit",
@@ -813,7 +814,10 @@ class CentralWebApiTest(unittest.TestCase):
         invalid = self.client.get(
             "/api/v1/web/decisions", params={"search": "界" * 67}
         )
-        self.registry_query.unavailable = True
+        self.registry_projection.mark_unavailable(
+            "org_demo", None, None, None,
+            "2026-08-06T10:00:00Z", "git_proof_failed",
+        )
         unavailable = self.client.get("/api/v1/web/decisions")
 
         self.assertEqual(404, mismatch.status_code)
@@ -1012,7 +1016,9 @@ class CentralWebApiTest(unittest.TestCase):
         payload = created.json()
         self.assertEqual("publishable", payload["publishability"])
         self.assertIsNone(payload["publication_id"])
-        self.assertEqual(COMMIT_SHA, self.registry_query.snapshot().commit_sha)
+        active = self.registry_projection.load_active("org_demo")
+        self.assertIsNotNone(active)
+        self.assertEqual(COMMIT_SHA, active.commit_sha)
         self.assertRegex(payload["base_commit"], r"^[0-9a-f]{40}$")
         self.assertEqual(1, len(payload["decisions"]))
         decision = payload["decisions"][0]

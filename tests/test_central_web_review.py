@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -10,6 +11,7 @@ from pathlib import Path
 from zdecision.capture.models import CandidateContent
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
+from zdecision.central.registry_projection import RegistryProjectionStore
 from zdecision.central.store import CentralStore
 from zdecision.central.web.contracts import DraftItem
 from zdecision.central.web.queries import CentralWebQueries
@@ -53,14 +55,23 @@ PRODUCT_SPACE_ID = decision_space_id("product", PRODUCT_ID)
 OTHER_SPACE_ID = decision_space_id("product", OTHER_PRODUCT_ID)
 
 
-class _RegistryQuery:
-    def snapshot(self) -> RegistrySnapshot:
-        return RegistrySnapshot(
-            "c" * 40,
-            {PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME)},
-            {PRODUCT_ID: ProductRegistry(PRODUCT_ID, {})},
-            {},
-        )
+def _projection(connection: sqlite3.Connection) -> RegistryProjectionStore:
+    store = RegistryProjectionStore(connection)
+    snapshot = RegistrySnapshot(
+        "c" * 40,
+        {PRODUCT_ID: ProductMetadata(PRODUCT_ID, PRODUCT_NAME)},
+        {PRODUCT_ID: ProductRegistry(PRODUCT_ID, {})},
+        {},
+    )
+    store.mark_syncing(
+        "org_demo", "c" * 40, "1" * 40,
+        "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+    )
+    store.install(
+        "org_demo", "1" * 40, snapshot,
+        "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+    )
+    return store
 
 
 def candidate_content(
@@ -159,7 +170,9 @@ class CentralWebReviewTest(unittest.TestCase):
                     NOW,
                 ),
             )
-        queries = CentralWebQueries(self.store.connection, _RegistryQuery())
+        queries = CentralWebQueries(
+            self.store.connection, _projection(self.store.connection)
+        )
         self.service = CentralReviewService(
             store=CentralWebStore(self.store.connection), queries=queries
         )
@@ -728,7 +741,7 @@ class CentralWebReviewTest(unittest.TestCase):
         self.service = CentralReviewService(
             store=CentralWebStore(self.store.connection),
             queries=CentralWebQueries(
-                self.store.connection, _RegistryQuery()
+                self.store.connection, _projection(self.store.connection)
             ),
         )
 

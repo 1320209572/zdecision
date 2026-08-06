@@ -12,6 +12,7 @@ from zdecision.capture.models import CandidateContent
 from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
+from zdecision.central.registry_projection import RegistryProjectionStore
 from zdecision.central.store import CentralStore
 from zdecision.central.web.contracts import CentralReviewBatch, CentralReviewItem
 from zdecision.central.web.previews import (
@@ -127,10 +128,20 @@ class CentralPreviewServiceTest(unittest.TestCase):
         git = GitRegistryAdapter(
             self.repository, expected_origin=str(self.remote.resolve())
         )
+        registry_projection = RegistryProjectionStore(self.central.connection)
+        snapshot = RegistryQuery(self.repository, git).snapshot()
+        registry_projection.mark_syncing(
+            "org_demo", snapshot.commit_sha, "1" * 40,
+            "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+        )
+        registry_projection.install(
+            "org_demo", "1" * 40, snapshot,
+            "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
+        )
         self.service = CentralPreviewService(
             store=self.store,
             queries=CentralWebQueries(
-                self.central.connection, RegistryQuery(self.repository, git)
+                self.central.connection, registry_projection
             ),
             catalog=RegistryCatalog(self.repository),
             git=git,
