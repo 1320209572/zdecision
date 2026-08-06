@@ -123,6 +123,7 @@ class RecallHostStore:
                         'pending', 'committed', 'blocked'
                     )),
                     result_digest TEXT,
+                    commit_fingerprint TEXT,
                     UNIQUE(session_id, turn_id)
                 );
 
@@ -151,6 +152,16 @@ class RecallHostStore:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(recall_turn_gates)"
+                ).fetchall()
+            }
+            if "commit_fingerprint" not in columns:
+                connection.execute(
+                    "ALTER TABLE recall_turn_gates ADD COLUMN commit_fingerprint TEXT"
+                )
         return cls(database_path, connection)
 
     def close(self) -> None:
@@ -158,6 +169,8 @@ class RecallHostStore:
 
     def get_session(self, session_id: str) -> RecallSession | None:
         session = _text(session_id, "session_id")
+        if self._is_internal_thread(session):
+            return None
         row = self._session_row(session)
         return None if row is None else _session(row)
 
@@ -209,11 +222,10 @@ class RecallHostStore:
                 self._connection.execute(
                     """
                     UPDATE recall_sessions
-                    SET state = 'active', authorization_turn_id = ?, cwd = ?,
-                        ended_at = NULL
+                    SET state = 'active', cwd = ?, ended_at = NULL
                     WHERE session_id = ?
                     """,
-                    (turn, working_directory, session),
+                    (working_directory, session),
                 )
             else:
                 raise RecallGateConflict("session already has an activation")
@@ -303,43 +315,58 @@ class RecallHostStore:
         session = _text(session_id, "session_id")
         turn = _text(turn_id, "turn_id")
         gate_id = _text(gate_id, "gate_id")
-        active_set = _optional_text(active_set_digest, "active_set_digest")
-        gate: sqlite3.Row | None = None
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             gate = self._gate_for_turn(session, turn)
             if gate is None or gate["gate_id"] != gate_id:
                 raise RecallGateConflict("turn gate does not match trusted binding")
-            if gate["state"] == "committed":
-                if gate["result_digest"] != _result_digest(result):
+            if self._is_internal_thread(session):
+                raise RecallGateConflict("internal threads are recall-disabled")
+            try:
+                active_set = _optional_text(active_set_digest, "active_set_digest")
+                _validate_result(result, gate)
+                fingerprint = _commit_fingerprint(result, active_set)
+            except (TypeError, ValueError, RecallGateConflict) as error:
+                if gate["state"] == "pending":
+                    self._block_gate(gate)
+                    self._connection.commit()
+                else:
+                    self._connection.rollback()
+                raise RecallGateConflict("turn gate result is invalid") from error
+            if gate["state"] in ("committed", "blocked"):
+                if gate["commit_fingerprint"] != fingerprint:
                     raise RecallGateConflict("turn gate result is already frozen")
-                committed = _gate(gate)
+                terminal = _gate(gate)
                 self._connection.commit()
-                return committed
+                return terminal
             if gate["state"] != "pending":
-                raise RecallGateConflict("turn gate is blocked")
-            current = self._required_session(session)
-            _validate_result(result, gate, current)
+                raise RecallGateConflict("turn gate is invalid")
+            try:
+                _validate_session_epoch(gate, self._required_session(session))
+            except RecallGateConflict as error:
+                self._block_gate(gate)
+                self._connection.commit()
+                raise RecallGateConflict("turn gate result is invalid") from error
             if result.disposition == "blocked":
                 self._connection.execute(
                     """
                     UPDATE recall_turn_gates
-                    SET state = 'blocked', result_digest = ?
+                    SET state = 'blocked', result_digest = ?, commit_fingerprint = ?
                     WHERE gate_id = ?
                     """,
-                    (_result_digest(result), gate_id),
+                    (_result_digest(result), fingerprint, gate["gate_id"]),
                 )
-                blocked = _gate(self._gate_by_id(gate_id))
+                blocked = _gate(self._gate_by_id(gate["gate_id"]))
                 self._connection.commit()
                 return blocked
             digest = _result_digest(result)
             self._connection.execute(
                 """
                 UPDATE recall_turn_gates
-                SET state = 'committed', result_digest = ?
+                SET state = 'committed', result_digest = ?, commit_fingerprint = ?
                 WHERE gate_id = ?
                 """,
-                (digest, gate_id),
+                (digest, fingerprint, gate["gate_id"]),
             )
             self._connection.execute(
                 """
@@ -358,19 +385,9 @@ class RecallHostStore:
                     session,
                 ),
             )
-            committed = _gate(self._gate_by_id(gate_id))
+            committed = _gate(self._gate_by_id(gate["gate_id"]))
             self._connection.commit()
             return committed
-        except RecallGateConflict:
-            if gate is not None and gate["state"] == "pending":
-                self._connection.execute(
-                    "UPDATE recall_turn_gates SET state = 'blocked' WHERE gate_id = ?",
-                    (gate_id,),
-                )
-                self._connection.commit()
-            else:
-                self._connection.rollback()
-            raise
         except Exception:
             self._connection.rollback()
             raise
@@ -378,6 +395,8 @@ class RecallHostStore:
     def require_committed_gate(self, session_id: str, turn_id: str) -> TurnGate:
         session = _text(session_id, "session_id")
         turn = _text(turn_id, "turn_id")
+        if self._is_internal_thread(session):
+            raise RecallGateConflict("internal threads are recall-disabled")
         row = self._gate_for_turn(session, turn)
         if row is None or row["state"] != "committed":
             raise RecallGateConflict("turn gate is not committed")
@@ -401,6 +420,8 @@ class RecallHostStore:
         active_set_key = active_set or ""
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            if self._is_internal_thread(session):
+                raise RecallGateConflict("internal threads are recall-disabled")
             current = self._session_row(session)
             if current is None or current["state"] != "active":
                 raise RecallGateConflict("session is not active for restoration")
@@ -462,6 +483,8 @@ class RecallHostStore:
         ended = _timestamp(_aware_utc(ended_at, "ended_at"))
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            if self._is_internal_thread(session):
+                raise RecallGateConflict("internal threads are recall-disabled")
             current = self._session_row(session)
             if current is None:
                 self._connection.commit()
@@ -490,6 +513,8 @@ class RecallHostStore:
         resumed = _timestamp(_aware_utc(now, "now"))
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            if self._is_internal_thread(session):
+                raise RecallGateConflict("internal threads are recall-disabled")
             current = self._session_row(session)
             if current is None:
                 self._connection.commit()
@@ -554,6 +579,18 @@ class RecallHostStore:
                 raise RecallGateConflict(
                     "operation ID already belongs to another internal thread"
                 ) from error
+            self._connection.execute(
+                """
+                UPDATE recall_turn_gates
+                SET state = 'blocked'
+                WHERE session_id = ? AND state = 'pending'
+                """,
+                (thread,),
+            )
+            self._connection.execute(
+                "UPDATE recall_sessions SET state = 'blocked' WHERE session_id = ?",
+                (thread,),
+            )
             result = _internal_thread(
                 self._connection.execute(
                     "SELECT * FROM recall_internal_threads WHERE thread_id = ?",
@@ -568,11 +605,21 @@ class RecallHostStore:
 
     def is_internal_thread(self, thread_id: str) -> bool:
         thread = _text(thread_id, "thread_id")
+        return self._is_internal_thread(thread)
+
+    def _is_internal_thread(self, thread_id: str) -> bool:
         return (
             self._connection.execute(
-                "SELECT 1 FROM recall_internal_threads WHERE thread_id = ?", (thread,)
+                "SELECT 1 FROM recall_internal_threads WHERE thread_id = ?",
+                (thread_id,),
             ).fetchone()
             is not None
+        )
+
+    def _block_gate(self, gate: sqlite3.Row) -> None:
+        self._connection.execute(
+            "UPDATE recall_turn_gates SET state = 'blocked' WHERE gate_id = ?",
+            (gate["gate_id"],),
         )
 
     def _session_row(self, session_id: str) -> sqlite3.Row | None:
@@ -655,9 +702,7 @@ def _internal_thread(row: sqlite3.Row | None) -> InternalThreadBinding:
     )
 
 
-def _validate_result(
-    result: TurnGateResult, gate: sqlite3.Row, session: RecallSession
-) -> None:
+def _validate_result(result: TurnGateResult, gate: sqlite3.Row) -> None:
     if not isinstance(result, TurnGateResult):
         raise RecallGateConflict("turn gate result is invalid")
     if result.disposition not in (
@@ -675,6 +720,9 @@ def _validate_result(
         raise RecallGateConflict("turn gate intent epoch is invalid")
     if not gate["intent_epoch"] <= result.intent_epoch <= gate["intent_epoch"] + 1:
         raise RecallGateConflict("turn gate intent epoch is stale")
+
+
+def _validate_session_epoch(gate: sqlite3.Row, session: RecallSession) -> None:
     if session.context_epoch != gate["context_epoch"]:
         raise RecallGateConflict("session context epoch is stale")
     if session.intent_epoch != gate["intent_epoch"]:
@@ -683,6 +731,19 @@ def _validate_result(
 
 def _result_digest(result: TurnGateResult) -> str:
     return hashlib.sha256(canonical_json_bytes(asdict(result))).hexdigest()
+
+
+def _commit_fingerprint(
+    result: TurnGateResult, active_set_digest: str | None
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "result": asdict(result),
+                "active_set_digest": active_set_digest,
+            }
+        )
+    ).hexdigest()
 
 
 def _text(value: object, name: str) -> str:

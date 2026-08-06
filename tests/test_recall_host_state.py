@@ -177,6 +177,147 @@ class RecallHostStoreTests(unittest.TestCase):
         with self.assertRaises(RecallGateConflict):
             self.store.require_committed_gate(SESSION_ID, "turn-2")
 
+    def test_cross_bound_gate_id_does_not_block_another_pending_turn(self) -> None:
+        """This catches a mismatched ID writing to a different trusted gate."""
+
+        self.activate()
+        self.activate(
+            session_id="session-2", turn_id="turn-2", binding_id="activation-2"
+        )
+        self.begin_gate()
+        self.begin_gate(session_id="session-2", turn_id="turn-2", gate_id="gate-2")
+
+        with self.assertRaises(RecallGateConflict):
+            self.commit_gate(gate_id="gate-2")
+
+        self.assertEqual("pending", self.begin_gate().state)
+        self.assertEqual(
+            "pending",
+            self.begin_gate(
+                session_id="session-2", turn_id="turn-2", gate_id="gate-2"
+            ).state,
+        )
+
+    def test_invalid_result_payload_blocks_the_exact_pending_gate(self) -> None:
+        """This catches payload validation rolling back instead of blocking a gate."""
+
+        self.activate()
+        self.begin_gate()
+
+        with self.assertRaises(RecallGateConflict):
+            self.commit_gate(result=_result(intent_digest=""))
+
+        self.assertEqual("blocked", self.begin_gate().state)
+
+    def test_invalid_active_set_blocks_the_exact_pending_gate(self) -> None:
+        """This catches pre-transaction active-set validation leaving a gate pending."""
+
+        self.activate()
+        self.begin_gate()
+
+        with self.assertRaises(RecallGateConflict):
+            self.commit_gate(active_set_digest="")
+
+        self.assertEqual("blocked", self.begin_gate().state)
+
+    def test_terminal_gate_replay_requires_the_full_submission_fingerprint(self) -> None:
+        """This catches terminal replays ignoring the active-set identity."""
+
+        self.activate()
+        self.begin_gate()
+        committed = self.commit_gate()
+
+        self.assertEqual(committed, self.commit_gate())
+        with self.assertRaises(RecallGateConflict):
+            self.commit_gate(active_set_digest="set-other")
+
+        self.begin_gate(
+            turn_id="turn-2", gate_id="gate-2", intent_epoch=1
+        )
+        blocked_result = _result(
+            disposition="blocked", context_epoch=0, intent_epoch=1
+        )
+        blocked = self.commit_gate(
+            turn_id="turn-2", gate_id="gate-2", result=blocked_result
+        )
+
+        self.assertEqual("blocked", blocked.state)
+        self.assertEqual(
+            blocked,
+            self.commit_gate(
+                turn_id="turn-2", gate_id="gate-2", result=blocked_result
+            ),
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.commit_gate(
+                turn_id="turn-2",
+                gate_id="gate-2",
+                result=blocked_result,
+                active_set_digest="set-other",
+            )
+
+    def test_late_internal_binding_terminates_pending_thread_recall(self) -> None:
+        """This catches a late Capture binding committing an inherited pending gate."""
+
+        self.activate(session_id="thread-capture", binding_id="activation-thread")
+        self.begin_gate(session_id="thread-capture", gate_id="gate-thread")
+        self.store.bind_internal_thread(
+            thread_id="thread-capture",
+            parent_thread_id=SESSION_ID,
+            purpose="capture",
+            operation_id="capture-late",
+            now=NOW,
+        )
+
+        with self.assertRaises(RecallGateConflict):
+            self.commit_gate(session_id="thread-capture", gate_id="gate-thread")
+        self.assertIsNone(self.store.get_session("thread-capture"))
+
+    def test_late_internal_binding_denies_committed_receipts_and_restoration(self) -> None:
+        """This catches late reconciliation binding retaining prior recall authority."""
+
+        self.activate(session_id="thread-reconciliation", binding_id="activation-thread")
+        self.begin_gate(session_id="thread-reconciliation", gate_id="gate-thread")
+        self.commit_gate(session_id="thread-reconciliation", gate_id="gate-thread")
+        self.store.begin_context_epoch(
+            session_id="thread-reconciliation",
+            source="compact",
+            latest_observed_turn_id=TURN_ID,
+            active_set_digest=ACTIVE_SET_DIGEST,
+            compaction_key="compact-thread",
+        )
+        self.store.bind_internal_thread(
+            thread_id="thread-reconciliation",
+            parent_thread_id=SESSION_ID,
+            purpose="reconciliation",
+            operation_id="reconciliation-late",
+            now=NOW,
+        )
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.require_committed_gate("thread-reconciliation", TURN_ID)
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_context_epoch(
+                session_id="thread-reconciliation",
+                source="compact",
+                latest_observed_turn_id=TURN_ID,
+                active_set_digest=ACTIVE_SET_DIGEST,
+                compaction_key="compact-thread",
+            )
+
+    def test_revalidation_reactivates_without_replacing_original_authorization(self) -> None:
+        """This catches trusted resume revalidation overwriting original authorization."""
+
+        self.activate()
+        self.store.mark_dormant(SESSION_ID, ended_at=NOW)
+        self.store.begin_resume(SESSION_ID, cwd="/tmp/recall", now=NOW)
+        revalidated = self.activate(
+            turn_id="turn-revalidate", binding_id="activation-revalidate"
+        )
+
+        self.assertEqual("active", revalidated.state)
+        self.assertEqual(TURN_ID, revalidated.authorization_turn_id)
+
     def test_compact_or_clear_replay_restores_once_per_host_event_key(self) -> None:
         """This catches duplicate host lifecycle delivery advancing context twice."""
 
@@ -285,4 +426,3 @@ class RecallHostStoreTests(unittest.TestCase):
             connection.close()
         self.assertEqual([("lease-existing",)], rows)
         self.assertEqual(["lease_id"], [column[1] for column in columns])
-
