@@ -321,33 +321,27 @@ class RegistryProjectionStore:
         product_rows, decision_rows, _ = _snapshot_rows(
             organization, tree, snapshot
         )
-        expected_products = {(row[2], row[7]) for row in product_rows}
-        expected_decisions = {
-            (row[2], row[3], row[4], row[15]) for row in decision_rows
-        }
+        expected_products = {tuple(row[2:]) for row in product_rows}
+        expected_decisions = {tuple(row[2:]) for row in decision_rows}
         products = self.connection.execute(
-            """SELECT product_id, product_digest
+            """SELECT product_id, product_name, product_path, registry_path,
+                      product_json, product_digest
                FROM registry_product_projection
                WHERE organization_id = ? AND registry_tree_oid = ?""",
             (organization, tree),
         ).fetchall()
         decisions = self.connection.execute(
-            """SELECT product_id, decision_id, revision, decision_digest
+            """SELECT product_id, decision_id, revision, lifecycle, head_path,
+                      claim, future_action, scope_summary, repositories_json,
+                      paths_json, invalidation_conditions_json,
+                      publication_preview_id, decision_json, decision_digest
                FROM registry_decision_projection
                WHERE organization_id = ? AND registry_tree_oid = ?""",
             (organization, tree),
         ).fetchall()
         return expected_products == {
-            (row["product_id"], row["product_digest"]) for row in products
-        } and expected_decisions == {
-            (
-                row["product_id"],
-                row["decision_id"],
-                row["revision"],
-                row["decision_digest"],
-            )
-            for row in decisions
-        }
+            tuple(row) for row in products
+        } and expected_decisions == {tuple(row) for row in decisions}
 
     def install(
         self,

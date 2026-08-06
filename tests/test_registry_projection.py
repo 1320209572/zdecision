@@ -379,6 +379,32 @@ class RegistryProjectionStoreTest(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual([COMMIT_A, COMMIT_B], query.calls)
 
+    def test_synchronize_rebuilds_same_tree_when_product_row_is_corrupt(
+        self,
+    ) -> None:
+        git = _VerifiedGit()
+        query = _CommitQuery(_snapshot())
+        synchronizer = RegistryProjectionSynchronizer(
+            git=git, query=query, store=self.projection,
+            clock=lambda: VERIFIED_AT,
+        )
+        synchronizer.synchronize("org_demo", COMMIT_A, VERIFIED_AT)
+        self.central.connection.execute(
+            """UPDATE registry_product_projection SET product_name = ?
+               WHERE organization_id = ? AND registry_tree_oid = ?""",
+            ("corrupt product name", "org_demo", TREE_A),
+        )
+        query.snapshot = _snapshot(COMMIT_B)
+
+        state = synchronizer.synchronize("org_demo", COMMIT_B, VERIFIED_AT)
+        active = self.projection.load_active("org_demo")
+
+        self.assertEqual("available", state.state)
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertEqual(COMMIT_B, active.commit_sha)
+        self.assertEqual(PRODUCT_NAME, active.snapshot.products[PRODUCT_ID].name)
+
     def test_parse_failure_marks_projection_unavailable_without_serving_old_rows(
         self,
     ) -> None:
