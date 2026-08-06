@@ -405,6 +405,48 @@ class RegistryProjectionStoreTest(unittest.TestCase):
         self.assertEqual(COMMIT_B, active.commit_sha)
         self.assertEqual(PRODUCT_NAME, active.snapshot.products[PRODUCT_ID].name)
 
+    def test_synchronize_rebuilds_same_tree_when_state_manifest_is_corrupt(
+        self,
+    ) -> None:
+        query = _CommitQuery(_snapshot())
+        synchronizer = RegistryProjectionSynchronizer(
+            git=_VerifiedGit(), query=query, store=self.projection,
+            clock=lambda: VERIFIED_AT,
+        )
+
+        for field, corrupted_value in (
+            ("product_count", 2),
+            ("decision_count", 1),
+            ("projection_digest", "0" * 64),
+        ):
+            with self.subTest(field=field):
+                query.snapshot = _snapshot(COMMIT_A)
+                expected = synchronizer.synchronize(
+                    "org_demo", COMMIT_A, VERIFIED_AT
+                )
+                self.central.connection.execute(
+                    f"""UPDATE registry_projection_state SET {field} = ?
+                       WHERE organization_id = ?""",
+                    (corrupted_value, "org_demo"),
+                )
+
+                self.assertFalse(
+                    self.projection.matches("org_demo", TREE_A, query.snapshot)
+                )
+                query.snapshot = _snapshot(COMMIT_B)
+                state = synchronizer.synchronize(
+                    "org_demo", COMMIT_B, VERIFIED_AT
+                )
+                active = self.projection.load_active("org_demo")
+
+                self.assertEqual(expected.product_count, state.product_count)
+                self.assertEqual(expected.decision_count, state.decision_count)
+                self.assertEqual(expected.projection_digest, state.projection_digest)
+                self.assertIsNotNone(active)
+                assert active is not None
+                self.assertEqual(COMMIT_B, active.commit_sha)
+                self.assertEqual(query.snapshot, active.snapshot)
+
     def test_parse_failure_marks_projection_unavailable_without_serving_old_rows(
         self,
     ) -> None:

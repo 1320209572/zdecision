@@ -318,9 +318,18 @@ class RegistryProjectionStore:
     ) -> bool:
         organization = require_id(organization_id, "organization_id")
         tree = _object_id(tree_oid, "tree_oid")
-        product_rows, decision_rows, _ = _snapshot_rows(
+        product_rows, decision_rows, projection_digest = _snapshot_rows(
             organization, tree, snapshot
         )
+        state = self.get_state(organization)
+        if (
+            state is None
+            or state.active_tree_oid != tree
+            or state.product_count != len(product_rows)
+            or state.decision_count != len(decision_rows)
+            or state.projection_digest != projection_digest
+        ):
+            return False
         expected_products = {tuple(row[2:]) for row in product_rows}
         expected_decisions = {tuple(row[2:]) for row in decision_rows}
         products = self.connection.execute(
