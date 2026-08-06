@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from zdecision.agent.repository import RepositoryResolver
@@ -21,6 +22,10 @@ from zdecision.central.decision_spaces import (
     EnabledRepository,
     LeafDecisionSpace,
     RepositoryDecisionRoute,
+)
+from zdecision.central.registry_projection import (
+    RegistryProjectionStore,
+    RegistryProjectionSynchronizer,
 )
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore, _validate_route_set
@@ -35,7 +40,7 @@ from zdecision.ids import (
     repository_route_id,
 )
 from zdecision.jsonio import atomic_create_json
-from zdecision.registry.git import GitRegistryAdapter
+from zdecision.registry.git import GitRegistryAdapter, GitRegistryError
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.query import RegistryQuery
 
@@ -172,6 +177,28 @@ def _initialize_demo_config(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _synchronize_registry_on_startup(
+    organization_id: str,
+    git: GitRegistryAdapter,
+    synchronizer: RegistryProjectionSynchronizer,
+    projection: RegistryProjectionStore,
+    verified_at: str,
+) -> None:
+    try:
+        verified_commit = git.fetch_and_require_exact_main()
+    except GitRegistryError:
+        projection.mark_unavailable(
+            organization_id,
+            None,
+            None,
+            None,
+            verified_at,
+            "git_proof_failed",
+        )
+        return
+    synchronizer.synchronize(organization_id, verified_commit, verified_at)
+
+
 def _run_server(arguments: argparse.Namespace) -> int:
     if not _is_loopback(arguments.host):
         raise CentralCliError("non_loopback_bind_forbidden")
@@ -211,12 +238,27 @@ def _run_server(arguments: argparse.Namespace) -> int:
             device_token_sha256=config["device_token_sha256"],
         )
         git = GitRegistryAdapter(registry_root)
+        projection = RegistryProjectionStore(store.connection)
         registry_query = RegistryQuery(registry_root, git)
+        synchronizer = RegistryProjectionSynchronizer(
+            git=git,
+            query=registry_query,
+            store=projection,
+        )
+        verified_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        _synchronize_registry_on_startup(
+            config["organization_id"],
+            git,
+            synchronizer,
+            projection,
+            verified_at,
+        )
         web_application = CentralWebApplication(
             store=CentralWebStore(store.connection),
-            queries=CentralWebQueries(store.connection, registry_query),
+            queries=CentralWebQueries(store.connection, projection),
             catalog=RegistryCatalog(registry_root),
             git=git,
+            registry_synchronizer=synchronizer,
         )
         app = create_app(
             CaptureRequestService(store),

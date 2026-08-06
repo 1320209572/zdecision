@@ -6,7 +6,9 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from itertools import combinations
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -19,7 +21,11 @@ from zdecision.central.decision_spaces import (
     LeafDecisionSpace,
     RepositoryDecisionRoute,
 )
-from zdecision.central.registry_projection import RegistryProjectionStore
+from zdecision.central.registry_projection import (
+    RegistryProjectionError,
+    RegistryProjectionStore,
+    RegistryProjectionSynchronizer,
+)
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
 from zdecision.central.web.application import CentralWebApplication
@@ -46,7 +52,7 @@ from zdecision.registry.models import (
     ProductRegistry,
     RootRegistry,
 )
-from zdecision.registry.query import RegistrySnapshot
+from zdecision.registry.query import RegistryQuery, RegistrySnapshot
 from zdecision.sync.contracts import (
     CandidateOwnershipSnapshot,
     CandidateRevisionUpload,
@@ -266,19 +272,29 @@ class CentralWebApiTest(unittest.TestCase):
         )
         self.registry_projection = RegistryProjectionStore(self.store.connection)
         self._install_registry_projection()
-        web = CentralWebApplication(
+        registry_query = RegistryQuery(repository, git)
+        self.synchronizer = RegistryProjectionSynchronizer(
+            git=git,
+            query=registry_query,
+            store=self.registry_projection,
+        )
+        self.synchronizer.synchronize = mock.Mock(
+            wraps=self.synchronizer.synchronize
+        )
+        self.web = CentralWebApplication(
             store=CentralWebStore(self.store.connection),
             queries=CentralWebQueries(
                 self.store.connection, self.registry_projection
             ),
             catalog=RegistryCatalog(repository),
             git=git,
+            registry_synchronizer=self.synchronizer,
         )
         self.client = TestClient(
             create_app(
                 CaptureRequestService(self.store),
                 identity,
-                web_application=web,
+                web_application=self.web,
                 static_root=static_root,
             )
         )
@@ -294,6 +310,29 @@ class CentralWebApiTest(unittest.TestCase):
             "org_demo", "1" * 40, snapshot,
             "2026-08-06T10:00:00Z", "2026-08-06T10:00:00Z",
         )
+
+    def test_registry_write_dependencies_must_be_configured_together(
+        self,
+    ) -> None:
+        assert self.web.previews is not None
+        dependencies = {
+            "catalog": self.web.previews.catalog,
+            "git": self.web.previews.git,
+            "registry_synchronizer": self.synchronizer,
+        }
+
+        for size in (1, 2):
+            for names in combinations(dependencies, size):
+                with self.subTest(configured=names):
+                    with self.assertRaises(ValueError):
+                        CentralWebApplication(
+                            store=self.web.store,
+                            queries=self.web.queries,
+                            **{
+                                name: dependencies[name]
+                                for name in names
+                            },
+                        )
 
     def test_dashboard_is_serialized_by_the_web_transport(self) -> None:
         response = self.client.get("/api/v1/web/dashboard")
@@ -1192,6 +1231,107 @@ class CentralWebApiTest(unittest.TestCase):
         self.assertNotIn("note", encoded)
         self.assertNotIn(self.revision.content.claim, encoded)
         self.assertEqual(1, len(detail.json()["decision_ids"]))
+        completed_record = CentralWebStore(
+            self.store.connection
+        ).get_publication_by_preview(
+            "org_demo", preview["preview_id"]
+        )
+        self.assertIsNotNone(completed_record)
+        assert completed_record is not None
+        self.assertEqual("completed", completed_record.state)
+        self.assertEqual(3, self.synchronizer.synchronize.call_count)
+        self.assertEqual(
+            [
+                mock.call(
+                    "org_demo",
+                    completed_record.commit_sha,
+                    completed_record.updated_at,
+                )
+            ]
+            * 3,
+            self.synchronizer.synchronize.call_args_list,
+        )
+        formal = self.client.get(
+            f"/api/v1/web/spaces/{PRODUCT_SPACE_ID}/decisions/"
+            f"{preview['decisions'][0]['decision_id']}"
+        )
+        self.assertEqual(200, formal.status_code, formal.text)
+
+    def test_projection_failure_preserves_completed_publication_and_hides_old_tree(
+        self,
+    ) -> None:
+        def fail_projection(
+            organization_id: str,
+            commit_sha: str,
+            verified_at: str,
+        ) -> None:
+            self.registry_projection.mark_unavailable(
+                organization_id,
+                commit_sha,
+                None,
+                verified_at,
+                verified_at,
+                "projection_install_failed",
+            )
+            raise RegistryProjectionError("registry_projection_error")
+
+        self.synchronizer.synchronize.side_effect = fail_projection
+        draft = self.client.put(
+            f"/api/v1/web/products/{PRODUCT_ID}/review-draft",
+            json=self.draft_body(action="accept"),
+        ).json()
+        review = self.client.post(
+            f"/api/v1/web/products/{PRODUCT_ID}/reviews",
+            json={
+                "client_action_id": "web_action_projection-failure-review",
+                "expected_draft_version": draft["version"],
+                "items": draft["items"],
+            },
+        ).json()
+        preview = self.client.post(
+            f"/api/v1/web/reviews/{review['review_batch_id']}/previews",
+            json={
+                "client_action_id": "web_action_projection-failure-preview"
+            },
+        ).json()
+
+        published = self.client.post(
+            f"/api/v1/web/publication-previews/{preview['preview_id']}/publish",
+            json={
+                "client_action_id": "web_action_projection-failure-publish"
+            },
+        )
+        self.assertEqual(200, published.status_code, published.text)
+        self.assertEqual("completed", published.json()["state"])
+        self.assertIsNotNone(published.json()["commit_sha"])
+        publication_id = published.json()["publication_id"]
+        publication_detail = self.client.get(
+            f"/api/v1/web/publications/{publication_id}"
+        )
+        publication_history = self.client.get("/api/v1/web/publications")
+        formal_list = self.client.get(
+            f"/api/v1/web/spaces/{PRODUCT_SPACE_ID}/decisions"
+        )
+        formal_detail = self.client.get(
+            f"/api/v1/web/spaces/{PRODUCT_SPACE_ID}/decisions/"
+            f"{self.formal_decision.decision_id}"
+        )
+
+        self.assertEqual(200, publication_detail.status_code)
+        self.assertEqual(
+            published.json()["commit_sha"],
+            publication_detail.json()["commit_sha"],
+        )
+        self.assertEqual(200, publication_history.status_code)
+        self.assertEqual(
+            published.json()["commit_sha"],
+            publication_history.json()["items"][0]["commit_sha"],
+        )
+        for response in (formal_list, formal_detail):
+            self.assertEqual(503, response.status_code, response.text)
+            self.assertEqual(
+                {"error": "registry_unavailable"}, response.json()
+            )
 
     def test_ambiguous_publication_resume_is_a_stable_409(self) -> None:
         draft = self.client.put(

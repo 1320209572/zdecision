@@ -14,11 +14,16 @@ from fastapi.testclient import TestClient
 from zdecision.capture.models import CandidateContent
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
+from zdecision.central.cli import _synchronize_registry_on_startup
 from zdecision.central.decision_spaces import (
     CatalogGroup,
     EnabledRepository,
     LeafDecisionSpace,
     RepositoryDecisionRoute,
+)
+from zdecision.central.registry_projection import (
+    RegistryProjectionStore,
+    RegistryProjectionSynchronizer,
 )
 from zdecision.central.service import CaptureRequestService
 from zdecision.central.store import CentralStore
@@ -86,6 +91,7 @@ class CentralWebVerticalTest(unittest.TestCase):
         self.http_fixture_json: list[str] = []
         self.client: TestClient | None = None
         self.store: CentralStore | None = None
+        self.projection: RegistryProjectionStore | None = None
 
         self._git("init", "--bare", str(self.remote), repository=self.root)
         self._git("init", "-b", "main", str(self.repository), repository=self.root)
@@ -170,6 +176,11 @@ class CentralWebVerticalTest(unittest.TestCase):
         return self.store
 
     @property
+    def active_projection(self) -> RegistryProjectionStore:
+        assert self.projection is not None
+        return self.projection
+
+    @property
     def authorization(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {DEVICE_TOKEN}"}
 
@@ -195,6 +206,7 @@ class CentralWebVerticalTest(unittest.TestCase):
         if self.store is not None:
             self.store.close()
             self.store = None
+        self.projection = None
 
     def restart_central_service(self) -> None:
         self._close_central_service()
@@ -210,13 +222,24 @@ class CentralWebVerticalTest(unittest.TestCase):
         git = GitRegistryAdapter(
             self.repository, expected_origin=str(self.remote.resolve())
         )
+        projection = RegistryProjectionStore(self.store.connection)
+        registry_query = RegistryQuery(self.repository, git)
+        synchronizer = RegistryProjectionSynchronizer(
+            git=git,
+            query=registry_query,
+            store=projection,
+        )
+        verified_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        _synchronize_registry_on_startup(
+            "org_demo", git, synchronizer, projection, verified_at
+        )
+        self.projection = projection
         web = CentralWebApplication(
             store=CentralWebStore(self.store.connection),
-            queries=CentralWebQueries(
-                self.store.connection, RegistryQuery(self.repository, git)
-            ),
+            queries=CentralWebQueries(self.store.connection, projection),
             catalog=RegistryCatalog(self.repository),
             git=git,
+            registry_synchronizer=synchronizer,
         )
         self.client = TestClient(
             create_app(
@@ -437,6 +460,12 @@ class CentralWebVerticalTest(unittest.TestCase):
         messages = self._git("log", "--format=%B", "--all").decode("utf-8")
         return messages.count(f"ZDecision-Preview: {preview_id}")
 
+    def git_commit_count_with_subject(self, subject_fragment: str) -> int:
+        subjects = self._git("log", "--format=%s", "--all").decode("utf-8")
+        return sum(
+            subject_fragment in subject for subject in subjects.splitlines()
+        )
+
     def receipt_count(self, family_id: str) -> int:
         return int(
             self.active_store.connection.execute(
@@ -491,6 +520,39 @@ class CentralWebVerticalTest(unittest.TestCase):
             env=environment,
         ).stdout.decode("ascii").strip()
 
+    def create_code_only_commit(self) -> str:
+        (self.repository / "code-only.txt").write_text(
+            "code-only change\n", "utf-8"
+        )
+        self._git("add", "code-only.txt")
+        self._git("commit", "-m", "code: change without registry update")
+        self._git("push", "origin", "main")
+        return self._git("rev-parse", "HEAD").decode("ascii").strip()
+
+    def publish_accepted_candidate(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        request_id = self.create_capture_request()
+        self.agent_upload_and_complete(
+            request_id, (self.candidate(FAMILY_ID, ACCEPTED_CLAIM),)
+        )
+        draft_response = self.active_client.get(
+            f"/api/v1/web/spaces/{DECISION_SPACE_ID}/review-draft"
+        )
+        self.assertEqual(200, draft_response.status_code, draft_response.text)
+        inbox_response = self.active_client.get(
+            f"/api/v1/web/spaces/{DECISION_SPACE_ID}/candidates"
+        )
+        self.assertEqual(200, inbox_response.status_code, inbox_response.text)
+        draft = {
+            **draft_response.json(),
+            "items": inbox_response.json()["items"],
+        }
+        saved = self.save_accept_draft(draft)
+        review = self.submit_review(saved)
+        preview = self.create_preview(review["review_batch_id"])
+        return preview, self.publish(preview["preview_id"])
+
     def all_git_blob_bytes(self) -> bytes:
         object_lines = self._git("rev-list", "--objects", "--all").splitlines()
         blobs: list[bytes] = []
@@ -499,6 +561,81 @@ class CentralWebVerticalTest(unittest.TestCase):
             if self._git("cat-file", "-t", object_id).strip() == b"blob":
                 blobs.append(self._git("cat-file", "blob", object_id))
         return b"\n".join(blobs)
+
+    def test_restart_rebuilds_projection_after_durable_publication_without_republishing(
+        self,
+    ) -> None:
+        preview, published = self.publish_accepted_candidate()
+        self.assertEqual("completed", published["state"])
+        published_commit = published["commit_sha"]
+        formal_decision_id = published["decision_ids"][0]
+
+        with self.active_store.connection:
+            self.active_store.connection.execute(
+                "DELETE FROM registry_decision_projection"
+            )
+            self.active_store.connection.execute(
+                "DELETE FROM registry_product_projection"
+            )
+            self.active_store.connection.execute(
+                "UPDATE registry_projection_state SET state = 'syncing'"
+            )
+
+        self.restart_central_service()
+        detail = self.active_client.get(
+            f"/api/v1/web/spaces/{DECISION_SPACE_ID}/decisions/"
+            f"{formal_decision_id}"
+        )
+        state = self.active_projection.get_state("org_demo")
+
+        self.assertEqual(200, detail.status_code, detail.text)
+        self.assertEqual(
+            formal_decision_id, detail.json()["decision_id"]
+        )
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(published_commit, state.active_commit)
+        self.assertEqual(1, self.git_commit_count_with_subject("decision("))
+        self.assertEqual(
+            1, self.publication_commit_count(preview["preview_id"])
+        )
+
+    def test_restart_updates_provenance_for_code_only_commit_without_rewriting_registry(
+        self,
+    ) -> None:
+        _, published = self.publish_accepted_candidate()
+        before = self.active_projection.get_state("org_demo")
+        self.assertIsNotNone(before)
+        assert before is not None
+        before_products = self.active_store.connection.execute(
+            "SELECT rowid, * FROM registry_product_projection"
+        ).fetchall()
+        before_decisions = self.active_store.connection.execute(
+            "SELECT rowid, * FROM registry_decision_projection"
+        ).fetchall()
+
+        code_commit = self.create_code_only_commit()
+        self.restart_central_service()
+        after = self.active_projection.get_state("org_demo")
+        after_products = self.active_store.connection.execute(
+            "SELECT rowid, * FROM registry_product_projection"
+        ).fetchall()
+        after_decisions = self.active_store.connection.execute(
+            "SELECT rowid, * FROM registry_decision_projection"
+        ).fetchall()
+
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertEqual("completed", published["state"])
+        self.assertEqual(code_commit, after.active_commit)
+        self.assertNotEqual(before.verified_at, after.verified_at)
+        self.assertEqual(before.active_tree_oid, after.active_tree_oid)
+        self.assertEqual(before.product_count, after.product_count)
+        self.assertEqual(before.decision_count, after.decision_count)
+        self.assertEqual(before.projection_digest, after.projection_digest)
+        self.assertEqual(before_products, after_products)
+        self.assertEqual(before_decisions, after_decisions)
+        self.assertEqual(1, self.git_commit_count_with_subject("decision("))
 
     def test_theme_review_preview_and_explicit_publish_use_v1_partition(
         self,

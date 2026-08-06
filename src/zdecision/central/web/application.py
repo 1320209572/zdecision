@@ -6,8 +6,13 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from zdecision.central.auth import Principal
+from zdecision.central.registry_projection import (
+    RegistryProjectionError,
+    RegistryProjectionSynchronizer,
+)
 from zdecision.central.web.contracts import (
     CandidateInboxView,
+    CentralPublication,
     DraftItem,
     ReviewDraft,
 )
@@ -48,6 +53,7 @@ class CentralWebApplication:
         queries: CentralWebQueries,
         catalog: RegistryCatalog | None = None,
         git: GitRegistryAdapter | None = None,
+        registry_synchronizer: RegistryProjectionSynchronizer | None = None,
     ) -> None:
         if not isinstance(store, CentralWebStore):
             raise TypeError("store must be a CentralWebStore")
@@ -56,8 +62,14 @@ class CentralWebApplication:
         self.store = store
         self.queries = queries
         self.reviews = CentralReviewService(store=store, queries=queries)
-        if (catalog is None) != (git is None):
+        configured = (
+            catalog is not None,
+            git is not None,
+            registry_synchronizer is not None,
+        )
+        if any(configured) and not all(configured):
             raise ValueError("Preview Registry dependencies must be configured together")
+        self.registry_synchronizer = registry_synchronizer
         self.previews = (
             CentralPreviewService(
                 store=store, queries=queries, catalog=catalog, git=git
@@ -211,6 +223,7 @@ class CentralWebApplication:
         publication = self._publication_service().confirm(
             principal, preview_id, client_action_id, now
         )
+        self._synchronize_completed_publication(publication)
         return self._publication_service().get(
             principal, publication.publication_id
         )
@@ -225,6 +238,7 @@ class CentralWebApplication:
         publication = self._publication_service().resume(
             principal, publication_id, client_action_id, now
         )
+        self._synchronize_completed_publication(publication)
         return self._publication_service().get(
             principal, publication.publication_id
         )
@@ -262,3 +276,20 @@ class CentralWebApplication:
         if self.publications is None:
             raise RuntimeError("Central Publication service is not configured")
         return self.publications
+
+    def _synchronize_completed_publication(
+        self,
+        publication: CentralPublication,
+    ) -> None:
+        if publication.state != "completed" or publication.commit_sha is None:
+            return
+        if self.registry_synchronizer is None:
+            raise RuntimeError("Registry synchronizer is not configured")
+        try:
+            self.registry_synchronizer.synchronize(
+                publication.organization_id,
+                publication.commit_sha,
+                publication.updated_at,
+            )
+        except RegistryProjectionError:
+            return
