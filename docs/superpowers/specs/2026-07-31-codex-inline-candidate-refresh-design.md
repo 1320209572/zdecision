@@ -488,3 +488,28 @@ identity from model or widget input. At minimum, acceptance must cover a task
 started above exactly one enabled child repository; zero eligible repositories
 or ambiguous activity across multiple repositories must continue to fail
 closed.
+
+## 15. Deferred known gap: current-Session path attribution in shared worktrees
+
+Real Codex Desktop acceptance on 2026-08-06 exposed a path-attribution gap.
+The **当前 Session** action correctly freezes one host-bound Session as the
+conversation source, but its Git path evidence also includes the repository's
+current dirty, staged, and untracked paths. When multiple Codex Sessions share
+one worktree, changes left by another Session can therefore create unrelated
+Decision-space slices. In the observed acceptance, one selected Session routed
+five `zmetis` paths, thirty-seven `third-party-services` paths, and four `cloud`
+paths even though only `third-party-services` produced Candidate revisions.
+
+This gap is deferred, but an empty result from an unrelated slice must not be
+treated as proof that the attribution is correct. Repository-wide worktree
+state cannot by itself prove that a path belongs to the selected Session. A
+later design must establish a host-verifiable Session-scoped touched-path
+ledger or equivalent evidence and intersect dirty, staged, untracked, and
+committed paths with that ownership boundary before routing.
+
+At minimum, acceptance must cover two Sessions that modify different product
+paths in the same enabled worktree. Clicking **当前 Session** must route only
+the selected Session's owned paths; clicking **所有有效 Session** may combine
+the independently attributed sets. Paths whose Session ownership cannot be
+proven must be excluded or make routing fail closed rather than being assigned
+from repository-wide dirty state.
