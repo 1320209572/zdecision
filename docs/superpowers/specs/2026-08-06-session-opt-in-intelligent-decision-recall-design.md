@@ -1,6 +1,7 @@
 # Session-Opt-In Intelligent Decision Recall Design
 
-**Status:** Approved for implementation planning on 2026-08-06.
+**Status:** Approved for implementation planning on 2026-08-06; Capture
+provenance amended on 2026-08-07.
 
 **Scope:** Packet 3 of the installed ZDecision Plugin. A user explicitly enables
 formal Decision recall in any Turn of one Codex development Session; ZDecision
@@ -16,6 +17,11 @@ Candidate refresh remains user-triggered and its failures remain independent
 of development. Decision recall is not globally automatic after installation;
 it is enabled only by an explicit native ZDecision selection in the current
 Session.
+
+**Capture provenance amendment:**
+`2026-08-07-recall-capture-provenance-design.md` replaces marker-only Capture
+exclusion with the approved prompt-anchor eligibility, host-derived reference
+lineage, conservative disposition, and human publication-gate contract.
 
 **Depends on:**
 
@@ -718,9 +724,10 @@ the parent cannot delegate its recall authorization. Only a native user
 activation in that task may enable it.
 
 Internal Capture forks always disable recall. Inherited Decision envelopes are
-reference context, not native user confirmation or Candidate evidence.
-Inventory and Extraction explicitly exclude them as confirmation, preventing a
-Decision feedback loop.
+reference context, not native user confirmation or Candidate evidence. The
+versioned evidence-eligibility firewall in the approved Capture provenance
+amendment governs Inventory, Extraction, reconciliation, compatibility, and
+the exact assurance boundary; marker text is not the safety mechanism.
 
 ## 14. User-visible feedback
 
@@ -861,8 +868,9 @@ Before retrieval implementation, prove in real Codex Desktop:
 7. supported app-server/host facts identify a Fork without inventing a
    `SessionStart` source, and inherited content stays inactive through context
    inspection plus receipt/tool rejection; and
-8. Capture forks remain recall-disabled and exclude inherited Decision
-   envelopes as confirmation.
+8. Capture forks remain recall-disabled and satisfy the versioned
+   Recall-to-Capture provenance acceptance contract without marker-only or
+   model-self-reported source authority.
 
 Failure stops Packet 3 and redesigns only host integration. Do not build the
 model stack or distribution path around an unproven assumption.
@@ -941,9 +949,9 @@ Packet 3 may add only:
   deviation records;
 - signed complete formal-Decision distribution from the verified read model;
 - local model lifecycle, indexes, hybrid retrieval, and reranking;
-- bounded applicability classification and Decision envelopes; and
-- the narrow Capture-prompt exclusion that prevents inherited Decision
-  envelopes from becoming confirmation evidence; and
+- bounded applicability classification and Decision envelopes;
+- the approved versioned Capture provenance firewall that binds host-issued
+  prompt anchors through Inventory, Extraction, reconciliation, and upload;
 - recall/conflict/freshness/restoration feedback in Codex.
 
 It must not add automatic Candidate generation, a cloud query service, central

@@ -1,6 +1,6 @@
 # Recall-to-Capture Provenance Firewall Design
 
-**Status:** Draft for focused review on 2026-08-07.
+**Status:** Approved for implementation planning on 2026-08-07.
 
 **Scope:** The narrow Packet 3 boundary that prevents recalled formal Decisions
 from silently qualifying themselves as new Candidate evidence when the user

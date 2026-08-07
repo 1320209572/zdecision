@@ -11,6 +11,9 @@ as tightened by the repository-bound presentation guard in
 `docs/superpowers/specs/2026-08-05-repository-bound-refresh-guard-design.md`.
 The current monorepo catalog, routing, leaf Review, and batch UI contract is
 `docs/superpowers/specs/2026-08-05-monorepo-product-routing-and-batch-review-design.md`.
+Recall-to-Capture source eligibility and feedback-loop prevention are governed
+by the approved focused amendment in
+`docs/superpowers/specs/2026-08-07-recall-capture-provenance-design.md`.
 
 Where the historical manual interaction and the Plugin interaction differ,
 section 12 governs new product implementation. Existing Capture, Review,
