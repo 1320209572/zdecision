@@ -452,7 +452,10 @@ class SessionIndex:
                     WHERE repository_id = ?
                       AND session_id = ?
                       AND {changed_clause}
-                    ORDER BY latest_observed_at DESC, latest_event_id DESC
+                    ORDER BY latest_ledger_rowid IS NULL,
+                             latest_ledger_rowid DESC,
+                             latest_observed_at DESC,
+                             latest_event_id DESC
                     LIMIT 1
                     """,
                     (repository_id, selected_session_id),

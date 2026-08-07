@@ -469,6 +469,45 @@ class SessionIndexTest(unittest.TestCase):
         self.assertEqual(1, len(frozen))
         self.assertEqual("turn_new", frozen[0].upper_turn_id)
 
+    def test_current_session_selects_latest_cross_lineage_ledger_stop(self) -> None:
+        """This catches current-session lineage selection by time or event-ID text."""
+
+        older_ledger_stop = observed_event(
+            "Stop", "session_a", "turn_main",
+            observed="2026-07-30T01:02:00+00:00", branch="main",
+        )
+        older_ledger_stop = AgentEvent(
+            "evt_f" + "8" * 31,
+            older_ledger_stop.invocation,
+            older_ledger_stop.state,
+            older_ledger_stop.failure_code,
+        )
+        later_ledger_stop = observed_event(
+            "Stop", "session_a", "turn_feature",
+            observed="2026-07-30T01:01:00+00:00", branch="feature",
+        )
+        later_ledger_stop = AgentEvent(
+            "evt_e" + "4" * 31,
+            later_ledger_stop.invocation,
+            later_ledger_stop.state,
+            later_ledger_stop.failure_code,
+        )
+        self.append_ledger_events(older_ledger_stop, later_ledger_stop)
+        self.index.observe(older_ledger_stop)
+        self.index.observe(later_ledger_stop)
+
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID,
+            REPOSITORY_ID,
+            NOW,
+            capture_scope="current_session",
+            selected_session_id="session_a",
+        )
+
+        self.assertEqual(1, len(frozen))
+        self.assertEqual("turn_feature", frozen[0].upper_turn_id)
+        self.assertEqual(later_ledger_stop.event_id, frozen[0].upper_stop_event_id)
+
     def test_current_session_is_empty_when_only_another_session_changed(self) -> None:
         self.index.observe(observed_event("Stop", "session_b", "turn_b"))
 
