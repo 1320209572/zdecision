@@ -136,7 +136,13 @@ class ReconciliationRunner:
 
         if not ordered:
             empty = ReconciliationResult.empty(
-                repository_id, decision_space_id
+                repository_id,
+                decision_space_id,
+                item_protocol=(
+                    "candidate-provenance-v1"
+                    if candidate_provenance is not None
+                    else None
+                ),
             )
             return self.request_state.store_slice_reconciliation(
                 request_id, slice_id, empty

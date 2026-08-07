@@ -15,7 +15,11 @@ from zdecision.agent.session_index import SessionIndex
 from zdecision.app_server.models import FeasibilityModelProfile
 from zdecision.app_server.requested_capture import SessionCaptureResult
 from zdecision.capture.models import Candidate, CandidateContent, SourceCheckpoint
-from zdecision.capture.reconciliation import ReconciliationDecision, apply_reconciliation
+from zdecision.capture.reconciliation import (
+    ReconciliationDecision,
+    ReconciliationResult,
+    apply_reconciliation,
+)
 from zdecision.capture.provenance import CandidateProvenance, CandidateProvenanceSummary
 from zdecision.central.decision_spaces import EnabledRepository, RepositoryDecisionRoute
 from zdecision.ids import candidate_family_id
@@ -407,6 +411,27 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             clock=lambda: NOW,
         )
 
+    def persist_empty_reconciliation_and_restart(
+        self, *, item_protocol: str | None
+    ):
+        view = self.views()[0]
+        result = ReconciliationResult.empty(
+            REPOSITORY_ID,
+            view.ownership.decision_space_id,
+            item_protocol=item_protocol,
+        )
+        self.request_state.store_slice_reconciliation(
+            REQUEST_ID, view.slice_id, result
+        )
+        self.request_state.close()
+        self.request_state = RequestStateStore.open(self.state)
+        self.addCleanup(self.request_state.close)
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        return client.uploads[0]
+
     def test_one_request_processes_two_independent_leaf_slices(self) -> None:
         client = FakeCentralClient(self.group, self.views())
 
@@ -433,6 +458,30 @@ class CaptureRequestProcessorTest(unittest.TestCase):
                 for item in batch.items
             )
         )
+
+    def test_empty_legacy_reconciliation_restart_keeps_legacy_slice_protocol(
+        self,
+    ) -> None:
+        batch = self.persist_empty_reconciliation_and_restart(
+            item_protocol=None
+        )
+
+        self.assertIsNone(batch.item_protocol)
+        self.assertNotIn("item_protocol", batch.to_dict())
+        self.assertEqual((), batch.items)
+
+    def test_empty_v1_reconciliation_restart_keeps_v1_slice_protocol(
+        self,
+    ) -> None:
+        batch = self.persist_empty_reconciliation_and_restart(
+            item_protocol="candidate-provenance-v1"
+        )
+
+        self.assertEqual("candidate-provenance-v1", batch.item_protocol)
+        self.assertEqual(
+            "candidate-provenance-v1", batch.to_dict()["item_protocol"]
+        )
+        self.assertEqual((), batch.items)
 
     def test_only_observations_with_candidate_provenance_are_reconciled(self) -> None:
         original_run = self.capture_runner.run

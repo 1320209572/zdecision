@@ -217,6 +217,7 @@ class ReconciliationResult:
     uploadable_revisions: tuple[CandidateFamilyRevision, ...]
     same_observation_ids: tuple[str, ...]
     ambiguous_observation_ids: tuple[str, ...]
+    item_protocol: Literal["candidate-provenance-v1"] | None = None
 
     def __post_init__(self) -> None:
         _pattern(self.repository_id, _REPOSITORY_ID, "repository_id")
@@ -290,15 +291,30 @@ class ReconciliationResult:
             self.ambiguous_observation_ids
         ):
             raise ValueError("observation result sets overlap")
+        if self.item_protocol not in (None, "candidate-provenance-v1"):
+            raise ValueError("item_protocol is invalid")
 
     @classmethod
     def empty(
-        cls, repository_id: str, decision_space_id: str
+        cls,
+        repository_id: str,
+        decision_space_id: str,
+        *,
+        item_protocol: Literal["candidate-provenance-v1"] | None = None,
     ) -> "ReconciliationResult":
-        return cls(repository_id, decision_space_id, (), (), (), (), ())
+        return cls(
+            repository_id,
+            decision_space_id,
+            (),
+            (),
+            (),
+            (),
+            (),
+            item_protocol,
+        )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "repository_id": self.repository_id,
             "decision_space_id": self.decision_space_id,
             "current_revisions": [
@@ -317,26 +333,28 @@ class ReconciliationResult:
                 self.ambiguous_observation_ids
             ),
         }
+        if self.item_protocol is not None:
+            result["item_protocol"] = self.item_protocol
+        return result
 
     @classmethod
     def from_dict(
         cls, value: Mapping[str, object]
     ) -> "ReconciliationResult":
-        _exact_fields(
-            value,
-            frozenset(
-                (
-                    "repository_id",
-                    "decision_space_id",
-                    "current_revisions",
-                    "new_revisions",
-                    "uploadable_revisions",
-                    "same_observation_ids",
-                    "ambiguous_observation_ids",
-                )
-            ),
-            "ReconciliationResult",
+        legacy_fields = frozenset(
+            (
+                "repository_id",
+                "decision_space_id",
+                "current_revisions",
+                "new_revisions",
+                "uploadable_revisions",
+                "same_observation_ids",
+                "ambiguous_observation_ids",
+            )
         )
+        fields = frozenset(value)
+        if fields not in (legacy_fields, legacy_fields | {"item_protocol"}):
+            raise ValueError("ReconciliationResult fields are invalid")
         return cls(
             repository_id=value["repository_id"],
             decision_space_id=value["decision_space_id"],
@@ -358,6 +376,7 @@ class ReconciliationResult:
                 value["ambiguous_observation_ids"],
                 "ambiguous_observation_ids",
             ),
+            item_protocol=value.get("item_protocol"),
         )
 
 
@@ -601,6 +620,11 @@ def apply_reconciliation(
         uploadable_revisions=uploadable,
         same_observation_ids=tuple(same_ids),
         ambiguous_observation_ids=tuple(ambiguous_ids),
+        item_protocol=(
+            "candidate-provenance-v1"
+            if candidate_provenance is not None
+            else None
+        ),
     )
 
 

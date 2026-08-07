@@ -249,7 +249,7 @@ class OnDemandCaptureProcessor:
             group.request_id, slice_view.slice_id
         )
         item_protocol = (
-            _result_item_protocol(result) if result is not None else None
+            result.item_protocol if result is not None else None
         )
         item_protocol_known = result is not None
         profile: FeasibilityModelProfile | None = None
@@ -327,6 +327,11 @@ class OnDemandCaptureProcessor:
                 result = ReconciliationResult.empty(
                     group.repository_id,
                     route_context.decision_space_id,
+                    item_protocol=(
+                        item_protocol
+                        if item_protocol_known
+                        else "candidate-provenance-v1"
+                    ),
                 )
                 result = self.request_state.store_slice_reconciliation(
                     group.request_id, slice_view.slice_id, result
@@ -342,11 +347,7 @@ class OnDemandCaptureProcessor:
             group.request_id,
             slice_view,
             result.uploadable_revisions,
-            item_protocol=(
-                item_protocol
-                if item_protocol_known
-                else "candidate-provenance-v1"
-            ),
+            item_protocol=result.item_protocol,
         )
         batch = self.request_state.commit_slice_result(
             group.request_id, slice_view.slice_id, result, batch
@@ -577,12 +578,3 @@ def _candidate_slice_batch(
         ).hexdigest(),
         item_protocol=item_protocol,
     )
-
-
-def _result_item_protocol(
-    result: ReconciliationResult,
-) -> str | None:
-    revisions = result.uploadable_revisions
-    if revisions and all(item.provenance is None for item in revisions):
-        return None
-    return "candidate-provenance-v1"
