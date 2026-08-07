@@ -1666,5 +1666,64 @@ class CaptureServiceTests(unittest.TestCase):
                     mutation()
 
 
+class EvidenceFirstExtractionTests(unittest.TestCase):
+    def test_v5_extraction_binds_each_candidate_to_one_eligible_signal(self) -> None:
+        """This catches extraction bypassing the validated Inventory sidecar."""
+        from tests.test_inventory import evidence_manifest, v5_inventory
+        from zdecision.capture.inventory import validate_inventory_v5
+        from zdecision.capture.models import SourceCheckpoint
+        from zdecision.capture.service import (
+            ExtractionValidationError,
+            validate_extraction_output_v5,
+        )
+
+        manifest = evidence_manifest()
+        inventory, signal_provenance = validate_inventory_v5(
+            v5_inventory(manifest), manifest
+        )
+        extraction = {
+            "candidates": [
+                {
+                    **valid_candidate(),
+                    "source_signal_ordinal": 1,
+                }
+            ]
+        }
+
+        candidates, candidate_provenance = validate_extraction_output_v5(
+            "cap_" + "a" * 32,
+            SourceCheckpoint("thread-1", "turn-1"),
+            "anheng",
+            extraction,
+            inventory,
+            signal_provenance,
+            manifest,
+        )
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual(
+            (manifest.anchors[0].receipt_id,),
+            candidate_provenance[0].evidence_receipt_ids,
+        )
+        forged = {
+            "candidates": [
+                {
+                    **extraction["candidates"][0],
+                    "evidence_receipt_ids": [manifest.anchors[0].receipt_id],
+                }
+            ]
+        }
+        with self.assertRaises(ExtractionValidationError):
+            validate_extraction_output_v5(
+                "cap_" + "a" * 32,
+                SourceCheckpoint("thread-1", "turn-1"),
+                "anheng",
+                forged,
+                inventory,
+                signal_provenance,
+                manifest,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

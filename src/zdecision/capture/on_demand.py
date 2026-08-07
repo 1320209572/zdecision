@@ -9,9 +9,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from zdecision.capture.inventory import InventoryResult, validate_inventory
+from zdecision.capture.inventory import (
+    InventoryResult,
+    validate_inventory,
+    validate_inventory_v5,
+)
 from zdecision.capture.models import Candidate, SourceCheckpoint
-from zdecision.capture.service import validate_extraction_output
+from zdecision.capture.provenance import (
+    CandidateProvenance,
+    CaptureEvidenceManifest,
+    SignalProvenance,
+)
+from zdecision.capture.service import (
+    validate_extraction_output,
+    validate_extraction_output_v5,
+)
 from zdecision.capture.templates import TemplateSnapshot
 from zdecision.ids import (
     ON_DEMAND_CAPTURE_PROTOCOL,
@@ -65,7 +77,8 @@ _FROZEN_V3_FIELDS = frozenset(
     )
 )
 _FROZEN_V4_FIELDS = _FROZEN_V3_FIELDS | frozenset(("route_context",))
-_RESULT_FIELDS = frozenset(
+_FROZEN_V5_FIELDS = _FROZEN_V4_FIELDS | frozenset(("evidence_manifest",))
+_RESULT_V1_FIELDS = frozenset(
     (
         "operation_id",
         "inventory",
@@ -73,6 +86,14 @@ _RESULT_FIELDS = frozenset(
         "extraction_sha256",
         "observations",
         "result_digest",
+    )
+)
+_RESULT_V2_FIELDS = _RESULT_V1_FIELDS | frozenset(
+    (
+        "result_version",
+        "evidence_manifest",
+        "signal_provenance",
+        "candidate_provenance",
     )
 )
 _OPERATION_STATUSES = frozenset(("open", "committed", "failed_terminal"))
@@ -194,7 +215,7 @@ class FrozenCaptureRouteContext:
 
 @dataclass(frozen=True)
 class FrozenCaptureInput:
-    record_version: Literal[3, 4]
+    record_version: Literal[3, 4, 5]
     protocol_revision: str
     operation_id: str
     request_id: str
@@ -214,9 +235,10 @@ class FrozenCaptureInput:
     model_discovery_digest: str
     model_discovered_at: str
     route_context: FrozenCaptureRouteContext | None
+    evidence_manifest: CaptureEvidenceManifest | None = None
 
     def __post_init__(self) -> None:
-        if self.record_version not in (3, 4) or isinstance(
+        if self.record_version not in (3, 4, 5) or isinstance(
             self.record_version, bool
         ):
             raise ValueError("FrozenCaptureInput record_version is invalid")
@@ -244,13 +266,21 @@ class FrozenCaptureInput:
             if (
                 not self.protocol_revision.startswith("extractor-v3")
                 or self.route_context is not None
+                or self.evidence_manifest is not None
             ):
                 raise ValueError("FrozenCaptureInput v3 fields are invalid")
-        elif (
+        elif self.record_version == 4 and (
             not self.protocol_revision.startswith("extractor-v4")
             or not isinstance(self.route_context, FrozenCaptureRouteContext)
+            or self.evidence_manifest is not None
         ):
             raise ValueError("FrozenCaptureInput protocol_revision is invalid")
+        elif self.record_version == 5 and (
+            not self.protocol_revision.startswith("extractor-v5")
+            or not isinstance(self.route_context, FrozenCaptureRouteContext)
+            or not isinstance(self.evidence_manifest, CaptureEvidenceManifest)
+        ):
+            raise ValueError("FrozenCaptureInput v5 fields are invalid")
         if not Path(self.cwd).is_absolute():
             raise ValueError("FrozenCaptureInput cwd must be absolute")
         if self.previous_handled_turn_id is not None:
@@ -288,6 +318,7 @@ class FrozenCaptureInput:
         model_discovery_digest: str,
         model_discovered_at: str,
         route_context: FrozenCaptureRouteContext,
+        evidence_manifest: CaptureEvidenceManifest,
         protocol_revision: str = ON_DEMAND_CAPTURE_PROTOCOL,
     ) -> "FrozenCaptureInput":
         identity = {
@@ -309,9 +340,10 @@ class FrozenCaptureInput:
             "model_discovery_digest": model_discovery_digest,
             "model_discovered_at": model_discovered_at,
             "route_context": route_context.to_dict(),
+            "evidence_manifest": evidence_manifest.to_dict(),
         }
         return cls(
-            record_version=4,
+            record_version=5,
             operation_id=on_demand_capture_operation_id(identity),
             protocol_revision=protocol_revision,
             request_id=request_id,
@@ -331,6 +363,7 @@ class FrozenCaptureInput:
             model_discovery_digest=model_discovery_digest,
             model_discovered_at=model_discovered_at,
             route_context=route_context,
+            evidence_manifest=evidence_manifest,
         )
 
     def _identity_payload(self) -> dict[str, object]:
@@ -356,6 +389,11 @@ class FrozenCaptureInput:
                 {}
                 if self.route_context is None
                 else {"route_context": self.route_context.to_dict()}
+            ),
+            **(
+                {}
+                if self.evidence_manifest is None
+                else {"evidence_manifest": self.evidence_manifest.to_dict()}
             ),
         }
 
@@ -389,6 +427,11 @@ class FrozenCaptureInput:
                 if self.route_context is None
                 else {"route_context": self.route_context.to_dict()}
             ),
+            **(
+                {}
+                if self.evidence_manifest is None
+                else {"evidence_manifest": self.evidence_manifest.to_dict()}
+            ),
         }
 
     @classmethod
@@ -396,7 +439,11 @@ class FrozenCaptureInput:
         cls, value: Mapping[str, object]
     ) -> "FrozenCaptureInput":
         version = value.get("record_version")
-        expected = _FROZEN_V3_FIELDS if version == 3 else _FROZEN_V4_FIELDS
+        expected = (
+            _FROZEN_V3_FIELDS
+            if version == 3
+            else _FROZEN_V4_FIELDS if version == 4 else _FROZEN_V5_FIELDS
+        )
         _require_exact_fields(value, expected, "FrozenCaptureInput")
         template = value["template"]
         if not isinstance(template, Mapping):
@@ -404,6 +451,9 @@ class FrozenCaptureInput:
         raw_context = value.get("route_context")
         if raw_context is not None and not isinstance(raw_context, Mapping):
             raise ValueError("FrozenCaptureInput route_context is invalid")
+        raw_manifest = value.get("evidence_manifest")
+        if raw_manifest is not None and not isinstance(raw_manifest, dict):
+            raise ValueError("FrozenCaptureInput evidence_manifest is invalid")
         return cls(
             record_version=value["record_version"],
             protocol_revision=value["protocol_revision"],
@@ -429,16 +479,25 @@ class FrozenCaptureInput:
                 if raw_context is None
                 else FrozenCaptureRouteContext.from_dict(raw_context)
             ),
+            evidence_manifest=(
+                None
+                if raw_manifest is None
+                else CaptureEvidenceManifest.from_dict(raw_manifest)
+            ),
         )
 
 
 @dataclass(frozen=True)
 class ValidatedCaptureResult:
+    result_version: Literal[1, 2]
     operation_id: str
     inventory: InventoryResult
     inventory_sha256: str
     extraction_sha256: str
     observations: tuple[Candidate, ...]
+    evidence_manifest: CaptureEvidenceManifest | None
+    signal_provenance: tuple[SignalProvenance, ...]
+    candidate_provenance: tuple[CandidateProvenance, ...]
     result_digest: str
 
     @classmethod
@@ -450,35 +509,74 @@ class ValidatedCaptureResult:
     ) -> "ValidatedCaptureResult":
         if not isinstance(frozen, FrozenCaptureInput):
             raise TypeError("frozen must be a FrozenCaptureInput")
-        inventory = validate_inventory(inventory_output)
-        observations = validate_extraction_output(
+        source = SourceCheckpoint(frozen.session_id, frozen.upper_turn_id)
+        if frozen.record_version in (3, 4):
+            inventory = validate_inventory(inventory_output)
+            observations = validate_extraction_output(
+                frozen.operation_id, source, frozen.product, extraction_output
+            )
+            inventory_sha256 = _sha256(inventory.to_dict())
+            extraction_sha256 = _sha256(extraction_output)
+            core = _result_v1_core(
+                frozen.operation_id,
+                inventory,
+                inventory_sha256,
+                extraction_sha256,
+                observations,
+            )
+            return cls(
+                result_version=1,
+                operation_id=frozen.operation_id,
+                inventory=inventory,
+                inventory_sha256=inventory_sha256,
+                extraction_sha256=extraction_sha256,
+                observations=observations,
+                evidence_manifest=None,
+                signal_provenance=(),
+                candidate_provenance=(),
+                result_digest=_sha256(core),
+            )
+        if frozen.record_version != 5 or frozen.evidence_manifest is None:
+            raise ValueError("FrozenCaptureInput result protocol is invalid")
+        inventory, signal_provenance = validate_inventory_v5(
+            inventory_output, frozen.evidence_manifest
+        )
+        observations, candidate_provenance = validate_extraction_output_v5(
             frozen.operation_id,
-            SourceCheckpoint(frozen.session_id, frozen.upper_turn_id),
+            source,
             frozen.product,
             extraction_output,
+            inventory,
+            signal_provenance,
+            frozen.evidence_manifest,
         )
         inventory_sha256 = _sha256(inventory.to_dict())
         extraction_sha256 = _sha256(extraction_output)
-        core = {
-            "operation_id": frozen.operation_id,
-            "inventory": inventory.to_dict(),
-            "inventory_sha256": inventory_sha256,
-            "extraction_sha256": extraction_sha256,
-            "observations": [
-                observation.to_dict() for observation in observations
-            ],
-        }
+        core = _result_v2_core(
+            frozen.operation_id,
+            inventory,
+            inventory_sha256,
+            extraction_sha256,
+            observations,
+            frozen.evidence_manifest,
+            signal_provenance,
+            candidate_provenance,
+        )
         return cls(
+            result_version=2,
             operation_id=frozen.operation_id,
             inventory=inventory,
             inventory_sha256=inventory_sha256,
             extraction_sha256=extraction_sha256,
             observations=observations,
+            evidence_manifest=frozen.evidence_manifest,
+            signal_provenance=signal_provenance,
+            candidate_provenance=candidate_provenance,
             result_digest=_sha256(core),
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        legacy = {
             "operation_id": self.operation_id,
             "inventory": self.inventory.to_dict(),
             "inventory_sha256": self.inventory_sha256,
@@ -488,14 +586,39 @@ class ValidatedCaptureResult:
             ],
             "result_digest": self.result_digest,
         }
+        if self.result_version == 1:
+            return legacy
+        return {
+            "result_version": 2,
+            **legacy,
+            "evidence_manifest": self.evidence_manifest.to_dict()
+            if self.evidence_manifest is not None
+            else None,
+            "signal_provenance": [
+                item.to_dict() for item in self.signal_provenance
+            ],
+            "candidate_provenance": [
+                item.to_dict() for item in self.candidate_provenance
+            ],
+        }
 
     @classmethod
     def from_dict(
-        cls, value: Mapping[str, object]
+        cls,
+        value: Mapping[str, object],
+        frozen: FrozenCaptureInput | None = None,
     ) -> "ValidatedCaptureResult":
+        version = 2 if value.get("result_version") == 2 else 1
         _require_exact_fields(
-            value, _RESULT_FIELDS, "ValidatedCaptureResult"
+            value,
+            _RESULT_V2_FIELDS if version == 2 else _RESULT_V1_FIELDS,
+            "ValidatedCaptureResult",
         )
+        if frozen is not None:
+            if not isinstance(frozen, FrozenCaptureInput) or (
+                (frozen.record_version == 5) != (version == 2)
+            ):
+                raise ValueError("ValidatedCaptureResult protocol pairing is invalid")
         operation_id = value["operation_id"]
         inventory_value = value["inventory"]
         observation_values = value["observations"]
@@ -540,36 +663,224 @@ class ValidatedCaptureResult:
         result_digest = _digest(value["result_digest"], "result_digest")
         if inventory_sha256 != _sha256(inventory.to_dict()):
             raise ValueError("ValidatedCaptureResult inventory digest mismatch")
+        evidence_manifest: CaptureEvidenceManifest | None = None
+        signal_provenance: tuple[SignalProvenance, ...] = ()
+        candidate_provenance: tuple[CandidateProvenance, ...] = ()
+        if version == 2:
+            raw_manifest = value["evidence_manifest"]
+            raw_signal_provenance = value["signal_provenance"]
+            raw_candidate_provenance = value["candidate_provenance"]
+            if (
+                not isinstance(raw_manifest, dict)
+                or not isinstance(raw_signal_provenance, list)
+                or not isinstance(raw_candidate_provenance, list)
+            ):
+                raise ValueError("ValidatedCaptureResult v2 fields are invalid")
+            evidence_manifest = CaptureEvidenceManifest.from_dict(raw_manifest)
+            signal_provenance = tuple(
+                SignalProvenance.from_dict(item)
+                for item in raw_signal_provenance
+            )
+            candidate_provenance = tuple(
+                CandidateProvenance.from_dict(item)
+                for item in raw_candidate_provenance
+            )
+            _validate_v2_sidecars(
+                inventory,
+                typed_observations,
+                evidence_manifest,
+                signal_provenance,
+                candidate_provenance,
+            )
+        if frozen is not None and (
+            frozen.operation_id != operation_id
+            or (
+                version == 2
+                and evidence_manifest != frozen.evidence_manifest
+            )
+        ):
+            raise ValueError("ValidatedCaptureResult frozen input mismatch")
         reconstructed_extraction = {
             "candidates": [
-                _candidate_as_extraction_item(item)
-                for item in typed_observations
+                {
+                    **_candidate_as_extraction_item(item),
+                    **(
+                        {}
+                        if version == 1
+                        else {
+                            "source_signal_ordinal": candidate_provenance[
+                                ordinal - 1
+                            ].source_signal_ordinal
+                        }
+                    ),
+                }
+                for ordinal, item in enumerate(typed_observations, start=1)
             ]
         }
         if extraction_sha256 != _sha256(reconstructed_extraction):
             raise ValueError(
                 "ValidatedCaptureResult extraction digest mismatch"
             )
-        core = {
-            "operation_id": operation_id,
-            "inventory": inventory.to_dict(),
-            "inventory_sha256": inventory_sha256,
-            "extraction_sha256": extraction_sha256,
-            "observations": [
-                observation.to_dict()
-                for observation in typed_observations
-            ],
-        }
+        core = (
+            _result_v1_core(
+                operation_id,
+                inventory,
+                inventory_sha256,
+                extraction_sha256,
+                typed_observations,
+            )
+            if version == 1
+            else _result_v2_core(
+                operation_id,
+                inventory,
+                inventory_sha256,
+                extraction_sha256,
+                typed_observations,
+                evidence_manifest,
+                signal_provenance,
+                candidate_provenance,
+            )
+        )
         if result_digest != _sha256(core):
             raise ValueError("ValidatedCaptureResult digest mismatch")
         return cls(
+            result_version=version,
             operation_id=operation_id,
             inventory=inventory,
             inventory_sha256=inventory_sha256,
             extraction_sha256=extraction_sha256,
             observations=typed_observations,
+            evidence_manifest=evidence_manifest,
+            signal_provenance=signal_provenance,
+            candidate_provenance=candidate_provenance,
             result_digest=result_digest,
         )
+
+
+def _result_v1_core(
+    operation_id: str,
+    inventory: InventoryResult,
+    inventory_sha256: str,
+    extraction_sha256: str,
+    observations: tuple[Candidate, ...],
+) -> dict[str, object]:
+    return {
+        "operation_id": operation_id,
+        "inventory": inventory.to_dict(),
+        "inventory_sha256": inventory_sha256,
+        "extraction_sha256": extraction_sha256,
+        "observations": [observation.to_dict() for observation in observations],
+    }
+
+
+def _result_v2_core(
+    operation_id: str,
+    inventory: InventoryResult,
+    inventory_sha256: str,
+    extraction_sha256: str,
+    observations: tuple[Candidate, ...],
+    evidence_manifest: CaptureEvidenceManifest | None,
+    signal_provenance: tuple[SignalProvenance, ...],
+    candidate_provenance: tuple[CandidateProvenance, ...],
+) -> dict[str, object]:
+    if evidence_manifest is None:
+        raise ValueError("ValidatedCaptureResult v2 manifest is missing")
+    return {
+        "result_version": 2,
+        **_result_v1_core(
+            operation_id,
+            inventory,
+            inventory_sha256,
+            extraction_sha256,
+            observations,
+        ),
+        "evidence_manifest": evidence_manifest.to_dict(),
+        "signal_provenance": [item.to_dict() for item in signal_provenance],
+        "candidate_provenance": [item.to_dict() for item in candidate_provenance],
+    }
+
+
+def _validate_v2_sidecars(
+    inventory: InventoryResult,
+    observations: tuple[Candidate, ...],
+    manifest: CaptureEvidenceManifest,
+    signal_provenance: tuple[SignalProvenance, ...],
+    candidate_provenance: tuple[CandidateProvenance, ...],
+) -> None:
+    if (
+        len(signal_provenance) != len(inventory.signals)
+        or tuple(item.signal_ordinal for item in signal_provenance)
+        != tuple(range(1, len(inventory.signals) + 1))
+        or len(candidate_provenance) != len(observations)
+        or tuple(item.candidate_id for item in candidate_provenance)
+        != tuple(item.candidate_id for item in observations)
+    ):
+        raise ValueError("ValidatedCaptureResult v2 sidecars are invalid")
+    _, expected_signal_provenance = validate_inventory_v5(
+        {
+            "signals": [
+                {
+                    **signal.to_dict(),
+                    "signal_ordinal": sidecar.signal_ordinal,
+                    "evidence_receipt_ids": list(
+                        sidecar.evidence_receipt_ids
+                    ),
+                }
+                for signal, sidecar in zip(
+                    inventory.signals, signal_provenance, strict=True
+                )
+            ],
+            "coverage": inventory.coverage.to_dict(),
+        },
+        manifest,
+    )
+    if signal_provenance != expected_signal_provenance:
+        raise ValueError("ValidatedCaptureResult v2 signal dispositions mismatch")
+    by_ordinal = {item.signal_ordinal: item for item in signal_provenance}
+    receipt_positions = {
+        anchor.receipt_id: ordinal
+        for ordinal, anchor in enumerate(manifest.anchors)
+    }
+    anchors_by_receipt = {
+        anchor.receipt_id: anchor for anchor in manifest.anchors
+    }
+    for item in signal_provenance:
+        if (
+            any(receipt not in receipt_positions for receipt in item.evidence_receipt_ids)
+            or tuple(
+                sorted(item.evidence_receipt_ids, key=receipt_positions.__getitem__)
+            )
+            != item.evidence_receipt_ids
+            or item.active_reference_set_digests
+            != tuple(
+                dict.fromkeys(
+                    anchor.active_reference_set_digest
+                    for receipt in item.evidence_receipt_ids
+                    if (
+                        anchor := anchors_by_receipt[receipt]
+                    ).active_reference_set_digest
+                    is not None
+                )
+            )
+        ):
+            raise ValueError("ValidatedCaptureResult v2 signal provenance mismatch")
+    source_ordinals = tuple(
+        item.source_signal_ordinal for item in candidate_provenance
+    )
+    if len(set(source_ordinals)) != len(source_ordinals):
+        raise ValueError("ValidatedCaptureResult v2 source signals repeat")
+    for item in candidate_provenance:
+        source = by_ordinal.get(item.source_signal_ordinal)
+        if (
+            source is None
+            or source.disposition != "candidate_eligible"
+            or item.manifest_digest != manifest.manifest_digest
+            or item.evidence_receipt_ids != source.evidence_receipt_ids
+            or item.active_reference_set_digests
+            != source.active_reference_set_digests
+            or item.reference_decision_ids
+        ):
+            raise ValueError("ValidatedCaptureResult v2 provenance mismatch")
 
 
 @dataclass(frozen=True)

@@ -3,6 +3,12 @@ from __future__ import annotations
 import copy
 import unittest
 
+from zdecision.capture.provenance import (
+    CaptureEvidenceManifest,
+    PromptAnchor,
+    prompt_anchor_receipt_id,
+)
+
 
 VALID_INVENTORY = {
     "signals": [
@@ -21,6 +27,34 @@ VALID_INVENTORY = {
         "known_gaps": [],
     },
 }
+
+
+def evidence_manifest(*, active_reference_set_digest: str | None = None) -> CaptureEvidenceManifest:
+    event_id = "evt_" + "1" * 32
+    anchor = PromptAnchor(
+        receipt_id=prompt_anchor_receipt_id(event_id),
+        hook_event_id=event_id,
+        turn_id="turn-1",
+        anchor_ordinal=1,
+        active_reference_set_digest=active_reference_set_digest,
+    )
+    return CaptureEvidenceManifest.create(
+        source_session_id="session-1",
+        previous_handled_event_id=None,
+        upper_stop_event_id="evt_" + "2" * 32,
+        anchors=(anchor,),
+    )
+
+
+def v5_inventory(manifest: CaptureEvidenceManifest) -> dict[str, object]:
+    value = copy.deepcopy(VALID_INVENTORY)
+    value["signals"][0].update(
+        {
+            "signal_ordinal": 1,
+            "evidence_receipt_ids": [manifest.anchors[0].receipt_id],
+        }
+    )
+    return value
 
 
 class InventoryValidationTests(unittest.TestCase):
@@ -219,6 +253,54 @@ class InventoryValidationTests(unittest.TestCase):
                 self.assertEqual("invalid_inventory", raised.exception.code)
                 self.assertNotIn(secret, raised.exception.message)
                 self.assertNotIn(secret, str(raised.exception))
+
+    def test_v5_uses_only_canonical_manifest_receipts_and_host_dispositions(self) -> None:
+        """This catches model-selected receipts bypassing the frozen allowlist."""
+        from zdecision.capture.inventory import (
+            InventoryValidationError,
+            validate_inventory_v5,
+        )
+
+        manifest = evidence_manifest(active_reference_set_digest="a" * 64)
+        inventory, provenance = validate_inventory_v5(
+            v5_inventory(manifest), manifest
+        )
+
+        self.assertEqual(VALID_INVENTORY, inventory.to_dict())
+        self.assertEqual("candidate_eligible", provenance[0].disposition)
+        self.assertEqual(("a" * 64,), provenance[0].active_reference_set_digests)
+
+        for receipts in (
+            ["rcpt_" + "f" * 64],
+            [manifest.anchors[0].receipt_id, manifest.anchors[0].receipt_id],
+            [],
+        ):
+            with self.subTest(receipts=receipts):
+                invalid = v5_inventory(manifest)
+                invalid["signals"][0]["evidence_receipt_ids"] = receipts
+                with self.assertRaises(InventoryValidationError):
+                    validate_inventory_v5(invalid, manifest)
+
+    def test_v5_reference_influenced_short_confirmation_never_becomes_eligible(self) -> None:
+        """This catches treating recall-active assent as an independent direction."""
+        from zdecision.capture.inventory import validate_inventory_v5
+
+        manifest = evidence_manifest(active_reference_set_digest="b" * 64)
+        short_confirmation = v5_inventory(manifest)
+        short_confirmation["signals"][0]["confirmation_basis"] = (
+            "explicit_user_confirmation"
+        )
+        _, confirmation_provenance = validate_inventory_v5(
+            short_confirmation, manifest
+        )
+        self.assertEqual("needs_evidence", confirmation_provenance[0].disposition)
+
+        uncertain = v5_inventory(manifest)
+        uncertain["signals"][0]["confirmation_basis"] = "uncertain"
+        _, uncertain_provenance = validate_inventory_v5(uncertain, manifest)
+        self.assertNotEqual(
+            "candidate_eligible", uncertain_provenance[0].disposition
+        )
 
 
 if __name__ == "__main__":

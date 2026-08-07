@@ -430,6 +430,25 @@ class TemplateCatalogTests(unittest.TestCase):
 
 
 class PromptContractTests(unittest.TestCase):
+    def test_v5_app_server_schemas_bind_host_supplied_enums(self) -> None:
+        """This catches a schema accepting receipts or ordinals outside the host set."""
+        from zdecision.app_server.models import (
+            extraction_output_schema,
+            inventory_output_schema,
+        )
+
+        receipts = ("rcpt_" + "1" * 64, "rcpt_" + "2" * 64)
+        inventory = inventory_output_schema(receipts)
+        signal = inventory["properties"]["signals"]["items"]
+        self.assertEqual(receipts, tuple(signal["properties"]["evidence_receipt_ids"]["items"]["enum"]))
+        self.assertIn("signal_ordinal", signal["required"])
+        self.assertFalse(signal["additionalProperties"])
+
+        extraction = extraction_output_schema("安恒", (2, 5))
+        candidate = extraction["properties"]["candidates"]["items"]
+        self.assertEqual([2, 5], candidate["properties"]["source_signal_ordinal"]["enum"])
+        self.assertIn("source_signal_ordinal", candidate["required"])
+
     def test_inventory_schema_uses_the_exact_system_contract(self) -> None:
         self.assertEqual(
             {

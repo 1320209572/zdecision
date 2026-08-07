@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 CAPTURE_EXTRACTOR_VERSION = "extractor-v2"
-ON_DEMAND_CAPTURE_PROTOCOL = "extractor-v4"
+ON_DEMAND_CAPTURE_PROTOCOL = "extractor-v5"
 PUBLISHER_FORMAT_VERSION = "zdecision-publisher/v1"
 
 _CAPTURE_ID = re.compile(r"^cap_[0-9a-f]{32}$")

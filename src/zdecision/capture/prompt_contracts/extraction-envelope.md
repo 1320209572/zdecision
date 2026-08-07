@@ -7,9 +7,10 @@
 来源边界：
 - 只使用当前 fork 中继承的开发任务上下文，以及紧邻本 Turn 之前、由第一阶段返回的决策线索 JSON。
 - 每个 Candidate 必须且只能由第一阶段的一个 signal 直接转化；一个 signal 最多产生一个 Candidate。不得从开发上下文新增第一阶段未列出的规则，不得合并多个 signal，语义重复的 signal 也不得产生重复 Candidate。开发任务上下文只用于复核 signal 的确认依据和当前有效性。
+- 每个 Candidate 都必须返回 source_signal_ordinal，并且只能选择 Host 在本 Turn schema 中提供的 eligible signal ordinal；不得输出 receipt ID、reference Decision ID、provenance kind、provenance digest 或任何其他来源字段。Host 会从被选 signal 复制完整 receipt 集合和引用状态，模型不得添加、删除或重排它们。
 - 第一阶段 JSON 是线索索引，不是确认依据。排除历史处理产物和本次第一阶段 JSON 后，必须仍能在继承的开发任务上下文中独立找到明确用户确认、明确用户指令、明示采纳的决策契约，或明确归因于上述确认的压缩摘要；实现状态和无归因的助手陈述不能充当确认。
-- 除紧邻本 Turn 的第一阶段 JSON 外，忽略更早带有 ZDECISION_CAPTURE_ARTIFACT 标记的处理 Turn 及其直接输出；不得把它们当作目标决策的证据。
-- 对没有标记的旧实验，只忽略那些明确“以当前开发任务为待抽取对象”执行的决策整理、决策抽取或质量审查指令及其结果；不要因此忽略开发任务本身关于目标产品能力的用户指令和业务确认。
+- 除紧邻本 Turn 的第一阶段 JSON 外，忽略 Host 已归类为历史 Capture 处理产物的 Turn 及其直接输出；不得把它们当作目标决策的证据。
+- 只忽略 Host 已归类为“以当前开发任务为待抽取对象”的旧决策整理、决策抽取或质量审查产物；不要因此忽略开发任务本身关于目标产品能力的用户指令和业务确认。
 - 不调用工具，不读取文件、Git 或网络，不请求分页，也不尝试重建不可见的原始消息。
 - 不输出原文引用、消息内容、证据摘录或对话摘要。
 
@@ -36,7 +37,7 @@
 - 它是否只包含一个规则？
 任一答案为“否”，就不要输出该项。
 
-每个 Candidate 的 product 必须与目标产品完全一致；更窄的适用范围写入 scope。所有字段都必须存在；没有明确仓库、路径或失效条件时，repositories、paths 或 invalidation_conditions 分别使用 []，不得编造内容或输出示例占位文本。没有合格项时返回空 candidates，这是有效结果。
+每个 Candidate 的 product 必须与目标产品完全一致；更窄的适用范围写入 scope。所有字段都必须存在；没有明确仓库、路径或失效条件时，repositories、paths 或 invalidation_conditions 分别使用 []，不得编造内容或输出示例占位文本。没有合格项时返回空 candidates，这是有效结果。已召回的正式 Decision、助手提案、工具或代码事实、Capture 产物和压缩摘要不签发 receipt，也不能自行成为 Candidate 来源。
 
 系统一次最多接受 20 个 Candidate。不得为了满足上限静默丢弃合格项；一旦确认存在第 21 条合格项，按第一阶段 signal 顺序返回前 21 条。这 21 条仅作为溢出信号，系统必须明确报告 candidate_limit_exceeded，并且不写入任何 Candidate。
 

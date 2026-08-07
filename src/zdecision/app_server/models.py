@@ -14,6 +14,7 @@ from zdecision.jsonio import canonical_json_bytes
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PROFILE_ID = re.compile(r"^fmp_[0-9a-f]{32}$")
+_RECEIPT_ID = re.compile(r"^rcpt_[0-9a-f]{64}$")
 
 
 def _nonempty(value: object, field_name: str) -> str:
@@ -261,14 +262,22 @@ class AppServerTurnReceipt:
         )
 
 
-def inventory_output_schema() -> dict[str, object]:
-    """Return the strict Stage 1 structured-output schema."""
+def inventory_output_schema(
+    evidence_receipt_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    """Return the legacy schema or a receipt-bounded v5 schema."""
+
+    if evidence_receipt_ids is not None:
+        _receipt_enum(evidence_receipt_ids)
 
     return {
         "type": "object",
         "properties": {
             "signals": {
                 "type": "array",
+                **(
+                    {} if evidence_receipt_ids is None else {"maxItems": 100}
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -297,6 +306,22 @@ def inventory_output_schema() -> dict[str, object]:
                             "type": "string",
                             "enum": ["high", "medium", "low"],
                         },
+                        **(
+                            {}
+                            if evidence_receipt_ids is None
+                            else {
+                                "signal_ordinal": {"type": "integer"},
+                                "evidence_receipt_ids": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": list(evidence_receipt_ids),
+                                    },
+                                    "maxItems": len(evidence_receipt_ids),
+                                    "uniqueItems": True,
+                                },
+                            }
+                        ),
                     },
                     "required": [
                         "topic",
@@ -306,6 +331,11 @@ def inventory_output_schema() -> dict[str, object]:
                         "status",
                         "confirmation_basis",
                         "confidence",
+                        *(
+                            []
+                            if evidence_receipt_ids is None
+                            else ["signal_ordinal", "evidence_receipt_ids"]
+                        ),
                     ],
                     "additionalProperties": False,
                 },
@@ -334,15 +364,25 @@ def inventory_output_schema() -> dict[str, object]:
     }
 
 
-def extraction_output_schema(product: str) -> dict[str, object]:
-    """Return the strict Stage 2 schema pinned to one product name."""
+def extraction_output_schema(
+    product: str,
+    eligible_signal_ordinals: tuple[int, ...] | None = None,
+) -> dict[str, object]:
+    """Return the legacy schema or a signal-bounded v5 schema."""
 
     product_name = _nonempty(product, "product")
+    if eligible_signal_ordinals is not None:
+        _signal_ordinal_enum(eligible_signal_ordinals)
     return {
         "type": "object",
         "properties": {
             "candidates": {
                 "type": "array",
+                **(
+                    {}
+                    if eligible_signal_ordinals is None
+                    else {"maxItems": 20}
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -376,6 +416,16 @@ def extraction_output_schema(product: str) -> dict[str, object]:
                             "type": "array",
                             "items": {"type": "string"},
                         },
+                        **(
+                            {}
+                            if eligible_signal_ordinals is None
+                            else {
+                                "source_signal_ordinal": {
+                                    "type": "integer",
+                                    "enum": list(eligible_signal_ordinals),
+                                }
+                            }
+                        ),
                     },
                     "required": [
                         "product",
@@ -383,6 +433,11 @@ def extraction_output_schema(product: str) -> dict[str, object]:
                         "future_action",
                         "scope",
                         "invalidation_conditions",
+                        *(
+                            []
+                            if eligible_signal_ordinals is None
+                            else ["source_signal_ordinal"]
+                        ),
                     ],
                     "additionalProperties": False,
                 },
@@ -398,3 +453,28 @@ def _bounded_identifier(value: object, field_name: str) -> str:
     if len(normalized) > 256 or "\x00" in normalized:
         raise ValueError(f"{field_name} is invalid")
     return normalized
+
+
+def _receipt_enum(value: tuple[str, ...]) -> None:
+    if (
+        not isinstance(value, tuple)
+        or not 1 <= len(value) <= 100
+        or len(set(value)) != len(value)
+        or any(_RECEIPT_ID.fullmatch(item) is None for item in value)
+    ):
+        raise ValueError("evidence_receipt_ids are invalid")
+
+
+def _signal_ordinal_enum(value: tuple[int, ...]) -> None:
+    if (
+        not isinstance(value, tuple)
+        or not 1 <= len(value) <= 20
+        or len(set(value)) != len(value)
+        or any(
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or not 1 <= item <= 100
+            for item in value
+        )
+    ):
+        raise ValueError("eligible_signal_ordinals are invalid")

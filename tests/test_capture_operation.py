@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import tempfile
 import sqlite3
 import unittest
@@ -15,6 +16,11 @@ from zdecision.capture.on_demand import (
     FrozenCaptureInput,
     FrozenCaptureRouteContext,
     ValidatedCaptureResult,
+)
+from zdecision.capture.provenance import (
+    CaptureEvidenceManifest,
+    PromptAnchor,
+    prompt_anchor_receipt_id,
 )
 from zdecision.capture.templates import TemplateCatalog
 
@@ -77,10 +83,10 @@ def frozen_input(**overrides: object) -> FrozenCaptureInput:
         "reasoning_effort": "medium",
         "model_discovery_digest": "7" * 64,
         "model_discovered_at": "2026-07-31T07:59:00Z",
-        "protocol_revision": "extractor-v3",
+        "protocol_revision": "extractor-v5",
         "route_context": route_context(),
+        "evidence_manifest": v5_manifest(),
     }
-    values["protocol_revision"] = "extractor-v4"
     values.update(overrides)
     return FrozenCaptureInput.create(**values)
 
@@ -91,20 +97,88 @@ def validated_result(
     claim: str = "Only page requests authorize capture.",
 ) -> ValidatedCaptureResult:
     selected = frozen or frozen_input()
+    if selected.evidence_manifest is None:
+        raise AssertionError("test frozen input must be v5")
+    inventory = copy.deepcopy(VALID_INVENTORY)
+    inventory["signals"][0].update(
+        {
+            "signal_ordinal": 1,
+            "evidence_receipt_ids": [
+                selected.evidence_manifest.anchors[0].receipt_id
+            ],
+        }
+    )
     return ValidatedCaptureResult.create(
         selected,
-        VALID_INVENTORY,
-        {"candidates": [valid_candidate(claim)]},
+        inventory,
+        {
+            "candidates": [
+                {**valid_candidate(claim), "source_signal_ordinal": 1}
+            ]
+        },
+    )
+
+
+def v5_manifest(event_digit: str = "e") -> CaptureEvidenceManifest:
+    event_id = "evt_" + event_digit * 32
+    return CaptureEvidenceManifest.create(
+        source_session_id="session-1",
+        previous_handled_event_id=None,
+        upper_stop_event_id="evt_" + "f" * 32,
+        anchors=(
+            PromptAnchor(
+                receipt_id=prompt_anchor_receipt_id(event_id),
+                hook_event_id=event_id,
+                turn_id="turn-1",
+                anchor_ordinal=1,
+                active_reference_set_digest=None,
+            ),
+        ),
     )
 
 
 class FrozenCaptureInputTests(unittest.TestCase):
+    def test_v5_frozen_input_requires_manifest_and_commits_sidecars(self) -> None:
+        """This catches silently producing a legacy result for evidence-first input."""
+        manifest = v5_manifest()
+        frozen = frozen_input(evidence_manifest=manifest)
+        inventory = {
+            "signals": [
+                {
+                    **VALID_INVENTORY["signals"][0],
+                    "signal_ordinal": 1,
+                    "evidence_receipt_ids": [manifest.anchors[0].receipt_id],
+                }
+            ],
+            "coverage": VALID_INVENTORY["coverage"],
+        }
+        result = ValidatedCaptureResult.create(
+            frozen,
+            inventory,
+            {"candidates": [{**valid_candidate(), "source_signal_ordinal": 1}]},
+        )
+
+        self.assertEqual(5, frozen.record_version)
+        self.assertEqual(2, result.result_version)
+        self.assertEqual(1, len(result.signal_provenance))
+        self.assertEqual(1, len(result.candidate_provenance))
+        self.assertEqual(result, ValidatedCaptureResult.from_dict(result.to_dict()))
+
+    def test_v5_result_rejects_a_different_frozen_manifest(self) -> None:
+        """This catches replaying a valid v5 result across frozen source windows."""
+        frozen = frozen_input()
+        other_frozen = frozen_input(evidence_manifest=v5_manifest("c"))
+        other_result = validated_result(other_frozen)
+
+        with self.assertRaises(ValueError):
+            ValidatedCaptureResult.from_dict(other_result.to_dict(), frozen)
+
     def test_operation_identity_binds_every_frozen_input(self) -> None:
         first = frozen_input()
         replay = frozen_input()
 
         self.assertEqual(first.operation_id, replay.operation_id)
-        self.assertEqual(4, first.record_version)
+        self.assertEqual(5, first.record_version)
 
         changes: tuple[dict[str, object], ...] = (
             {"request_id": "crq_" + "8" * 32},
@@ -128,7 +202,7 @@ class FrozenCaptureInputTests(unittest.TestCase):
             {"reasoning_effort": "high"},
             {"model_discovery_digest": "8" * 64},
             {"model_discovered_at": "2026-07-31T08:00:00Z"},
-            {"protocol_revision": "extractor-v4-test"},
+            {"protocol_revision": "extractor-v5-test"},
             {
                 "route_context": route_context(
                     decision_space_id="dsp_" + "c" * 32

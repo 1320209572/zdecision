@@ -7,11 +7,13 @@
 来源边界：
 - 只分析当前 fork 中继承的开发任务上下文。
 - 不调用工具，不读取文件、Git 或网络，不请求分页，也不尝试重建当前上下文中不可见的原始消息。
-- 忽略上下文中更早带有 ZDECISION_CAPTURE_ARTIFACT 标记的处理 Turn 及其直接输出；它们是历史处理产物，不是目标决策的事实或确认依据。
-- 对没有标记的旧实验，只忽略那些明确“以当前开发任务为待抽取对象”执行的决策整理、决策抽取或质量审查指令及其结果；不要因此忽略开发任务本身关于目标产品能力的用户指令和业务确认。
+- 忽略 Host 已归类为历史 Capture 处理产物的 Turn 及其直接输出；它们不是目标决策的事实或确认依据。
+- 只忽略 Host 已归类为“以当前开发任务为待抽取对象”的旧决策整理、决策抽取或质量审查产物；不要因此忽略开发任务本身关于目标产品能力的用户指令和业务确认。
 - 如果上下文经历过压缩，只使用实际保留下来的内容。缺失、冲突或无法确认的部分写入 coverage.known_gaps，禁止自行补全。
 
 你的任务不是直接产出 Candidate，而是从最早到最晚扫描保留上下文，建立尽可能完整、去重并符合下方模板政策的决策线索清单。
+
+证据来源由 Host 单独签发：每个 signal 都必须返回 signal_ordinal 和 evidence_receipt_ids。receipt ordinal N 对应冻结来源窗口中第 N 个合格、由 Hook 观察到的用户 Prompt；只能从本 Turn Host 提供的枚举中原样选择，不能编造、重复、重排或借用其他窗口的 ID。current_confirmed 必须至少选择一个 receipt。已召回的正式 Decision、助手提案、工具或代码事实、旧 Capture 产物、压缩摘要和任何文本标记都不签发 receipt ID；它们只能作为需要谨慎处理的上下文，不能替代 Host receipt。
 
 <decision_policy template_id="{{template_id}}" revision="{{template_revision}}">
 {{policy_body}}</decision_policy>
@@ -27,7 +29,7 @@ confidence 的判定标准：
 
 coverage.known_gaps 只记录从保留上下文中能够具体指出、并可能影响某条线索判断的缺口；不要仅因为上下文发生过压缩就写入笼统缺口，也不要臆造缺失内容。
 
-所有字段都必须存在。没有具体缺口时 known_gaps 使用 []；枚举字段必须选择一个单独值，不得输出带“|”的组合值或示例占位文本。
+所有字段都必须存在。没有具体缺口时 known_gaps 使用 []；枚举字段必须选择一个单独值，不得输出带“|”的组合值或示例占位文本。Host 的实际结构化 schema 还要求每个 signal 的 signal_ordinal 和 evidence_receipt_ids；该 schema 是唯一的字段边界。
 
 系统本阶段最多接受 100 个 signal 和 256 KiB 的编码后 JSON。不得静默丢弃线索；一旦确认存在第 101 个 signal，按上下文顺序返回前 101 个，让系统明确报告 inventory_signal_limit_exceeded。如果输出超过字节限制或被截断，系统必须报告 inventory_output_too_large 或 invalid_inventory，且不得启动第二阶段。
 

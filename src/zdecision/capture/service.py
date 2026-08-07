@@ -14,6 +14,11 @@ from zdecision.capture.inventory import (
     InventoryValidationError,
     validate_inventory,
 )
+from zdecision.capture.provenance import (
+    CandidateProvenance,
+    CaptureEvidenceManifest,
+    SignalProvenance,
+)
 from zdecision.capture.models import (
     Candidate,
     CandidateContent,
@@ -40,6 +45,16 @@ from zdecision.private_store.filesystem import (
 _MAX_CANDIDATES = 20
 _MAX_CANDIDATE_BYTES = 16 * 1024
 _RESULT_FIELDS = frozenset(("candidates",))
+_V5_CANDIDATE_FIELDS = frozenset(
+    (
+        "product",
+        "claim",
+        "future_action",
+        "scope",
+        "invalidation_conditions",
+        "source_signal_ordinal",
+    )
+)
 _CANDIDATE_FIELDS = frozenset(
     ("product", "claim", "future_action", "scope", "invalidation_conditions")
 )
@@ -242,6 +257,91 @@ def validate_extraction_output(
             )
         )
     return tuple(validated)
+
+
+def validate_extraction_output_v5(
+    operation_id: str,
+    source: SourceCheckpoint,
+    product: str,
+    extraction: object,
+    inventory: InventoryResult,
+    signal_provenance: tuple[SignalProvenance, ...],
+    manifest: CaptureEvidenceManifest,
+) -> tuple[tuple[Candidate, ...], tuple[CandidateProvenance, ...]]:
+    """Bind each v5 Candidate to exactly one eligible Inventory signal."""
+
+    if not isinstance(inventory, InventoryResult):
+        raise TypeError("inventory must be an InventoryResult")
+    if not isinstance(manifest, CaptureEvidenceManifest):
+        raise TypeError("manifest must be a CaptureEvidenceManifest")
+    if (
+        not isinstance(signal_provenance, tuple)
+        or len(signal_provenance) != len(inventory.signals)
+        or any(not isinstance(item, SignalProvenance) for item in signal_provenance)
+        or tuple(item.signal_ordinal for item in signal_provenance)
+        != tuple(range(1, len(inventory.signals) + 1))
+    ):
+        raise ExtractionValidationError(
+            "invalid_extraction", "Extraction output does not match the required schema"
+        )
+    if not isinstance(extraction, Mapping):
+        raise _invalid_extraction()
+    _require_exact_fields(extraction, _RESULT_FIELDS)
+    raw_candidates = extraction["candidates"]
+    if not isinstance(raw_candidates, list):
+        raise _invalid_extraction()
+    if len(raw_candidates) > _MAX_CANDIDATES:
+        raise ExtractionValidationError(
+            "candidate_limit_exceeded",
+            "Extraction contains more than 20 Candidates",
+        )
+    eligible = {
+        item.signal_ordinal: item
+        for item in signal_provenance
+        if item.disposition == "candidate_eligible"
+    }
+    legacy_candidates: list[dict[str, object]] = []
+    selected_sidecars: list[SignalProvenance] = []
+    seen_ordinals: set[int] = set()
+    for raw_candidate in raw_candidates:
+        if (
+            not isinstance(raw_candidate, Mapping)
+            or frozenset(raw_candidate) != _V5_CANDIDATE_FIELDS
+        ):
+            raise _invalid_extraction()
+        source_signal_ordinal = raw_candidate["source_signal_ordinal"]
+        if (
+            not isinstance(source_signal_ordinal, int)
+            or isinstance(source_signal_ordinal, bool)
+            or source_signal_ordinal in seen_ordinals
+            or source_signal_ordinal not in eligible
+        ):
+            raise _invalid_extraction()
+        seen_ordinals.add(source_signal_ordinal)
+        selected_sidecars.append(eligible[source_signal_ordinal])
+        legacy_candidates.append(
+            {
+                field: raw_candidate[field]
+                for field in _CANDIDATE_FIELDS
+            }
+        )
+    candidates = validate_extraction_output(
+        operation_id,
+        source,
+        product,
+        {"candidates": legacy_candidates},
+    )
+    provenance = tuple(
+        CandidateProvenance.create(
+            candidate_id=candidate.candidate_id,
+            manifest_digest=manifest.manifest_digest,
+            source_signal_ordinal=sidecar.signal_ordinal,
+            evidence_receipt_ids=sidecar.evidence_receipt_ids,
+            active_reference_set_digests=sidecar.active_reference_set_digests,
+        )
+        for candidate, sidecar in zip(candidates, selected_sidecars, strict=True)
+    )
+    return candidates, provenance
 
 
 class CaptureService:
