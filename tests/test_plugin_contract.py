@@ -12,6 +12,8 @@ MARKETPLACE_PATH = REPOSITORY_ROOT / ".agents" / "plugins" / "marketplace.json"
 EXPECTED_LIFECYCLE_HOOKS = {
     "SessionStart",
     "UserPromptSubmit",
+    "PreCompact",
+    "PostCompact",
     "PostToolUse",
     "Stop",
     "SessionEnd",
@@ -96,7 +98,9 @@ class PluginContractTests(unittest.TestCase):
                 handler = handlers[0]
                 self.assertEqual("command", handler["type"])
                 self.assertEqual("zdecision-agent hook", handler["command"])
-                if event_name in {"SessionStart", "UserPromptSubmit"}:
+                if event_name == "SessionStart":
+                    self.assertEqual(0, handler["additionalContextLimit"])
+                elif event_name == "UserPromptSubmit":
                     self.assertEqual(4000, handler["additionalContextLimit"])
                 else:
                     self.assertNotIn("additionalContextLimit", handler)
@@ -106,7 +110,12 @@ class PluginContractTests(unittest.TestCase):
         pre_tool_groups = hooks["PreToolUse"]
         self.assertEqual(1, len(pre_tool_groups))
         self.assertEqual(
-            "mcp__zdecision_local__show_zdecision_update",
+            (
+                "mcp__zdecision_local__show_zdecision_update|"
+                "mcp__zdecision_local__activate_zdecision_recall|"
+                "mcp__zdecision_local__gate_zdecision_turn|"
+                "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
+            ),
             pre_tool_groups[0]["matcher"],
         )
         self.assertEqual(1, len(pre_tool_groups[0]["hooks"]))
@@ -115,6 +124,8 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual("zdecision-agent hook", handler["command"])
         self.assertLessEqual(handler["timeout"], 3)
         self.assertNotIn("additionalContextLimit", handler)
+        for event_name in ("PreCompact", "PostCompact"):
+            self.assertEqual("manual|auto", hooks[event_name][0]["matcher"])
 
     def test_plugin_skill_describes_the_page_authorized_workflow(self) -> None:
         skill_path = PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"

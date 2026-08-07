@@ -16,6 +16,8 @@ from zdecision.jsonio import canonical_json_bytes
 HookEventName = Literal[
     "SessionStart",
     "UserPromptSubmit",
+    "PreCompact",
+    "PostCompact",
     "PostToolUse",
     "Stop",
     "SessionEnd",
@@ -30,9 +32,19 @@ EventState = Literal[
 ]
 
 HOOK_EVENT_NAMES = frozenset(
-    ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")
+    (
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreCompact",
+        "PostCompact",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+    )
 )
-TURN_SCOPED_EVENTS = frozenset(("UserPromptSubmit", "PostToolUse", "Stop"))
+TURN_SCOPED_EVENTS = frozenset(
+    ("UserPromptSubmit", "PreCompact", "PostCompact", "PostToolUse", "Stop")
+)
 EVENT_STATES = frozenset(
     (
         "recorded",
@@ -126,6 +138,11 @@ class HookInvocation:
             if reason != "other":
                 raise InvalidHookInvocation("Session end reason is invalid")
             safe_fact = {"reason": "other"}
+        elif event_name in ("PreCompact", "PostCompact"):
+            trigger = value.get("trigger")
+            if trigger not in ("manual", "auto"):
+                raise InvalidHookInvocation("compaction trigger is invalid")
+            safe_fact = {"trigger": trigger}
         elif event_name == "PostToolUse":
             tool_name = _safe_tool_name(value.get("tool_name"))
             tool_use_id = _safe_identifier(value.get("tool_use_id"), "tool_use_id")

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import secrets
 from collections.abc import Callable, Mapping
@@ -12,8 +14,10 @@ from pathlib import Path
 from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import HookInvocation, HookResponse, InvalidHookInvocation
+from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.ids import product_id
+from zdecision.jsonio import canonical_json_bytes
 
 
 INVALID_HOOK_OUTPUT = {"systemMessage": "ZDecision ignored an invalid hook event."}
@@ -21,8 +25,18 @@ UNAVAILABLE_HOOK_OUTPUT = {
     "systemMessage": "ZDecision could not record this lifecycle event."
 }
 CONTROL_BINDING_TOOL = "mcp__zdecision_local__show_zdecision_update"
+ACTIVATE_RECALL_TOOL = "mcp__zdecision_local__activate_zdecision_recall"
+TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
+RECALL_MUTATION_MATCHER = "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
 _CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_ACTIVE_GATE_INSTRUCTION = (
+    "ZDecision recall is active. Call gate_zdecision_turn before substantive "
+    "output or development tools in this Turn."
+)
+_RESUME_INSTRUCTION = (
+    "ZDecision recall revalidation is required before development continues."
+)
 
 
 def handle_hook(
@@ -34,6 +48,9 @@ def handle_hook(
     worker_waker: Callable[[Path], None] | None = None,
     control_store: ControlBindingStore | None = None,
     control_id_factory: Callable[[], str] | None = None,
+    recall_store: RecallHostStore | None = None,
+    activation_binding_id_factory: Callable[[], str] | None = None,
+    turn_gate_id_factory: Callable[..., str] | None = None,
     session_lease_seconds: float = 120.0,
 ) -> HookResponse:
     """Validate and record one Hook without retaining discarded host fields."""
@@ -41,13 +58,16 @@ def handle_hook(
     try:
         value = _decode_hook(raw)
         if value.get("hook_event_name") == "PreToolUse":
-            return handle_control_binding_hook(
+            return handle_pre_tool_hook(
                 value,
                 database=database,
                 clock=clock,
                 repository_resolver=repository_resolver,
                 control_store=control_store,
                 control_id_factory=control_id_factory,
+                recall_store=recall_store,
+                activation_binding_id_factory=activation_binding_id_factory,
+                turn_gate_id_factory=turn_gate_id_factory,
             )
         observed_at = clock()
         occurred_at = _format_time(observed_at)
@@ -85,16 +105,436 @@ def handle_hook(
                 expires_at=expires_at,
                 create=False,
             )
+        recall_output = _handle_recall_lifecycle(
+            value,
+            invocation=invocation,
+            database=database,
+            recall_store=recall_store,
+            now=lease_time,
+            turn_gate_id_factory=turn_gate_id_factory,
+        )
         if worker_waker is None:
             from zdecision.agent.worker import wake_worker
 
             worker_waker = wake_worker
         worker_waker(database.path)
-        return HookResponse(event_id=event.event_id, output={})
+        return HookResponse(event_id=event.event_id, output=recall_output)
     except (InvalidHookInvocation, UnicodeDecodeError, json.JSONDecodeError, TypeError):
         return HookResponse(event_id="", output=INVALID_HOOK_OUTPUT)
     except Exception:
         return HookResponse(event_id="", output=UNAVAILABLE_HOOK_OUTPUT)
+
+
+def handle_pre_tool_hook(
+    value: Mapping[str, object],
+    *,
+    database: AgentDatabase,
+    clock: Callable[[], datetime | str],
+    repository_resolver: RepositoryResolver | None = None,
+    control_store: ControlBindingStore | None = None,
+    control_id_factory: Callable[[], str] | None = None,
+    recall_store: RecallHostStore | None = None,
+    activation_binding_id_factory: Callable[[], str] | None = None,
+    turn_gate_id_factory: Callable[..., str] | None = None,
+) -> HookResponse:
+    """Dispatch trusted PreToolUse controls before the active-Turn guard."""
+
+    tool_name = value.get("tool_name")
+    if tool_name == CONTROL_BINDING_TOOL:
+        return handle_control_binding_hook(
+            value,
+            database=database,
+            clock=clock,
+            repository_resolver=repository_resolver,
+            control_store=control_store,
+            control_id_factory=control_id_factory,
+        )
+    owned_store: RecallHostStore | None = None
+    try:
+        store = recall_store
+        if store is None:
+            owned_store = RecallHostStore.open(database.path)
+            store = owned_store
+        if tool_name in (ACTIVATE_RECALL_TOOL, TURN_GATE_TOOL):
+            return bind_recall_tool_call(
+                value,
+                database=database,
+                clock=clock,
+                repository_resolver=repository_resolver,
+                recall_store=store,
+                activation_binding_id_factory=activation_binding_id_factory,
+                turn_gate_id_factory=turn_gate_id_factory,
+            )
+        return guard_active_turn_tool(value, database=database, recall_store=store)
+    except Exception:
+        return _pre_tool_response("deny")
+    finally:
+        if owned_store is not None:
+            try:
+                owned_store.close()
+            except Exception:
+                pass
+
+
+def bind_recall_tool_call(
+    value: Mapping[str, object],
+    *,
+    database: AgentDatabase,
+    clock: Callable[[], datetime | str],
+    repository_resolver: RepositoryResolver | None,
+    recall_store: RecallHostStore,
+    activation_binding_id_factory: Callable[[], str] | None,
+    turn_gate_id_factory: Callable[..., str] | None,
+) -> HookResponse:
+    """Replace model-authored recall coordinates with one trusted binding."""
+
+    try:
+        session_id, turn_id, cwd = _trusted_recall_coordinates(
+            value,
+            database=database,
+            repository_resolver=repository_resolver,
+        )
+        tool_name = value.get("tool_name")
+        if tool_name == ACTIVATE_RECALL_TOOL:
+            binding_id = (
+                activation_binding_id_factory()
+                if activation_binding_id_factory is not None
+                else _opaque_id("activation", session_id, turn_id, cwd)
+            )
+            binding_id = _safe_generated_identifier(binding_id)
+            recall_store.bind_activation(
+                session_id=session_id,
+                turn_id=turn_id,
+                cwd=cwd,
+                binding_id=binding_id,
+                now=_parse_time(_format_time(clock())),
+            )
+            return _pre_tool_response(
+                "allow", updated_input={"activation_binding_id": binding_id}
+            )
+        if tool_name != TURN_GATE_TOOL:
+            raise ValueError("recall tool is invalid")
+        session = recall_store.get_session(session_id)
+        if session is None or session.state != "active" or session.cwd != cwd:
+            raise RecallGateConflict("session is not active for this CWD")
+        gate_id = _turn_gate_id(
+            session_id,
+            turn_id,
+            session.context_epoch,
+            session.intent_epoch,
+            None,
+            turn_gate_id_factory,
+        )
+        recall_store.begin_turn_gate(
+            session_id=session_id,
+            turn_id=turn_id,
+            context_epoch=session.context_epoch,
+            intent_epoch=session.intent_epoch,
+            active_generation=None,
+            gate_id=gate_id,
+        )
+        return _pre_tool_response(
+            "allow", updated_input={"turn_gate_id": gate_id}
+        )
+    except Exception:
+        return _pre_tool_response("deny")
+
+
+def guard_active_turn_tool(
+    value: Mapping[str, object],
+    *,
+    database: AgentDatabase,
+    recall_store: RecallHostStore,
+) -> HookResponse:
+    """Deny only selected Sessions whose exact current Turn is not committed."""
+
+    try:
+        session_id = _safe_host_identifier(value.get("session_id"))
+    except ValueError:
+        return HookResponse(event_id="", output={})
+    session = recall_store.get_session(session_id)
+    if session is None or session.state in ("bypassed", "dormant", "closed"):
+        return HookResponse(event_id="", output={})
+    if session.state != "active":
+        return _pre_tool_response("deny")
+    try:
+        turn_id = _safe_host_identifier(value.get("turn_id"))
+        cwd = _safe_absolute_cwd(value.get("cwd"))
+        if session.cwd != cwd:
+            raise RecallGateConflict("active Session CWD changed")
+        if not database.has_open_observed_turn(session_id, turn_id, cwd):
+            raise RecallGateConflict("host Turn is not current")
+        recall_store.require_committed_gate(session_id, turn_id)
+    except Exception:
+        return _pre_tool_response("deny")
+    return HookResponse(event_id="", output={})
+
+
+def _handle_recall_lifecycle(
+    value: Mapping[str, object],
+    *,
+    invocation: HookInvocation,
+    database: AgentDatabase,
+    recall_store: RecallHostStore | None,
+    now: datetime,
+    turn_gate_id_factory: Callable[..., str] | None,
+) -> Mapping[str, object]:
+    if invocation.event_name not in (
+        "UserPromptSubmit",
+        "SessionStart",
+        "SessionEnd",
+    ):
+        return {}
+    owned_store: RecallHostStore | None = None
+    try:
+        store = recall_store
+        if store is None:
+            owned_store = RecallHostStore.open(database.path)
+            store = owned_store
+        session = store.get_session(invocation.session_id)
+        if invocation.event_name == "SessionEnd":
+            if session is not None:
+                store.mark_dormant(invocation.session_id, ended_at=now)
+            return {}
+        if invocation.event_name == "UserPromptSubmit":
+            if session is None or session.state != "active":
+                return {}
+            if invocation.turn_id is None:
+                return _additional_context(
+                    "UserPromptSubmit", _blocked_envelope("invalid_native_turn")
+                )
+            gate_id = _turn_gate_id(
+                invocation.session_id,
+                invocation.turn_id,
+                session.context_epoch,
+                session.intent_epoch,
+                None,
+                turn_gate_id_factory,
+            )
+            try:
+                store.begin_turn_gate(
+                    session_id=invocation.session_id,
+                    turn_id=invocation.turn_id,
+                    context_epoch=session.context_epoch,
+                    intent_epoch=session.intent_epoch,
+                    active_generation=None,
+                    gate_id=gate_id,
+                )
+            except RecallGateConflict:
+                return _additional_context(
+                    "UserPromptSubmit", _blocked_envelope("invalid_turn_gate")
+                )
+            return _additional_context("UserPromptSubmit", _ACTIVE_GATE_INSTRUCTION)
+        if session is None:
+            return {}
+        if invocation.source == "resume":
+            if session.state == "dormant":
+                store.begin_resume(invocation.session_id, invocation.cwd, now)
+                return _additional_context("SessionStart", _RESUME_INSTRUCTION)
+            return {}
+        if invocation.source not in ("compact", "clear"):
+            return {}
+        if (
+            session.state != "active"
+            or session.last_gate_turn_id is None
+            or session.active_set_digest is None
+        ):
+            return _additional_context(
+                "SessionStart", _blocked_envelope("restoration_unavailable")
+            )
+        if invocation.source == "compact":
+            compaction_key = _matched_compaction_key(
+                value,
+                invocation=invocation,
+                database=database,
+            )
+            if compaction_key is None:
+                return _additional_context(
+                    "SessionStart", _blocked_envelope("unmatched_compaction")
+                )
+        else:
+            compaction_key = _opaque_id(
+                "clear",
+                invocation.session_id,
+                invocation.source,
+                session.last_gate_turn_id,
+                session.active_set_digest,
+            )
+        try:
+            restoration = store.begin_context_epoch(
+                session_id=invocation.session_id,
+                source=invocation.source,
+                latest_observed_turn_id=session.last_gate_turn_id,
+                active_set_digest=session.active_set_digest,
+                compaction_key=compaction_key,
+            )
+        except RecallGateConflict:
+            return _additional_context(
+                "SessionStart", _blocked_envelope("restoration_conflict")
+            )
+        receipt_id = _opaque_id(
+            "restoration", restoration.compaction_key, restoration.context_epoch
+        )
+        return _additional_context(
+            "SessionStart",
+            _json_context(
+                {
+                    "marker": "ZDECISION_RECALL_RESTORATION",
+                    "receipt_id": receipt_id,
+                    "context_epoch": restoration.context_epoch,
+                    "active_set_digest": restoration.active_set_digest,
+                }
+            ),
+        )
+    finally:
+        if owned_store is not None:
+            owned_store.close()
+
+
+def _matched_compaction_key(
+    value: Mapping[str, object],
+    *,
+    invocation: HookInvocation,
+    database: AgentDatabase,
+) -> str | None:
+    try:
+        native_turn_id = _safe_host_identifier(value.get("turn_id"))
+    except ValueError:
+        return None
+    relevant = tuple(
+        event.invocation
+        for event in database.list_events(invocation.session_id)
+        if event.invocation.event_name in (
+            "PreCompact",
+            "PostCompact",
+            "SessionStart",
+        )
+    )
+    if len(relevant) < 3:
+        return None
+    pre_compact, post_compact, session_start = relevant[-3:]
+    if (
+        pre_compact.event_name != "PreCompact"
+        or post_compact.event_name != "PostCompact"
+        or session_start.event_name != "SessionStart"
+        or session_start.source != "compact"
+        or pre_compact.turn_id != native_turn_id
+        or post_compact.turn_id != native_turn_id
+        or pre_compact.cwd != invocation.cwd
+        or post_compact.cwd != invocation.cwd
+        or pre_compact.safe_fact.get("trigger")
+        != post_compact.safe_fact.get("trigger")
+    ):
+        return None
+    return _opaque_id(
+        "compact",
+        invocation.session_id,
+        native_turn_id,
+        pre_compact.safe_fact["trigger"],
+    )
+
+
+def _trusted_recall_coordinates(
+    value: Mapping[str, object],
+    *,
+    database: AgentDatabase,
+    repository_resolver: RepositoryResolver | None,
+) -> tuple[str, str, str]:
+    if value.get("hook_event_name") != "PreToolUse" or "agent_id" in value:
+        raise ValueError("untrusted recall binding envelope")
+    session_id = _safe_host_identifier(value.get("session_id"))
+    turn_id = _safe_host_identifier(value.get("turn_id"))
+    cwd = _safe_absolute_cwd(value.get("cwd"))
+    repository = (repository_resolver or RepositoryResolver()).resolve(cwd)
+    if repository is None:
+        raise ValueError("repository is unresolved")
+    enabled = database.get_enabled_repository(repository.repository_id)
+    if enabled is None or not enabled.enabled:
+        raise ValueError("repository is not enabled")
+    if not database.has_open_observed_turn(session_id, turn_id, cwd):
+        raise ValueError("host Turn was not observed")
+    return session_id, turn_id, cwd
+
+
+def _turn_gate_id(
+    session_id: str,
+    turn_id: str,
+    context_epoch: int,
+    intent_epoch: int,
+    active_generation: int | None,
+    factory: Callable[..., str] | None,
+) -> str:
+    value = (
+        factory(
+            session_id,
+            turn_id,
+            context_epoch,
+            intent_epoch,
+            active_generation,
+        )
+        if factory is not None
+        else _opaque_id(
+            "gate",
+            session_id,
+            turn_id,
+            context_epoch,
+            intent_epoch,
+            active_generation,
+        )
+    )
+    return _safe_generated_identifier(value)
+
+
+def _opaque_id(prefix: str, *coordinates: object) -> str:
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {"domain": f"zdecision-recall-{prefix}-v1", "coordinates": coordinates}
+        )
+    ).hexdigest()
+    return f"{prefix}_{digest[:32]}"
+
+
+def _safe_generated_identifier(value: object) -> str:
+    if not isinstance(value, str) or _SAFE_HOST_IDENTIFIER.fullmatch(value) is None:
+        raise ValueError("generated binding ID is invalid")
+    return value
+
+
+def _safe_absolute_cwd(value: object) -> str:
+    if not isinstance(value, str) or not Path(value).is_absolute() or "\x00" in value:
+        raise ValueError("cwd is invalid")
+    return os.path.normpath(value)
+
+
+def _pre_tool_response(
+    decision: str,
+    *,
+    updated_input: Mapping[str, object] | None = None,
+) -> HookResponse:
+    output: dict[str, object] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+    }
+    if updated_input is not None:
+        output["updatedInput"] = dict(updated_input)
+    return HookResponse(event_id="", output={"hookSpecificOutput": output})
+
+
+def _additional_context(event_name: str, context: str) -> dict[str, object]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": context,
+        }
+    }
+
+
+def _blocked_envelope(reason: str) -> str:
+    return _json_context({"marker": "ZDECISION_RECALL_BLOCKED", "reason": reason})
+
+
+def _json_context(value: Mapping[str, object]) -> str:
+    return canonical_json_bytes(dict(value)).decode("utf-8")
 
 
 def handle_control_binding_hook(

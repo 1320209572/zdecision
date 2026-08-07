@@ -7,10 +7,12 @@ import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import handle_hook
+from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
@@ -62,6 +64,7 @@ class HookLatencyTests(unittest.TestCase):
         )
         self.database_path = self.root / "state" / "zdecision.sqlite3"
         self.database = AgentDatabase.open(self.database_path)
+        self.recall_store = RecallHostStore.open(self.database_path)
         self.resolver = RepositoryResolver(timeout_seconds=0.5)
         snapshot = self.resolver.resolve(self.repository)
         self.assertIsNotNone(snapshot)
@@ -78,6 +81,8 @@ class HookLatencyTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        if hasattr(self, "recall_store"):
+            self.recall_store.close()
         if hasattr(self, "database"):
             self.database.close()
         if hasattr(self, "temporary_directory"):
@@ -147,6 +152,46 @@ class HookLatencyTests(unittest.TestCase):
         self.assertGreaterEqual(worker_elapsed, 0.19)
         self.assertEqual(1, processor.calls)
         self.assertEqual(1, cycle.failed_retryable)
+
+    def test_active_turn_gate_hook_p95_is_at_most_150_milliseconds(self) -> None:
+        self.recall_store.bind_activation(
+            session_id="thr_active_latency",
+            turn_id="turn_activation",
+            cwd=str(self.repository),
+            binding_id="activation-latency",
+            now=FIXED_TIME,
+        )
+
+        elapsed_milliseconds: list[float] = []
+        with patch(
+            "socket.socket.connect",
+            side_effect=AssertionError("Hook must not make a network call"),
+        ):
+            for index in range(200):
+                started = time.perf_counter()
+                raw = {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "thr_active_latency",
+                    "turn_id": f"turn_{index}",
+                    "cwd": str(self.repository),
+                    "prompt": "must not be read",
+                }
+                response = handle_hook(
+                    raw,
+                    database=self.database,
+                    clock=lambda: FIXED_TIME,
+                    repository_resolver=self.resolver,
+                    worker_waker=lambda _: None,
+                    recall_store=self.recall_store,
+                )
+                elapsed_milliseconds.append((time.perf_counter() - started) * 1000)
+                self.assertTrue(response.event_id)
+                self.assertIn("additionalContext", response.output["hookSpecificOutput"])
+
+        ordered = sorted(elapsed_milliseconds)
+        p95 = ordered[math.ceil(0.95 * len(ordered)) - 1]
+        print(f"Active recall Hook latency p95: {p95:.2f} ms")
+        self.assertLessEqual(p95, 150.0)
 
 
 if __name__ == "__main__":

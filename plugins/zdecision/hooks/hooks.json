@@ -9,7 +9,7 @@
             "type": "command",
             "command": "zdecision-agent hook",
             "timeout": 3,
-            "additionalContextLimit": 4000
+            "additionalContextLimit": 0
           }
         ]
       }
@@ -26,9 +26,33 @@
         ]
       }
     ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zdecision-agent hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
-        "matcher": "mcp__zdecision_local__show_zdecision_update",
+        "matcher": "mcp__zdecision_local__show_zdecision_update|mcp__zdecision_local__activate_zdecision_recall|mcp__zdecision_local__gate_zdecision_turn|Bash|apply_patch|Edit|Write|Agent|mcp__.*",
         "hooks": [
           {
             "type": "command",

@@ -254,13 +254,23 @@ class ControlBindingHookTests(unittest.TestCase):
             ("unsafe session", self._raw(session_id="session with spaces")),
             ("missing turn", self._raw(turn_id=None)),
             ("relative cwd", self._raw(cwd="relative/path")),
-            ("wrong tool", self._raw(tool_name="mcp__other__render")),
         )
 
         for name, raw in cases:
             with self.subTest(name=name):
                 self.assertEqual(DENIED_OUTPUT, self._handle(raw).output)
                 self.assertIsNone(self.control_store.get(CONTROL_ID))
+
+        wrong_tool = handle_control_binding_hook(
+            self._raw(tool_name="mcp__other__render"),
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.repository_resolver,
+            control_store=self.control_store,
+            control_id_factory=lambda: CONTROL_ID,
+        )
+        self.assertEqual(DENIED_OUTPUT, wrong_tool.output)
+        self.assertIsNone(self.control_store.get(CONTROL_ID))
 
         self._observe_prompt()
         self.database.put_enabled_repository(
