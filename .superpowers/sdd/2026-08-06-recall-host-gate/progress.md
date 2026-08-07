@@ -29,4 +29,8 @@ Task 7 provenance Task 5 focused verification: `.venv/bin/python -m unittest tes
 Task 7 provenance Task 5 full verification: `.venv/bin/python -m unittest discover -s tests -v` — Ran 838 tests, OK (skipped=3).
 Task 7: complete — all six provenance hard-stop audit statements passed; `capture_evidence_provenance_unavailable` was not recorded.
 Task 7 provenance Task 5 fix round 1: acceptance evidence strengthened in tests only; amended RED ran 8 tests and failed 8 at the five documented gaps; `.venv/bin/python -m unittest tests.test_recall_capture_isolation tests.integration.test_on_demand_capture_core tests.integration.test_central_web_vertical -v` then ran 36 tests in 13.150s, OK. Production unchanged; the previously mandated single full run remains `Ran 838 tests, OK (skipped=3)` and was not rerun.
+Task 7 final review: one Important cross-task seam found — v5 Extraction rejected zero and 21-100 eligible signal ordinals by conflating eligibility cardinality with the 20-Candidate output cap.
+Task 7 final review fix: `0f3503c` accepts 0-100 eligible ordinals, closes the empty schema at zero Candidates, retains the independent 20-Candidate cap, and adds runner/processor regressions. Focused verification ran 139 tests, OK; scoped re-review was clean.
+Task 7 final verification after the production fix: `.venv/bin/python -m unittest discover -s tests -v` — Ran 843 tests in 82.234s, OK (skipped=3).
+Task 7: complete at `0f3503c` — all implementation tasks and the final scoped fix are committed and review-clean; all six provenance hard-stop statements remain true.
 Task 8 has not started.
