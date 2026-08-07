@@ -200,12 +200,21 @@ class PluginContractTests(unittest.TestCase):
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
 
         self.assertIn('default_prompt: "更新候选决策"', agent_config)
-        self.assertEqual(
-            ["更新候选决策"], manifest["interface"]["defaultPrompt"]
-        )
+        prompts = manifest["interface"]["defaultPrompt"]
+        self.assertEqual("更新候选决策", prompts[0])
+        self.assertIn("ZDecision Recall", prompts[1])
+        self.assertLessEqual(len(prompts), 3)
         self.assertIn(
             "allow_implicit_invocation: true", agent_config
         )
+
+    def test_manifest_describes_opt_in_recall_without_automatic_capture(self) -> None:
+        manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
+        serialized = json.dumps(manifest, sort_keys=True)
+
+        self.assertIn("Session opt-in", serialized)
+        self.assertIn("Candidate refresh remains explicit", serialized)
+        self.assertNotIn("automatically recalls", serialized)
 
     def test_plugin_exposes_no_model_based_automatic_capture_tools(
         self,

@@ -1,7 +1,7 @@
 {
   "name": "zdecision",
   "version": "0.1.0",
-  "description": "Automatically capture, review, and recall formal decisions",
+  "description": "Session-opt-in recall gating; Candidate refresh remains explicit",
   "author": {
     "name": "ZDecision"
   },
@@ -9,13 +9,14 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "ZDecision",
-    "shortDescription": "Capture and recall reviewed decisions",
-    "longDescription": "Automatically captures decision candidates locally and recalls only reviewed formal decisions.",
+    "shortDescription": "Explicit Candidate refresh and Session recall",
+    "longDescription": "Session opt-in enables the recall gate; Candidate refresh remains explicit. Installing the Plugin does not automatically recall Decisions.",
     "developerName": "ZDecision",
     "category": "Productivity",
     "capabilities": ["Read"],
     "defaultPrompt": [
-      "更新候选决策"
+      "更新候选决策",
+      "使用 ZDecision Recall 应用相关正式决策"
     ]
   }
 }
