@@ -578,10 +578,7 @@ def run_mcp(
             evidence_gateway_factory=lambda: AppServerGateway.connect(
                 database=database
             ),
-            recall_skill_path=(
-                Path(__file__).resolve().parents[3]
-                / "plugins/zdecision/skills/decision-recall/SKILL.md"
-            ),
+            recall_skill_path=None,
         )
         create_mcp_server(tools, recall_tools).run(transport="stdio")
     finally:

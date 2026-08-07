@@ -494,6 +494,7 @@ class AppServerGatewayTests(unittest.TestCase):
                     {
                         "id": SOURCE_TURN,
                         "status": "inProgress",
+                        "itemsView": "full",
                         "items": [
                             {
                                 "id": "user-1",
@@ -541,8 +542,10 @@ class AppServerGatewayTests(unittest.TestCase):
                                 "type": "mcpToolCall",
                                 "server": "zdecision-local",
                                 "tool": "activate_zdecision_recall",
-                                "status": "completed",
-                                "arguments": {"prompt": private},
+                                "status": "inProgress",
+                                "arguments": {
+                                    "activation_binding_id": "activation-binding"
+                                },
                                 "result": {
                                     "content": [{"type": "text", "text": private}],
                                     "structuredContent": {
@@ -615,6 +618,7 @@ class AppServerGatewayTests(unittest.TestCase):
                     "mcpToolCall",
                     "mcp-1",
                     tool_name="activate_zdecision_recall",
+                    operation_id="activation-binding",
                     probe_id="probe-abc123",
                 ),
                 app_server_models.TurnItemEvidence("agentMessage", "agent-1"),
@@ -638,6 +642,33 @@ class AppServerGatewayTests(unittest.TestCase):
             ),
             gateway.client.requests[0],
         )
+
+    def test_active_turn_evidence_rejects_non_full_item_views(self) -> None:
+        """This catches a truncated Turn being treated as ordering evidence."""
+
+        for items_view in ("summary", "compact", None):
+            with self.subTest(items_view=items_view):
+                turn = {
+                    "id": SOURCE_TURN,
+                    "status": "inProgress",
+                    "items": [],
+                }
+                if items_view is not None:
+                    turn["itemsView"] = items_view
+                response = {
+                    "thread": {
+                        "id": SOURCE_THREAD,
+                        "sessionId": SOURCE_THREAD,
+                        "forkedFromId": None,
+                        "cwd": str(self.root),
+                        "ephemeral": False,
+                        "turns": [turn],
+                    }
+                }
+                with self.assertRaises(InvalidAppServerResponse):
+                    self._gateway(
+                        ScriptedClient([response])
+                    ).read_active_turn_evidence(SOURCE_THREAD, SOURCE_TURN)
 
     def test_active_turn_evidence_rejects_non_active_or_ambiguous_turns(self) -> None:
         """This catches completed or duplicate Turns being used post hoc."""

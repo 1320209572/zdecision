@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -115,7 +116,9 @@ class RecallHostStore:
                     session_id TEXT NOT NULL,
                     turn_id TEXT NOT NULL,
                     cwd TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    plugin_root TEXT,
+                    plugin_bundle_digest TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS recall_turn_gates (
@@ -132,6 +135,8 @@ class RecallHostStore:
                     )),
                     result_digest TEXT,
                     commit_fingerprint TEXT,
+                    plugin_root TEXT,
+                    plugin_bundle_digest TEXT,
                     UNIQUE(session_id, turn_id)
                 );
 
@@ -170,6 +175,31 @@ class RecallHostStore:
                 connection.execute(
                     "ALTER TABLE recall_turn_gates ADD COLUMN commit_fingerprint TEXT"
                 )
+            if "plugin_root" not in columns:
+                connection.execute(
+                    "ALTER TABLE recall_turn_gates ADD COLUMN plugin_root TEXT"
+                )
+            if "plugin_bundle_digest" not in columns:
+                connection.execute(
+                    "ALTER TABLE recall_turn_gates "
+                    "ADD COLUMN plugin_bundle_digest TEXT"
+                )
+            activation_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(recall_activation_bindings)"
+                ).fetchall()
+            }
+            if "plugin_root" not in activation_columns:
+                connection.execute(
+                    "ALTER TABLE recall_activation_bindings "
+                    "ADD COLUMN plugin_root TEXT"
+                )
+            if "plugin_bundle_digest" not in activation_columns:
+                connection.execute(
+                    "ALTER TABLE recall_activation_bindings "
+                    "ADD COLUMN plugin_bundle_digest TEXT"
+                )
         return cls(database_path, connection)
 
     def close(self) -> None:
@@ -198,12 +228,16 @@ class RecallHostStore:
         cwd: str,
         binding_id: str,
         now: datetime,
+        plugin_root: str | None = None,
     ) -> RecallSession:
         session = _text(session_id, "session_id")
         turn = _text(turn_id, "turn_id")
         binding = _text(binding_id, "binding_id")
         working_directory = _absolute_path(cwd)
         created_at = _timestamp(_aware_utc(now, "now"))
+        installed_root, bundle_digest = _optional_installed_plugin_binding(
+            plugin_root
+        )
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             if self.is_internal_thread(session):
@@ -217,6 +251,8 @@ class RecallHostStore:
                     bound["session_id"] != session
                     or bound["turn_id"] != turn
                     or bound["cwd"] != working_directory
+                    or bound["plugin_root"] != installed_root
+                    or bound["plugin_bundle_digest"] != bundle_digest
                 ):
                     raise RecallGateConflict("activation binding is already frozen")
                 result = self._required_session(session)
@@ -248,10 +284,19 @@ class RecallHostStore:
             self._connection.execute(
                 """
                 INSERT INTO recall_activation_bindings(
-                    binding_id, session_id, turn_id, cwd, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    binding_id, session_id, turn_id, cwd, created_at,
+                    plugin_root, plugin_bundle_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (binding, session, turn, working_directory, created_at),
+                (
+                    binding,
+                    session,
+                    turn,
+                    working_directory,
+                    created_at,
+                    installed_root,
+                    bundle_digest,
+                ),
             )
             result = self._required_session(session)
             self._connection.commit()
@@ -269,6 +314,7 @@ class RecallHostStore:
         intent_epoch: int,
         active_generation: int | None,
         gate_id: str,
+        plugin_root: str | None = None,
     ) -> TurnGate:
         session = _text(session_id, "session_id")
         turn = _text(turn_id, "turn_id")
@@ -276,21 +322,29 @@ class RecallHostStore:
         context = _epoch(context_epoch, "context_epoch")
         intent = _epoch(intent_epoch, "intent_epoch")
         generation = _generation(active_generation)
+        installed_root, bundle_digest = _optional_installed_plugin_binding(
+            plugin_root
+        )
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             if self.is_internal_thread(session):
                 raise RecallGateConflict("internal threads are recall-disabled")
             existing = self._gate_for_turn(session, turn)
             if existing is not None:
-                if _gate(existing) != TurnGate(
-                    gate_id=gate,
-                    session_id=session,
-                    turn_id=turn,
-                    context_epoch=context,
-                    intent_epoch=intent,
-                    active_generation=generation,
-                    state=existing["state"],
-                    result_digest=existing["result_digest"],
+                if (
+                    existing["plugin_root"] != installed_root
+                    or existing["plugin_bundle_digest"] != bundle_digest
+                    or _gate(existing)
+                    != TurnGate(
+                        gate_id=gate,
+                        session_id=session,
+                        turn_id=turn,
+                        context_epoch=context,
+                        intent_epoch=intent,
+                        active_generation=generation,
+                        state=existing["state"],
+                        result_digest=existing["result_digest"],
+                    )
                 ):
                     raise RecallGateConflict("native turn gate is already frozen")
                 result = _gate(existing)
@@ -307,10 +361,20 @@ class RecallHostStore:
                 """
                 INSERT INTO recall_turn_gates(
                     gate_id, session_id, turn_id, context_epoch, intent_epoch,
-                    active_generation, state, result_digest
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL)
+                    active_generation, state, result_digest, plugin_root,
+                    plugin_bundle_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
                 """,
-                (gate, session, turn, context, intent, generation),
+                (
+                    gate,
+                    session,
+                    turn,
+                    context,
+                    intent,
+                    generation,
+                    installed_root,
+                    bundle_digest,
+                ),
             )
             result = _gate(self._gate_by_id(gate))
             self._connection.commit()
@@ -318,6 +382,32 @@ class RecallHostStore:
         except Exception:
             self._connection.rollback()
             raise
+
+    def bound_recall_skill_path(
+        self, binding_kind: str, binding_id: str
+    ) -> Path | None:
+        """Revalidate the exact plugin root frozen with one Hook binding."""
+
+        binding = _text(binding_id, "binding_id")
+        if binding_kind == "activation":
+            table = "recall_activation_bindings"
+            id_column = "binding_id"
+        elif binding_kind == "turn":
+            table = "recall_turn_gates"
+            id_column = "gate_id"
+        else:
+            raise ValueError("binding_kind is invalid")
+        row = self._connection.execute(
+            f"SELECT plugin_root, plugin_bundle_digest FROM {table} "
+            f"WHERE {id_column} = ?",
+            (binding,),
+        ).fetchone()
+        if row is None or row["plugin_root"] is None:
+            return None
+        bundle = _installed_recall_bundle(row["plugin_root"])
+        if bundle is None or bundle[1] != row["plugin_bundle_digest"]:
+            return None
+        return bundle[0]
 
     def commit_turn_gate(
         self,
@@ -840,6 +930,89 @@ def _absolute_path(value: object) -> str:
     if not os.path.isabs(path):
         raise ValueError("cwd must be absolute")
     return os.path.normpath(path)
+
+
+def installed_recall_skill_path(plugin_root: object) -> Path | None:
+    """Validate one Hook-provided installed plugin root and exact Recall Skill."""
+
+    bundle = _installed_recall_bundle(plugin_root)
+    return None if bundle is None else bundle[0]
+
+
+def _installed_recall_bundle(
+    plugin_root: object,
+) -> tuple[Path, str] | None:
+    if (
+        not isinstance(plugin_root, str)
+        or not plugin_root
+        or len(plugin_root) > 4096
+        or "\x00" in plugin_root
+    ):
+        return None
+    try:
+        supplied_root = Path(plugin_root)
+        if not supplied_root.is_absolute():
+            return None
+        root = supplied_root.resolve(strict=True)
+        manifest_path = (root / ".codex-plugin/plugin.json").resolve(
+            strict=True
+        )
+        mcp_path = (root / ".mcp.json").resolve(strict=True)
+        skill_path = (root / "skills/decision-recall/SKILL.md").resolve(
+            strict=True
+        )
+        if (
+            root not in manifest_path.parents
+            or root not in mcp_path.parents
+            or root not in skill_path.parents
+            or not manifest_path.is_file()
+            or not mcp_path.is_file()
+            or not skill_path.is_file()
+            or manifest_path.stat().st_size > 65_536
+            or mcp_path.stat().st_size > 65_536
+            or skill_path.stat().st_size > 262_144
+        ):
+            return None
+        manifest_bytes = manifest_path.read_bytes()
+        mcp_bytes = mcp_path.read_bytes()
+        skill_bytes = skill_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        mcp_config = json.loads(mcp_bytes)
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("name") != "zdecision"
+            or manifest.get("skills") != "./skills/"
+            or manifest.get("mcpServers") != "./.mcp.json"
+            or not isinstance(mcp_config, dict)
+        ):
+            return None
+        servers = mcp_config.get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        server = servers.get("zdecision-local")
+        if (
+            not isinstance(server, dict)
+            or server.get("command") != "zdecision-agent"
+            or server.get("args") != ["mcp"]
+        ):
+            return None
+        bundle_digest = hashlib.sha256(
+            manifest_bytes + b"\0" + mcp_bytes + b"\0" + skill_bytes
+        ).hexdigest()
+        return skill_path, bundle_digest
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError):
+        return None
+
+
+def _optional_installed_plugin_binding(
+    value: object,
+) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    bundle = _installed_recall_bundle(value)
+    if bundle is None:
+        raise ValueError("plugin_root is not a verified ZDecision plugin")
+    return str(bundle[0].parents[2]), bundle[1]
 
 
 def _epoch(value: object, name: str) -> int:

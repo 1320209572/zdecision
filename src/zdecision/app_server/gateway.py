@@ -229,6 +229,10 @@ class AppServerGateway:
         turn = matches[0]
         if turn.get("status") != "inProgress":
             raise IncompleteSourceTurn("The requested Turn is not active")
+        if turn.get("itemsView") != "full":
+            raise InvalidAppServerResponse(
+                "active Turn did not include the full item view"
+            )
         items = turn.get("items")
         if not isinstance(items, list) or len(items) > 4096:
             raise InvalidAppServerResponse("active Turn items are invalid")
@@ -714,18 +718,21 @@ def _turn_item_evidence(
 ) -> TurnItemEvidence:
     item_id = _bounded_response_string(item.get("id"), "Turn item id")
     tool_name = None
+    operation_id = None
     receipt_id = None
     probe_id = None
     if item_type == "hookPrompt":
         receipt_id = _hook_receipt_id(item)
     elif item_type == "mcpToolCall":
         tool_name = _bounded_response_string(item.get("tool"), "MCP tool name")
+        operation_id = _mcp_zdecision_operation_id(item, tool_name)
         receipt_id, probe_id = _mcp_zdecision_ids(item, tool_name)
     try:
         return TurnItemEvidence(
             item_type=item_type,
             item_id=item_id,
             tool_name=tool_name,
+            operation_id=operation_id,
             receipt_id=receipt_id,
             probe_id=probe_id,
         )
@@ -763,6 +770,35 @@ def _hook_receipt_id(item: Mapping[str, object]) -> str | None:
     if len(receipts) > 1:
         raise InvalidAppServerResponse("hookPrompt repeated ZDecision receipts")
     return next(iter(receipts), None)
+
+
+def _mcp_zdecision_operation_id(
+    item: Mapping[str, object], tool_name: str
+) -> str | None:
+    if (
+        item.get("server") != "zdecision-local"
+        or tool_name not in _ZDECISION_RECALL_TOOLS
+        or item.get("status") != "inProgress"
+    ):
+        return None
+    arguments = item.get("arguments")
+    if not isinstance(arguments, Mapping):
+        raise InvalidAppServerResponse(
+            "active ZDecision MCP arguments are invalid"
+        )
+    field_name = (
+        "activation_binding_id"
+        if tool_name == "activate_zdecision_recall"
+        else "turn_gate_id"
+    )
+    try:
+        return _bounded_response_string(
+            arguments.get(field_name), "ZDecision operation id"
+        )
+    except ValueError as error:
+        raise InvalidAppServerResponse(
+            "active ZDecision operation id is invalid"
+        ) from error
 
 
 def _mcp_zdecision_ids(

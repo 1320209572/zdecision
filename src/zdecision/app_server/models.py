@@ -153,6 +153,7 @@ class TurnItemEvidence:
     ]
     item_id: str
     tool_name: str | None = None
+    operation_id: str | None = None
     receipt_id: str | None = None
     probe_id: str | None = None
 
@@ -171,6 +172,10 @@ class TurnItemEvidence:
             _bounded_identifier(self.tool_name, "tool_name")
             if self.item_type != "mcpToolCall":
                 raise ValueError("tool_name is only valid for mcpToolCall")
+        if self.operation_id is not None:
+            _bounded_identifier(self.operation_id, "operation_id")
+            if self.item_type != "mcpToolCall":
+                raise ValueError("operation_id is only valid for mcpToolCall")
         for field_name, value in (
             ("receipt_id", self.receipt_id),
             ("probe_id", self.probe_id),

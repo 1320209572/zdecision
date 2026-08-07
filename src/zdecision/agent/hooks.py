@@ -14,7 +14,11 @@ from pathlib import Path
 from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import HookInvocation, HookResponse, InvalidHookInvocation
-from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
+from zdecision.agent.recall_host_state import (
+    RecallGateConflict,
+    RecallHostStore,
+    installed_recall_skill_path,
+)
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.ids import product_id
 from zdecision.jsonio import canonical_json_bytes
@@ -200,6 +204,7 @@ def bind_recall_tool_call(
             database=database,
             repository_resolver=repository_resolver,
         )
+        plugin_root = _trusted_plugin_root()
         tool_name = value.get("tool_name")
         if tool_name == ACTIVATE_RECALL_TOOL:
             binding_id = (
@@ -214,6 +219,7 @@ def bind_recall_tool_call(
                 cwd=cwd,
                 binding_id=binding_id,
                 now=_parse_time(_format_time(clock())),
+                plugin_root=plugin_root,
             )
             return _pre_tool_response(
                 "allow", updated_input={"activation_binding_id": binding_id}
@@ -238,6 +244,7 @@ def bind_recall_tool_call(
             intent_epoch=session.intent_epoch,
             active_generation=None,
             gate_id=gate_id,
+            plugin_root=plugin_root,
         )
         return _pre_tool_response(
             "allow", updated_input={"turn_gate_id": gate_id}
@@ -311,6 +318,13 @@ def _handle_recall_lifecycle(
                 return _additional_context(
                     "UserPromptSubmit", _blocked_envelope("invalid_native_turn")
                 )
+            try:
+                plugin_root = _trusted_plugin_root()
+            except ValueError:
+                return _additional_context(
+                    "UserPromptSubmit",
+                    _blocked_envelope("plugin_runtime_unavailable"),
+                )
             gate_id = _turn_gate_id(
                 invocation.session_id,
                 invocation.turn_id,
@@ -327,6 +341,7 @@ def _handle_recall_lifecycle(
                     intent_epoch=session.intent_epoch,
                     active_generation=None,
                     gate_id=gate_id,
+                    plugin_root=plugin_root,
                 )
             except RecallGateConflict:
                 return _additional_context(
@@ -509,6 +524,13 @@ def _trusted_recall_coordinates(
     if not database.has_open_observed_turn(session_id, turn_id, cwd):
         raise ValueError("host Turn was not observed")
     return session_id, turn_id, cwd
+
+
+def _trusted_plugin_root() -> str:
+    skill_path = installed_recall_skill_path(os.environ.get("PLUGIN_ROOT"))
+    if skill_path is None:
+        raise ValueError("trusted plugin root is unavailable")
+    return str(skill_path.parents[2])
 
 
 def _turn_gate_id(

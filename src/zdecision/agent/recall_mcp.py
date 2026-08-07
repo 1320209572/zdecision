@@ -166,7 +166,15 @@ class RecallMcpTools:
             if self._has_later_gate(session.session_id, receipt["gate_id"]):
                 return _blocked("invalid_binding")
             return self._reconcile_receipt(receipt, session, turn_id)
-        if not self._native_selection_proven(session, turn_id):
+        if not self._active_turn_barrier_proven(
+            session,
+            turn_id,
+            tool_name="activate_zdecision_recall",
+            operation_id=activation_binding_id,
+            binding_kind="activation",
+            binding_id=activation_binding_id,
+            require_native_selection=True,
+        ):
             return _blocked("native_selection_unproven")
         return self._claim_provider_result(
             kind="activation",
@@ -179,11 +187,26 @@ class RecallMcpTools:
             invoke=lambda: self.provider.activate(parsed),
         )
 
-    def _native_selection_proven(
-        self, session: RecallSession, turn_id: str
+    def _active_turn_barrier_proven(
+        self,
+        session: RecallSession,
+        turn_id: str,
+        *,
+        tool_name: str,
+        operation_id: str,
+        binding_kind: str,
+        binding_id: str,
+        require_native_selection: bool,
     ) -> bool:
         factory = self.evidence_gateway_factory
         recall_skill_path = self.recall_skill_path
+        if recall_skill_path is None:
+            try:
+                recall_skill_path = self.host_store.bound_recall_skill_path(
+                    binding_kind, binding_id
+                )
+            except Exception:
+                recall_skill_path = None
         if (
             factory is None
             or recall_skill_path is None
@@ -216,9 +239,32 @@ class RecallMcpTools:
             or evidence.thread.cwd != self.cwd
         ):
             return False
-        return any(
+        if require_native_selection and not any(
             Path(selected.path).resolve(strict=False) == recall_skill_path
             for selected in evidence.selected_skills
+        ):
+            return False
+        matching_items = [
+            (index, item)
+            for index, item in enumerate(evidence.ordered_items)
+            if item.item_type == "mcpToolCall" and item.tool_name == tool_name
+        ]
+        if len(matching_items) != 1:
+            return False
+        target_index, target = matching_items[0]
+        if target.operation_id != operation_id:
+            return False
+        if not any(
+            item.item_type == "hookPrompt"
+            for item in evidence.ordered_items[:target_index]
+        ):
+            return False
+        substantive_types = frozenset(
+            ("agentMessage", "commandExecution", "fileChange")
+        )
+        return not any(
+            item.item_type in substantive_types
+            for item in evidence.ordered_items[:target_index]
         )
 
     def gate_zdecision_turn(
@@ -236,6 +282,16 @@ class RecallMcpTools:
             if receipt["intent_digest"] != parsed.digest:
                 return _blocked("binding_replayed")
             return self._reconcile_receipt(receipt, session, turn_id)
+        if not self._active_turn_barrier_proven(
+            session,
+            turn_id,
+            tool_name="gate_zdecision_turn",
+            operation_id=turn_gate_id,
+            binding_kind="turn",
+            binding_id=turn_gate_id,
+            require_native_selection=False,
+        ):
+            return _blocked("host_gate_unavailable")
         return self._claim_provider_result(
             kind="turn",
             binding_id=turn_gate_id,

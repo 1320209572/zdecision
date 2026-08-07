@@ -65,6 +65,40 @@ class RecallHookGateTests(unittest.TestCase):
             "remote", "add", "origin", "https://github.com/OpenAI/example.git"
         )
         self.database_path = self.root / "state" / "zdecision.sqlite3"
+        self.plugin_root = self.root / "plugin-cache/zdecision/0.1.0"
+        recall_skill = self.plugin_root / "skills/decision-recall/SKILL.md"
+        recall_skill.parent.mkdir(parents=True)
+        recall_skill.write_text("---\nname: decision-recall\n---\n", "utf-8")
+        (self.plugin_root / ".codex-plugin").mkdir()
+        (self.plugin_root / ".codex-plugin/plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "zdecision",
+                    "version": "0.1.0",
+                    "skills": "./skills/",
+                    "mcpServers": "./.mcp.json",
+                }
+            ),
+            "utf-8",
+        )
+        (self.plugin_root / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "zdecision-local": {
+                            "command": "zdecision-agent",
+                            "args": ["mcp"],
+                        }
+                    }
+                }
+            ),
+            "utf-8",
+        )
+        environment = patch.dict(
+            "os.environ", {"PLUGIN_ROOT": str(self.plugin_root)}, clear=False
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.database = AgentDatabase.open(self.database_path)
         self.addCleanup(self.database.close)
         self.recall_store = RecallHostStore.open(self.database_path)
@@ -248,7 +282,25 @@ class RecallHookGateTests(unittest.TestCase):
             response.output.get("hookSpecificOutput", {}).get("updatedInput"),
         )
         self.assertEqual("active", self.recall_store.get_session("session-a").state)
+        self.assertEqual(
+            (self.plugin_root / "skills/decision-recall/SKILL.md").resolve(),
+            self.recall_store.bound_recall_skill_path(
+                "activation", ACTIVATION_ID
+            ),
+        )
         self.assert_private_values_absent(response)
+
+    def test_activation_denies_an_unverified_plugin_root(self) -> None:
+        """This catches arbitrary Hook environment paths becoming authority."""
+
+        self._prompt()
+        with patch.dict(
+            "os.environ", {"PLUGIN_ROOT": str(self.repository)}, clear=False
+        ):
+            response = self._pre_tool(ACTIVATE_RECALL_TOOL)
+
+        self.assertEqual("deny", self._decision(response))
+        self.assertIsNone(self.recall_store.get_session("session-a"))
 
     def test_active_prompt_creates_pending_gate_and_bounded_instruction(self) -> None:
         self._activate()
@@ -267,6 +319,7 @@ class RecallHookGateTests(unittest.TestCase):
             intent_epoch=0,
             active_generation=None,
             gate_id=GATE_ID,
+            plugin_root=str(self.plugin_root),
         )
         self.assertEqual("pending", gate.state)
 

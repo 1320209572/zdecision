@@ -28,6 +28,7 @@ from zdecision.app_server.models import (
     ActiveTurnEvidence,
     SelectedSkill,
     ThreadIdentity,
+    TurnItemEvidence,
 )
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.recall.session import HostProbeEnvelope, RecallIntent, TurnGateResult
@@ -133,6 +134,32 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.recall_skill_path.parent.mkdir(parents=True)
         self.recall_skill_path.write_text("---\nname: decision-recall\n---\n", "utf-8")
+        self.installed_plugin_root = self.recall_skill_path.parents[2]
+        (self.installed_plugin_root / ".codex-plugin").mkdir()
+        (self.installed_plugin_root / ".codex-plugin/plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "zdecision",
+                    "version": "0.1.0",
+                    "skills": "./skills/",
+                    "mcpServers": "./.mcp.json",
+                }
+            ),
+            "utf-8",
+        )
+        (self.installed_plugin_root / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "zdecision-local": {
+                            "command": "zdecision-agent",
+                            "args": ["mcp"],
+                        }
+                    }
+                }
+            ),
+            "utf-8",
+        )
         self.database_path = self.root / "agent" / "zdecision.sqlite3"
         self.database = AgentDatabase.open(self.database_path)
         self.addCleanup(self.database.close)
@@ -146,6 +173,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             cwd=self.cwd,
             binding_id=ACTIVATION_BINDING,
             now=NOW,
+            plugin_root=str(self.installed_plugin_root),
         )
 
     def active_evidence(
@@ -157,6 +185,9 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         session_tree_id: str | None = None,
         forked_from_id: str | None = None,
         selected_path: Path | None = None,
+        ordered_items: tuple[TurnItemEvidence, ...] | None = None,
+        activation_operation_id: str = ACTIVATION_BINDING,
+        gate_operation_id: str = TURN_GATE,
     ) -> ActiveTurnEvidence:
         return ActiveTurnEvidence(
             thread=ThreadIdentity(
@@ -174,7 +205,25 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
                     path=str((selected_path or self.recall_skill_path).resolve()),
                 ),
             ),
-            ordered_items=(),
+            ordered_items=(
+                (
+                    TurnItemEvidence("hookPrompt", "hook-current"),
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "activation-current",
+                        tool_name="activate_zdecision_recall",
+                        operation_id=activation_operation_id,
+                    ),
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "gate-current",
+                        tool_name="gate_zdecision_turn",
+                        operation_id=gate_operation_id,
+                    ),
+                )
+                if ordered_items is None
+                else ordered_items
+            ),
         )
 
     def tools(
@@ -206,6 +255,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             intent_epoch=0,
             active_generation=None,
             gate_id=TURN_GATE,
+            plugin_root=str(self.installed_plugin_root),
         )
 
     def assert_private_absent(self, value: object) -> None:
@@ -295,6 +345,199 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(gateway.closed)
         self.assertEqual(1, provider.activation_calls)
 
+    def test_activation_enforces_first_answer_barrier_before_provider(self) -> None:
+        """This catches missing, late, stale, or duplicate current activation items."""
+
+        self.bind_activation()
+        cases = (
+            (),
+            (
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "activation-current",
+                    tool_name="activate_zdecision_recall",
+                    operation_id=ACTIVATION_BINDING,
+                ),
+                TurnItemEvidence("hookPrompt", "hook-late"),
+            ),
+            (
+                TurnItemEvidence("hookPrompt", "hook-current"),
+                TurnItemEvidence("agentMessage", "answer-before-gate"),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "activation-current",
+                    tool_name="activate_zdecision_recall",
+                    operation_id=ACTIVATION_BINDING,
+                ),
+            ),
+            (
+                TurnItemEvidence("hookPrompt", "hook-current"),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "activation-old",
+                    tool_name="activate_zdecision_recall",
+                    operation_id="old-activation-binding",
+                ),
+            ),
+            (
+                TurnItemEvidence("hookPrompt", "hook-current"),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "activation-one",
+                    tool_name="activate_zdecision_recall",
+                    operation_id=ACTIVATION_BINDING,
+                ),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "activation-two",
+                    tool_name="activate_zdecision_recall",
+                    operation_id=ACTIVATION_BINDING,
+                ),
+            ),
+        )
+
+        for ordered_items in cases:
+            with self.subTest(ordered_items=ordered_items):
+                provider = StaticProvider(_probe())
+                gateway = StaticEvidenceGateway(
+                    self.active_evidence(ordered_items=ordered_items)
+                )
+                result = self.tools(
+                    provider,
+                    evidence_gateway_factory=lambda gateway=gateway: gateway,
+                ).activate_zdecision_recall(
+                    activation_binding_id=ACTIVATION_BINDING,
+                    intent=_intent(),
+                )
+                self.assertEqual(
+                    {"state": "blocked", "code": "native_selection_unproven"},
+                    result,
+                )
+                self.assertEqual(0, provider.activation_calls)
+
+    def test_context_compaction_is_not_substantive_barrier_output(self) -> None:
+        """This catches compaction alone being mistaken for an answer or mutation."""
+
+        self.bind_activation()
+        provider = StaticProvider(_probe())
+        evidence = self.active_evidence(
+            ordered_items=(
+                TurnItemEvidence("contextCompaction", "compact-before"),
+                TurnItemEvidence("hookPrompt", "hook-current"),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "activation-current",
+                    tool_name="activate_zdecision_recall",
+                    operation_id=ACTIVATION_BINDING,
+                ),
+            )
+        )
+
+        result = self.tools(
+            provider,
+            evidence_gateway_factory=lambda: StaticEvidenceGateway(evidence),
+        ).activate_zdecision_recall(
+            activation_binding_id=ACTIVATION_BINDING,
+            intent=_intent(),
+        )
+
+        self.assertEqual("active", result["state"])
+        self.assertEqual(1, provider.activation_calls)
+
+    def test_installed_skill_path_accepts_only_the_runtime_bound_copy(self) -> None:
+        """This catches the source checkout masquerading as the installed Skill."""
+
+        self.bind_activation()
+        source_skill = (
+            Path(mcp_server.__file__).resolve().parents[3]
+            / "plugins/zdecision/skills/decision-recall/SKILL.md"
+        )
+        self.assertNotEqual(source_skill.resolve(), self.recall_skill_path.resolve())
+        provider = StaticProvider(_probe())
+        bound_tools = RecallMcpTools(
+            host_store=self.store,
+            provider=provider,
+            cwd=self.cwd,
+            live_acceptance=True,
+            evidence_gateway_factory=lambda: StaticEvidenceGateway(
+                self.active_evidence(selected_path=source_skill)
+            ),
+            recall_skill_path=None,
+        )
+        rejected = bound_tools.activate_zdecision_recall(
+            activation_binding_id=ACTIVATION_BINDING,
+            intent=_intent(),
+        )
+        bound_tools.evidence_gateway_factory = lambda: StaticEvidenceGateway(
+            self.active_evidence(selected_path=self.recall_skill_path)
+        )
+        accepted = bound_tools.activate_zdecision_recall(
+            activation_binding_id=ACTIVATION_BINDING,
+            intent=_intent(),
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "native_selection_unproven"},
+            rejected,
+        )
+        self.assertEqual("active", accepted["state"])
+        self.assertEqual(1, provider.activation_calls)
+
+    def test_tampered_bound_plugin_fails_closed_before_provider(self) -> None:
+        """This catches a once-bound plugin root bypassing later file tampering."""
+
+        self.bind_activation()
+        self.recall_skill_path.write_text(
+            "---\nname: decision-recall\n---\nTAMPERED\n", "utf-8"
+        )
+        provider = StaticProvider(_probe())
+        result = RecallMcpTools(
+            host_store=self.store,
+            provider=provider,
+            cwd=self.cwd,
+            evidence_gateway_factory=lambda: StaticEvidenceGateway(
+                self.active_evidence()
+            ),
+            recall_skill_path=None,
+        ).activate_zdecision_recall(
+            activation_binding_id=ACTIVATION_BINDING,
+            intent=_intent(),
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "native_selection_unproven"}, result
+        )
+        self.assertEqual(0, provider.activation_calls)
+
+    def test_unbound_plugin_root_fails_closed_before_provider(self) -> None:
+        """This catches legacy or non-Hook bindings gaining installed-path authority."""
+
+        self.store.bind_activation(
+            session_id=PRIVATE_SESSION,
+            turn_id=PRIVATE_TURN,
+            cwd=self.cwd,
+            binding_id=ACTIVATION_BINDING,
+            now=NOW,
+        )
+        provider = StaticProvider(_probe())
+        result = RecallMcpTools(
+            host_store=self.store,
+            provider=provider,
+            cwd=self.cwd,
+            evidence_gateway_factory=lambda: StaticEvidenceGateway(
+                self.active_evidence()
+            ),
+            recall_skill_path=None,
+        ).activate_zdecision_recall(
+            activation_binding_id=ACTIVATION_BINDING,
+            intent=_intent(),
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "native_selection_unproven"}, result
+        )
+        self.assertEqual(0, provider.activation_calls)
+
     def test_activation_rejects_unproven_turn_path_or_cwd_evidence(self) -> None:
         """This catches Prompt text, another Skill, or nearby identity authorizing recall."""
 
@@ -354,6 +597,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             turn_id=child_turn,
             session_tree_id=root_thread,
             forked_from_id=root_thread,
+            activation_operation_id=binding_id,
         )
         gateway = StaticEvidenceGateway(evidence)
 
@@ -412,6 +656,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         """This catches receipt transactions leaking SQLite handles until GC."""
 
         self.bind_activation()
+        gc.collect()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ResourceWarning)
             self.tools().activate_zdecision_recall(
@@ -463,6 +708,100 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, replay)
         self.assertEqual(1, provider.gate_calls)
         self.assert_private_absent(first)
+
+    def test_gate_enforces_current_turn_barrier_before_provider(self) -> None:
+        """This catches unreadable, missing, late, stale, or duplicate gate items."""
+
+        self.seed_pending_turn()
+        cases: tuple[ActiveTurnEvidence | BaseException, ...] = (
+            RuntimeError("controlled app-server unavailable"),
+            self.active_evidence(ordered_items=()),
+            self.active_evidence(
+                ordered_items=(
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "gate-current",
+                        tool_name="gate_zdecision_turn",
+                        operation_id=TURN_GATE,
+                    ),
+                    TurnItemEvidence("hookPrompt", "hook-late"),
+                )
+            ),
+            self.active_evidence(
+                ordered_items=(
+                    TurnItemEvidence("hookPrompt", "hook-current"),
+                    TurnItemEvidence("commandExecution", "command-before-gate"),
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "gate-current",
+                        tool_name="gate_zdecision_turn",
+                        operation_id=TURN_GATE,
+                    ),
+                )
+            ),
+            self.active_evidence(
+                ordered_items=(
+                    TurnItemEvidence("hookPrompt", "hook-current"),
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "gate-old",
+                        tool_name="gate_zdecision_turn",
+                        operation_id="old-turn-gate",
+                    ),
+                )
+            ),
+            self.active_evidence(
+                ordered_items=(
+                    TurnItemEvidence("hookPrompt", "hook-current"),
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "gate-one",
+                        tool_name="gate_zdecision_turn",
+                        operation_id=TURN_GATE,
+                    ),
+                    TurnItemEvidence(
+                        "mcpToolCall",
+                        "gate-two",
+                        tool_name="gate_zdecision_turn",
+                        operation_id=TURN_GATE,
+                    ),
+                )
+            ),
+        )
+
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                provider = StaticProvider(_probe("probe-turn"))
+                result = self.tools(
+                    provider,
+                    evidence_gateway_factory=(
+                        lambda evidence=evidence: StaticEvidenceGateway(evidence)
+                    ),
+                ).gate_zdecision_turn(turn_gate_id=TURN_GATE, intent=_intent())
+
+                self.assertEqual(
+                    {"state": "blocked", "code": "host_gate_unavailable"},
+                    result,
+                )
+                self.assertEqual(0, provider.gate_calls)
+
+    def test_gate_uses_the_exact_hook_bound_plugin_bundle(self) -> None:
+        """This catches production gate calls depending on MCP cwd or environment."""
+
+        self.seed_pending_turn()
+        provider = StaticProvider(_probe("probe-turn"))
+        result = RecallMcpTools(
+            host_store=self.store,
+            provider=provider,
+            cwd=self.cwd,
+            evidence_gateway_factory=lambda: StaticEvidenceGateway(
+                self.active_evidence()
+            ),
+            recall_skill_path=None,
+        ).gate_zdecision_turn(turn_gate_id=TURN_GATE, intent=_intent())
+
+        self.assertEqual("active", result["state"])
+        self.assertEqual(1, provider.gate_calls)
 
     def test_gate_reconciles_crash_after_commit_before_receipt_ack(self) -> None:
         """This catches a crash window rerunning the provider after durable commit."""
@@ -720,13 +1059,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(captured[0], mcp_server.LocalMcpTools)
         self.assertIsInstance(captured[1], RecallMcpTools)
         self.assertIsNotNone(captured[1].evidence_gateway_factory)
-        self.assertEqual(
-            (
-                Path(mcp_server.__file__).resolve().parents[3]
-                / "plugins/zdecision/skills/decision-recall/SKILL.md"
-            ).resolve(),
-            captured[1].recall_skill_path,
-        )
+        self.assertIsNone(captured[1].recall_skill_path)
         self.assertEqual("stdio", server.transport)
 
 
