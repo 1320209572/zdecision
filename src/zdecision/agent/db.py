@@ -18,6 +18,7 @@ from zdecision.agent.events import (
     event_id_for,
     RepositorySnapshot,
 )
+from zdecision.capture.provenance import PromptAnchor, prompt_anchor_receipt_id
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.jsonio import canonical_json_bytes
 
@@ -240,6 +241,89 @@ class AgentDatabase:
             "SELECT * FROM events WHERE session_id = ? ORDER BY rowid", (session_id,)
         ).fetchall()
         return tuple(self._event_from_row(row) for row in rows)
+
+    def prompt_anchors_between(
+        self,
+        *,
+        session_id: str,
+        cwd: str,
+        repository_id: str,
+        previous_handled_event_id: str | None,
+        upper_stop_event_id: str,
+    ) -> tuple[PromptAnchor, ...]:
+        """Return canonical Hook prompt anchors inside one frozen Stop window."""
+
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is invalid")
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise ValueError("cwd is invalid")
+        if not isinstance(repository_id, str) or _REPOSITORY_ID.fullmatch(repository_id) is None:
+            raise ValueError("repository_id is invalid")
+        if not isinstance(upper_stop_event_id, str) or not upper_stop_event_id:
+            raise ValueError("upper_stop_event_id is invalid")
+        if previous_handled_event_id is not None and (
+            not isinstance(previous_handled_event_id, str)
+            or not previous_handled_event_id
+        ):
+            raise ValueError("previous_handled_event_id is invalid")
+
+        upper = self._connection.execute(
+            """
+            SELECT rowid
+            FROM events
+            WHERE event_id = ?
+              AND event_type = 'Stop'
+              AND session_id = ?
+              AND cwd = ?
+              AND repository_id = ?
+            """,
+            (upper_stop_event_id, session_id, cwd, repository_id),
+        ).fetchone()
+        if upper is None:
+            raise ValueError("upper Stop boundary is invalid")
+        lower_rowid = 0
+        if previous_handled_event_id is not None:
+            lower = self._connection.execute(
+                """
+                SELECT rowid
+                FROM events
+                WHERE event_id = ?
+                  AND event_type = 'Stop'
+                  AND session_id = ?
+                  AND cwd = ?
+                  AND repository_id = ?
+                """,
+                (previous_handled_event_id, session_id, cwd, repository_id),
+            ).fetchone()
+            if lower is None or lower["rowid"] >= upper["rowid"]:
+                raise ValueError("lower Stop boundary is invalid")
+            lower_rowid = lower["rowid"]
+        prompts = self._connection.execute(
+            """
+            SELECT event_id, turn_id
+            FROM events
+            WHERE event_type = 'UserPromptSubmit'
+              AND session_id = ?
+              AND cwd = ?
+              AND repository_id = ?
+              AND rowid > ?
+              AND rowid <= ?
+            ORDER BY rowid
+            """,
+            (session_id, cwd, repository_id, lower_rowid, upper["rowid"]),
+        ).fetchall()
+        if len(prompts) > 100:
+            raise ValueError("prompt anchor limit exceeded")
+        return tuple(
+            PromptAnchor(
+                receipt_id=prompt_anchor_receipt_id(row["event_id"]),
+                hook_event_id=row["event_id"],
+                turn_id=row["turn_id"],
+                anchor_ordinal=ordinal,
+                active_reference_set_digest=None,
+            )
+            for ordinal, row in enumerate(prompts, start=1)
+        )
 
     def latest_open_boundary(self, cwd: str) -> tuple[str, str] | None:
         event = self.latest_turn_event(cwd)

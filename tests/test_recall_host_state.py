@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -152,6 +153,49 @@ class RecallHostStoreTests(unittest.TestCase):
         self.assertEqual("intent-a", session.active_intent_digest)
         self.assertEqual(ACTIVE_SET_DIGEST, session.active_set_digest)
         self.assertEqual(TURN_ID, session.last_gate_turn_id)
+
+    def test_committed_gate_records_per_turn_reference_state_version(self) -> None:
+        """This catches treating a new empty reference set as legacy unknown state."""
+
+        self.activate()
+        self.begin_gate()
+        committed = self.commit_gate(active_set_digest=None)
+
+        self.assertEqual(None, committed.active_set_digest)
+        self.assertEqual(1, committed.reference_state_version)
+
+    def test_pre_migration_committed_gate_keeps_unknown_reference_state(self) -> None:
+        """This catches migration backfilling a legacy gate from current Session state."""
+
+        self.store.close()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("DROP TABLE recall_turn_gates")
+            connection.execute(
+                """
+                CREATE TABLE recall_turn_gates (
+                    gate_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL, context_epoch INTEGER NOT NULL,
+                    intent_epoch INTEGER NOT NULL, active_generation INTEGER,
+                    state TEXT NOT NULL, result_digest TEXT, commit_fingerprint TEXT,
+                    plugin_root TEXT, plugin_bundle_digest TEXT,
+                    UNIQUE(session_id, turn_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recall_turn_gates VALUES (?, ?, ?, 0, 1, NULL,
+                    'committed', ?, ?, NULL, NULL)
+                """,
+                (GATE_ID, SESSION_ID, TURN_ID, "a" * 64, "b" * 64),
+            )
+            connection.commit()
+        self.store = RecallHostStore.open(self.path)
+
+        legacy = self.store.require_committed_gate(SESSION_ID, TURN_ID)
+
+        self.assertIsNone(legacy.active_set_digest)
+        self.assertIsNone(legacy.reference_state_version)
 
     def test_invalid_result_blocks_current_turn_without_replacing_active_set(self) -> None:
         """This catches an invalid replay erasing prior trusted recall state."""

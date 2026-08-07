@@ -132,6 +132,100 @@ class SessionIndexTest(unittest.TestCase):
         self.assertEqual(["turn_1"], [item.upper_turn_id for item in first])
         self.assertEqual(["turn_2"], [item.upper_turn_id for item in second])
         self.assertEqual("turn_1", second[0].previous_handled_turn_id)
+        self.assertEqual(first[0].upper_stop_event_id, second[0].previous_handled_event_id)
+
+    def test_freeze_and_acknowledgement_preserve_event_boundaries(self) -> None:
+        """This catches a replay recomputing event boundaries from later activity."""
+
+        first_stop = observed_event("Stop", "session_a", "turn_1")
+        self.index.observe(first_stop)
+        frozen = self.index.freeze_sources(
+            FIRST_REQUEST_ID, REPOSITORY_ID, NOW, capture_scope="all_valid_sessions"
+        )
+        self.index.acknowledge(FIRST_REQUEST_ID, "a" * 64, NOW)
+        second_stop = observed_event(
+            "Stop", "session_a", "turn_2", observed="2026-07-30T01:01:00+00:00"
+        )
+        self.index.observe(second_stop)
+        next_sources = self.index.freeze_sources(
+            SECOND_REQUEST_ID, REPOSITORY_ID, NOW, capture_scope="all_valid_sessions"
+        )
+
+        self.assertEqual(first_stop.event_id, frozen[0].upper_stop_event_id)
+        self.assertIsNone(frozen[0].previous_handled_event_id)
+        self.assertEqual(first_stop.event_id, next_sources[0].previous_handled_event_id)
+        self.assertEqual(second_stop.event_id, next_sources[0].upper_stop_event_id)
+
+    def test_old_boundary_tables_open_with_null_event_boundaries(self) -> None:
+        """This catches migration inferring event boundaries from legacy Turn state."""
+
+        self.index.close()
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            connection.execute("DROP TABLE session_checkpoints")
+            connection.execute("DROP TABLE capture_request_sources")
+            connection.execute(
+                """
+                CREATE TABLE session_checkpoints (
+                    source_key TEXT PRIMARY KEY, repository_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL, cwd TEXT NOT NULL, lineage TEXT NOT NULL,
+                    latest_turn_id TEXT NOT NULL, latest_event_id TEXT NOT NULL,
+                    latest_observed_at TEXT NOT NULL,
+                    latest_source_fingerprint TEXT NOT NULL, handled_turn_id TEXT,
+                    handled_source_fingerprint TEXT, latest_head_commit TEXT,
+                    handled_head_commit TEXT, excluded_reason TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE capture_request_sources (
+                    request_id TEXT NOT NULL, source_key TEXT NOT NULL,
+                    repository_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL, lineage TEXT NOT NULL,
+                    previous_handled_turn_id TEXT, upper_turn_id TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    previous_handled_head_commit TEXT, upper_head_commit TEXT,
+                    state TEXT NOT NULL, excluded_reason TEXT, frozen_at TEXT NOT NULL,
+                    acknowledged_at TEXT, acknowledgement_digest TEXT,
+                    PRIMARY KEY(request_id, source_key)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO session_checkpoints VALUES (
+                    'src_old', ?, 'session_old', '/workspace/product', 'lin_old',
+                    'turn_handled', 'evt_latest', '2026-07-30T01:00:00Z',
+                    ?, 'turn_handled', ?, NULL, NULL, NULL
+                )
+                """,
+                (REPOSITORY_ID, "a" * 64, "b" * 64),
+            )
+            connection.execute(
+                """
+                INSERT INTO capture_request_sources VALUES (
+                    ?, 'src_old', ?, 'session_old', '/workspace/product', 'lin_old',
+                    'turn_handled', 'turn_upper', ?, NULL, NULL, 'frozen', NULL,
+                    ?, NULL, NULL
+                )
+                """,
+                (FIRST_REQUEST_ID, REPOSITORY_ID, "a" * 64, NOW.isoformat()),
+            )
+            connection.commit()
+
+        self.index = SessionIndex.open(self.database_path)
+        checkpoint = self.index._connection.execute(
+            "SELECT handled_event_id FROM session_checkpoints WHERE source_key = 'src_old'"
+        ).fetchone()
+        source = self.index._connection.execute(
+            """SELECT previous_handled_event_id, upper_stop_event_id
+               FROM capture_request_sources WHERE request_id = ?""",
+            (FIRST_REQUEST_ID,),
+        ).fetchone()
+
+        self.assertIsNone(checkpoint["handled_event_id"])
+        self.assertIsNone(source["previous_handled_event_id"])
+        self.assertIsNone(source["upper_stop_event_id"])
 
     def test_failed_request_does_not_advance_handled_checkpoint(self) -> None:
         self.index.observe(observed_event("Stop", "session_a", "turn_1"))

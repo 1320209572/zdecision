@@ -43,6 +43,8 @@ class TurnGate:
     active_generation: int | None
     state: TurnGateState
     result_digest: str | None
+    active_set_digest: str | None = None
+    reference_state_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,8 @@ class RecallHostStore:
                     )),
                     result_digest TEXT,
                     commit_fingerprint TEXT,
+                    active_set_digest TEXT,
+                    reference_state_version INTEGER,
                     plugin_root TEXT,
                     plugin_bundle_digest TEXT,
                     UNIQUE(session_id, turn_id)
@@ -174,6 +178,16 @@ class RecallHostStore:
             if "commit_fingerprint" not in columns:
                 connection.execute(
                     "ALTER TABLE recall_turn_gates ADD COLUMN commit_fingerprint TEXT"
+                )
+            if "active_set_digest" not in columns:
+                connection.execute(
+                    "ALTER TABLE recall_turn_gates ADD COLUMN "
+                    "active_set_digest TEXT"
+                )
+            if "reference_state_version" not in columns:
+                connection.execute(
+                    "ALTER TABLE recall_turn_gates ADD COLUMN "
+                    "reference_state_version INTEGER"
                 )
             if "plugin_root" not in columns:
                 connection.execute(
@@ -469,10 +483,11 @@ class RecallHostStore:
             self._connection.execute(
                 """
                 UPDATE recall_turn_gates
-                SET state = 'committed', result_digest = ?, commit_fingerprint = ?
+                SET state = 'committed', result_digest = ?, commit_fingerprint = ?,
+                    active_set_digest = ?, reference_state_version = 1
                 WHERE gate_id = ?
                 """,
-                (digest, fingerprint, gate["gate_id"]),
+                (digest, fingerprint, active_set, gate["gate_id"]),
             )
             self._connection.execute(
                 """
@@ -843,6 +858,8 @@ def _gate(row: sqlite3.Row | None) -> TurnGate:
         active_generation=row["active_generation"],
         state=row["state"],
         result_digest=row["result_digest"],
+        active_set_digest=row["active_set_digest"],
+        reference_state_version=row["reference_state_version"],
     )
 
 

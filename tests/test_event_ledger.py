@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import subprocess
 import tempfile
@@ -105,6 +106,154 @@ class EventLedgerTests(unittest.TestCase):
             repository_resolver=self.repository_resolver,
             worker_waker=lambda _: None,
         )
+
+    def test_prompt_anchors_are_bounded_by_exact_stop_rows_in_append_order(self) -> None:
+        """This catches querying prompts by Turn text, recency, or an unbound Stop."""
+
+        sentinel = "PROMPT-MUST-NEVER-PERSIST-6C79"
+        prompt_one = self._handle(
+            self._raw("UserPromptSubmit", turn_id="turn_one", prompt=sentinel)
+        )
+        stop_one = self._handle(self._raw("Stop", turn_id="turn_one"))
+        prompt_two = self._handle(
+            self._raw("UserPromptSubmit", turn_id="turn_two", prompt=sentinel)
+        )
+        stop_two = self._handle(self._raw("Stop", turn_id="turn_two"))
+        post_boundary = self._handle(
+            self._raw("UserPromptSubmit", turn_id="turn_three", prompt=sentinel)
+        )
+
+        first_window = self.database.prompt_anchors_between(
+            session_id="thr_fixture",
+            cwd=str(self.repository),
+            repository_id=self.snapshot.repository_id,
+            previous_handled_event_id=None,
+            upper_stop_event_id=stop_two.event_id,
+        )
+        second_window = self.database.prompt_anchors_between(
+            session_id="thr_fixture",
+            cwd=str(self.repository),
+            repository_id=self.snapshot.repository_id,
+            previous_handled_event_id=stop_one.event_id,
+            upper_stop_event_id=stop_two.event_id,
+        )
+
+        self.assertEqual(
+            (prompt_one.event_id, prompt_two.event_id),
+            tuple(item.hook_event_id for item in first_window),
+        )
+        self.assertEqual(
+            ("turn_one", "turn_two"),
+            tuple(item.turn_id for item in first_window),
+        )
+        self.assertEqual((1, 2), tuple(item.anchor_ordinal for item in first_window))
+        self.assertEqual(
+            (prompt_two.event_id,),
+            tuple(item.hook_event_id for item in second_window),
+        )
+        self.assertNotIn(
+            post_boundary.event_id,
+            {item.hook_event_id for item in first_window},
+        )
+
+        for lower, upper in (
+            ("evt_" + "f" * 32, stop_two.event_id),
+            (stop_two.event_id, stop_one.event_id),
+            (stop_two.event_id, stop_two.event_id),
+        ):
+            with self.subTest(lower=lower, upper=upper):
+                with self.assertRaises(ValueError):
+                    self.database.prompt_anchors_between(
+                        session_id="thr_fixture",
+                        cwd=str(self.repository),
+                        repository_id=self.snapshot.repository_id,
+                        previous_handled_event_id=lower,
+                        upper_stop_event_id=upper,
+                    )
+        for session_id, cwd, repository_id in (
+            ("thr_other", str(self.repository), self.snapshot.repository_id),
+            ("thr_fixture", "/wrong/cwd", self.snapshot.repository_id),
+            ("thr_fixture", str(self.repository), "repo_" + "f" * 32),
+        ):
+            with self.subTest(session_id=session_id, cwd=cwd, repository_id=repository_id):
+                with self.assertRaises(ValueError):
+                    self.database.prompt_anchors_between(
+                        session_id=session_id,
+                        cwd=cwd,
+                        repository_id=repository_id,
+                        previous_handled_event_id=None,
+                        upper_stop_event_id=stop_two.event_id,
+                    )
+
+    def test_prompt_anchor_receipts_survive_reopen_without_prompt_persistence(self) -> None:
+        """This catches storing a Prompt, prompt hash, or transcript alongside anchors."""
+
+        sentinel = "PROMPT-MUST-NEVER-PERSIST-4B82"
+        transcript = "transcript-private-4B82.jsonl"
+        prompt = self._handle(
+            self._raw(
+                "UserPromptSubmit",
+                turn_id="turn_private_anchor",
+                prompt=sentinel,
+                transcript_path=transcript,
+            )
+        )
+        stop = self._handle(self._raw("Stop", turn_id="turn_private_anchor"))
+        expected = self.database.prompt_anchors_between(
+            session_id="thr_fixture",
+            cwd=str(self.repository),
+            repository_id=self.snapshot.repository_id,
+            previous_handled_event_id=None,
+            upper_stop_event_id=stop.event_id,
+        )
+        self.database.close()
+        self.database = AgentDatabase.open(self.database_path)
+        actual = self.database.prompt_anchors_between(
+            session_id="thr_fixture",
+            cwd=str(self.repository),
+            repository_id=self.snapshot.repository_id,
+            previous_handled_event_id=None,
+            upper_stop_event_id=stop.event_id,
+        )
+
+        self.assertEqual(expected, actual)
+        self.assertEqual(prompt.event_id, actual[0].hook_event_id)
+        forbidden = (sentinel, hashlib.sha256(sentinel.encode()).hexdigest(), transcript)
+        table_names = self.database._connection.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"""
+        ).fetchall()
+        persisted_values: list[str] = []
+        for table_name in table_names:
+            name = table_name["name"]
+            columns = self.database._connection.execute(
+                f'PRAGMA table_info("{name}")'
+            ).fetchall()
+            text_or_blob = [
+                column["name"]
+                for column in columns
+                if "TEXT" in column["type"].upper()
+                or "BLOB" in column["type"].upper()
+            ]
+            if text_or_blob:
+                selected = ", ".join(f'"{column}"' for column in text_or_blob)
+                rows = self.database._connection.execute(
+                    f'SELECT {selected} FROM "{name}"'
+                ).fetchall()
+                persisted_values.extend(
+                    value.decode("utf-8", "ignore")
+                    if isinstance(value, bytes)
+                    else str(value)
+                    for row in rows
+                    for value in row
+                    if isinstance(value, (str, bytes))
+                )
+        persisted = "\n".join(
+            persisted_values
+        )
+        for value in forbidden:
+            with self.subTest(value=value):
+                self.assertNotIn(value, persisted)
 
     def test_all_five_hook_kinds_record_only_allowlisted_facts(self) -> None:
         hooks = (

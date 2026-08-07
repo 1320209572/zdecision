@@ -35,6 +35,8 @@ class FrozenSessionSource:
     source_fingerprint: str
     previous_handled_head_commit: str | None = None
     upper_head_commit: str | None = None
+    previous_handled_event_id: str | None = None
+    upper_stop_event_id: str | None = None
 
 
 class RequestModelProfileConflict(Exception):
@@ -76,6 +78,7 @@ class SessionIndex:
                     latest_source_fingerprint TEXT NOT NULL,
                     handled_turn_id TEXT,
                     handled_source_fingerprint TEXT,
+                    handled_event_id TEXT,
                     latest_head_commit TEXT,
                     handled_head_commit TEXT,
                     excluded_reason TEXT,
@@ -109,6 +112,8 @@ class SessionIndex:
                     source_fingerprint TEXT NOT NULL,
                     previous_handled_head_commit TEXT,
                     upper_head_commit TEXT,
+                    previous_handled_event_id TEXT,
+                    upper_stop_event_id TEXT,
                     state TEXT NOT NULL CHECK(
                         state IN ('frozen','excluded','acknowledged')
                     ),
@@ -164,6 +169,11 @@ class SessionIndex:
                     "ALTER TABLE session_checkpoints ADD COLUMN "
                     "handled_head_commit TEXT"
                 )
+            if "handled_event_id" not in checkpoint_columns:
+                connection.execute(
+                    "ALTER TABLE session_checkpoints ADD COLUMN "
+                    "handled_event_id TEXT"
+                )
             source_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -179,6 +189,16 @@ class SessionIndex:
                 connection.execute(
                     "ALTER TABLE capture_request_sources ADD COLUMN "
                     "upper_head_commit TEXT"
+                )
+            if "previous_handled_event_id" not in source_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_sources ADD COLUMN "
+                    "previous_handled_event_id TEXT"
+                )
+            if "upper_stop_event_id" not in source_columns:
+                connection.execute(
+                    "ALTER TABLE capture_request_sources ADD COLUMN "
+                    "upper_stop_event_id TEXT"
                 )
         return cls(database_path, connection)
 
@@ -397,7 +417,7 @@ class SessionIndex:
                     SELECT source_key, repository_id, session_id, cwd, lineage,
                            handled_turn_id, latest_turn_id,
                            latest_source_fingerprint, handled_head_commit,
-                           latest_head_commit
+                           latest_head_commit, handled_event_id, latest_event_id
                     FROM session_checkpoints
                     WHERE repository_id = ?
                       AND session_id = ?
@@ -413,7 +433,7 @@ class SessionIndex:
                     SELECT source_key, repository_id, session_id, cwd, lineage,
                            handled_turn_id, latest_turn_id,
                            latest_source_fingerprint, handled_head_commit,
-                           latest_head_commit
+                           latest_head_commit, handled_event_id, latest_event_id
                     FROM session_checkpoints
                     WHERE repository_id = ?
                       AND {changed_clause}
@@ -428,9 +448,10 @@ class SessionIndex:
                         request_id, source_key, repository_id, session_id,
                         cwd, lineage, previous_handled_turn_id, upper_turn_id,
                         source_fingerprint, previous_handled_head_commit,
-                        upper_head_commit, state, excluded_reason, frozen_at,
+                        upper_head_commit, previous_handled_event_id,
+                        upper_stop_event_id, state, excluded_reason, frozen_at,
                         acknowledged_at, acknowledgement_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'frozen', NULL,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'frozen', NULL,
                               ?, NULL, NULL)
                     """,
                     (
@@ -445,6 +466,8 @@ class SessionIndex:
                         checkpoint["latest_source_fingerprint"],
                         checkpoint["handled_head_commit"],
                         checkpoint["latest_head_commit"],
+                        self._legacy_handled_event_id(checkpoint),
+                        checkpoint["latest_event_id"],
                         timestamp,
                     ),
                 )
@@ -600,7 +623,7 @@ class SessionIndex:
             sources = self._connection.execute(
                 """
                 SELECT source_key, upper_turn_id, source_fingerprint,
-                       upper_head_commit
+                       upper_head_commit, upper_stop_event_id
                 FROM capture_request_sources
                 WHERE request_id = ?
                 ORDER BY source_key
@@ -613,13 +636,15 @@ class SessionIndex:
                     UPDATE session_checkpoints
                     SET handled_turn_id = ?,
                         handled_source_fingerprint = ?,
-                        handled_head_commit = ?
+                        handled_head_commit = ?,
+                        handled_event_id = ?
                     WHERE source_key = ?
                     """,
                     (
                         source["upper_turn_id"],
                         source["source_fingerprint"],
                         source["upper_head_commit"],
+                        source["upper_stop_event_id"],
                         source["source_key"],
                     ),
                 )
@@ -654,7 +679,8 @@ class SessionIndex:
             SELECT request_id, source_key, repository_id, session_id, cwd,
                    lineage, previous_handled_turn_id, upper_turn_id,
                    source_fingerprint, previous_handled_head_commit,
-                   upper_head_commit
+                   upper_head_commit, previous_handled_event_id,
+                   upper_stop_event_id
             FROM capture_request_sources
             WHERE request_id = ? AND excluded_reason IS NULL
             ORDER BY source_key
@@ -676,9 +702,44 @@ class SessionIndex:
                     row["previous_handled_head_commit"]
                 ),
                 upper_head_commit=row["upper_head_commit"],
+                previous_handled_event_id=row["previous_handled_event_id"],
+                upper_stop_event_id=row["upper_stop_event_id"],
             )
             for row in rows
         )
+
+    def _legacy_handled_event_id(self, checkpoint: sqlite3.Row) -> str | None:
+        """Resolve only an exact old Stop boundary; never infer one by recency."""
+
+        if checkpoint["handled_event_id"] is not None:
+            return checkpoint["handled_event_id"]
+        if checkpoint["handled_turn_id"] is None:
+            return None
+        events_table = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+        if events_table is None:
+            return None
+        matches = self._connection.execute(
+            """
+            SELECT event_id
+            FROM events
+            WHERE event_type = 'Stop'
+              AND session_id = ?
+              AND cwd = ?
+              AND repository_id = ?
+              AND turn_id = ?
+            ORDER BY rowid
+            LIMIT 2
+            """,
+            (
+                checkpoint["session_id"],
+                checkpoint["cwd"],
+                checkpoint["repository_id"],
+                checkpoint["handled_turn_id"],
+            ),
+        ).fetchall()
+        return matches[0]["event_id"] if len(matches) == 1 else None
 
 
 class SessionIndexEventProcessor:
