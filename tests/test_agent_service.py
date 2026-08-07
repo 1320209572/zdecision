@@ -9,7 +9,7 @@ from argparse import Namespace
 from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.central_client import CentralClientError
@@ -573,6 +573,40 @@ class AgentServiceTest(unittest.TestCase):
             processor.routing_store.close()
             processor.control_store.close()
             processor.capture_runner.operation_store.close()
+
+    def test_configured_processor_closes_recall_store_when_retirement_fails(
+        self,
+    ) -> None:
+        config = AgentConfig(
+            central_url="http://127.0.0.1:8765",
+            organization_id="org_demo",
+            device_id="device_demo",
+            device_token="device-secret-token",
+            repositories=(EnabledRepository(REPOSITORY_ID, True),),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = (
+                Path(directory).resolve() / "agent" / "zdecision.sqlite3"
+            )
+            database = AgentDatabase.open(state_path)
+            self.addCleanup(database.close)
+            recall_store = Mock()
+
+            with patch(
+                "zdecision.agent.recall_host_state.RecallHostStore.open",
+                return_value=recall_store,
+            ), patch.object(
+                database,
+                "retire_legacy_automatic_capture",
+                side_effect=RuntimeError("retirement failed"),
+            ), patch.object(
+                database, "close", wraps=database.close
+            ) as close_database:
+                with self.assertRaisesRegex(RuntimeError, "retirement failed"):
+                    configured_processor(database, config, state_path)
+
+            recall_store.close.assert_called_once_with()
+            close_database.assert_not_called()
 
 
 if __name__ == "__main__":

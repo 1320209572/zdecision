@@ -198,6 +198,7 @@ class OnDemandCaptureProcessor:
             )
             return
 
+        excluded_source_keys: set[str] = set()
         for slice_view, slice_plan in zip(
             slices, plan.slices, strict=True
         ):
@@ -206,7 +207,16 @@ class OnDemandCaptureProcessor:
             ):
                 continue
             self._process_slice(
-                group, slice_view, slice_plan, sources, client
+                group,
+                slice_view,
+                slice_plan,
+                tuple(
+                    source
+                    for source in sources
+                    if source.source_key not in excluded_source_keys
+                ),
+                excluded_source_keys,
+                client,
             )
 
         ordered_slice_ids = tuple(item.slice_id for item in plan.slices)
@@ -224,6 +234,7 @@ class OnDemandCaptureProcessor:
         slice_view: CaptureSliceView,
         slice_plan: CaptureSlicePlan,
         sources: tuple[FrozenSessionSource, ...],
+        excluded_source_keys: set[str],
         client,
     ) -> None:
         route_context = self._route_context(slice_view, slice_plan)
@@ -248,6 +259,7 @@ class OnDemandCaptureProcessor:
                 route_context,
                 slice_plan.matched_paths,
                 profile,
+                excluded_source_keys,
                 client,
             )
             observations = tuple(
@@ -343,6 +355,7 @@ class OnDemandCaptureProcessor:
         route_context: FrozenCaptureRouteContext,
         matched_paths: tuple[str, ...],
         profile: FeasibilityModelProfile | None,
+        excluded_source_keys: set[str],
         client,
     ) -> tuple[tuple[FrozenSessionSource, SessionCaptureResult], ...]:
         if sources:
@@ -374,6 +387,7 @@ class OnDemandCaptureProcessor:
                     source.source_key,
                     "user_prompt_evidence_unavailable",
                 )
+                excluded_source_keys.add(source.source_key)
                 continue
             if not isinstance(capture, SessionCaptureResult):
                 raise TerminalCaptureRequestError("capture_result_invalid")

@@ -51,6 +51,7 @@ class FakeGitPaths:
 class FakeCaptureRunner:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.source_calls: list[str] = []
         self.profile = FeasibilityModelProfile.create(
             model_id="model-default",
             reasoning_effort="medium",
@@ -79,6 +80,7 @@ class FakeCaptureRunner:
         model_profile,
         heartbeat=None,
     ):
+        self.source_calls.append(source.session_id)
         if source.session_id in self.unavailable_sessions:
             from zdecision.app_server.requested_capture import (
                 SourceEvidenceUnavailable,
@@ -501,8 +503,27 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual("user_prompt_evidence_unavailable", row["excluded_reason"])
         self.assertEqual(0, self.reconciliation_runner.calls)
+        self.assertEqual([SESSION_ID], self.capture_runner.source_calls)
         self.assertEqual(2, len(client.uploads))
         self.assertTrue(all(not batch.items for batch in client.uploads))
+
+    def test_unavailable_source_is_not_reinvoked_in_later_slices(self) -> None:
+        second_session = "019fb100-0000-7000-8000-000000000010"
+        self.observe_stop(
+            session_id=second_session,
+            turn_id="019fb100-0000-7000-8000-000000000011",
+            occurred_at="2026-08-05T05:00:01Z",
+        )
+        self.capture_runner.unavailable_sessions.add(SESSION_ID)
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        self.assertEqual(1, self.capture_runner.source_calls.count(SESSION_ID))
+        self.assertEqual(2, self.capture_runner.source_calls.count(second_session))
+        self.assertEqual(2, self.reconciliation_runner.calls)
+        self.assertEqual(2, len(client.uploads))
+        self.assertTrue(all(len(batch.items) == 1 for batch in client.uploads))
 
     def test_slice_rejects_mixed_legacy_and_v5_capture_results(self) -> None:
         from zdecision.agent.service import TerminalCaptureRequestError

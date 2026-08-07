@@ -272,15 +272,23 @@ def configured_processor(
     local_state_path = Path(state_path)
     package_root = Path(__file__).resolve().parents[1]
     repository_root = package_root.parents[1]
-    session_index = SessionIndex.open(local_state_path)
-    operation_store = CaptureOperationStore.open(local_state_path)
-    request_state = RequestStateStore.open(local_state_path)
-    routing_store = CaptureRoutingStore.open(local_state_path)
-    control_store = ControlBindingStore.open(local_state_path)
-    recall_host_store = RecallHostStore.open(Path(database.path).resolve())
-    database.retire_legacy_automatic_capture()
+    session_index = None
+    operation_store = None
+    request_state = None
+    routing_store = None
+    control_store = None
+    recall_host_store = None
     gateway = None
     try:
+        session_index = SessionIndex.open(local_state_path)
+        operation_store = CaptureOperationStore.open(local_state_path)
+        request_state = RequestStateStore.open(local_state_path)
+        routing_store = CaptureRoutingStore.open(local_state_path)
+        control_store = ControlBindingStore.open(local_state_path)
+        recall_host_store = RecallHostStore.open(
+            Path(database.path).resolve()
+        )
+        database.retire_legacy_automatic_capture()
         gateway = AppServerGateway.connect(database=database)
         template_catalog = TemplateCatalog(
             repository_root / "decision-templates",
@@ -308,12 +316,16 @@ def configured_processor(
             clock=lambda: datetime.now(UTC),
         )
     except Exception:
-        session_index.close()
-        request_state.close()
-        routing_store.close()
-        operation_store.close()
-        control_store.close()
-        recall_host_store.close()
+        for store in (
+            recall_host_store,
+            control_store,
+            routing_store,
+            request_state,
+            operation_store,
+            session_index,
+        ):
+            if store is not None:
+                store.close()
         close_gateway = getattr(gateway, "close", None)
         if callable(close_gateway):
             close_gateway()
