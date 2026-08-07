@@ -74,6 +74,7 @@ class SessionIndex:
                     lineage TEXT NOT NULL,
                     latest_turn_id TEXT NOT NULL,
                     latest_event_id TEXT NOT NULL,
+                    latest_ledger_rowid INTEGER,
                     latest_observed_at TEXT NOT NULL,
                     latest_source_fingerprint TEXT NOT NULL,
                     handled_turn_id TEXT,
@@ -174,6 +175,11 @@ class SessionIndex:
                     "ALTER TABLE session_checkpoints ADD COLUMN "
                     "handled_event_id TEXT"
                 )
+            if "latest_ledger_rowid" not in checkpoint_columns:
+                connection.execute(
+                    "ALTER TABLE session_checkpoints ADD COLUMN "
+                    "latest_ledger_rowid INTEGER"
+                )
             source_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -255,13 +261,14 @@ class SessionIndex:
                 }
             )
         ).hexdigest()
+        ledger_rowid = self._event_ledger_rowid(event.event_id)
 
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self._connection.execute(
                 """
                 SELECT repository_id, session_id, lineage,
-                       latest_observed_at, latest_event_id
+                       latest_ledger_rowid
                 FROM session_checkpoints
                 WHERE source_key = ?
                 """,
@@ -280,11 +287,17 @@ class SessionIndex:
                 )
                 if identity != expected:
                     raise ValueError("Session source identity conflicts")
-                current_position = (
-                    existing["latest_observed_at"],
-                    existing["latest_event_id"],
-                )
-                if (observed_at, event.event_id) <= current_position:
+                if (
+                    ledger_rowid is not None
+                    and existing["latest_ledger_rowid"] is not None
+                    and ledger_rowid <= existing["latest_ledger_rowid"]
+                ):
+                    self._connection.commit()
+                    return
+                if (
+                    ledger_rowid is None
+                    and existing["latest_ledger_rowid"] is not None
+                ):
                     self._connection.commit()
                     return
                 self._connection.execute(
@@ -293,6 +306,7 @@ class SessionIndex:
                     SET cwd = ?,
                         latest_turn_id = ?,
                         latest_event_id = ?,
+                        latest_ledger_rowid = ?,
                         latest_observed_at = ?,
                         latest_source_fingerprint = ?,
                         latest_head_commit = ?
@@ -302,6 +316,7 @@ class SessionIndex:
                         invocation.cwd,
                         invocation.turn_id,
                         event.event_id,
+                        ledger_rowid,
                         observed_at,
                         source_fingerprint,
                         invocation.head_commit,
@@ -313,11 +328,12 @@ class SessionIndex:
                     """
                     INSERT INTO session_checkpoints(
                         source_key, repository_id, session_id, cwd, lineage,
-                        latest_turn_id, latest_event_id, latest_observed_at,
+                        latest_turn_id, latest_event_id, latest_ledger_rowid,
+                        latest_observed_at,
                         latest_source_fingerprint, handled_turn_id,
                         handled_source_fingerprint, latest_head_commit,
                         handled_head_commit, excluded_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL,
                               NULL)
                     """,
                     (
@@ -328,6 +344,7 @@ class SessionIndex:
                         lineage,
                         invocation.turn_id,
                         event.event_id,
+                        ledger_rowid,
                         observed_at,
                         source_fingerprint,
                         invocation.head_commit,
@@ -337,6 +354,19 @@ class SessionIndex:
         except Exception:
             self._connection.rollback()
             raise
+
+    def _event_ledger_rowid(self, event_id: str) -> int | None:
+        """Return the local ledger append ordinal for a recorded Hook event."""
+
+        events_table = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+        if events_table is None:
+            return None
+        row = self._connection.execute(
+            "SELECT rowid FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return None if row is None else row["rowid"]
 
     def freeze_sources(
         self,

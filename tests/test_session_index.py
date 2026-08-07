@@ -97,6 +97,16 @@ class SessionIndexTest(unittest.TestCase):
         if hasattr(self, "temporary_directory"):
             self.temporary_directory.cleanup()
 
+    def append_ledger_events(self, *events: AgentEvent) -> None:
+        self.index._connection.execute(
+            "CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY)"
+        )
+        self.index._connection.executemany(
+            "INSERT INTO events(event_id) VALUES (?)",
+            tuple((event.event_id,) for event in events),
+        )
+        self.index._connection.commit()
+
     def test_freeze_keeps_later_activity_for_the_next_request(self) -> None:
         self.index.observe(
             observed_event(
@@ -267,30 +277,50 @@ class SessionIndexTest(unittest.TestCase):
         self.assertEqual((), replay)
         self.assertEqual(["turn_1"], [item.upper_turn_id for item in next_request])
 
-    def test_out_of_order_stop_does_not_regress_latest_turn(self) -> None:
-        self.index.observe(
-            observed_event(
-                "Stop",
-                "session_a",
-                "turn_2",
-                observed="2026-07-30T01:01:00+00:00",
-            )
+    def test_ledger_append_order_controls_equal_and_nonmonotonic_stop_timestamps(
+        self,
+    ) -> None:
+        """This catches Stop boundaries ordered by timestamp or event-ID text."""
+
+        equal_first = observed_event("Stop", "session_equal", "turn_1")
+        equal_first = AgentEvent(
+            "evt_f" + "9" * 31,
+            equal_first.invocation,
+            equal_first.state,
+            equal_first.failure_code,
         )
-        self.index.observe(
-            observed_event(
-                "Stop",
-                "session_a",
-                "turn_1",
-                observed="2026-07-30T01:00:00+00:00",
-            )
+        equal_second = observed_event("Stop", "session_equal", "turn_2")
+        equal_second = AgentEvent(
+            "evt_e" + "5" * 31,
+            equal_second.invocation,
+            equal_second.state,
+            equal_second.failure_code,
         )
+        older = observed_event(
+            "Stop", "session_nonmonotonic", "turn_1",
+            observed="2026-07-30T01:00:00+00:00",
+        )
+        newer = observed_event(
+            "Stop", "session_nonmonotonic", "turn_2",
+            observed="2026-07-30T01:01:00+00:00",
+        )
+        self.append_ledger_events(equal_first, equal_second, older, newer)
+
+        self.index.observe(equal_first)
+        self.index.observe(equal_second)
+        self.index.observe(newer)
+        self.index.observe(older)
 
         frozen = self.index.freeze_sources(
             FIRST_REQUEST_ID, REPOSITORY_ID, NOW,
             capture_scope="all_valid_sessions",
         )
 
-        self.assertEqual("turn_2", frozen[0].upper_turn_id)
+        by_session = {source.session_id: source for source in frozen}
+        self.assertEqual("turn_2", by_session["session_equal"].upper_turn_id)
+        self.assertEqual(equal_second.event_id, by_session["session_equal"].upper_stop_event_id)
+        self.assertEqual("turn_2", by_session["session_nonmonotonic"].upper_turn_id)
+        self.assertEqual(newer.event_id, by_session["session_nonmonotonic"].upper_stop_event_id)
 
     def test_only_repository_bound_stop_events_are_indexed(self) -> None:
         self.index.observe(observed_event("UserPromptSubmit", "session_a", "turn_1"))
