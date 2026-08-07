@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import queue
 import tempfile
 import threading
 import unittest
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +32,7 @@ from zdecision.app_server.jsonl import (
     ProcessJsonlTransport,
     UnexpectedServerRequest,
 )
+from zdecision.app_server import models as app_server_models
 from zdecision.app_server.models import FeasibilityModelProfile, SourceBoundary
 from zdecision.jsonio import canonical_json_bytes
 
@@ -362,6 +365,351 @@ class AppServerGatewayTests(unittest.TestCase):
                 ],
             }
         }
+
+    def test_reads_root_and_fork_identity(self) -> None:
+        """This catches tree provenance being substituted for exact Thread identity."""
+
+        client = ScriptedClient(
+            [
+                {
+                    "thread": {
+                        "id": SOURCE_THREAD,
+                        "sessionId": SOURCE_THREAD,
+                        "forkedFromId": None,
+                        "cwd": str(self.root),
+                        "ephemeral": False,
+                        "turns": [],
+                    }
+                },
+                {
+                    "thread": {
+                        "id": FORK_THREAD,
+                        "sessionId": SOURCE_THREAD,
+                        "forkedFromId": SOURCE_THREAD,
+                        "cwd": str(self.root),
+                        "ephemeral": False,
+                        "turns": [],
+                    }
+                },
+            ]
+        )
+        gateway = self._gateway(client)
+
+        self.assertTrue(
+            hasattr(gateway, "read_thread_identity"),
+            "read_thread_identity contract is missing",
+        )
+
+        root = gateway.read_thread_identity(SOURCE_THREAD)
+        child = gateway.read_thread_identity(FORK_THREAD)
+
+        self.assertEqual(
+            app_server_models.ThreadIdentity(
+                thread_id=SOURCE_THREAD,
+                session_tree_id=SOURCE_THREAD,
+                forked_from_id=None,
+                cwd=str(self.root),
+                ephemeral=False,
+            ),
+            root,
+        )
+        self.assertEqual(
+            app_server_models.ThreadIdentity(
+                thread_id=FORK_THREAD,
+                session_tree_id=SOURCE_THREAD,
+                forked_from_id=SOURCE_THREAD,
+                cwd=str(self.root),
+                ephemeral=False,
+            ),
+            child,
+        )
+        self.assertEqual(
+            [
+                (
+                    "thread/read",
+                    {"threadId": SOURCE_THREAD, "includeTurns": False},
+                ),
+                (
+                    "thread/read",
+                    {"threadId": FORK_THREAD, "includeTurns": False},
+                ),
+            ],
+            client.requests,
+        )
+
+    def test_rejects_malformed_or_contradictory_thread_identity(self) -> None:
+        """This catches malformed ancestry being accepted as trusted identity."""
+
+        valid = {
+            "id": SOURCE_THREAD,
+            "sessionId": SOURCE_THREAD,
+            "forkedFromId": None,
+            "cwd": str(self.root),
+            "ephemeral": False,
+            "turns": [],
+        }
+        invalid_values = (
+            ({**valid, "id": FORK_THREAD}, SOURCE_THREAD),
+            ({**valid, "sessionId": 7}, SOURCE_THREAD),
+            (
+                {key: value for key, value in valid.items() if key != "forkedFromId"},
+                SOURCE_THREAD,
+            ),
+            ({**valid, "cwd": "relative/path"}, SOURCE_THREAD),
+            ({**valid, "ephemeral": 0}, SOURCE_THREAD),
+            ({**valid, "forkedFromId": SOURCE_THREAD}, SOURCE_THREAD),
+            ({**valid, "forkedFromId": 7}, SOURCE_THREAD),
+            ({**valid, "sessionId": FORK_THREAD}, SOURCE_THREAD),
+            (
+                {
+                    **valid,
+                    "id": FORK_THREAD,
+                    "sessionId": FORK_THREAD,
+                    "forkedFromId": SOURCE_THREAD,
+                },
+                FORK_THREAD,
+            ),
+        )
+
+        for thread, requested_id in invalid_values:
+            with self.subTest(thread=thread):
+                gateway = self._gateway(ScriptedClient([{"thread": thread}]))
+                with self.assertRaises(InvalidAppServerResponse):
+                    gateway.read_thread_identity(requested_id)
+
+    def test_reads_exact_active_turn_native_selection_and_bounded_items(self) -> None:
+        """This catches prompt text or private item payloads becoming gate evidence."""
+
+        recall_path = self.root / "plugins/zdecision/skills/decision-recall/SKILL.md"
+        non_recall_path = self.root / "skills/other/SKILL.md"
+        private = "private-prompt-arguments-source-output"
+        response = {
+            "thread": {
+                "id": SOURCE_THREAD,
+                "sessionId": SOURCE_THREAD,
+                "forkedFromId": None,
+                "cwd": str(self.root),
+                "ephemeral": False,
+                "turns": [
+                    {
+                        "id": SOURCE_TURN,
+                        "status": "inProgress",
+                        "items": [
+                            {
+                                "id": "user-1",
+                                "type": "userMessage",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": f"select decision-recall {private}",
+                                    },
+                                    {
+                                        "type": "skill",
+                                        "name": "decision-recall",
+                                        "path": str(
+                                            recall_path.parent
+                                            / ".."
+                                            / "decision-recall"
+                                            / "SKILL.md"
+                                        ),
+                                    },
+                                    {
+                                        "type": "mention",
+                                        "name": "other",
+                                        "path": str(non_recall_path),
+                                    },
+                                ],
+                            },
+                            {
+                                "id": "hook-1",
+                                "type": "hookPrompt",
+                                "fragments": [
+                                    {
+                                        "hookRunId": "hook-run-1",
+                                        "text": json.dumps(
+                                            {
+                                                "marker": "ZDECISION_RECALL_RESTORATION",
+                                                "receipt_id": "restoration_abc123",
+                                                "private": private,
+                                            }
+                                        ),
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "mcp-1",
+                                "type": "mcpToolCall",
+                                "server": "zdecision-local",
+                                "tool": "activate_zdecision_recall",
+                                "status": "completed",
+                                "arguments": {"prompt": private},
+                                "result": {
+                                    "content": [{"type": "text", "text": private}],
+                                    "structuredContent": {
+                                        "state": "active",
+                                        "receipt": "host_probe_applied",
+                                        "probe": {
+                                            "probe_id": "probe-abc123",
+                                            "marker": "host_gate_fixture_not_formal",
+                                            "instruction": private,
+                                        },
+                                    },
+                                },
+                            },
+                            {
+                                "id": "agent-1",
+                                "type": "agentMessage",
+                                "text": private,
+                            },
+                            {
+                                "id": "command-1",
+                                "type": "commandExecution",
+                                "command": private,
+                                "commandActions": [],
+                                "cwd": str(self.root),
+                                "status": "completed",
+                                "aggregatedOutput": private,
+                                "source": private,
+                            },
+                            {
+                                "id": "file-1",
+                                "type": "fileChange",
+                                "changes": [{"path": private}],
+                                "status": "completed",
+                            },
+                            {"id": "compact-1", "type": "contextCompaction"},
+                        ],
+                    }
+                ],
+            }
+        }
+        gateway = self._gateway(ScriptedClient([response]))
+
+        self.assertTrue(
+            hasattr(gateway, "read_active_turn_evidence"),
+            "read_active_turn_evidence contract is missing",
+        )
+        evidence = gateway.read_active_turn_evidence(SOURCE_THREAD, SOURCE_TURN)
+
+        self.assertEqual(
+            (
+                app_server_models.SelectedSkill(
+                    selection_type="skill",
+                    name="decision-recall",
+                    path=str(recall_path.resolve()),
+                ),
+                app_server_models.SelectedSkill(
+                    selection_type="mention",
+                    name="other",
+                    path=str(non_recall_path.resolve()),
+                ),
+            ),
+            evidence.selected_skills,
+        )
+        self.assertEqual(
+            (
+                app_server_models.TurnItemEvidence(
+                    "hookPrompt", "hook-1", receipt_id="restoration_abc123"
+                ),
+                app_server_models.TurnItemEvidence(
+                    "mcpToolCall",
+                    "mcp-1",
+                    tool_name="activate_zdecision_recall",
+                    probe_id="probe-abc123",
+                ),
+                app_server_models.TurnItemEvidence("agentMessage", "agent-1"),
+                app_server_models.TurnItemEvidence(
+                    "commandExecution", "command-1"
+                ),
+                app_server_models.TurnItemEvidence("fileChange", "file-1"),
+                app_server_models.TurnItemEvidence(
+                    "contextCompaction", "compact-1"
+                ),
+            ),
+            evidence.ordered_items,
+        )
+        self.assertEqual(SOURCE_TURN, evidence.turn_id)
+        self.assertEqual(SOURCE_THREAD, evidence.thread.thread_id)
+        self.assertNotIn(private, repr(asdict(evidence)))
+        self.assertEqual(
+            (
+                "thread/read",
+                {"threadId": SOURCE_THREAD, "includeTurns": True},
+            ),
+            gateway.client.requests[0],
+        )
+
+    def test_active_turn_evidence_rejects_non_active_or_ambiguous_turns(self) -> None:
+        """This catches completed or duplicate Turns being used post hoc."""
+
+        thread = {
+            "id": SOURCE_THREAD,
+            "sessionId": SOURCE_THREAD,
+            "forkedFromId": None,
+            "cwd": str(self.root),
+            "ephemeral": False,
+            "turns": [],
+        }
+        cases = (
+            ([], UnknownSourceTurn),
+            (
+                [{"id": SOURCE_TURN, "status": "completed", "items": []}],
+                IncompleteSourceTurn,
+            ),
+            (
+                [
+                    {"id": SOURCE_TURN, "status": "inProgress", "items": []},
+                    {"id": SOURCE_TURN, "status": "inProgress", "items": []},
+                ],
+                InvalidAppServerResponse,
+            ),
+        )
+
+        for turns, error in cases:
+            with self.subTest(turns=turns):
+                gateway = self._gateway(
+                    ScriptedClient([{"thread": {**thread, "turns": turns}}])
+                )
+                with self.assertRaises(error):
+                    gateway.read_active_turn_evidence(SOURCE_THREAD, SOURCE_TURN)
+
+    def test_active_turn_evidence_rejects_malformed_bounded_metadata(self) -> None:
+        """This catches malformed official item fields escaping protocol validation."""
+
+        response = {
+            "thread": {
+                "id": SOURCE_THREAD,
+                "sessionId": SOURCE_THREAD,
+                "forkedFromId": None,
+                "cwd": str(self.root),
+                "ephemeral": False,
+                "turns": [
+                    {
+                        "id": SOURCE_TURN,
+                        "status": "inProgress",
+                        "items": [
+                            {
+                                "id": "mcp-1",
+                                "type": "mcpToolCall",
+                                "server": "zdecision-local",
+                                "tool": 7,
+                                "status": "completed",
+                                "arguments": {},
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+
+        try:
+            self._gateway(
+                ScriptedClient([response])
+            ).read_active_turn_evidence(SOURCE_THREAD, SOURCE_TURN)
+        except Exception as error:
+            self.assertIsInstance(error, InvalidAppServerResponse)
+        else:
+            self.fail("malformed MCP metadata was accepted")
 
     def test_connect_prefers_an_explicit_host_transport(self):
         def initialize(message, transport: QueueTransport) -> None:
@@ -913,6 +1261,14 @@ class AppServerGatewayTests(unittest.TestCase):
         )
         with self.assertRaises(InvalidAppServerResponse):
             wrong_source.fork_disposable_thread(
+                SOURCE_THREAD, SOURCE_TURN
+            )
+
+        missing_source = self._gateway(
+            ScriptedClient([{"thread": {"id": FORK_THREAD}}])
+        )
+        with self.assertRaises(InvalidAppServerResponse):
+            missing_source.fork_disposable_thread(
                 SOURCE_THREAD, SOURCE_TURN
             )
 

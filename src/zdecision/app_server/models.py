@@ -93,6 +93,127 @@ class SourceBoundary:
 
 
 @dataclass(frozen=True)
+class ThreadIdentity:
+    thread_id: str
+    session_tree_id: str
+    forked_from_id: str | None
+    cwd: str
+    ephemeral: bool
+
+    def __post_init__(self) -> None:
+        thread_id = _bounded_identifier(self.thread_id, "thread_id")
+        session_tree_id = _bounded_identifier(
+            self.session_tree_id, "session_tree_id"
+        )
+        if self.forked_from_id is None:
+            if session_tree_id != thread_id:
+                raise ValueError("root session_tree_id must equal thread_id")
+        else:
+            parent = _bounded_identifier(
+                self.forked_from_id, "forked_from_id"
+            )
+            if parent == thread_id:
+                raise ValueError("forked_from_id must not equal thread_id")
+            if session_tree_id == thread_id:
+                raise ValueError("child session_tree_id must differ from thread_id")
+        if not isinstance(self.cwd, str) or not Path(self.cwd).is_absolute():
+            raise ValueError("cwd must be an absolute path")
+        if not isinstance(self.ephemeral, bool):
+            raise ValueError("ephemeral must be a boolean")
+
+
+@dataclass(frozen=True)
+class SelectedSkill:
+    selection_type: Literal["skill", "mention"]
+    name: str
+    path: str
+
+    def __post_init__(self) -> None:
+        if self.selection_type not in ("skill", "mention"):
+            raise ValueError("selection_type is invalid")
+        _bounded_identifier(self.name, "name")
+        if (
+            not isinstance(self.path, str)
+            or len(self.path) > 4096
+            or "\x00" in self.path
+            or not Path(self.path).is_absolute()
+        ):
+            raise ValueError("path must be a bounded absolute path")
+
+
+@dataclass(frozen=True)
+class TurnItemEvidence:
+    item_type: Literal[
+        "hookPrompt",
+        "mcpToolCall",
+        "agentMessage",
+        "commandExecution",
+        "fileChange",
+        "contextCompaction",
+    ]
+    item_id: str
+    tool_name: str | None = None
+    receipt_id: str | None = None
+    probe_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.item_type not in (
+            "hookPrompt",
+            "mcpToolCall",
+            "agentMessage",
+            "commandExecution",
+            "fileChange",
+            "contextCompaction",
+        ):
+            raise ValueError("item_type is invalid")
+        _bounded_identifier(self.item_id, "item_id")
+        if self.tool_name is not None:
+            _bounded_identifier(self.tool_name, "tool_name")
+            if self.item_type != "mcpToolCall":
+                raise ValueError("tool_name is only valid for mcpToolCall")
+        for field_name, value in (
+            ("receipt_id", self.receipt_id),
+            ("probe_id", self.probe_id),
+        ):
+            if value is not None:
+                _bounded_identifier(value, field_name)
+        if self.receipt_id is not None and self.item_type not in (
+            "hookPrompt",
+            "mcpToolCall",
+        ):
+            raise ValueError("receipt_id has an invalid item type")
+        if self.probe_id is not None and self.item_type != "mcpToolCall":
+            raise ValueError("probe_id is only valid for mcpToolCall")
+
+
+@dataclass(frozen=True)
+class ActiveTurnEvidence:
+    thread: ThreadIdentity
+    turn_id: str
+    selected_skills: tuple[SelectedSkill, ...]
+    ordered_items: tuple[TurnItemEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.thread, ThreadIdentity):
+            raise TypeError("thread must be a ThreadIdentity")
+        _bounded_identifier(self.turn_id, "turn_id")
+        if not isinstance(self.selected_skills, tuple) or len(
+            self.selected_skills
+        ) > 256:
+            raise ValueError("selected_skills is invalid")
+        if not all(isinstance(value, SelectedSkill) for value in self.selected_skills):
+            raise TypeError("selected_skills contains an invalid value")
+        if not isinstance(self.ordered_items, tuple) or len(
+            self.ordered_items
+        ) > 4096:
+            raise ValueError("ordered_items is invalid")
+        if not all(
+            isinstance(value, TurnItemEvidence) for value in self.ordered_items
+        ):
+            raise TypeError("ordered_items contains an invalid value")
+
+
+@dataclass(frozen=True)
 class AppServerTurnReceipt:
     thread_id: str
     turn_id: str
@@ -265,3 +386,10 @@ def extraction_output_schema(product: str) -> dict[str, object]:
         "required": ["candidates"],
         "additionalProperties": False,
     }
+
+
+def _bounded_identifier(value: object, field_name: str) -> str:
+    normalized = _nonempty(value, field_name)
+    if len(normalized) > 256 or "\x00" in normalized:
+        raise ValueError(f"{field_name} is invalid")
+    return normalized

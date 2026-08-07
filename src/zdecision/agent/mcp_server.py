@@ -33,6 +33,7 @@ from zdecision.agent.recall_mcp import (
 )
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.service import load_agent_config
+from zdecision.app_server.gateway import AppServerGateway
 from zdecision.sync.contracts import (
     CaptureRequestCreate,
     CaptureRequestView,
@@ -574,6 +575,13 @@ def run_mcp(
             provider=provider,
             cwd=cwd,
             live_acceptance=live_acceptance,
+            evidence_gateway_factory=lambda: AppServerGateway.connect(
+                database=database
+            ),
+            recall_skill_path=(
+                Path(__file__).resolve().parents[3]
+                / "plugins/zdecision/skills/decision-recall/SKILL.md"
+            ),
         )
         create_mcp_server(tools, recall_tools).run(transport="stdio")
     finally:

@@ -17,6 +17,7 @@ from zdecision.agent.recall_host_state import (
     RecallHostStore,
     RecallSession,
 )
+from zdecision.app_server.models import ActiveTurnEvidence
 from zdecision.jsonio import atomic_write_json, canonical_json_bytes
 from zdecision.recall.session import HostProbeEnvelope, RecallIntent, TurnGateResult
 
@@ -36,6 +37,14 @@ class RecallGateProvider(Protocol):
     def gate(
         self, previous: RecallSession, intent: RecallIntent
     ) -> TurnGateResult: ...
+
+
+class ActiveTurnEvidenceGateway(Protocol):
+    def read_active_turn_evidence(
+        self, thread_id: str, turn_id: str
+    ) -> ActiveTurnEvidence: ...
+
+    def close(self) -> None: ...
 
 
 class ReadinessRecallGateProvider:
@@ -124,11 +133,20 @@ class RecallMcpTools:
         provider: RecallGateProvider,
         cwd: str,
         live_acceptance: bool = False,
+        evidence_gateway_factory: Callable[[], ActiveTurnEvidenceGateway]
+        | None = None,
+        recall_skill_path: Path | None = None,
     ) -> None:
         self.host_store = host_store
         self.provider = provider
         self.cwd = os.path.normpath(cwd)
         self.live_acceptance = live_acceptance
+        self.evidence_gateway_factory = evidence_gateway_factory
+        self.recall_skill_path = (
+            None
+            if recall_skill_path is None
+            else Path(recall_skill_path).resolve(strict=False)
+        )
         self._ensure_receipt_schema()
 
     def activate_zdecision_recall(
@@ -148,7 +166,7 @@ class RecallMcpTools:
             if self._has_later_gate(session.session_id, receipt["gate_id"]):
                 return _blocked("invalid_binding")
             return self._reconcile_receipt(receipt, session, turn_id)
-        if not self.live_acceptance:
+        if not self._native_selection_proven(session, turn_id):
             return _blocked("native_selection_unproven")
         return self._claim_provider_result(
             kind="activation",
@@ -159,6 +177,48 @@ class RecallMcpTools:
             turn_id=turn_id,
             activation=True,
             invoke=lambda: self.provider.activate(parsed),
+        )
+
+    def _native_selection_proven(
+        self, session: RecallSession, turn_id: str
+    ) -> bool:
+        factory = self.evidence_gateway_factory
+        recall_skill_path = self.recall_skill_path
+        if (
+            factory is None
+            or recall_skill_path is None
+            or not recall_skill_path.is_file()
+        ):
+            return False
+        gateway: ActiveTurnEvidenceGateway | None = None
+        evidence: ActiveTurnEvidence | None = None
+        connection_closed = False
+        try:
+            gateway = factory()
+            evidence = gateway.read_active_turn_evidence(
+                session.session_id, turn_id
+            )
+        except Exception:
+            return False
+        finally:
+            if gateway is not None:
+                try:
+                    gateway.close()
+                    connection_closed = True
+                except Exception:
+                    connection_closed = False
+        if evidence is None or not connection_closed:
+            return False
+        if (
+            evidence.thread.thread_id != session.session_id
+            or evidence.turn_id != turn_id
+            or evidence.thread.cwd != session.cwd
+            or evidence.thread.cwd != self.cwd
+        ):
+            return False
+        return any(
+            Path(selected.path).resolve(strict=False) == recall_skill_path
+            for selected in evidence.selected_skills
         )
 
     def gate_zdecision_turn(
