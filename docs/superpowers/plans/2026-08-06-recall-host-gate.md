@@ -566,67 +566,27 @@ git commit -m "feat: validate recall thread and fork identity"
 
 ---
 
-### Task 7: Exclude recalled envelopes from Capture confirmation
+### Task 7: Implement the Recall-to-Capture provenance firewall
 
-**Files:**
-- Modify: `src/zdecision/capture/prompt_contracts/inventory-envelope.md`
-- Modify: `src/zdecision/capture/prompt_contracts/extraction-envelope.md`
-- Modify: `src/zdecision/capture/prompt_contracts/candidate-reconciliation-v1.md`
-- Modify: `src/zdecision/app_server/requested_capture.py`
-- Modify: `src/zdecision/app_server/reconciliation_runner.py`
-- Modify: `src/zdecision/agent/service.py`
-- Modify: `tests/test_capture_operation.py`
-- Modify: `tests/test_requested_capture.py`
-- Modify: `tests/test_reconciliation_runner.py`
-- Modify: `tests/test_templates.py`
-- Create: `tests/test_recall_capture_isolation.py`
+The former marker-only exclusion is superseded. The authoritative design and
+implementation plan are:
 
-- [ ] **Step 1: Write failing prompt and structured-output isolation tests**
+- `../specs/2026-08-07-recall-capture-provenance-design.md`
+- `2026-08-07-recall-capture-provenance.md`
 
-Feed a Capture fork a host-probe envelope and a typed recalled-Decision envelope that state a plausible business rule. Assert Inventory cannot label either `explicit_user_confirmation`, `explicit_user_direction`, or `adopted_decision_contract`; Extraction produces no Candidate unless separate native source evidence confirms the conclusion. Assert reconciliation never upgrades envelope-only text into a Candidate.
+- [ ] **Step 1: Execute the five focused implementation tasks**
 
-Test that `RequestedCaptureRunner` registers the returned child Thread with `purpose="capture"` after `fork_disposable_thread()` and before its first structured Turn. Test that `ReconciliationRunner` registers its disposable Thread with `purpose="reconciliation"` before its first structured Turn. Activation and gate binding for either internal purpose must be denied even when inherited content contains native-looking Skill text.
+Use the focused plan's RED/GREEN sequence and five bounded commits. Do not
+substitute Prompt-marker filtering, transcript parsing, raw Prompt storage, or
+model-authored source labels.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Apply its completion and hard-stop rules**
 
-```bash
-.venv/bin/python -m unittest tests.test_recall_capture_isolation -v
-```
-
-Expected: FAIL because the prompt contracts do not name this exclusion.
-
-- [ ] **Step 3: Add the narrow exclusion**
-
-Inject the shared `RecallHostStore` from `configured_processor()` into both runners. Define typed markers `ZDECISION_DECISION_ENVELOPE`, `ZDECISION_RETIREMENT`, `ZDECISION_RECEIPT`, and `host_gate_fixture_not_formal` as non-native reference context. They may help locate a topic but never confirm a Candidate. Keep the legitimate `adopted_decision_contract` enum for separately proven native source; do not otherwise change the business extraction template.
-
-- [ ] **Step 4: Run GREEN and Capture regressions**
-
-```bash
-.venv/bin/python -m unittest \
-  tests.test_recall_capture_isolation \
-  tests.test_capture_operation \
-  tests.test_reconciliation_runner -v
-```
-
-Expected: all tests pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add \
-  src/zdecision/capture/prompt_contracts/inventory-envelope.md \
-  src/zdecision/capture/prompt_contracts/extraction-envelope.md \
-  src/zdecision/capture/prompt_contracts/candidate-reconciliation-v1.md \
-  src/zdecision/app_server/requested_capture.py \
-  src/zdecision/app_server/reconciliation_runner.py \
-  src/zdecision/agent/service.py \
-  tests/test_capture_operation.py \
-  tests/test_requested_capture.py \
-  tests/test_reconciliation_runner.py \
-  tests/test_templates.py \
-  tests/test_recall_capture_isolation.py
-git commit -m "fix: exclude recalled decisions from capture evidence"
-```
+Task 7 is complete only after the focused vertical tests and one full suite
+pass, Central receives only the minimal provenance kind/digest, legacy records
+remain readable, and the SDD progress file records the exact evidence. If the
+host prompt-event association is unavailable, record
+`capture_evidence_provenance_unavailable` and stop Packet 3.
 
 ---
 
@@ -646,7 +606,8 @@ The test composes real Hook JSON, Recall stores, MCP domain methods, and a fake 
 - same-intent gate replay is idempotent;
 - compact/clear restoration occurs once;
 - child identity begins disabled; and
-- Capture fork sees envelopes only as non-evidentiary context.
+- one native Prompt produces one stable frozen Hook anchor while Capture and
+  reconciliation preserve the approved provenance firewall.
 
 - [ ] **Step 2: Run the focused automated Gate suite**
 
@@ -658,6 +619,7 @@ The test composes real Hook JSON, Recall stores, MCP domain methods, and a fake 
   tests.test_mcp_recall_host_gate \
   tests.test_recall_skill_contract \
   tests.test_app_server_gateway \
+  tests.test_capture_provenance \
   tests.test_recall_capture_isolation \
   tests.integration.test_recall_host_gate -v
 ```
@@ -684,7 +646,16 @@ Record native task IDs, operation receipts, timestamps, and sanitized results on
 4. **Later active Turn:** force a pending gate, demonstrate one denied mutation attempt, commit the gate, and demonstrate the exact tool is then allowed. Replay another Turn's gate and verify denial.
 5. **Compact/clear:** relevant probe -> an empty-match `继续` -> compact/clear. The same active probe restores once; the next Prompt does not duplicate it. Repeat with a maximum-size 10,000-byte synthetic envelope and prove `thread/read` contains the complete marker/digest rather than a saved-file preview.
 6. **Fork:** create a real user-visible Fork. Prove supported parent/child facts, child disabled state, inherited probe marked inactive, and a conflicting child task does not apply it before explicit child activation.
-7. **Capture fork:** run the existing explicit Candidate refresh from a Session containing the probe and verify no Candidate treats the probe as confirmation.
+7. **Capture provenance:** run the existing explicit Candidate refresh from a
+   Session containing the probe. Prove one ordinary native Prompt produces one
+   stable Hook anchor; the Capture fork selects only IDs from its frozen
+   manifest; retry, resume, compact, and Fork do not mint or rebind anchors;
+   the probe plus an unrelated **继续** produces no eligible Candidate; a later
+   independent explicit user rule can qualify through its own anchor; and a
+   Hook-created continuation is either distinguishable from physical-user
+   submission or is conservatively retained only as
+   `hook_observed_user_prompt_anchor`, never upgraded to human-authorship
+   proof.
 
 - [ ] **Step 5: Apply the hard stop rule**
 
@@ -694,7 +665,9 @@ Pass only when all seven cases succeed. In particular:
 - if visible development text precedes activation/gating, stop;
 - if Hook `session_id` cannot map to exact child `thread.id`, stop;
 - if compact restoration cannot be made idempotent, stop; or
-- if Capture accepts recalled/probe text as confirmation, stop.
+- if Capture accepts recalled/probe text without a frozen qualifying anchor,
+  or prompt-event association changes across retry/compact/Fork, record
+  `capture_evidence_provenance_unavailable` and stop.
 
 Do not soften a failure into a warning and do not start Gate 2.
 
