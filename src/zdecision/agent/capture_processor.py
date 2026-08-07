@@ -36,6 +36,7 @@ from zdecision.app_server.requested_capture import (
     RequestedCaptureFailed,
     SessionCaptureResult,
     SourceBoundaryUnavailable,
+    SourceEvidenceUnavailable,
     SourceNotInteractive,
 )
 from zdecision.capture.on_demand import FrozenCaptureRouteContext
@@ -367,6 +368,13 @@ class OnDemandCaptureProcessor:
                     group.request_id, source.source_key, "subagent_session"
                 )
                 continue
+            except SourceEvidenceUnavailable:
+                self.session_index.mark_excluded(
+                    group.request_id,
+                    source.source_key,
+                    "user_prompt_evidence_unavailable",
+                )
+                continue
             if not isinstance(capture, SessionCaptureResult):
                 raise TerminalCaptureRequestError("capture_result_invalid")
             if capture.source_key != source.source_key:
@@ -374,6 +382,16 @@ class OnDemandCaptureProcessor:
             if capture.model_profile != profile:
                 raise TerminalCaptureRequestError("model_profile_mismatch")
             captures.append((source, capture))
+        protocols = {
+            "v5"
+            if capture.protocol_revision.startswith("extractor-v5")
+            else "legacy"
+            for _, capture in captures
+        }
+        if protocols == {"legacy", "v5"}:
+            raise TerminalCaptureRequestError(
+                "legacy_capture_protocol_mixed"
+            )
         return tuple(captures)
 
     def _deliver_slice(

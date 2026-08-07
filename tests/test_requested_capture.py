@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
+from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from tests.test_inventory import VALID_INVENTORY
 from zdecision.agent.capture_operation_store import CaptureOperationStore
+from zdecision.agent.db import AgentDatabase
+from zdecision.agent.events import HookInvocation, RepositorySnapshot
+from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
 from zdecision.agent.session_index import FrozenSessionSource
 from zdecision.app_server.gateway import (
     FrozenModelProfileUnavailable,
@@ -19,8 +26,10 @@ from zdecision.app_server.models import (
     FeasibilityModelProfile,
     SourceBoundary,
 )
-from zdecision.capture.on_demand import FrozenCaptureRouteContext
+from zdecision.capture.on_demand import FrozenCaptureInput, FrozenCaptureRouteContext
 from zdecision.capture.templates import TemplateCatalog
+from zdecision.ids import on_demand_capture_operation_id
+from zdecision.jsonio import canonical_json_bytes
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +41,8 @@ REQUEST_ID = "crq_11111111111111111111111111111111"
 SOURCE_SESSION = "019fb100-0000-7000-8000-000000000001"
 SOURCE_TURN = "019fb100-0000-7000-8000-000000000002"
 MATCHED_PATHS = ("packages/shared/theme/src/index.ts",)
+REPOSITORY_ID = "repo_33333333333333333333333333333333"
+NOW = datetime(2026, 8, 7, 4, 0, tzinfo=UTC)
 
 
 class FakeGateway:
@@ -77,6 +88,10 @@ class FakeGateway:
         self.archive_failures_remaining = 0
         self.archived_threads: list[str] = []
         self.prompts: list[str] = []
+        self.schemas: list[dict[str, object]] = []
+        self.binding_store: RecallHostStore | None = None
+        self.invalid_inventory_receipt = False
+        self.invalid_extraction_ordinal = False
 
     def list_interactive_thread_ids(self, cwd: str) -> frozenset[str]:
         if cwd != self.cwd:
@@ -134,18 +149,43 @@ class FakeGateway:
         cwd: str,
     ) -> AppServerTurnReceipt:
         self.prompts.append(prompt)
+        self.schemas.append(output_schema)
+        if self.binding_store is not None and not self.binding_store.is_internal_thread(
+            thread_id
+        ):
+            raise AssertionError("structured Turn started before internal binding")
         properties = output_schema.get("properties", {})
         if "signals" in properties:
             stage = "inventory"
             self.inventory_count += 1
             count = self.inventory_count
-            output = VALID_INVENTORY
+            output = deepcopy(VALID_INVENTORY)
+            signal_properties = properties["signals"]["items"]["properties"]
+            if "evidence_receipt_ids" in signal_properties:
+                receipts = signal_properties["evidence_receipt_ids"]["items"][
+                    "enum"
+                ]
+                output["signals"][0]["signal_ordinal"] = 1
+                output["signals"][0]["evidence_receipt_ids"] = [receipts[0]]
+                if self.invalid_inventory_receipt:
+                    output["signals"][0]["evidence_receipt_ids"] = [
+                        "rcpt_" + "f" * 64
+                    ]
             should_drop = self.drop_first_inventory_result and count == 1
         elif "candidates" in properties:
             stage = "extraction"
             self.extraction_count += 1
             count = self.extraction_count
-            output = self.extraction_output
+            output = deepcopy(self.extraction_output)
+            candidate_properties = properties["candidates"]["items"][
+                "properties"
+            ]
+            if "source_signal_ordinal" in candidate_properties:
+                ordinal = candidate_properties["source_signal_ordinal"]["enum"][0]
+                for candidate in output["candidates"]:
+                    candidate["source_signal_ordinal"] = ordinal
+                    if self.invalid_extraction_ordinal:
+                        candidate["source_signal_ordinal"] = ordinal + 99
             should_drop = self.drop_first_extraction_result and count == 1
         else:
             raise AssertionError("unexpected structured-output schema")
@@ -180,6 +220,12 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
             self.root / "capture-operations.sqlite3"
         )
         self.addCleanup(self.operation_store.close)
+        self.state_path = self.root / "agent.sqlite3"
+        self.evidence_ledger = AgentDatabase.open(self.state_path)
+        self.addCleanup(self.evidence_ledger.close)
+        self.recall_host_store = RecallHostStore.open(self.state_path)
+        self.addCleanup(self.recall_host_store.close)
+        self.gateway.binding_store = self.recall_host_store
         self.catalog = TemplateCatalog(
             self.template_root, ENVELOPE_ROOT
         )
@@ -193,17 +239,32 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
             gateway=self.gateway,
             operation_store=self.operation_store,
             template_catalog=self.catalog,
+            evidence_ledger=self.evidence_ledger,
+            recall_host_store=self.recall_host_store,
         )
+        repository = RepositorySnapshot(
+            REPOSITORY_ID, str(self.root), "main", "d" * 40
+        )
+        prompt = self._record_event(
+            "UserPromptSubmit", SOURCE_TURN, repository, "2026-08-07T04:00:00Z"
+        )
+        stop = self._record_event(
+            "Stop", SOURCE_TURN, repository, "2026-08-07T04:00:01Z"
+        )
+        self.prompt_event_id = prompt.event_id
+        self.stop_event_id = stop.event_id
         self.source = FrozenSessionSource(
             request_id=REQUEST_ID,
             source_key="src_22222222222222222222222222222222",
-            repository_id="repo_33333333333333333333333333333333",
+            repository_id=REPOSITORY_ID,
             session_id=SOURCE_SESSION,
             cwd=str(self.root),
             lineage="lin_44444444444444444444444444444444",
             previous_handled_turn_id=None,
             upper_turn_id=SOURCE_TURN,
             source_fingerprint="5" * 64,
+            previous_handled_event_id=None,
+            upper_stop_event_id=self.stop_event_id,
         )
         self.route_context = FrozenCaptureRouteContext(
             decision_space_id="dsp_" + "6" * 32,
@@ -220,6 +281,74 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         self.gateway.extraction_output["candidates"][0]["product"] = (
             self.route_context.decision_space_name
         )
+
+    def _record_event(
+        self,
+        event_name: str,
+        turn_id: str,
+        repository: RepositorySnapshot,
+        occurred_at: str,
+    ):
+        invocation = HookInvocation.from_dict(
+            {
+                "hook_event_name": event_name,
+                "session_id": SOURCE_SESSION,
+                "turn_id": turn_id,
+                "cwd": str(self.root),
+                **({"prompt": "never persisted"} if event_name == "UserPromptSubmit" else {}),
+            },
+            occurred_at=occurred_at,
+            repository=repository,
+        )
+        return self.evidence_ledger.record_hook(invocation)
+
+    def _legacy_operation(self, *, record_version: int = 4, route_context=None):
+        template = self.catalog.render("business", self.route_context.decision_space_name)
+        context = self.route_context if route_context is None else route_context
+        identity = {
+            "protocol": f"extractor-v{record_version}",
+            "request_id": self.source.request_id,
+            "repository_id": self.source.repository_id,
+            "source_key": self.source.source_key,
+            "session_id": self.source.session_id,
+            "cwd": self.source.cwd,
+            "lineage": self.source.lineage,
+            "previous_handled_turn_id": self.source.previous_handled_turn_id,
+            "upper_turn_id": self.source.upper_turn_id,
+            "source_fingerprint": self.source.source_fingerprint,
+            "product": context.decision_space_name,
+            "template": template.to_dict(),
+            "model_profile_id": self.request_profile.profile_id,
+            "model_id": self.request_profile.model_id,
+            "reasoning_effort": self.request_profile.reasoning_effort,
+            "model_discovery_digest": self.request_profile.discovery_digest,
+            "model_discovered_at": self.request_profile.discovered_at,
+        }
+        if record_version == 4:
+            identity["route_context"] = context.to_dict()
+        frozen = FrozenCaptureInput(
+            record_version=record_version,
+            protocol_revision=f"extractor-v{record_version}",
+            operation_id=on_demand_capture_operation_id(identity),
+            request_id=self.source.request_id,
+            repository_id=self.source.repository_id,
+            source_key=self.source.source_key,
+            session_id=self.source.session_id,
+            cwd=self.source.cwd,
+            lineage=self.source.lineage,
+            previous_handled_turn_id=self.source.previous_handled_turn_id,
+            upper_turn_id=self.source.upper_turn_id,
+            source_fingerprint=self.source.source_fingerprint,
+            product=context.decision_space_name,
+            template=template,
+            model_profile_id=self.request_profile.profile_id,
+            model_id=self.request_profile.model_id,
+            reasoning_effort=self.request_profile.reasoning_effort,
+            model_discovery_digest=self.request_profile.discovery_digest,
+            model_discovered_at=self.request_profile.discovered_at,
+            route_context=None if record_version == 3 else context,
+        )
+        return self.operation_store.ensure_operation(frozen)
 
     def _run(self):
         return self.runner.run(
@@ -318,6 +447,338 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
 
         with self.assertRaises(SourceNotInteractive):
             self._run()
+
+    def test_missing_event_boundaries_fail_before_operation_or_fork(self) -> None:
+        from zdecision.app_server.requested_capture import SourceEvidenceUnavailable
+
+        self.source = replace(self.source, upper_stop_event_id=None)
+
+        with self.assertRaises(SourceEvidenceUnavailable):
+            self._run()
+
+        self.assertEqual(0, self.gateway.fork_count)
+        self.assertIsNone(
+            self.operation_store.operation_for_source(
+                REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+            )
+        )
+
+    def test_empty_prompt_anchor_window_fails_before_fork(self) -> None:
+        from zdecision.app_server.requested_capture import SourceEvidenceUnavailable
+
+        with self.evidence_ledger._connection:
+            self.evidence_ledger._connection.execute(
+                "DELETE FROM events WHERE event_id = ?", (self.prompt_event_id,)
+            )
+
+        with self.assertRaises(SourceEvidenceUnavailable):
+            self._run()
+
+        self.assertEqual(0, self.gateway.fork_count)
+
+    def test_untrusted_recall_gate_state_fails_before_fork(self) -> None:
+        from zdecision.app_server.requested_capture import SourceEvidenceUnavailable
+
+        cases = (("pending", None), ("committed", None))
+        for state, reference_version in cases:
+            with self.subTest(state=state, reference_version=reference_version):
+                with self.recall_host_store._connection:
+                    self.recall_host_store._connection.execute(
+                        "DELETE FROM recall_turn_gates"
+                    )
+                    self.recall_host_store._connection.execute(
+                        """
+                        INSERT INTO recall_turn_gates(
+                            gate_id, session_id, turn_id, context_epoch,
+                            intent_epoch, active_generation, state,
+                            result_digest, commit_fingerprint,
+                            active_set_digest, reference_state_version,
+                            plugin_root, plugin_bundle_digest
+                        ) VALUES (?, ?, ?, 0, 0, NULL, ?, ?, ?, ?, ?, NULL, NULL)
+                        """,
+                        (
+                            f"gate-{state}",
+                            SOURCE_SESSION,
+                            SOURCE_TURN,
+                            state,
+                            "a" * 64 if state == "committed" else None,
+                            "b" * 64 if state == "committed" else None,
+                            "c" * 64 if state == "committed" else None,
+                            reference_version,
+                        ),
+                    )
+
+                with self.assertRaises(SourceEvidenceUnavailable):
+                    self._run()
+
+                self.assertEqual(0, self.gateway.fork_count)
+
+    def test_invalid_committed_reference_digest_fails_before_fork(self) -> None:
+        from zdecision.app_server.requested_capture import SourceEvidenceUnavailable
+
+        with self.recall_host_store._connection:
+            self.recall_host_store._connection.execute(
+                """
+                INSERT INTO recall_turn_gates(
+                    gate_id, session_id, turn_id, context_epoch,
+                    intent_epoch, active_generation, state,
+                    result_digest, commit_fingerprint,
+                    active_set_digest, reference_state_version,
+                    plugin_root, plugin_bundle_digest
+                ) VALUES ('gate-invalid-digest', ?, ?, 0, 0, NULL,
+                    'committed', ?, ?, 'not-a-digest', 1, NULL, NULL)
+                """,
+                (SOURCE_SESSION, SOURCE_TURN, "a" * 64, "b" * 64),
+            )
+
+        with self.assertRaises(SourceEvidenceUnavailable):
+            self._run()
+
+        self.assertEqual(0, self.gateway.fork_count)
+
+    def test_manifest_copies_only_committed_v1_reference_digest(self) -> None:
+        active_digest = "c" * 64
+        with self.recall_host_store._connection:
+            self.recall_host_store._connection.execute(
+                """
+                INSERT INTO recall_turn_gates(
+                    gate_id, session_id, turn_id, context_epoch,
+                    intent_epoch, active_generation, state,
+                    result_digest, commit_fingerprint,
+                    active_set_digest, reference_state_version,
+                    plugin_root, plugin_bundle_digest
+                ) VALUES ('gate-valid-digest', ?, ?, 0, 0, NULL,
+                    'committed', ?, ?, ?, 1, NULL, NULL)
+                """,
+                (SOURCE_SESSION, SOURCE_TURN, "a" * 64, "b" * 64, active_digest),
+            )
+
+        self._run()
+
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        self.assertEqual(
+            active_digest,
+            operation.frozen.evidence_manifest.anchors[0].active_reference_set_digest,
+        )
+
+    def test_v5_manifest_is_immutable_across_retry_restart_and_later_events(
+        self,
+    ) -> None:
+        from zdecision.app_server.requested_capture import (
+            CaptureAttemptRetryable,
+            RequestedCaptureRunner,
+        )
+
+        self.gateway.drop_first_fork_response = True
+        with self.assertRaises(CaptureAttemptRetryable):
+            self._run()
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        manifest_bytes = canonical_json_bytes(
+            operation.frozen.evidence_manifest.to_dict()
+        )
+        repository = RepositorySnapshot(
+            REPOSITORY_ID, str(self.root), "main", "d" * 40
+        )
+        self._record_event(
+            "UserPromptSubmit",
+            "019fb100-0000-7000-8000-000000000099",
+            repository,
+            "2026-08-07T04:00:02Z",
+        )
+        self._record_event(
+            "Stop",
+            "019fb100-0000-7000-8000-000000000099",
+            repository,
+            "2026-08-07T04:00:03Z",
+        )
+        self.runner = RequestedCaptureRunner(
+            gateway=self.gateway,
+            operation_store=self.operation_store,
+            template_catalog=self.catalog,
+            evidence_ledger=self.evidence_ledger,
+            recall_host_store=self.recall_host_store,
+        )
+
+        self._run()
+
+        replayed = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        self.assertEqual(
+            manifest_bytes,
+            canonical_json_bytes(replayed.frozen.evidence_manifest.to_dict()),
+        )
+        self.assertEqual(1, len(replayed.frozen.evidence_manifest.anchors))
+
+    def test_legacy_operation_resumes_without_v5_manifest_or_sidecars(self) -> None:
+        operation = self._legacy_operation()
+
+        result = self._run()
+        replay = self._run()
+
+        self.assertEqual(operation.operation_id, result.capture_operation_id)
+        self.assertEqual(result, replay)
+        self.assertEqual(1, self.gateway.fork_count)
+        self.assertEqual("extractor-v4", result.protocol_revision)
+        self.assertEqual((), result.signal_provenance)
+        self.assertEqual((), result.candidate_provenance)
+        inventory_schema = self.gateway.schemas[0]
+        signal_properties = inventory_schema["properties"]["signals"]["items"][
+            "properties"
+        ]
+        self.assertNotIn("evidence_receipt_ids", signal_properties)
+
+    def test_v3_operation_resumes_without_manifest_reinterpretation(self) -> None:
+        operation = self._legacy_operation(record_version=3)
+
+        self.assertEqual(
+            self.request_profile,
+            self.runner.operation_profile(self.source, self.route_context),
+        )
+        result = self._run()
+
+        self.assertEqual(operation.operation_id, result.capture_operation_id)
+        self.assertEqual("extractor-v3", result.protocol_revision)
+        self.assertEqual((), result.signal_provenance)
+        self.assertEqual((), result.candidate_provenance)
+
+    def test_legacy_request_cannot_create_a_v5_sibling_operation(self) -> None:
+        from zdecision.app_server.requested_capture import RequestedCaptureFailed
+
+        self._legacy_operation()
+        sibling_context = FrozenCaptureRouteContext(
+            decision_space_id="dsp_" + "9" * 32,
+            decision_space_kind="shared_unit",
+            decision_space_name="Shared / sibling",
+            route_id="drr_" + "a" * 32,
+            route_configuration_version=1,
+            compatibility_product_id="prod_" + "b" * 32,
+            matched_path_digest=self.route_context.matched_path_digest,
+        )
+
+        with self.assertRaisesRegex(
+            RequestedCaptureFailed, "legacy_capture_protocol_mixed"
+        ):
+            self.runner.run(
+                self.source,
+                route_context=sibling_context,
+                matched_paths=MATCHED_PATHS,
+                template_id="business",
+                model_profile=self.request_profile,
+            )
+
+        self.assertEqual(0, self.gateway.fork_count)
+
+    def test_v5_schemas_are_bounded_to_manifest_and_eligible_signals(self) -> None:
+        self._run()
+
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        receipt_enum = self.gateway.schemas[0]["properties"]["signals"]["items"][
+            "properties"
+        ]["evidence_receipt_ids"]["items"]["enum"]
+        ordinal_enum = self.gateway.schemas[1]["properties"]["candidates"]["items"][
+            "properties"
+        ]["source_signal_ordinal"]["enum"]
+        self.assertEqual(
+            [operation.frozen.evidence_manifest.anchors[0].receipt_id], receipt_enum
+        )
+        self.assertEqual([1], ordinal_enum)
+        manifest_section = self.gateway.prompts[0].split(
+            "ZDECISION_FROZEN_PROMPT_ANCHOR_MANIFEST\n", 1
+        )[1].split("\nEND_ZDECISION_FROZEN_PROMPT_ANCHOR_MANIFEST", 1)[0]
+        payload = json.loads(manifest_section.splitlines()[-1])
+        self.assertEqual(
+            {
+                "anchors": [
+                    {
+                        "receipt_id": receipt_enum[0],
+                        "anchor_ordinal": 1,
+                        "active_reference_set_digest": None,
+                    }
+                ]
+            },
+            payload,
+        )
+        self.assertNotIn(self.prompt_event_id, manifest_section)
+        self.assertNotIn(SOURCE_TURN, manifest_section)
+
+    def test_invalid_v5_receipt_terminalizes_once_without_model_retry(self) -> None:
+        from zdecision.app_server.requested_capture import (
+            RequestedCaptureFailed,
+            SourceBoundaryUnavailable,
+        )
+
+        self.gateway.invalid_inventory_receipt = True
+        with self.assertRaisesRegex(
+            RequestedCaptureFailed, "capture_provenance_invalid"
+        ):
+            self._run()
+        counts = (self.gateway.fork_count, self.gateway.inventory_count)
+
+        with self.assertRaises(SourceBoundaryUnavailable):
+            self._run()
+
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        self.assertEqual("failed_terminal", operation.status)
+        self.assertEqual("capture_provenance_invalid", operation.failure_code)
+        self.assertEqual(counts, (self.gateway.fork_count, self.gateway.inventory_count))
+
+    def test_invalid_v5_signal_link_terminalizes_without_retry(self) -> None:
+        from zdecision.app_server.requested_capture import RequestedCaptureFailed
+
+        self.gateway.invalid_extraction_ordinal = True
+
+        with self.assertRaisesRegex(
+            RequestedCaptureFailed, "capture_provenance_invalid"
+        ):
+            self._run()
+
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        self.assertEqual("failed_terminal", operation.status)
+        self.assertEqual("capture_provenance_invalid", operation.failure_code)
+        self.assertEqual(1, self.gateway.fork_count)
+        self.assertEqual(1, self.gateway.extraction_count)
+
+    def test_capture_thread_is_bound_before_first_turn_and_recall_denied(self) -> None:
+        self._run()
+
+        row = self.recall_host_store._connection.execute(
+            "SELECT * FROM recall_internal_threads WHERE thread_id = 'fork-1'"
+        ).fetchone()
+        self.assertEqual("capture", row["purpose"])
+        self.assertEqual(SOURCE_SESSION, row["parent_thread_id"])
+        with self.assertRaises(RecallGateConflict):
+            self.recall_host_store.bind_activation(
+                session_id="fork-1",
+                turn_id="capture-turn",
+                cwd=str(self.root),
+                binding_id="capture-activation",
+                now=NOW,
+            )
+
+    def test_capture_binding_failure_archives_before_any_structured_turn(self) -> None:
+        from zdecision.app_server.requested_capture import RequestedCaptureFailed
+
+        with patch.object(
+            self.recall_host_store,
+            "bind_internal_thread",
+            side_effect=RecallGateConflict("binding unavailable"),
+        ):
+            with self.assertRaises(RequestedCaptureFailed):
+                self._run()
+
+        self.assertEqual(0, self.gateway.inventory_count)
+        self.assertEqual(["fork-1"], self.gateway.archived_threads)
 
     def test_unknown_fork_starts_a_new_generation(self) -> None:
         from zdecision.app_server.requested_capture import (

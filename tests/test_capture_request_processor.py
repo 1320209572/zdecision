@@ -57,6 +57,8 @@ class FakeCaptureRunner:
             discovery_digest="a" * 64,
             discovered_at="2026-08-05T05:00:00Z",
         )
+        self.protocol_by_session: dict[str, str] = {}
+        self.unavailable_sessions: set[str] = set()
 
     def sweep_archives(self) -> None:
         pass
@@ -77,6 +79,12 @@ class FakeCaptureRunner:
         model_profile,
         heartbeat=None,
     ):
+        if source.session_id in self.unavailable_sessions:
+            from zdecision.app_server.requested_capture import (
+                SourceEvidenceUnavailable,
+            )
+
+            raise SourceEvidenceUnavailable("missing prompt anchors")
         self.calls.append(route_context.decision_space_id)
         seed = route_context.route_id[4]
         observation = Candidate(
@@ -103,10 +111,18 @@ class FakeCaptureRunner:
             observations=(observation,),
             evidence_digest="b" * 64,
             model_profile=model_profile,
+            protocol_revision=self.protocol_by_session.get(
+                source.session_id, "extractor-v5"
+            ),
+            signal_provenance=(),
+            candidate_provenance=(),
         )
 
 
 class FakeReconciliationRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def sweep_archives(self) -> None:
         pass
 
@@ -123,6 +139,7 @@ class FakeReconciliationRunner:
         profile,
         heartbeat=None,
     ):
+        self.calls += 1
         decisions = tuple(
             ReconciliationDecision(
                 item.candidate_id,
@@ -265,6 +282,29 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         self.git_paths = FakeGitPaths(evidence)
         self.capture_runner = FakeCaptureRunner()
         self.reconciliation_runner = FakeReconciliationRunner()
+
+    def observe_stop(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        occurred_at: str,
+    ) -> None:
+        repository = RepositorySnapshot(
+            REPOSITORY_ID, str(self.root), "main", "d" * 40
+        )
+        invocation = HookInvocation.from_dict(
+            {
+                "hook_event_name": "Stop",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "cwd": str(self.root),
+            },
+            occurred_at=occurred_at,
+            repository=repository,
+        )
+        event = self.database.record_hook(invocation)
+        self.session_index.observe(event)
 
     def route(self, seed, prefix, decision_space_id):
         return RepositoryDecisionRoute(
@@ -443,6 +483,49 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         )
         self.assertEqual(1, len(next_sources))
         self.assertIsNone(next_sources[0].previous_handled_turn_id)
+
+    def test_unavailable_source_evidence_is_terminally_excluded_without_retry(
+        self,
+    ) -> None:
+        self.capture_runner.unavailable_sessions.add(SESSION_ID)
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        row = self.session_index._connection.execute(
+            """
+            SELECT excluded_reason FROM capture_request_sources
+            WHERE request_id = ?
+            """,
+            (REQUEST_ID,),
+        ).fetchone()
+        self.assertEqual("user_prompt_evidence_unavailable", row["excluded_reason"])
+        self.assertEqual(0, self.reconciliation_runner.calls)
+        self.assertEqual(2, len(client.uploads))
+        self.assertTrue(all(not batch.items for batch in client.uploads))
+
+    def test_slice_rejects_mixed_legacy_and_v5_capture_results(self) -> None:
+        from zdecision.agent.service import TerminalCaptureRequestError
+
+        second_session = "019fb100-0000-7000-8000-000000000010"
+        self.observe_stop(
+            session_id=second_session,
+            turn_id="019fb100-0000-7000-8000-000000000011",
+            occurred_at="2026-08-05T05:00:01Z",
+        )
+        self.capture_runner.protocol_by_session = {
+            SESSION_ID: "extractor-v4",
+            second_session: "extractor-v5",
+        }
+        client = FakeCentralClient(self.group, self.views())
+
+        with self.assertRaisesRegex(
+            TerminalCaptureRequestError, "legacy_capture_protocol_mixed"
+        ):
+            self.processor().process(self.group, client)
+
+        self.assertEqual(0, self.reconciliation_runner.calls)
+        self.assertEqual([], client.uploads)
 
 
 if __name__ == "__main__":

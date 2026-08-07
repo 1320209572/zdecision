@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
+from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.request_state import RequestStateStore
 from zdecision.app_server.gateway import (
     AppServerGateway,
@@ -55,11 +56,15 @@ class ReconciliationRunner:
         *,
         gateway: AppServerGateway,
         request_state: RequestStateStore,
+        recall_host_store: RecallHostStore,
     ) -> None:
         self.gateway = gateway
         if not isinstance(request_state, RequestStateStore):
             raise TypeError("request_state must be a RequestStateStore")
+        if not isinstance(recall_host_store, RecallHostStore):
+            raise TypeError("recall_host_store must be a RecallHostStore")
         self.request_state = request_state
+        self.recall_host_store = recall_host_store
 
     def run(
         self,
@@ -149,6 +154,25 @@ class ReconciliationRunner:
         except (AppServerError, AppServerGatewayError) as error:
             raise ReconciliationAttemptRetryable(
                 "Disposable reconciliation Thread must be retried"
+            ) from error
+
+        try:
+            self.recall_host_store.bind_internal_thread(
+                thread_id=thread_id,
+                parent_thread_id=thread_id,
+                purpose="reconciliation",
+                operation_id=(
+                    f"reconciliation:{request_id}:{slice_id}:{thread_id}"
+                ),
+                now=datetime.now(UTC),
+            )
+        except Exception as error:
+            try:
+                self.gateway.archive_thread(thread_id)
+            except (AppServerError, AppServerGatewayError):
+                pass
+            raise ReconciliationRunnerError(
+                "Reconciliation internal Thread binding failed"
             ) from error
 
         try:

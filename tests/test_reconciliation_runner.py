@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
 from zdecision.app_server.jsonl import AppServerTimeout
 from zdecision.app_server.models import (
     AppServerTurnReceipt,
@@ -23,8 +25,6 @@ SLICE_ID = "csl_55555555555555555555555555555555"
 DECISION_SPACE_ID = "dsp_66666666666666666666666666666666"
 SOURCE_THREAD = "source-thread-must-not-leak"
 SOURCE_TURN = "source-turn-must-not-leak"
-
-
 def _observation() -> Candidate:
     return Candidate(
         candidate_id="cand_" + "3" * 32 + "_01",
@@ -83,6 +83,7 @@ class FakeGateway:
         self.archived_threads: list[str] = []
         self.last_prompt: str | None = None
         self.last_schema: dict[str, object] | None = None
+        self.binding_store: RecallHostStore | None = None
 
     def start_disposable_thread(
         self,
@@ -105,6 +106,10 @@ class FakeGateway:
         cwd: str,
     ) -> AppServerTurnReceipt:
         self.assert_call_context(cwd, profile)
+        if self.binding_store is not None and not self.binding_store.is_internal_thread(
+            thread_id
+        ):
+            raise AssertionError("structured Turn started before internal binding")
         self.started_turns += 1
         self.last_prompt = prompt
         self.last_schema = output_schema
@@ -151,9 +156,15 @@ class ReconciliationRunnerTest(unittest.TestCase):
             self.root / "agent.sqlite3"
         )
         self.addCleanup(self.request_state.close)
+        self.recall_host_store = RecallHostStore.open(
+            self.root / "agent.sqlite3"
+        )
+        self.addCleanup(self.recall_host_store.close)
+        self.gateway.binding_store = self.recall_host_store
         self.runner = ReconciliationRunner(
             gateway=self.gateway,
             request_state=self.request_state,
+            recall_host_store=self.recall_host_store,
         )
 
     def _run(self, observations: tuple[Candidate, ...] | None = None):
@@ -310,6 +321,49 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertEqual(
             ["reconciliation-thread-1"],
             self.gateway.archived_threads,
+        )
+
+    def test_reconciliation_thread_is_bound_before_turn_and_recall_denied(
+        self,
+    ) -> None:
+        self._run()
+
+        row = self.recall_host_store._connection.execute(
+            """
+            SELECT * FROM recall_internal_threads
+            WHERE thread_id = 'reconciliation-thread-1'
+            """
+        ).fetchone()
+        self.assertEqual("reconciliation", row["purpose"])
+        self.assertEqual("reconciliation-thread-1", row["parent_thread_id"])
+        self.assertIn(REQUEST_ID, row["operation_id"])
+        self.assertIn(SLICE_ID, row["operation_id"])
+        with self.assertRaises(RecallGateConflict):
+            self.recall_host_store.begin_turn_gate(
+                session_id="reconciliation-thread-1",
+                turn_id="reconciliation-turn",
+                context_epoch=0,
+                intent_epoch=0,
+                active_generation=None,
+                gate_id="reconciliation-gate",
+            )
+
+    def test_reconciliation_binding_failure_archives_before_turn(self) -> None:
+        from zdecision.app_server.reconciliation_runner import (
+            ReconciliationRunnerError,
+        )
+
+        with patch.object(
+            self.recall_host_store,
+            "bind_internal_thread",
+            side_effect=RecallGateConflict("binding unavailable"),
+        ):
+            with self.assertRaises(ReconciliationRunnerError):
+                self._run()
+
+        self.assertEqual(0, self.gateway.started_turns)
+        self.assertEqual(
+            ["reconciliation-thread-1"], self.gateway.archived_threads
         )
 
 

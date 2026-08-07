@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 
-from zdecision.agent.capture_operation_store import CaptureOperationStore
+from zdecision.agent.capture_operation_store import (
+    CaptureOperationCorrupt,
+    CaptureOperationStore,
+)
+from zdecision.agent.db import AgentDatabase
+from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.session_index import FrozenSessionSource
 from zdecision.app_server.gateway import (
     AppServerGateway,
@@ -34,6 +40,7 @@ from zdecision.app_server.models import (
 from zdecision.capture.inventory import (
     InventoryValidationError,
     validate_inventory,
+    validate_inventory_v5,
 )
 from zdecision.capture.models import Candidate
 from zdecision.capture.on_demand import (
@@ -42,6 +49,11 @@ from zdecision.capture.on_demand import (
     FrozenCaptureInput,
     FrozenCaptureRouteContext,
     ValidatedCaptureResult,
+)
+from zdecision.capture.provenance import (
+    CandidateProvenance,
+    CaptureEvidenceManifest,
+    SignalProvenance,
 )
 from zdecision.capture.service import ExtractionValidationError
 from zdecision.capture.templates import TemplateCatalog
@@ -58,6 +70,10 @@ class SourceNotInteractive(RequestedCaptureError):
 
 class SourceBoundaryUnavailable(RequestedCaptureError):
     """The exact frozen source boundary can no longer be read."""
+
+
+class SourceEvidenceUnavailable(RequestedCaptureError):
+    """The frozen source cannot produce a verified prompt-anchor manifest."""
 
 
 class CaptureAttemptRetryable(RequestedCaptureError):
@@ -82,6 +98,9 @@ class SessionCaptureResult:
     observations: tuple[Candidate, ...]
     evidence_digest: str
     model_profile: FeasibilityModelProfile
+    protocol_revision: str
+    signal_provenance: tuple[SignalProvenance, ...]
+    candidate_provenance: tuple[CandidateProvenance, ...]
 
 
 class RequestedCaptureRunner:
@@ -93,6 +112,8 @@ class RequestedCaptureRunner:
         gateway: AppServerGateway,
         operation_store: CaptureOperationStore,
         template_catalog: TemplateCatalog,
+        evidence_ledger: AgentDatabase,
+        recall_host_store: RecallHostStore,
     ) -> None:
         self.gateway = gateway
         if not isinstance(operation_store, CaptureOperationStore):
@@ -101,8 +122,14 @@ class RequestedCaptureRunner:
             )
         if not isinstance(template_catalog, TemplateCatalog):
             raise TypeError("template_catalog must be a TemplateCatalog")
+        if not isinstance(evidence_ledger, AgentDatabase):
+            raise TypeError("evidence_ledger must be an AgentDatabase")
+        if not isinstance(recall_host_store, RecallHostStore):
+            raise TypeError("recall_host_store must be a RecallHostStore")
         self.operation_store = operation_store
         self.template_catalog = template_catalog
+        self.evidence_ledger = evidence_ledger
+        self.recall_host_store = recall_host_store
 
     def run(
         self,
@@ -175,10 +202,23 @@ class RequestedCaptureRunner:
             )
 
         if existing is None:
+            owned = self.operation_store.operation_for_source(
+                source.request_id, source.source_key
+            )
+            if owned is not None and owned.frozen.record_version in (3, 4):
+                if owned.frozen.record_version == 3:
+                    existing = owned
+                else:
+                    raise RequestedCaptureFailed(
+                        "legacy_capture_protocol_mixed"
+                    )
+
+        if existing is None:
             profile = model_profile
             template = self.template_catalog.render(
                 template_id_value, product
             )
+            evidence_manifest = self._build_manifest(source)
             frozen = FrozenCaptureInput.create(
                 request_id=source.request_id,
                 repository_id=source.repository_id,
@@ -199,6 +239,7 @@ class RequestedCaptureRunner:
                 model_discovery_digest=profile.discovery_digest,
                 model_discovered_at=profile.discovered_at,
                 route_context=route_context,
+                evidence_manifest=evidence_manifest,
             )
             operation = self.operation_store.ensure_operation(frozen)
         else:
@@ -212,6 +253,8 @@ class RequestedCaptureRunner:
                 model_profile,
             )
             profile = model_profile
+            if operation.frozen.record_version == 5:
+                self._verify_frozen_manifest(operation, source)
 
         if operation.status == "failed_terminal":
             raise SourceBoundaryUnavailable(
@@ -256,6 +299,37 @@ class RequestedCaptureRunner:
         attempt = self.operation_store.attach_thread(
             attempt.attempt_id, fork_thread_id
         )
+
+        try:
+            self.recall_host_store.bind_internal_thread(
+                thread_id=fork_thread_id,
+                parent_thread_id=source.session_id,
+                purpose="capture",
+                operation_id=attempt.attempt_id,
+                now=datetime.now(UTC),
+            )
+        except Exception as error:
+            self._abandon(
+                attempt.attempt_id, "capture_internal_binding_failed"
+            )
+            self.operation_store.fail_operation_terminal(
+                operation.operation_id, "capture_internal_binding_failed"
+            )
+            raise RequestedCaptureFailed(
+                "Capture internal Thread binding failed"
+            ) from error
+
+        if operation.frozen.record_version == 5:
+            return self._run_v5_attempt(
+                source=source,
+                operation=operation,
+                attempt_id=attempt.attempt_id,
+                fork_thread_id=fork_thread_id,
+                profile=profile,
+                route_context=route_context,
+                matched_paths=matched_paths,
+                heartbeat=heartbeat,
+            )
 
         try:
             _heartbeat(heartbeat)
@@ -346,6 +420,192 @@ class RequestedCaptureRunner:
             )
         return self._result(source, committed, profile)
 
+    def _build_manifest(
+        self, source: FrozenSessionSource
+    ) -> CaptureEvidenceManifest:
+        if source.upper_stop_event_id is None:
+            raise SourceEvidenceUnavailable(
+                "Frozen source has no upper Stop event"
+            )
+        try:
+            anchors = self.evidence_ledger.prompt_anchors_between(
+                session_id=source.session_id,
+                cwd=source.cwd,
+                repository_id=source.repository_id,
+                previous_handled_event_id=(
+                    source.previous_handled_event_id
+                ),
+                upper_stop_event_id=source.upper_stop_event_id,
+            )
+            verified = []
+            for anchor in anchors:
+                gate = self.recall_host_store.get_turn_gate(
+                    source.session_id, anchor.turn_id
+                )
+                if gate is not None and (
+                    gate.state != "committed"
+                    or gate.reference_state_version != 1
+                ):
+                    raise ValueError("Recall gate is not provenance-ready")
+                verified.append(
+                    replace(
+                        anchor,
+                        active_reference_set_digest=(
+                            None if gate is None else gate.active_set_digest
+                        ),
+                    )
+                )
+            return CaptureEvidenceManifest.create(
+                source_session_id=source.session_id,
+                previous_handled_event_id=source.previous_handled_event_id,
+                upper_stop_event_id=source.upper_stop_event_id,
+                anchors=tuple(verified),
+            )
+        except (ValueError, sqlite3.Error) as error:
+            raise SourceEvidenceUnavailable(
+                "Frozen prompt-anchor evidence is unavailable"
+            ) from error
+
+    @staticmethod
+    def _verify_frozen_manifest(
+        operation: CaptureOperation, source: FrozenSessionSource
+    ) -> None:
+        manifest = operation.frozen.evidence_manifest
+        if (
+            manifest is None
+            or manifest.source_session_id != source.session_id
+            or manifest.previous_handled_event_id
+            != source.previous_handled_event_id
+            or manifest.upper_stop_event_id != source.upper_stop_event_id
+        ):
+            raise SourceEvidenceUnavailable(
+                "Frozen Capture manifest conflicts with its source"
+            )
+
+    def _run_v5_attempt(
+        self,
+        *,
+        source: FrozenSessionSource,
+        operation: CaptureOperation,
+        attempt_id: str,
+        fork_thread_id: str,
+        profile: FeasibilityModelProfile,
+        route_context: FrozenCaptureRouteContext,
+        matched_paths: tuple[str, ...],
+        heartbeat: Callable[[], None] | None,
+    ) -> SessionCaptureResult:
+        manifest = operation.frozen.evidence_manifest
+        if manifest is None:
+            raise RequestedCaptureFailed("capture_provenance_invalid")
+        receipt_ids = tuple(anchor.receipt_id for anchor in manifest.anchors)
+        try:
+            _heartbeat(heartbeat)
+            inventory_receipt = self.gateway.run_structured_turn(
+                thread_id=fork_thread_id,
+                prompt=(
+                    operation.frozen.template.inventory_prompt
+                    + _manifest_instruction(manifest)
+                ),
+                output_schema=inventory_output_schema(receipt_ids),
+                profile=profile,
+                cwd=operation.frozen.cwd,
+            )
+            _heartbeat(heartbeat)
+        except (AppServerError, AppServerGatewayError) as error:
+            self._abandon(
+                attempt_id, _attempt_failure_code("inventory", error)
+            )
+            raise CaptureAttemptRetryable(
+                "Disposable Inventory attempt must be retried"
+            ) from error
+        try:
+            _verify_receipt(inventory_receipt, fork_thread_id, profile)
+            self.operation_store.attach_turn(
+                attempt_id, "inventory", inventory_receipt.turn_id
+            )
+            inventory, signal_provenance = validate_inventory_v5(
+                inventory_receipt.structured_output, manifest
+            )
+        except (InventoryValidationError, RequestedCaptureFailed) as error:
+            self._fail_provenance(operation, attempt_id, error)
+
+        eligible_ordinals = tuple(
+            item.signal_ordinal
+            for item in signal_provenance
+            if item.disposition == "candidate_eligible"
+        )
+        try:
+            _heartbeat(heartbeat)
+            extraction_receipt = self.gateway.run_structured_turn(
+                thread_id=fork_thread_id,
+                prompt=(
+                    operation.frozen.template.extraction_prompt
+                    + _leaf_instruction(route_context, matched_paths)
+                ),
+                output_schema=extraction_output_schema(
+                    operation.frozen.product, eligible_ordinals
+                ),
+                profile=profile,
+                cwd=operation.frozen.cwd,
+            )
+            _heartbeat(heartbeat)
+        except (AppServerError, AppServerGatewayError) as error:
+            self._abandon(
+                attempt_id, _attempt_failure_code("extraction", error)
+            )
+            raise CaptureAttemptRetryable(
+                "Disposable Extraction attempt must be retried"
+            ) from error
+        try:
+            _verify_receipt(extraction_receipt, fork_thread_id, profile)
+            self.operation_store.attach_turn(
+                attempt_id, "extraction", extraction_receipt.turn_id
+            )
+            validated = ValidatedCaptureResult.create(
+                operation.frozen,
+                inventory_receipt.structured_output,
+                extraction_receipt.structured_output,
+            )
+            if (
+                validated.result_version != 2
+                or validated.evidence_manifest != manifest
+                or validated.signal_provenance != signal_provenance
+                or validated.inventory != inventory
+            ):
+                raise RequestedCaptureFailed(
+                    "capture_provenance_invalid"
+                )
+        except (
+            InventoryValidationError,
+            ExtractionValidationError,
+            RequestedCaptureFailed,
+            ValueError,
+        ) as error:
+            self._fail_provenance(operation, attempt_id, error)
+
+        self.operation_store.store_validated_attempt(
+            attempt_id, validated, _now()
+        )
+        committed = self.operation_store.commit_attempt(attempt_id)
+        self.sweep_archives()
+        if committed.result is None:
+            raise CaptureAttemptRetryable(
+                "Capture generation was superseded before commit"
+            )
+        return self._result(source, committed, profile)
+
+    def _fail_provenance(
+        self,
+        operation: CaptureOperation,
+        attempt_id: str,
+        error: Exception,
+    ) -> None:
+        self._abandon(attempt_id, "capture_provenance_invalid")
+        self.operation_store.fail_operation_terminal(
+            operation.operation_id, "capture_provenance_invalid"
+        )
+        raise RequestedCaptureFailed("capture_provenance_invalid") from error
+
     def operation_profile(
         self,
         source: FrozenSessionSource,
@@ -360,6 +620,15 @@ class RequestedCaptureRunner:
             if route_context is None
             else route_context.decision_space_id,
         )
+        if operation is None and route_context is not None:
+            try:
+                legacy = self.operation_store.operation_for_source(
+                    source.request_id, source.source_key
+                )
+            except CaptureOperationCorrupt:
+                legacy = None
+            if legacy is not None and legacy.frozen.record_version == 3:
+                operation = legacy
         return None if operation is None else _profile(operation.frozen)
 
     def resolve_request_profile(
@@ -429,7 +698,6 @@ class RequestedCaptureRunner:
             source.upper_turn_id,
             source.source_fingerprint,
             product,
-            route_context,
             template_id,
             profile.profile_id,
             profile.model_id,
@@ -448,7 +716,6 @@ class RequestedCaptureRunner:
             frozen.upper_turn_id,
             frozen.source_fingerprint,
             frozen.product,
-            frozen.route_context,
             frozen.template.template_id,
             frozen.model_profile_id,
             frozen.model_id,
@@ -456,7 +723,10 @@ class RequestedCaptureRunner:
             frozen.model_discovery_digest,
             frozen.model_discovered_at,
         )
-        if actual != expected:
+        if actual != expected or (
+            frozen.record_version != 3
+            and frozen.route_context != route_context
+        ):
             raise RequestedCaptureFailed(
                 "Capture replay input conflicts with its frozen operation"
             )
@@ -476,6 +746,22 @@ class RequestedCaptureRunner:
                 "Committed Capture evidence is incomplete"
             )
         result = commit.result
+        if (
+            commit.operation.frozen.record_version == 5
+            and (
+                result.result_version != 2
+                or result.evidence_manifest
+                != commit.operation.frozen.evidence_manifest
+            )
+        ) or (
+            commit.operation.frozen.record_version in (3, 4)
+            and (
+                result.result_version != 1
+                or result.signal_provenance
+                or result.candidate_provenance
+            )
+        ):
+            raise RequestedCaptureFailed("capture_provenance_invalid")
         evidence_digest = hashlib.sha256(
             canonical_json_bytes(
                 {
@@ -507,6 +793,9 @@ class RequestedCaptureRunner:
             observations=result.observations,
             evidence_digest=evidence_digest,
             model_profile=profile,
+            protocol_revision=commit.operation.frozen.protocol_revision,
+            signal_provenance=result.signal_provenance,
+            candidate_provenance=result.candidate_provenance,
         )
 
 
@@ -576,6 +865,30 @@ def _leaf_instruction(
         "Shared leaf.\n"
         f"{payload}\n"
         "END_ZDECISION_FIXED_DECISION_SPACE"
+    )
+
+
+def _manifest_instruction(manifest: CaptureEvidenceManifest) -> str:
+    payload = canonical_json_bytes(
+        {
+            "anchors": [
+                {
+                    "receipt_id": anchor.receipt_id,
+                    "anchor_ordinal": anchor.anchor_ordinal,
+                    "active_reference_set_digest": (
+                        anchor.active_reference_set_digest
+                    ),
+                }
+                for anchor in manifest.anchors
+            ]
+        }
+    ).decode("utf-8")
+    return (
+        "\n\nZDECISION_FROZEN_PROMPT_ANCHOR_MANIFEST\n"
+        "Use only the opaque receipt IDs below as user-prompt evidence. "
+        "Return receipt IDs in manifest order.\n"
+        f"{payload}\n"
+        "END_ZDECISION_FROZEN_PROMPT_ANCHOR_MANIFEST"
     )
 
 

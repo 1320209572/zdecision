@@ -258,6 +258,7 @@ def configured_processor(
     from zdecision.agent.control_bindings import ControlBindingStore
     from zdecision.agent.git_path_evidence import GitPathEvidenceReader
     from zdecision.agent.request_state import RequestStateStore
+    from zdecision.agent.recall_host_state import RecallHostStore
     from zdecision.agent.session_index import SessionIndex
     from zdecision.app_server.gateway import AppServerGateway
     from zdecision.app_server.reconciliation_runner import (
@@ -276,6 +277,7 @@ def configured_processor(
     request_state = RequestStateStore.open(local_state_path)
     routing_store = CaptureRoutingStore.open(local_state_path)
     control_store = ControlBindingStore.open(local_state_path)
+    recall_host_store = RecallHostStore.open(Path(database.path).resolve())
     database.retire_legacy_automatic_capture()
     gateway = None
     try:
@@ -293,10 +295,13 @@ def configured_processor(
                 gateway=gateway,
                 operation_store=operation_store,
                 template_catalog=template_catalog,
+                evidence_ledger=database,
+                recall_host_store=recall_host_store,
             ),
             reconciliation_runner=ReconciliationRunner(
                 gateway=gateway,
                 request_state=request_state,
+                recall_host_store=recall_host_store,
             ),
             request_state=request_state,
             control_store=control_store,
@@ -308,6 +313,7 @@ def configured_processor(
         routing_store.close()
         operation_store.close()
         control_store.close()
+        recall_host_store.close()
         close_gateway = getattr(gateway, "close", None)
         if callable(close_gateway):
             close_gateway()
