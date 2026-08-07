@@ -73,3 +73,36 @@ legacy/v2 results fail before persistence, while v3/v4 frozen bytes round-trip
 exactly. Additional focused coverage exercises receipt ordering and manifest
 membership, host dispositions, eligible ordinal uniqueness, and multi-receipt
 sidecar order.
+
+## Fix round 2
+
+### RED
+
+Command:
+
+```bash
+.venv/bin/python -m unittest tests.test_capture_operation.FrozenCaptureInputTests.test_historical_v3_and_v4_frozen_bytes_round_trip_exactly tests.test_capture_operation.FrozenCaptureInputTests.test_code_and_tool_only_v5_signal_cannot_create_an_observation -v
+```
+
+Result: `FAILED (failures=2)`. The initial literal v3/v4 fixture bytes omitted
+the canonical terminal newline, while the independent code/tool-only corpus
+case passed. This exposed fixture formatting rather than a production defect.
+
+### GREEN
+
+Commands:
+
+```bash
+.venv/bin/python -m unittest tests.test_inventory tests.test_capture tests.test_capture_operation tests.test_templates -q
+git diff --check
+.venv/bin/python -m compileall -q src/zdecision/capture src/zdecision/agent tests
+```
+
+Result: `Ran 124 tests in 0.408s ... OK`; diff and compilation checks completed
+with exit code 0.
+
+The v3/v4 check now loads fixed, literal canonical JSON byte fixtures rather
+than generating historical inputs through the current serializer, and verifies
+their exact bytes on reserialization. A receipt-free v5 code/tool-only signal
+uses its actual input shape and is shown unable to create an observation or
+become candidate eligible.

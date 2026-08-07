@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import tempfile
 import sqlite3
 import unittest
@@ -35,6 +36,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_ROOT = REPOSITORY_ROOT / "decision-templates"
 ENVELOPE_ROOT = REPOSITORY_ROOT / "src" / "zdecision" / "capture" / "prompt_contracts"
 NOW = "2026-07-31T08:00:00Z"
+HISTORICAL_FROZEN_V3 = b'{"cwd":"/repo","lineage":"lin_44444444444444444444444444444444","model_discovered_at":"2026-01-01T00:00:00Z","model_discovery_digest":"7777777777777777777777777777777777777777777777777777777777777777","model_id":"model","model_profile_id":"fmp_66666666666666666666666666666666","operation_id":"cap_0a5398bd34b112580598c641e74cd1e0","previous_handled_turn_id":null,"product":"Historic","protocol_revision":"extractor-v3","reasoning_effort":"low","record_version":3,"repository_id":"repo_22222222222222222222222222222222","request_id":"crq_11111111111111111111111111111111","session_id":"session-1","source_fingerprint":"5555555555555555555555555555555555555555555555555555555555555555","source_key":"src_33333333333333333333333333333333","template":{"candidate_contract_version":"candidate-v1","extraction_prompt":"extraction","extraction_prompt_sha256":"02dc4d5f9f2b4e2d2236a30029aa298c3d17dbe516003d0b126e2634272b66b6","inventory_contract_version":"inventory-v1","inventory_prompt":"inventory","inventory_prompt_sha256":"16ab2dd6f5ebf6c2a34d3f9af59b0c29e7bfea1e4514a7bc4776db8aaba1554d","prompt_bundle_sha256":"11a0ba0b387c379baaedf8dbde7ba7d9af916f4a6ba2f326cff69b8368368429","renderer_version":"renderer-v1","revision":1,"template_id":"historic","template_source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","title":"Historic"},"upper_turn_id":"turn-1"}'
+HISTORICAL_FROZEN_V4 = b'{"cwd":"/repo","lineage":"lin_44444444444444444444444444444444","model_discovered_at":"2026-01-01T00:00:00Z","model_discovery_digest":"7777777777777777777777777777777777777777777777777777777777777777","model_id":"model","model_profile_id":"fmp_66666666666666666666666666666666","operation_id":"cap_dbe31bbec3048364748480e17b1ae3f6","previous_handled_turn_id":null,"product":"Historic","protocol_revision":"extractor-v4","reasoning_effort":"low","record_version":4,"repository_id":"repo_22222222222222222222222222222222","request_id":"crq_11111111111111111111111111111111","route_context":{"compatibility_product_id":"prod_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","decision_space_id":"dsp_88888888888888888888888888888888","decision_space_kind":"product","decision_space_name":"ZDecision","matched_path_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","route_configuration_version":1,"route_id":"drr_99999999999999999999999999999999"},"session_id":"session-1","source_fingerprint":"5555555555555555555555555555555555555555555555555555555555555555","source_key":"src_33333333333333333333333333333333","template":{"candidate_contract_version":"candidate-v1","extraction_prompt":"extraction","extraction_prompt_sha256":"02dc4d5f9f2b4e2d2236a30029aa298c3d17dbe516003d0b126e2634272b66b6","inventory_contract_version":"inventory-v1","inventory_prompt":"inventory","inventory_prompt_sha256":"16ab2dd6f5ebf6c2a34d3f9af59b0c29e7bfea1e4514a7bc4776db8aaba1554d","prompt_bundle_sha256":"11a0ba0b387c379baaedf8dbde7ba7d9af916f4a6ba2f326cff69b8368368429","renderer_version":"renderer-v1","revision":1,"template_id":"historic","template_source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","title":"Historic"},"upper_turn_id":"turn-1"}'
+HISTORICAL_FROZEN_V3 += b"\n"
+HISTORICAL_FROZEN_V4 += b"\n"
 
 
 def route_context(**overrides: object) -> FrozenCaptureRouteContext:
@@ -240,20 +245,14 @@ def v2_result_for_operation(operation_id: str) -> ValidatedCaptureResult:
 class FrozenCaptureInputTests(unittest.TestCase):
     def test_historical_v3_and_v4_frozen_bytes_round_trip_exactly(self) -> None:
         """This catches v5 serialization rewriting previously frozen inputs."""
-        for record_version in (3, 4):
-            with self.subTest(record_version=record_version):
-                historical = legacy_frozen_input(record_version)
-                encoded = canonical_json_bytes(historical.to_dict())
-                self.assertEqual(
-                    encoded,
-                    canonical_json_bytes(
-                        FrozenCaptureInput.from_dict(historical.to_dict()).to_dict()
-                    ),
-                )
+        for encoded in (HISTORICAL_FROZEN_V3, HISTORICAL_FROZEN_V4):
+            with self.subTest(record_version=json.loads(encoded)["record_version"]):
+                historical = FrozenCaptureInput.from_dict(json.loads(encoded))
+                self.assertEqual(encoded, canonical_json_bytes(historical.to_dict()))
                 result = ValidatedCaptureResult.create(
                     historical,
                     VALID_INVENTORY,
-                    {"candidates": [valid_candidate()]},
+                    {"candidates": [{**valid_candidate(), "product": "Historic"}]},
                 )
                 self.assertEqual(1, result.result_version)
                 self.assertEqual(
@@ -295,6 +294,38 @@ class FrozenCaptureInputTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             ValidatedCaptureResult.from_dict(other_result.to_dict(), frozen)
+
+    def test_code_and_tool_only_v5_signal_cannot_create_an_observation(self) -> None:
+        """This catches promoting an unanchored code/tool corpus fact."""
+        frozen = frozen_input()
+        code_only_inventory = {
+            "signals": [
+                {
+                    "signal_ordinal": 1,
+                    "topic": "Tool-reported endpoint",
+                    "rule": "The command output says the endpoint passed",
+                    "future_effect": "No durable user choice is established",
+                    "scope": "Code and tool output only",
+                    "status": "unresolved",
+                    "confirmation_basis": "uncertain",
+                    "confidence": "low",
+                    "evidence_receipt_ids": [],
+                }
+            ],
+            "coverage": {
+                "reviewed_retained_context": "earliest_to_latest",
+                "known_gaps": [],
+            },
+        }
+
+        result = ValidatedCaptureResult.create(
+            frozen, code_only_inventory, {"candidates": []}
+        )
+
+        self.assertEqual((), result.observations)
+        self.assertNotEqual(
+            "candidate_eligible", result.signal_provenance[0].disposition
+        )
 
     def test_operation_identity_binds_every_frozen_input(self) -> None:
         first = frozen_input()
