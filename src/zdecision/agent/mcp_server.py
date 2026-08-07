@@ -10,6 +10,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 from mcp.types import CallToolResult, TextContent
+from pydantic import ConfigDict
 
 from zdecision.agent.browser_launcher import (
     BrowserLauncher,
@@ -25,6 +26,12 @@ from zdecision.agent.control_bindings import (
 )
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.repository import RepositoryResolver
+from zdecision.agent.recall_mcp import (
+    LiveHostProbeProvider,
+    ReadinessRecallGateProvider,
+    RecallMcpTools,
+)
+from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.service import load_agent_config
 from zdecision.sync.contracts import (
     CaptureRequestCreate,
@@ -354,7 +361,10 @@ class LocalMcpTools:
             return None
 
 
-def create_mcp_server(tools: LocalMcpTools):
+def create_mcp_server(
+    tools: LocalMcpTools,
+    recall_tools: RecallMcpTools | None = None,
+):
     """Create the local server and its isolated Candidate refresh card."""
 
     from mcp.server.fastmcp import FastMCP
@@ -378,6 +388,12 @@ def create_mcp_server(tools: LocalMcpTools):
         destructiveHint=False,
         idempotentHint=False,
         openWorldHint=True,
+    )
+    recall_action = ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
     )
 
     @server.resource(
@@ -461,7 +477,55 @@ def create_mcp_server(tools: LocalMcpTools):
     def open_zdecision_dashboard(control_id: str) -> dict[str, object]:
         return tools.open_zdecision_dashboard(control_id)
 
+    if recall_tools is not None:
+
+        @server.tool(
+            title="Activate ZDecision Recall",
+            description="Activate Recall through one trusted host binding.",
+            annotations=recall_action,
+        )
+        def activate_zdecision_recall(
+            activation_binding_id: str,
+            intent: object,
+        ) -> dict[str, object]:
+            return recall_tools.activate_zdecision_recall(
+                activation_binding_id=activation_binding_id,
+                intent=intent,
+            )
+
+        @server.tool(
+            title="Gate ZDecision Recall Turn",
+            description="Gate one native Turn through its trusted host binding.",
+            annotations=recall_action,
+        )
+        def gate_zdecision_turn(
+            turn_gate_id: str,
+            intent: object,
+        ) -> dict[str, object]:
+            return recall_tools.gate_zdecision_turn(
+                turn_gate_id=turn_gate_id,
+                intent=intent,
+            )
+
+        _forbid_extra_tool_input(server, "activate_zdecision_recall")
+        _forbid_extra_tool_input(server, "gate_zdecision_turn")
+
     return server
+
+
+def _forbid_extra_tool_input(server: object, tool_name: str) -> None:
+    """Make the current MCP SDK's generated argument model closed-world."""
+
+    tool = server._tool_manager.get_tool(tool_name)
+    if tool is None:
+        raise RuntimeError("Recall MCP tool registration failed")
+    argument_model = tool.fn_metadata.arg_model
+    argument_model.model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+    argument_model.model_rebuild(force=True)
+    tool.parameters = argument_model.model_json_schema(by_alias=True)
 
 
 def run_mcp(
@@ -473,6 +537,7 @@ def run_mcp(
     """Start the MCP SDK only for the explicit `mcp` subcommand."""
 
     database = AgentDatabase.open(database_path)
+    recall_store = RecallHostStore.open(database_path)
     binding_store: ControlBindingStore | None = None
     client: CentralClient | None = None
     central_base_url: str | None = None
@@ -498,12 +563,25 @@ def run_mcp(
             central_base_url=central_base_url,
             browser_launcher=SystemDefaultBrowserLauncher(),
         )
-        create_mcp_server(tools).run(transport="stdio")
+        live_acceptance = os.environ.get("ZDECISION_LIVE_ACCEPTANCE") == "1"
+        provider = (
+            LiveHostProbeProvider(database_path, cwd)
+            if live_acceptance
+            else ReadinessRecallGateProvider()
+        )
+        recall_tools = RecallMcpTools(
+            host_store=recall_store,
+            provider=provider,
+            cwd=cwd,
+            live_acceptance=live_acceptance,
+        )
+        create_mcp_server(tools, recall_tools).run(transport="stdio")
     finally:
         if client is not None:
             client.close()
         if binding_store is not None:
             binding_store.close()
+        recall_store.close()
         database.close()
 
 

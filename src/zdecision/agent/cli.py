@@ -8,6 +8,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.private_store.filesystem import private_state_root
@@ -36,6 +37,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("mcp", help="serve the local ZDecision MCP tools over stdio")
     subparsers.add_parser("worker", help="run the singleton local Agent worker")
     subparsers.add_parser("status", help="show bounded local Agent status")
+    if os.environ.get("ZDECISION_LIVE_ACCEPTANCE") == "1":
+        recall_gate = subparsers.add_parser(
+            "recall-host-gate",
+            help="manage the live-acceptance-only Recall host probe",
+        )
+        recall_actions = recall_gate.add_subparsers(
+            dest="recall_host_gate_action", required=True
+        )
+        prepare = recall_actions.add_parser(
+            "prepare", help="prepare one bounded Recall host probe"
+        )
+        prepare.add_argument("--cwd", required=True)
+        recall_actions.add_parser("clear", help="clear prepared Recall host probes")
     service = subparsers.add_parser(
         "service", help="manage the persistent local delivery service"
     )
@@ -124,6 +138,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             sys.stdout.buffer.write(canonical_json_bytes(tools.zdecision_status()))
             return 0
+        if arguments.command == "recall-host-gate":
+            return _run_recall_host_gate(arguments, database, state_path)
         return _configure_test_repository(arguments, database)
     finally:
         database.close()
@@ -161,6 +177,41 @@ def _configure_test_repository(
 
 def _write_error(code: str) -> None:
     sys.stderr.buffer.write(canonical_json_bytes({"error": code}))
+
+
+def _run_recall_host_gate(
+    arguments: argparse.Namespace,
+    database: AgentDatabase,
+    state_path: Path,
+) -> int:
+    from zdecision.agent.recall_mcp import clear_host_probes, prepare_host_probe
+    from zdecision.agent.repository import RepositoryResolver
+
+    if arguments.recall_host_gate_action == "clear":
+        clear_host_probes(state_path)
+        sys.stdout.buffer.write(canonical_json_bytes({"cleared": True}))
+        return 0
+    requested = Path(arguments.cwd).expanduser()
+    if not requested.is_absolute():
+        _write_error("recall_host_gate_invalid_repository")
+        return 1
+    cwd = str(requested.resolve())
+    snapshot = RepositoryResolver().resolve(cwd)
+    repository = (
+        None
+        if snapshot is None
+        else database.get_enabled_repository(snapshot.repository_id)
+    )
+    if repository is None or not repository.enabled:
+        _write_error("recall_host_gate_invalid_repository")
+        return 1
+    prepare_host_probe(
+        state_path,
+        cwd,
+        f"probe_{uuid4().hex}",
+    )
+    sys.stdout.buffer.write(canonical_json_bytes({"prepared": True}))
+    return 0
 
 
 def _run_service_command(

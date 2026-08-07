@@ -1904,8 +1904,13 @@ vm.runInThisContext(shippedScript);
         observed: dict[str, object] = {}
 
         class RecordingServer:
-            def __init__(self, tools: LocalMcpTools) -> None:
+            def __init__(
+                self,
+                tools: LocalMcpTools,
+                recall_tools: mcp_server.RecallMcpTools,
+            ) -> None:
                 self.tools = tools
+                observed["recall_tools"] = recall_tools
 
             def run(self, *, transport: str) -> None:
                 observed["transport"] = transport
@@ -1929,6 +1934,7 @@ vm.runInThisContext(shippedScript);
             )
 
         self.assertEqual("stdio", observed["transport"])
+        self.assertIsInstance(observed["recall_tools"], mcp_server.RecallMcpTools)
         result = observed["result"]
         self.assertEqual(
             {
@@ -1944,8 +1950,13 @@ vm.runInThisContext(shippedScript);
         observed: dict[str, object] = {}
 
         class RecordingServer:
-            def __init__(self, tools: LocalMcpTools) -> None:
+            def __init__(
+                self,
+                tools: LocalMcpTools,
+                recall_tools: mcp_server.RecallMcpTools,
+            ) -> None:
                 self.tools = tools
+                observed["recall_tools"] = recall_tools
 
             def run(self, *, transport: str) -> None:
                 observed["transport"] = transport
@@ -1983,6 +1994,7 @@ vm.runInThisContext(shippedScript);
                 self.fail(f"MCP must still start: {error}")
 
         self.assertEqual("stdio", observed["transport"])
+        self.assertIsInstance(observed["recall_tools"], mcp_server.RecallMcpTools)
         self.assertEqual(
             "disabled", observed["result"].structuredContent["safe_state"]
         )
