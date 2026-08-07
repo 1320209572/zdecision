@@ -381,7 +381,9 @@ def extraction_output_schema(
                 **(
                     {}
                     if eligible_signal_ordinals is None
-                    else {"maxItems": 20}
+                    else {
+                        "maxItems": 20 if eligible_signal_ordinals else 0
+                    }
                 ),
                 "items": {
                     "type": "object",
@@ -418,7 +420,7 @@ def extraction_output_schema(
                         },
                         **(
                             {}
-                            if eligible_signal_ordinals is None
+                            if not eligible_signal_ordinals
                             else {
                                 "source_signal_ordinal": {
                                     "type": "integer",
@@ -435,7 +437,7 @@ def extraction_output_schema(
                         "invalidation_conditions",
                         *(
                             []
-                            if eligible_signal_ordinals is None
+                            if not eligible_signal_ordinals
                             else ["source_signal_ordinal"]
                         ),
                     ],
@@ -468,7 +470,7 @@ def _receipt_enum(value: tuple[str, ...]) -> None:
 def _signal_ordinal_enum(value: tuple[int, ...]) -> None:
     if (
         not isinstance(value, tuple)
-        or not 1 <= len(value) <= 20
+        or len(value) > 100
         or len(set(value)) != len(value)
         or any(
             not isinstance(item, int)

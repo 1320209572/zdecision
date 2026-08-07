@@ -449,6 +449,34 @@ class PromptContractTests(unittest.TestCase):
         self.assertEqual([2, 5], candidate["properties"]["source_signal_ordinal"]["enum"])
         self.assertIn("source_signal_ordinal", candidate["required"])
 
+    def test_v5_extraction_schema_closes_an_empty_eligible_set(self) -> None:
+        from zdecision.app_server.models import extraction_output_schema
+
+        schema = extraction_output_schema("安恒", ())
+        candidates = schema["properties"]["candidates"]
+        candidate = candidates["items"]
+
+        self.assertEqual(0, candidates["maxItems"])
+        self.assertNotIn("source_signal_ordinal", candidate["properties"])
+        self.assertNotIn("source_signal_ordinal", candidate["required"])
+        self.assertFalse(candidate["additionalProperties"])
+        self.assertFalse(schema["additionalProperties"])
+
+    def test_v5_extraction_schema_keeps_eligibility_independent_of_candidate_cap(
+        self,
+    ) -> None:
+        from zdecision.app_server.models import extraction_output_schema
+
+        ordinals = tuple(range(1, 101))
+        schema = extraction_output_schema("安恒", ordinals)
+        candidates = schema["properties"]["candidates"]
+
+        self.assertEqual(20, candidates["maxItems"])
+        self.assertEqual(
+            list(range(1, 101)),
+            candidates["items"]["properties"]["source_signal_ordinal"]["enum"],
+        )
+
     def test_inventory_schema_uses_the_exact_system_contract(self) -> None:
         self.assertEqual(
             {

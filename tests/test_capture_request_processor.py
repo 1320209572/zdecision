@@ -65,6 +65,7 @@ class FakeCaptureRunner:
         )
         self.protocol_by_session: dict[str, str] = {}
         self.unavailable_sessions: set[str] = set()
+        self.zero_eligible = False
 
     def sweep_archives(self) -> None:
         pass
@@ -94,6 +95,23 @@ class FakeCaptureRunner:
             raise SourceEvidenceUnavailable("missing prompt anchors")
         self.calls.append(route_context.decision_space_id)
         seed = route_context.route_id[4]
+        if self.zero_eligible:
+            from zdecision.app_server.models import extraction_output_schema
+
+            extraction_output_schema(route_context.decision_space_name, ())
+            return SessionCaptureResult(
+                status="completed",
+                source_key=source.source_key,
+                capture_operation_id="cap_" + seed * 32,
+                inventory_turn_id="inventory-turn",
+                extraction_turn_id="extraction-turn",
+                observations=(),
+                evidence_digest="b" * 64,
+                model_profile=model_profile,
+                protocol_revision="extractor-v5",
+                signal_provenance=(),
+                candidate_provenance=(),
+            )
         observation = Candidate(
             candidate_id="cand_" + seed * 32 + "_01",
             capture_id="cap_" + seed * 32,
@@ -540,6 +558,20 @@ class CaptureRequestProcessorTest(unittest.TestCase):
 
         self.assertEqual([], self.capture_runner.calls)
         self.assertEqual([], client.completed)
+
+    def test_zero_eligible_capture_completes_without_retry_or_upload_content(
+        self,
+    ) -> None:
+        self.capture_runner.zero_eligible = True
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        self.assertEqual(2, len(self.capture_runner.source_calls))
+        self.assertEqual(0, self.reconciliation_runner.calls)
+        self.assertEqual(2, len(client.uploads))
+        self.assertTrue(all(batch.items == () for batch in client.uploads))
+        self.assertEqual(1, len(client.completed))
 
     def test_restart_after_one_receipt_skips_all_completed_model_work(self) -> None:
         first = FakeCentralClient(self.group, self.views())

@@ -62,6 +62,7 @@ class FakeGateway:
         self.support_check_count = 0
         self.profile_available = True
         self.stage_names: list[str] = []
+        self.inventory_output: dict[str, object] | None = None
         self.extraction_output: dict[str, object] = {
             "candidates": [
                 {
@@ -92,6 +93,7 @@ class FakeGateway:
         self.binding_store: RecallHostStore | None = None
         self.invalid_inventory_receipt = False
         self.invalid_extraction_ordinal = False
+        self.extraction_source_ordinal: int | None = None
 
     def list_interactive_thread_ids(self, cwd: str) -> frozenset[str]:
         if cwd != self.cwd:
@@ -159,14 +161,19 @@ class FakeGateway:
             stage = "inventory"
             self.inventory_count += 1
             count = self.inventory_count
-            output = deepcopy(VALID_INVENTORY)
+            output = deepcopy(
+                VALID_INVENTORY
+                if self.inventory_output is None
+                else self.inventory_output
+            )
             signal_properties = properties["signals"]["items"]["properties"]
             if "evidence_receipt_ids" in signal_properties:
                 receipts = signal_properties["evidence_receipt_ids"]["items"][
                     "enum"
                 ]
-                output["signals"][0]["signal_ordinal"] = 1
-                output["signals"][0]["evidence_receipt_ids"] = [receipts[0]]
+                for ordinal, signal in enumerate(output["signals"], start=1):
+                    signal["signal_ordinal"] = ordinal
+                    signal["evidence_receipt_ids"] = [receipts[0]]
                 if self.invalid_inventory_receipt:
                     output["signals"][0]["evidence_receipt_ids"] = [
                         "rcpt_" + "f" * 64
@@ -181,7 +188,11 @@ class FakeGateway:
                 "properties"
             ]
             if "source_signal_ordinal" in candidate_properties:
-                ordinal = candidate_properties["source_signal_ordinal"]["enum"][0]
+                ordinal = (
+                    self.extraction_source_ordinal
+                    if self.extraction_source_ordinal is not None
+                    else candidate_properties["source_signal_ordinal"]["enum"][0]
+                )
                 for candidate in output["candidates"]:
                     candidate["source_signal_ordinal"] = ordinal
                     if self.invalid_extraction_ordinal:
@@ -707,6 +718,54 @@ class RequestedCaptureRunnerTest(unittest.TestCase):
         )
         self.assertNotIn(self.prompt_event_id, manifest_section)
         self.assertNotIn(SOURCE_TURN, manifest_section)
+
+    def test_v5_zero_eligible_inventory_commits_an_empty_v2_result(self) -> None:
+        self.gateway.inventory_output = deepcopy(VALID_INVENTORY)
+        self.gateway.inventory_output["signals"][0]["status"] = "unresolved"
+        self.gateway.extraction_output = {"candidates": []}
+
+        result = self._run()
+
+        operation = self.operation_store.operation_for_source(
+            REQUEST_ID, self.source.source_key, self.route_context.decision_space_id
+        )
+        commit = self.operation_store.committed_capture(operation.operation_id)
+        candidate_schema = self.gateway.schemas[1]["properties"]["candidates"]
+        self.assertEqual(("inventory", "extraction"), tuple(self.gateway.stage_names))
+        self.assertEqual(
+            (1, 1),
+            (self.gateway.inventory_count, self.gateway.extraction_count),
+        )
+        self.assertEqual(0, candidate_schema["maxItems"])
+        self.assertNotIn(
+            "source_signal_ordinal", candidate_schema["items"]["properties"]
+        )
+        self.assertEqual((), result.observations)
+        self.assertEqual("committed", operation.status)
+        self.assertEqual(2, commit.result.result_version)
+        self.assertEqual((), commit.result.candidate_provenance)
+
+    def test_v5_extraction_schema_accepts_all_eligible_signal_ordinals(self) -> None:
+        signal = deepcopy(VALID_INVENTORY["signals"][0])
+        self.gateway.inventory_output = {
+            "signals": [
+                {**deepcopy(signal), "topic": f"topic-{ordinal}"}
+                for ordinal in range(1, 22)
+            ],
+            "coverage": deepcopy(VALID_INVENTORY["coverage"]),
+        }
+        self.gateway.extraction_source_ordinal = 21
+
+        result = self._run()
+
+        candidate_schema = self.gateway.schemas[1]["properties"]["candidates"]
+        ordinal_enum = candidate_schema["items"]["properties"][
+            "source_signal_ordinal"
+        ]["enum"]
+        self.assertEqual(list(range(1, 22)), ordinal_enum)
+        self.assertEqual(20, candidate_schema["maxItems"])
+        self.assertEqual(1, len(result.observations))
+        self.assertEqual(21, result.candidate_provenance[0].source_signal_ordinal)
 
     def test_invalid_v5_receipt_terminalizes_once_without_model_retry(self) -> None:
         from zdecision.app_server.requested_capture import (
