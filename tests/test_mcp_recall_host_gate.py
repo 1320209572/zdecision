@@ -21,6 +21,7 @@ from zdecision.agent.recall_mcp import (
     ReadinessRecallGateProvider,
     RecallMcpTools,
     host_probe_path,
+    prepare_host_probe,
 )
 from zdecision.agent.events import RepositorySnapshot
 from zdecision.central.decision_spaces import EnabledRepository
@@ -387,6 +388,100 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def test_live_gate_claim_prevents_interleaved_blocked_loser(self) -> None:
+        """This catches a loser freezing blocked after the winner reads the probe."""
+
+        self.seed_pending_turn()
+        prepare_host_probe(self.database_path, self.cwd, "probe-interleaved")
+        loser = self.tools(
+            LiveHostProbeProvider(self.database_path, self.cwd)
+        )
+
+        class InterleavingProvider(LiveHostProbeProvider):
+            loser_response: dict[str, object] | None = None
+
+            def gate(self, previous, intent: RecallIntent) -> TurnGateResult:
+                winner = super().gate(previous, intent)
+                self.loser_response = loser.gate_zdecision_turn(
+                    turn_gate_id=TURN_GATE,
+                    intent=intent.to_dict(),
+                )
+                return winner
+
+        provider = InterleavingProvider(self.database_path, self.cwd)
+        winner_response = self.tools(provider).gate_zdecision_turn(
+            turn_gate_id=TURN_GATE,
+            intent=_intent(),
+        )
+
+        self.assertEqual("active", winner_response["state"])
+        self.assertEqual(
+            {"state": "blocked", "code": "host_gate_busy"},
+            provider.loser_response,
+        )
+        self.assertEqual(
+            "committed",
+            self.store.get_turn_gate(PRIVATE_SESSION, PRIVATE_TURN).state,
+        )
+        self.assertFalse(host_probe_path(self.database_path, self.cwd).exists())
+
+    def test_live_probe_survives_crash_after_read_and_retry_applies_it(self) -> None:
+        """This catches a provider crash permanently consuming its probe file."""
+
+        self.seed_pending_turn()
+        prepare_host_probe(self.database_path, self.cwd, "probe-read-crash")
+
+        class CrashAfterReadProvider(LiveHostProbeProvider):
+            crash = True
+
+            def gate(self, previous, intent: RecallIntent) -> TurnGateResult:
+                result = super().gate(previous, intent)
+                if self.crash:
+                    self.crash = False
+                    raise RuntimeError("bounded fixture crash")
+                return result
+
+        provider = CrashAfterReadProvider(self.database_path, self.cwd)
+        tools = self.tools(provider)
+        first = tools.gate_zdecision_turn(turn_gate_id=TURN_GATE, intent=_intent())
+        replay = tools.gate_zdecision_turn(turn_gate_id=TURN_GATE, intent=_intent())
+
+        self.assertEqual(
+            {"state": "blocked", "code": "host_gate_unavailable"}, first
+        )
+        self.assertEqual("active", replay["state"])
+        self.assertEqual(
+            "committed",
+            self.store.get_turn_gate(PRIVATE_SESSION, PRIVATE_TURN).state,
+        )
+
+    def test_live_probe_ack_loss_is_cleaned_up_by_receipt_replay(self) -> None:
+        """This catches a post-commit crash leaving a reusable live probe."""
+
+        self.seed_pending_turn()
+        prepare_host_probe(self.database_path, self.cwd, "probe-ack-crash")
+
+        class AckCrashProvider(LiveHostProbeProvider):
+            acknowledgements = 0
+
+            def acknowledge(self, probe: HostProbeEnvelope) -> None:
+                self.acknowledgements += 1
+                if self.acknowledgements == 1:
+                    raise OSError("bounded fixture ack crash")
+                super().acknowledge(probe)
+
+        provider = AckCrashProvider(self.database_path, self.cwd)
+        tools = self.tools(provider)
+        first = tools.gate_zdecision_turn(turn_gate_id=TURN_GATE, intent=_intent())
+        path = host_probe_path(self.database_path, self.cwd)
+        self.assertTrue(path.exists())
+
+        replay = tools.gate_zdecision_turn(turn_gate_id=TURN_GATE, intent=_intent())
+
+        self.assertEqual(first, replay)
+        self.assertEqual(2, provider.acknowledgements)
+        self.assertFalse(path.exists())
+
     def test_blocked_provider_freezes_gate_without_replacing_active_set(self) -> None:
         """This catches readiness-only production accidentally claiming retrieval."""
 
@@ -535,8 +630,8 @@ class RecallHostProbeCliTests(unittest.TestCase):
         self.assertEqual({"cleared": True}, cleared)
         self.assertFalse(path.exists())
 
-    def test_live_provider_returns_marker_once_after_prepare(self) -> None:
-        """This catches an unprepared or replayed fixture looking like host evidence."""
+    def test_live_provider_read_is_recoverable_until_tool_ack(self) -> None:
+        """This catches provider read deleting a fixture before durable ownership."""
 
         self.run_cli("recall-host-gate", "prepare", "--cwd", str(self.cwd))
         provider = LiveHostProbeProvider(self.state_path, str(self.cwd.resolve()))
@@ -546,8 +641,10 @@ class RecallHostProbeCliTests(unittest.TestCase):
         second = provider.activate(intent)
 
         self.assertEqual("host_gate_fixture_not_formal", first.probe.marker)
-        self.assertEqual("blocked", second.disposition)
-        self.assertIsNone(second.probe)
+        self.assertEqual(first, second)
+        self.assertTrue(
+            host_probe_path(self.state_path, str(self.cwd.resolve())).exists()
+        )
 
 
 if __name__ == "__main__":

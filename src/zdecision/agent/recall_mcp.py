@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -23,6 +23,11 @@ from zdecision.recall.session import HostProbeEnvelope, RecallIntent, TurnGateRe
 
 _FIXTURE_MARKER = "host_gate_fixture_not_formal"
 _FIXTURE_INSTRUCTION = "Use only this bounded host-gate fixture."
+_CLAIM_TIMEOUT_SECONDS = 0.05
+
+
+class _ClaimBusy(Exception):
+    pass
 
 
 class RecallGateProvider(Protocol):
@@ -58,7 +63,7 @@ class LiveHostProbeProvider:
         self.path = host_probe_path(database_path, cwd)
 
     def activate(self, intent: RecallIntent) -> TurnGateResult:
-        probe = self._take_probe()
+        probe = self._read_probe()
         return TurnGateResult(
             "retrieve" if probe is not None else "blocked",
             intent.digest,
@@ -70,7 +75,7 @@ class LiveHostProbeProvider:
     def gate(
         self, previous: RecallSession, intent: RecallIntent
     ) -> TurnGateResult:
-        probe = self._take_probe()
+        probe = self._read_probe()
         return TurnGateResult(
             "retrieve" if probe is not None else "blocked",
             intent.digest,
@@ -79,7 +84,11 @@ class LiveHostProbeProvider:
             probe,
         )
 
-    def _take_probe(self) -> HostProbeEnvelope | None:
+    def acknowledge(self, probe: HostProbeEnvelope) -> None:
+        if self._read_probe() == probe:
+            self.path.unlink(missing_ok=True)
+
+    def _read_probe(self) -> HostProbeEnvelope | None:
         try:
             value = json.loads(self.path.read_text("utf-8"))
             if not isinstance(value, dict) or frozenset(value) != frozenset(
@@ -100,7 +109,6 @@ class LiveHostProbeProvider:
                 marker=value["marker"],
                 instruction=instruction,
             )
-            self.path.unlink()
             return probe
         except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
@@ -142,50 +150,16 @@ class RecallMcpTools:
             return self._reconcile_receipt(receipt, session, turn_id)
         if not self.live_acceptance:
             return _blocked("native_selection_unproven")
-        try:
-            result = self.provider.activate(parsed)
-        except Exception:
-            return _blocked("host_gate_unavailable")
-        if not _valid_result(result, parsed, session, activation=True):
-            return _blocked("host_gate_unavailable")
-        if result.disposition == "blocked":
-            return _blocked("host_gate_only")
-        if result.disposition == "clarify_product":
-            return _clarify()
-        if result.probe is None:
-            return _blocked("host_gate_unavailable")
-        gate_id = _activation_gate_id(activation_binding_id)
-        response = _active(result.probe)
-        active_set_digest = _probe_digest(result.probe)
-        try:
-            self.host_store.begin_turn_gate(
-                session_id=session.session_id,
-                turn_id=turn_id,
-                context_epoch=session.context_epoch,
-                intent_epoch=session.intent_epoch,
-                active_generation=None,
-                gate_id=gate_id,
-            )
-            self._prepare_receipt(
-                "activation",
-                activation_binding_id,
-                parsed.digest,
-                gate_id,
-                result,
-                active_set_digest,
-                response,
-            )
-            self.host_store.commit_turn_gate(
-                session_id=session.session_id,
-                turn_id=turn_id,
-                gate_id=gate_id,
-                result=result,
-                active_set_digest=active_set_digest,
-            )
-            self._apply_receipt("activation", activation_binding_id)
-            return response
-        except (OSError, sqlite3.Error, RecallGateConflict, ValueError):
-            return _blocked("host_gate_unavailable")
+        return self._claim_provider_result(
+            kind="activation",
+            binding_id=activation_binding_id,
+            gate_id=_activation_gate_id(activation_binding_id),
+            parsed=parsed,
+            session=session,
+            turn_id=turn_id,
+            activation=True,
+            invoke=lambda: self.provider.activate(parsed),
+        )
 
     def gate_zdecision_turn(
         self, *, turn_gate_id: str, intent: object
@@ -202,42 +176,115 @@ class RecallMcpTools:
             if receipt["intent_digest"] != parsed.digest:
                 return _blocked("binding_replayed")
             return self._reconcile_receipt(receipt, session, turn_id)
+        return self._claim_provider_result(
+            kind="turn",
+            binding_id=turn_gate_id,
+            gate_id=turn_gate_id,
+            parsed=parsed,
+            session=session,
+            turn_id=turn_id,
+            activation=False,
+            invoke=lambda: self.provider.gate(session, parsed),
+        )
+
+    def _claim_provider_result(
+        self,
+        *,
+        kind: str,
+        binding_id: str,
+        gate_id: str,
+        parsed: RecallIntent,
+        session: RecallSession,
+        turn_id: str,
+        activation: bool,
+        invoke: Callable[[], TurnGateResult],
+    ) -> dict[str, object]:
         try:
-            result = self.provider.gate(session, parsed)
+            with self._connection(
+                timeout_seconds=_CLAIM_TIMEOUT_SECONDS
+            ) as connection:
+                receipt = self._receipt_from(connection, kind, binding_id)
+                if receipt is None:
+                    claim = connection.execute(
+                        """
+                        SELECT intent_digest FROM recall_mcp_claims
+                        WHERE binding_kind = ? AND binding_id = ?
+                        """,
+                        (kind, binding_id),
+                    ).fetchone()
+                    if claim is not None:
+                        if claim["intent_digest"] != parsed.digest:
+                            return _blocked("binding_replayed")
+                        raise _ClaimBusy
+                    connection.execute(
+                        """
+                        INSERT INTO recall_mcp_claims(
+                            binding_kind, binding_id, intent_digest
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (kind, binding_id, parsed.digest),
+                    )
+                    result = invoke()
+                    if not _valid_result(
+                        result, parsed, session, activation=activation
+                    ):
+                        raise ValueError("provider result is invalid")
+                    response = _response_for_result(result)
+                    active_set_digest = (
+                        _probe_digest(result.probe)
+                        if result.probe is not None
+                        else session.active_set_digest
+                    )
+                    if result.probe is not None:
+                        owner = connection.execute(
+                            """
+                            SELECT binding_kind, binding_id
+                            FROM recall_host_probe_claims
+                            WHERE probe_digest = ?
+                            """,
+                            (active_set_digest,),
+                        ).fetchone()
+                        if owner is None:
+                            connection.execute(
+                                """
+                                INSERT INTO recall_host_probe_claims(
+                                    probe_digest, binding_kind, binding_id
+                                ) VALUES (?, ?, ?)
+                                """,
+                                (active_set_digest, kind, binding_id),
+                            )
+                        elif (
+                            owner["binding_kind"] != kind
+                            or owner["binding_id"] != binding_id
+                        ):
+                            raise _ClaimBusy
+                    requires_gate_commit = result.disposition != "clarify_product" and (
+                        kind == "turn" or result.disposition != "blocked"
+                    )
+                    self._insert_receipt(
+                        connection,
+                        kind,
+                        binding_id,
+                        parsed.digest,
+                        gate_id,
+                        result,
+                        active_set_digest,
+                        response,
+                        state=("prepared" if requires_gate_commit else "applied"),
+                    )
+                    receipt = self._receipt_from(connection, kind, binding_id)
+                elif receipt["intent_digest"] != parsed.digest:
+                    return _blocked("binding_replayed")
+            if receipt is None:
+                return _blocked("host_gate_unavailable")
+            return self._reconcile_receipt(receipt, session, turn_id)
+        except _ClaimBusy:
+            return _blocked("host_gate_busy")
+        except sqlite3.OperationalError as error:
+            if "locked" in str(error).lower() or "busy" in str(error).lower():
+                return _blocked("host_gate_busy")
+            return _blocked("host_gate_unavailable")
         except Exception:
-            return _blocked("host_gate_unavailable")
-        if not _valid_result(result, parsed, session, activation=False):
-            return _blocked("host_gate_unavailable")
-        if result.disposition == "clarify_product":
-            return _clarify()
-        if result.disposition == "blocked":
-            response = _blocked("host_gate_only")
-            active_set_digest = session.active_set_digest
-        elif result.probe is not None:
-            response = _active(result.probe)
-            active_set_digest = _probe_digest(result.probe)
-        else:
-            return _blocked("host_gate_unavailable")
-        try:
-            self._prepare_receipt(
-                "turn",
-                turn_gate_id,
-                parsed.digest,
-                turn_gate_id,
-                result,
-                active_set_digest,
-                response,
-            )
-            self.host_store.commit_turn_gate(
-                session_id=session.session_id,
-                turn_id=turn_id,
-                gate_id=turn_gate_id,
-                result=result,
-                active_set_digest=active_set_digest,
-            )
-            self._apply_receipt("turn", turn_gate_id)
-            return response
-        except (OSError, sqlite3.Error, RecallGateConflict, ValueError):
             return _blocked("host_gate_unavailable")
 
     def _activation_binding(
@@ -330,6 +377,15 @@ class RecallMcpTools:
             if response != _response_for_result(result):
                 raise ValueError("response is invalid")
             if receipt["state"] == "prepared":
+                if receipt["binding_kind"] == "activation":
+                    self.host_store.begin_turn_gate(
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                        context_epoch=session.context_epoch,
+                        intent_epoch=session.intent_epoch,
+                        active_generation=None,
+                        gate_id=receipt["gate_id"],
+                    )
                 self.host_store.commit_turn_gate(
                     session_id=session.session_id,
                     turn_id=turn_id,
@@ -338,13 +394,14 @@ class RecallMcpTools:
                     active_set_digest=receipt["active_set_digest"],
                 )
                 self._apply_receipt(receipt["binding_kind"], receipt["binding_id"])
-            return response
         except (json.JSONDecodeError, OSError, sqlite3.Error, RecallGateConflict, ValueError):
             return _blocked("host_gate_unavailable")
+        self._acknowledge_probe(result.probe)
+        return response
 
     def _ensure_receipt_schema(self) -> None:
         with self._connection() as connection:
-            connection.execute(
+            connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS recall_mcp_receipts (
                     binding_kind TEXT NOT NULL CHECK(binding_kind IN ('activation','turn')),
@@ -356,22 +413,42 @@ class RecallMcpTools:
                     response_json BLOB NOT NULL,
                     state TEXT NOT NULL CHECK(state IN ('prepared','applied')),
                     PRIMARY KEY(binding_kind, binding_id)
-                )
+                );
+
+                CREATE TABLE IF NOT EXISTS recall_mcp_claims (
+                    binding_kind TEXT NOT NULL CHECK(binding_kind IN ('activation','turn')),
+                    binding_id TEXT NOT NULL,
+                    intent_digest TEXT NOT NULL,
+                    PRIMARY KEY(binding_kind, binding_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS recall_host_probe_claims (
+                    probe_digest TEXT PRIMARY KEY,
+                    binding_kind TEXT NOT NULL CHECK(binding_kind IN ('activation','turn')),
+                    binding_id TEXT NOT NULL,
+                    UNIQUE(binding_kind, binding_id)
+                );
                 """
             )
 
     def _receipt(self, kind: str, binding_id: str) -> sqlite3.Row | None:
         with self._connection() as connection:
-            return connection.execute(
-                """
-                SELECT * FROM recall_mcp_receipts
-                WHERE binding_kind = ? AND binding_id = ?
-                """,
-                (kind, binding_id),
-            ).fetchone()
+            return self._receipt_from(connection, kind, binding_id)
 
-    def _prepare_receipt(
+    def _receipt_from(
+        self, connection: sqlite3.Connection, kind: str, binding_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT * FROM recall_mcp_receipts
+            WHERE binding_kind = ? AND binding_id = ?
+            """,
+            (kind, binding_id),
+        ).fetchone()
+
+    def _insert_receipt(
         self,
+        connection: sqlite3.Connection,
         kind: str,
         binding_id: str,
         intent_digest: str,
@@ -379,25 +456,27 @@ class RecallMcpTools:
         result: TurnGateResult,
         active_set_digest: str | None,
         response: dict[str, object],
+        *,
+        state: str,
     ) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO recall_mcp_receipts(
-                    binding_kind, binding_id, intent_digest, gate_id,
-                    result_json, active_set_digest, response_json, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared')
-                """,
-                (
-                    kind,
-                    binding_id,
-                    intent_digest,
-                    gate_id,
-                    canonical_json_bytes(asdict(result)),
-                    active_set_digest,
-                    canonical_json_bytes(response),
-                ),
-            )
+        connection.execute(
+            """
+            INSERT INTO recall_mcp_receipts(
+                binding_kind, binding_id, intent_digest, gate_id,
+                result_json, active_set_digest, response_json, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                kind,
+                binding_id,
+                intent_digest,
+                gate_id,
+                canonical_json_bytes(asdict(result)),
+                active_set_digest,
+                canonical_json_bytes(response),
+                state,
+            ),
+        )
 
     def _apply_receipt(self, kind: str, binding_id: str) -> None:
         with self._connection() as connection:
@@ -409,11 +488,23 @@ class RecallMcpTools:
                 (kind, binding_id),
             )
 
+    def _acknowledge_probe(self, probe: HostProbeEnvelope | None) -> None:
+        if probe is None or not isinstance(self.provider, LiveHostProbeProvider):
+            return
+        try:
+            self.provider.acknowledge(probe)
+        except OSError:
+            return
+
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.host_store.path, timeout=5.0)
+    def _connection(
+        self, *, timeout_seconds: float = 5.0
+    ) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(
+            self.host_store.path, timeout=timeout_seconds
+        )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}")
         try:
             with connection:
                 yield connection
@@ -509,6 +600,8 @@ def _valid_probe(probe: object) -> bool:
 def _response_for_result(result: TurnGateResult) -> dict[str, object]:
     if result.disposition == "blocked" and result.probe is None:
         return _blocked("host_gate_only")
+    if result.disposition == "clarify_product" and result.probe is None:
+        return _clarify()
     if result.disposition != "blocked" and _valid_probe(result.probe):
         return _active(result.probe)
     raise ValueError("result response is invalid")
