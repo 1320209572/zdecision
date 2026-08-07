@@ -360,6 +360,55 @@ class RecallHostStoreTests(unittest.TestCase):
         self.assertEqual(2, later.context_epoch)
         self.assertEqual(2, self.store.get_session(SESSION_ID).context_epoch)
 
+    def test_context_epoch_atomically_rebases_only_the_exact_pending_gate(self) -> None:
+        """This catches compact advancing past a frozen old-epoch pending gate."""
+
+        self.activate()
+        self.begin_gate()
+        self.commit_gate()
+        self.begin_gate(
+            turn_id="turn-2", gate_id="gate-2", intent_epoch=1
+        )
+        self.begin_gate(
+            turn_id="turn-3", gate_id="gate-3", intent_epoch=1
+        )
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_context_epoch(
+                session_id=SESSION_ID,
+                source="compact",
+                latest_observed_turn_id=TURN_ID,
+                active_set_digest=ACTIVE_SET_DIGEST,
+                compaction_key="compact-rebase",
+                pending_turn_id="turn-2",
+                pending_gate_id="gate-3",
+                rebased_gate_id="gate-2-context-1",
+            )
+
+        self.assertEqual(0, self.store.get_session(SESSION_ID).context_epoch)
+        self.assertEqual(
+            "gate-2", self.store.get_turn_gate(SESSION_ID, "turn-2").gate_id
+        )
+        restoration = self.store.begin_context_epoch(
+            session_id=SESSION_ID,
+            source="compact",
+            latest_observed_turn_id=TURN_ID,
+            active_set_digest=ACTIVE_SET_DIGEST,
+            compaction_key="compact-rebase",
+            pending_turn_id="turn-2",
+            pending_gate_id="gate-2",
+            rebased_gate_id="gate-2-context-1",
+        )
+
+        rebased = self.store.get_turn_gate(SESSION_ID, "turn-2")
+        untouched = self.store.get_turn_gate(SESSION_ID, "turn-3")
+        self.assertEqual(1, restoration.context_epoch)
+        self.assertEqual("gate-2-context-1", rebased.gate_id)
+        self.assertEqual(1, rebased.context_epoch)
+        self.assertEqual("pending", rebased.state)
+        self.assertEqual("gate-3", untouched.gate_id)
+        self.assertEqual(0, untouched.context_epoch)
+
     def test_session_end_and_resume_preserve_authorization_but_require_revalidation(self) -> None:
         """This catches dormant Sessions losing authorization or resuming as active."""
 

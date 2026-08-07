@@ -8,12 +8,13 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import CONTROL_BINDING_TOOL, handle_hook
-from zdecision.agent.recall_host_state import RecallHostStore
+from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
@@ -26,6 +27,7 @@ TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
 ACTIVATION_ID = "activation-hook-bound"
 GATE_ID = "gate-hook-bound"
 GATE_ID_C = "gate-hook-bound-c"
+GATE_ID_C_REBASED = "gate-hook-bound-c-rebased"
 CONTROL_ID = "ctl_0123456789abcdef0123456789abcdef"
 PRIVATE_SENTINELS = (
     "RAW-PROMPT-SECRET",
@@ -106,8 +108,14 @@ class RecallHookGateTests(unittest.TestCase):
             recall_store=self.recall_store,
             activation_binding_id_factory=lambda: ACTIVATION_ID,
             turn_gate_id_factory=(
-                lambda _session_id, turn_id, *_: (
-                    GATE_ID if turn_id == "turn-b" else GATE_ID_C
+                lambda _session_id, turn_id, context_epoch, *_: (
+                    GATE_ID
+                    if turn_id == "turn-b"
+                    else (
+                        GATE_ID_C_REBASED
+                        if context_epoch == 1
+                        else GATE_ID_C
+                    )
                 )
             ),
         )
@@ -425,7 +433,7 @@ class RecallHookGateTests(unittest.TestCase):
         self.recall_store.commit_turn_gate(
             session_id="session-a",
             turn_id="turn-c",
-            gate_id=GATE_ID_C,
+            gate_id=GATE_ID_C_REBASED,
             result=_result(context_epoch=1),
             active_set_digest="set-a",
         )
@@ -448,6 +456,108 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual(0, self.recall_store.get_session("session-a").context_epoch)
         self.assert_private_values_absent(response)
 
+    def test_compact_atomically_rebases_pending_gate_for_the_same_open_turn(self) -> None:
+        self._commit_active_set()
+        self._prompt(turn_id="turn-c")
+        self._compact_event("PreCompact", turn_id="turn-c")
+        self._compact_event("PostCompact", turn_id="turn-c")
+
+        restoration = self._session_start("compact", turn_id="turn-c")
+        gate_binding = self._pre_tool(TURN_GATE_TOOL, turn_id="turn-c")
+
+        envelope = json.loads(
+            restoration.output["hookSpecificOutput"]["additionalContext"]
+        )
+        self.assertEqual(1, envelope["context_epoch"])
+        self.assertEqual("allow", self._decision(gate_binding))
+        self.assertEqual(
+            {"turn_gate_id": GATE_ID_C_REBASED},
+            gate_binding.output["hookSpecificOutput"]["updatedInput"],
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.recall_store.commit_turn_gate(
+                session_id="session-a",
+                turn_id="turn-c",
+                gate_id=GATE_ID_C,
+                result=_result(context_epoch=1, intent_epoch=1),
+                active_set_digest="set-a",
+            )
+        self.recall_store.commit_turn_gate(
+            session_id="session-a",
+            turn_id="turn-c",
+            gate_id=GATE_ID_C_REBASED,
+            result=_result(context_epoch=1, intent_epoch=1),
+            active_set_digest="set-a",
+        )
+        self.assertEqual({}, self._pre_tool("Bash", turn_id="turn-c").output)
+
+    def test_unrelated_store_failures_fail_open_but_recall_bindings_fail_closed(
+        self,
+    ) -> None:
+        self._prompt()
+        unrelated = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-unknown",
+            "turn_id": "turn-unknown",
+            "cwd": str(self.repository),
+            "tool_name": "Bash",
+            "tool_input": {"command": "true"},
+        }
+        activation = {
+            **unrelated,
+            "session_id": "session-a",
+            "turn_id": "turn-a",
+            "tool_name": ACTIVATE_RECALL_TOOL,
+            "tool_input": {},
+        }
+        gate = {**activation, "tool_name": TURN_GATE_TOOL}
+
+        with patch(
+            "zdecision.agent.hooks.RecallHostStore.open",
+            side_effect=RuntimeError("store unavailable"),
+        ) as open_store:
+            unrelated_response = handle_hook(
+                unrelated,
+                database=self.database,
+                clock=lambda: NOW,
+                repository_resolver=self.resolver,
+                worker_waker=lambda _: None,
+            )
+            activation_response = handle_hook(
+                activation,
+                database=self.database,
+                clock=lambda: NOW,
+                repository_resolver=self.resolver,
+                worker_waker=lambda _: None,
+            )
+            gate_response = handle_hook(
+                gate,
+                database=self.database,
+                clock=lambda: NOW,
+                repository_resolver=self.resolver,
+                worker_waker=lambda _: None,
+            )
+
+        class FailingReadStore:
+            def get_session(self, _session_id: str):
+                raise RuntimeError("read unavailable")
+
+        read_failure = handle_hook(
+            unrelated,
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.resolver,
+            worker_waker=lambda _: None,
+            recall_store=FailingReadStore(),  # type: ignore[arg-type]
+        )
+
+        self.assertEqual({}, unrelated_response.output)
+        self.assertEqual({}, read_failure.output)
+        self.assertEqual("deny", self._decision(activation_response))
+        self.assertEqual("deny", self._decision(gate_response))
+        for call in open_store.call_args_list:
+            self.assertLessEqual(call.kwargs["timeout_seconds"], 0.1)
+
     def test_startup_resume_and_session_end_preserve_candidate_lifecycle(self) -> None:
         self._activate()
         initial_count = self.database.count_events()
@@ -468,6 +578,7 @@ class RecallHookGateTests(unittest.TestCase):
         resumed = self._session_start("resume")
         self.assertEqual("activating", self.recall_store.get_session("session-a").state)
         self.assertEqual(0, self.recall_store.get_session("session-a").context_epoch)
+        self.assertEqual("deny", self._decision(self._pre_tool("Bash")))
         self.assertEqual(initial_count + 3, self.database.count_events())
         for response in (startup, ended, resumed):
             self.assert_private_values_absent(response)

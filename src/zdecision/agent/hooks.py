@@ -30,6 +30,7 @@ TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
 RECALL_MUTATION_MATCHER = "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
 _CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_HOOK_STORE_TIMEOUT_SECONDS = 0.05
 _ACTIVE_GATE_INSTRUCTION = (
     "ZDecision recall is active. Call gate_zdecision_turn before substantive "
     "output or development tools in this Turn."
@@ -149,13 +150,16 @@ def handle_pre_tool_hook(
             control_store=control_store,
             control_id_factory=control_id_factory,
         )
+    recall_binding = tool_name in (ACTIVATE_RECALL_TOOL, TURN_GATE_TOOL)
     owned_store: RecallHostStore | None = None
     try:
         store = recall_store
         if store is None:
-            owned_store = RecallHostStore.open(database.path)
+            owned_store = RecallHostStore.open(
+                database.path, timeout_seconds=_HOOK_STORE_TIMEOUT_SECONDS
+            )
             store = owned_store
-        if tool_name in (ACTIVATE_RECALL_TOOL, TURN_GATE_TOOL):
+        if recall_binding:
             return bind_recall_tool_call(
                 value,
                 database=database,
@@ -167,7 +171,9 @@ def handle_pre_tool_hook(
             )
         return guard_active_turn_tool(value, database=database, recall_store=store)
     except Exception:
-        return _pre_tool_response("deny")
+        if recall_binding:
+            return _pre_tool_response("deny")
+        return HookResponse(event_id="", output={})
     finally:
         if owned_store is not None:
             try:
@@ -253,7 +259,7 @@ def guard_active_turn_tool(
     except ValueError:
         return HookResponse(event_id="", output={})
     session = recall_store.get_session(session_id)
-    if session is None or session.state in ("bypassed", "dormant", "closed"):
+    if session is None or session.state not in ("active", "activating"):
         return HookResponse(event_id="", output={})
     if session.state != "active":
         return _pre_tool_response("deny")
@@ -289,7 +295,9 @@ def _handle_recall_lifecycle(
     try:
         store = recall_store
         if store is None:
-            owned_store = RecallHostStore.open(database.path)
+            owned_store = RecallHostStore.open(
+                database.path, timeout_seconds=_HOOK_STORE_TIMEOUT_SECONDS
+            )
             store = owned_store
         session = store.get_session(invocation.session_id)
         if invocation.event_name == "SessionEnd":
@@ -343,15 +351,53 @@ def _handle_recall_lifecycle(
                 "SessionStart", _blocked_envelope("restoration_unavailable")
             )
         if invocation.source == "compact":
-            compaction_key = _matched_compaction_key(
+            matched_compaction = _matched_compaction_key(
                 value,
                 invocation=invocation,
                 database=database,
             )
-            if compaction_key is None:
+            if matched_compaction is None:
                 return _additional_context(
                     "SessionStart", _blocked_envelope("unmatched_compaction")
                 )
+            compaction_key, compaction_turn_id = matched_compaction
+            if not database.has_open_observed_turn(
+                invocation.session_id,
+                compaction_turn_id,
+                invocation.cwd,
+            ):
+                return _additional_context(
+                    "SessionStart", _blocked_envelope("unmatched_compaction")
+                )
+            compact_gate = store.get_turn_gate(
+                invocation.session_id, compaction_turn_id
+            )
+            if compact_gate is not None and compact_gate.state == "blocked":
+                return _additional_context(
+                    "SessionStart", _blocked_envelope("restoration_conflict")
+                )
+            if compact_gate is not None and compact_gate.state == "pending":
+                pending_turn_id = compaction_turn_id
+                pending_gate_id = _turn_gate_id(
+                    invocation.session_id,
+                    compaction_turn_id,
+                    session.context_epoch,
+                    session.intent_epoch,
+                    compact_gate.active_generation,
+                    turn_gate_id_factory,
+                )
+                rebased_gate_id = _turn_gate_id(
+                    invocation.session_id,
+                    compaction_turn_id,
+                    session.context_epoch + 1,
+                    session.intent_epoch,
+                    compact_gate.active_generation,
+                    turn_gate_id_factory,
+                )
+            else:
+                pending_turn_id = None
+                pending_gate_id = None
+                rebased_gate_id = None
         else:
             compaction_key = _opaque_id(
                 "clear",
@@ -360,6 +406,9 @@ def _handle_recall_lifecycle(
                 session.last_gate_turn_id,
                 session.active_set_digest,
             )
+            pending_turn_id = None
+            pending_gate_id = None
+            rebased_gate_id = None
         try:
             restoration = store.begin_context_epoch(
                 session_id=invocation.session_id,
@@ -367,6 +416,9 @@ def _handle_recall_lifecycle(
                 latest_observed_turn_id=session.last_gate_turn_id,
                 active_set_digest=session.active_set_digest,
                 compaction_key=compaction_key,
+                pending_turn_id=pending_turn_id,
+                pending_gate_id=pending_gate_id,
+                rebased_gate_id=rebased_gate_id,
             )
         except RecallGateConflict:
             return _additional_context(
@@ -396,7 +448,7 @@ def _matched_compaction_key(
     *,
     invocation: HookInvocation,
     database: AgentDatabase,
-) -> str | None:
+) -> tuple[str, str] | None:
     try:
         native_turn_id = _safe_host_identifier(value.get("turn_id"))
     except ValueError:
@@ -426,11 +478,14 @@ def _matched_compaction_key(
         != post_compact.safe_fact.get("trigger")
     ):
         return None
-    return _opaque_id(
-        "compact",
-        invocation.session_id,
+    return (
+        _opaque_id(
+            "compact",
+            invocation.session_id,
+            native_turn_id,
+            pre_compact.safe_fact["trigger"],
+        ),
         native_turn_id,
-        pre_compact.safe_fact["trigger"],
     )
 
 

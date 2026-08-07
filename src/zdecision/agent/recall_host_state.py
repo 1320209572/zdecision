@@ -75,12 +75,20 @@ class RecallHostStore:
         self._connection = connection
 
     @classmethod
-    def open(cls, path: Path) -> "RecallHostStore":
+    def open(
+        cls, path: Path, *, timeout_seconds: float = 5.0
+    ) -> "RecallHostStore":
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0 < timeout_seconds <= 5.0
+        ):
+            raise ValueError("timeout_seconds is invalid")
         database_path = Path(path)
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path, timeout=5.0)
+        connection = sqlite3.connect(database_path, timeout=timeout_seconds)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}")
         connection.execute("PRAGMA journal_mode = WAL")
         with connection:
             connection.executescript(
@@ -173,6 +181,14 @@ class RecallHostStore:
             return None
         row = self._session_row(session)
         return None if row is None else _session(row)
+
+    def get_turn_gate(self, session_id: str, turn_id: str) -> TurnGate | None:
+        session = _text(session_id, "session_id")
+        turn = _text(turn_id, "turn_id")
+        if self._is_internal_thread(session):
+            return None
+        row = self._gate_for_turn(session, turn)
+        return None if row is None else _gate(row)
 
     def bind_activation(
         self,
@@ -410,6 +426,9 @@ class RecallHostStore:
         latest_observed_turn_id: str,
         active_set_digest: str | None,
         compaction_key: str,
+        pending_turn_id: str | None = None,
+        pending_gate_id: str | None = None,
+        rebased_gate_id: str | None = None,
     ) -> ContextRestoration:
         session = _text(session_id, "session_id")
         if source not in ("compact", "clear"):
@@ -418,6 +437,19 @@ class RecallHostStore:
         active_set = _optional_text(active_set_digest, "active_set_digest")
         key = _text(compaction_key, "compaction_key")
         active_set_key = active_set or ""
+        rebase_values = (pending_turn_id, pending_gate_id, rebased_gate_id)
+        if any(value is not None for value in rebase_values):
+            if source != "compact" or not all(
+                value is not None for value in rebase_values
+            ):
+                raise ValueError("pending gate rebase is invalid")
+            pending_turn = _text(pending_turn_id, "pending_turn_id")
+            pending_gate = _text(pending_gate_id, "pending_gate_id")
+            rebased_gate = _text(rebased_gate_id, "rebased_gate_id")
+        else:
+            pending_turn = None
+            pending_gate = None
+            rebased_gate = None
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             if self._is_internal_thread(session):
@@ -425,6 +457,24 @@ class RecallHostStore:
             current = self._session_row(session)
             if current is None or current["state"] != "active":
                 raise RecallGateConflict("session is not active for restoration")
+            replay_row = self._connection.execute(
+                """
+                SELECT * FROM recall_context_restorations
+                WHERE compaction_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if replay_row is not None:
+                if (
+                    replay_row["session_id"] != session
+                    or replay_row["source"] != source
+                ):
+                    raise RecallGateConflict(
+                        "compaction key already belongs to another event"
+                    )
+                replay = _restoration(replay_row)
+                self._connection.commit()
+                return replay
             if (
                 current["last_gate_turn_id"] != latest_turn
                 or current["active_set_digest"] != active_set
@@ -450,6 +500,17 @@ class RecallHostStore:
             ).fetchone() is not None:
                 raise RecallGateConflict("compaction key already belongs to another event")
             epoch = current["context_epoch"] + 1
+            if pending_turn is not None:
+                gate = self._gate_for_turn(session, pending_turn)
+                if (
+                    gate is None
+                    or gate["gate_id"] != pending_gate
+                    or gate["state"] != "pending"
+                    or gate["context_epoch"] != current["context_epoch"]
+                    or gate["intent_epoch"] != current["intent_epoch"]
+                    or self._gate_by_id(rebased_gate) is not None
+                ):
+                    raise RecallGateConflict("pending gate rebase is invalid")
             self._connection.execute(
                 """
                 INSERT INTO recall_context_restorations(
@@ -464,6 +525,24 @@ class RecallHostStore:
                 "UPDATE recall_sessions SET context_epoch = ? WHERE session_id = ?",
                 (epoch, session),
             )
+            if pending_turn is not None:
+                updated = self._connection.execute(
+                    """
+                    UPDATE recall_turn_gates
+                    SET gate_id = ?, context_epoch = ?
+                    WHERE session_id = ? AND turn_id = ?
+                      AND gate_id = ? AND state = 'pending'
+                    """,
+                    (
+                        rebased_gate,
+                        epoch,
+                        session,
+                        pending_turn,
+                        pending_gate,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RecallGateConflict("pending gate rebase is invalid")
             restoration = _restoration(
                 self._connection.execute(
                     "SELECT * FROM recall_context_restorations WHERE compaction_key = ?",
