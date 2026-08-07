@@ -28,6 +28,7 @@ from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.git_path_evidence import GitPathEvidenceReader
 from zdecision.agent.hooks import handle_hook
 from zdecision.agent.request_state import RequestStateStore
+from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.service import AgentService
 from zdecision.agent.session_index import (
     SessionIndex,
@@ -60,6 +61,7 @@ from zdecision.ids import (
     product_id,
     repository_route_id,
 )
+from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import RepositoryView
 
 
@@ -325,12 +327,32 @@ class FakeAppServerGateway:
         if "signals" in properties:
             stage = "inventory"
             output = copy.deepcopy(VALID_INVENTORY)
+            signal_properties = properties["signals"]["items"]["properties"]
+            if "evidence_receipt_ids" in signal_properties:
+                receipt_id = signal_properties["evidence_receipt_ids"][
+                    "items"
+                ]["enum"][0]
+                output["signals"][0].update(
+                    {
+                        "signal_ordinal": 1,
+                        "evidence_receipt_ids": [receipt_id],
+                    }
+                )
         elif "candidates" in properties:
             stage = "extraction"
             product = properties["candidates"]["items"]["properties"][
                 "product"
             ]["enum"][0]
             output = self._extraction_output(thread_id, product)
+            candidate_properties = properties["candidates"]["items"][
+                "properties"
+            ]
+            if "source_signal_ordinal" in candidate_properties:
+                signal_ordinal = candidate_properties[
+                    "source_signal_ordinal"
+                ]["enum"][0]
+                for candidate in output["candidates"]:
+                    candidate["source_signal_ordinal"] = signal_ordinal
         elif "results" in properties:
             stage = "reconciliation"
             output = self._reconciliation_output(prompt)
@@ -481,6 +503,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.request_state: RequestStateStore | None = None
         self.routing_store: CaptureRoutingStore | None = None
         self.control_store: ControlBindingStore | None = None
+        self.recall_host_store: RecallHostStore | None = None
         self.capture_runner: RequestedCaptureRunner | None = None
         self.reconciliation_runner: ReconciliationRunner | None = None
         self.central_client: CentralClient | None = None
@@ -970,10 +993,24 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
 
         operation = self._capture_operation(request_id)
         first_attempt = self._capture_attempts(request_id)[0]
+        manifest = operation.frozen.evidence_manifest
+        self.assertIsNotNone(manifest)
+        assert manifest is not None
+        late_inventory = copy.deepcopy(VALID_INVENTORY)
+        late_inventory["signals"][0].update(
+            {
+                "signal_ordinal": 1,
+                "evidence_receipt_ids": [manifest.anchors[0].receipt_id],
+            }
+        )
+        late_extraction = self.gateway.candidate_output(
+            "late different output"
+        )
+        late_extraction["candidates"][0]["source_signal_ordinal"] = 1
         late = ValidatedCaptureResult.create(
             operation.frozen,
-            VALID_INVENTORY,
-            self.gateway.candidate_output("late different output"),
+            late_inventory,
+            late_extraction,
         )
         self.operation_store.store_validated_attempt(
             first_attempt["attempt_id"], late, "2026-07-31T06:10:00Z"
@@ -1213,7 +1250,74 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         )
 
         first_turn_counts = dict(self.gateway.structured_turn_creates)
+        operation_before = self._capture_operation(request_id)
+        result_before = self.operation_store.committed_result(
+            operation_before.operation_id
+        )
+        self.assertIsNotNone(result_before)
+        assert result_before is not None
+        frozen_manifest_bytes = canonical_json_bytes(
+            operation_before.frozen.evidence_manifest.to_dict()
+        )
+        sidecar_bytes = canonical_json_bytes(
+            {
+                "signal_provenance": [
+                    item.to_dict() for item in result_before.signal_provenance
+                ],
+                "candidate_provenance": [
+                    item.to_dict() for item in result_before.candidate_provenance
+                ],
+            }
+        )
+        result_digest = result_before.result_digest
+        outbox_before = tuple(
+            self.request_state._connection.execute(
+                """
+                SELECT batch_json, batch_digest
+                FROM slice_candidate_outbox
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        )
         self._restart_local()
+        operation_after = self._capture_operation(request_id)
+        result_after = self.operation_store.committed_result(
+            operation_after.operation_id
+        )
+        self.assertIsNotNone(result_after)
+        assert result_after is not None
+        self.assertEqual(
+            frozen_manifest_bytes,
+            canonical_json_bytes(operation_after.frozen.evidence_manifest.to_dict()),
+        )
+        self.assertEqual(
+            sidecar_bytes,
+            canonical_json_bytes(
+                {
+                    "signal_provenance": [
+                        item.to_dict() for item in result_after.signal_provenance
+                    ],
+                    "candidate_provenance": [
+                        item.to_dict() for item in result_after.candidate_provenance
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(result_digest, result_after.result_digest)
+        self.assertEqual(
+            outbox_before,
+            tuple(
+                self.request_state._connection.execute(
+                    """
+                    SELECT batch_json, batch_digest
+                    FROM slice_candidate_outbox
+                    WHERE request_id = ?
+                    """,
+                    (request_id,),
+                ).fetchone()
+            ),
+        )
         self._retry_request()
 
         self.assertEqual("succeeded", self._request(request_id)["state"])
@@ -1327,6 +1431,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.request_state = RequestStateStore.open(self.agent_path)
         self.routing_store = CaptureRoutingStore.open(self.agent_path)
         self.control_store = ControlBindingStore.open(self.agent_path)
+        self.recall_host_store = RecallHostStore.open(self.agent_path)
         self.agent_database.retire_legacy_automatic_capture()
         catalog = TemplateCatalog(
             REPOSITORY_ROOT / "decision-templates",
@@ -1336,10 +1441,13 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             gateway=self.gateway,
             operation_store=self.operation_store,
             template_catalog=catalog,
+            evidence_ledger=self.agent_database,
+            recall_host_store=self.recall_host_store,
         )
         self.reconciliation_runner = ReconciliationRunner(
             gateway=self.gateway,
             request_state=self.request_state,
+            recall_host_store=self.recall_host_store,
         )
         processor = OnDemandCaptureProcessor(
             database=self.agent_database,
@@ -1383,6 +1491,9 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         if self.control_store is not None:
             self.control_store.close()
             self.control_store = None
+        if self.recall_host_store is not None:
+            self.recall_host_store.close()
+            self.recall_host_store = None
         if self.operation_store is not None:
             self.operation_store.close()
             self.operation_store = None

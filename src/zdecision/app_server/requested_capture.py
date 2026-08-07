@@ -9,10 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 
-from zdecision.agent.capture_operation_store import (
-    CaptureOperationCorrupt,
-    CaptureOperationStore,
-)
+from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.session_index import FrozenSessionSource
@@ -202,7 +199,7 @@ class RequestedCaptureRunner:
             )
 
         if existing is None:
-            owned = self.operation_store.operation_for_source(
+            owned = self.operation_store.legacy_operation_for_source(
                 source.request_id, source.source_key
             )
             if owned is not None and owned.frozen.record_version in (3, 4):
@@ -621,12 +618,9 @@ class RequestedCaptureRunner:
             else route_context.decision_space_id,
         )
         if operation is None and route_context is not None:
-            try:
-                legacy = self.operation_store.operation_for_source(
-                    source.request_id, source.source_key
-                )
-            except CaptureOperationCorrupt:
-                legacy = None
+            legacy = self.operation_store.legacy_operation_for_source(
+                source.request_id, source.source_key
+            )
             if legacy is not None and legacy.frozen.record_version == 3:
                 operation = legacy
         return None if operation is None else _profile(operation.frozen)

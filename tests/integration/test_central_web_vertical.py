@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from zdecision.capture.models import CandidateContent
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.central.api import create_app
 from zdecision.central.auth import DemoIdentityProvider
 from zdecision.central.cli import _synchronize_registry_on_startup
@@ -72,7 +73,14 @@ FORBIDDEN_FIELDS = {
     "commit_message": "PRIVATE_LOCAL_PATH_SENTINEL_7fa26",
     "decision_bytes": "PRIVATE_DECISION_BYTES_SENTINEL_288cd",
     "session_id": "PRIVATE_SESSION_SENTINEL_64f90",
+    "turn_id": "PRIVATE_TURN_SENTINEL_8c117",
+    "hook_event_id": "PRIVATE_HOOK_EVENT_SENTINEL_320df",
+    "receipt_id": "PRIVATE_RECEIPT_SENTINEL_b42ac",
+    "active_reference_set_digest": "PRIVATE_REFERENCE_SET_SENTINEL_29dce",
     "prompt": "PRIVATE_PROMPT_SENTINEL_c503b",
+    "source_path": "PRIVATE_SOURCE_PATH_SENTINEL_713ca",
+    "transcript": "PRIVATE_TRANSCRIPT_SENTINEL_d204f",
+    "reference_decision_ids": "PRIVATE_REFERENCE_DECISION_SENTINEL_5bd82",
 }
 
 
@@ -272,6 +280,11 @@ class CentralWebVerticalTest(unittest.TestCase):
             content=content,
             content_digest=content_digest,
             evidence_digest="e" * 64,
+            provenance=CandidateProvenanceSummary(
+                protocol="candidate-provenance-v1",
+                kind="host_observed_user_prompt_anchor",
+                digest="a" * 64,
+            ),
         )
 
     def create_capture_request(self) -> str:
@@ -343,6 +356,7 @@ class CentralWebVerticalTest(unittest.TestCase):
             decision_space_id=DECISION_SPACE_ID,
             items=candidates,
             batch_digest=batch_digest,
+            item_protocol="candidate-provenance-v1",
         )
         uploaded = self._record(
             self.active_client.put(

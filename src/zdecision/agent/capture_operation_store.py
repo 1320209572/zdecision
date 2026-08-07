@@ -228,6 +228,32 @@ class CaptureOperationStore:
             )
         return None if not operations else operations[0]
 
+    def legacy_operation_for_source(
+        self,
+        request_id: str,
+        source_key: str,
+    ) -> CaptureOperation | None:
+        request = _nonempty(request_id, "request_id")
+        source = _nonempty(source_key, "source_key")
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_operations
+            WHERE request_id = ? AND source_key = ?
+            """,
+            (request, source),
+        ).fetchall()
+        operations = tuple(
+            operation
+            for operation in (self._operation(row) for row in rows)
+            if operation.frozen.record_version in (3, 4)
+        )
+        if len(operations) > 1:
+            raise CaptureOperationCorrupt(
+                "Capture request source has multiple legacy operations"
+            )
+        return None if not operations else operations[0]
+
     def active_validated_attempt(
         self, operation_id: str
     ) -> ExecutionAttempt | None:
