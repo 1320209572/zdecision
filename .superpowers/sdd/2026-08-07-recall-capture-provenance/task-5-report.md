@@ -109,3 +109,68 @@ No blocking concerns. The complete suite still emits the existing
 FastAPI/TestClient deprecation warning and one pre-existing SQLite
 `ResourceWarning`; neither corresponds to a test failure. No real Codex
 Desktop acceptance was attempted.
+
+## Fix round 1
+
+Status: complete. This round strengthens only acceptance tests and fixtures;
+production code is unchanged and Task 8 remains unstarted.
+
+The amended cases now provide the missing evidence:
+
+- cases 1-4 use a deterministic semantic corpus model that consumes recalled,
+  probe, assistant, tool, code, Capture-artifact, compaction, and Hook Prompt
+  channels together with a real ledger-derived, Stop-bounded host manifest;
+  non-Prompt sources produce zero validated Extraction observations, while an
+  independently receipted Prompt produces one Candidate. Identical recalled
+  and Prompt text differs only by channel and receipt authority;
+- case 5 records real prompts in the source Session, another Session, and
+  after the frozen source Stop. Unknown, duplicate, reordered, cross-Session,
+  post-boundary, and malformed forged receipt outputs each traverse
+  `RequestedCaptureRunner`, terminate with `capture_provenance_invalid`, leave
+  one abandoned/archived attempt, and cannot start a second model attempt;
+- case 9 carries adoption, `needs_evidence`, and every excluded disposition to
+  reconciliation/outbox/upload, proving zero reconciliation calls, zero
+  Candidate revisions, and two empty v1 staged/uploaded slice batches;
+- case 12 consumes an actual recalled rule plus a Hook-observed `继续` Prompt
+  and produces `needs_evidence`; its comment explicitly scopes this as model
+  quality rather than host proof; and
+- the Central vertical sends every forbidden field/value independently, then
+  separately scans accepted normalized v1 revision records, Central SQLite,
+  accepted HTTP responses, and Git blobs for every sentinel value.
+
+Amended RED command:
+
+```text
+.venv/bin/python -m unittest \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_01_recalled_decision_or_host_probe_without_anchor_yields_zero_candidates \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_02_non_prompt_sources_alone_yield_zero_candidates \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_03_anchored_explicit_direction_qualifies_with_recalled_context \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_04_identical_recalled_and_prompt_text_is_distinguished_by_receipt \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_05_invalid_receipt_sets_fail_the_complete_attempt \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_09_noneligible_dispositions_upload_no_candidate_content \
+  tests.test_recall_capture_isolation.RecallCaptureIsolationTest.test_12_recalled_rule_plus_unrelated_continue_anchor_needs_evidence \
+  tests.integration.test_central_web_vertical.CentralWebVerticalTest.test_theme_review_preview_and_explicit_publish_use_v1_partition -v
+```
+
+Result: `Ran 8 tests` — `FAILED (failures=8)`. Each failure was the intended
+missing acceptance boundary; no production failure was exposed.
+
+Amended specific GREEN used the same command and passed: `Ran 8 tests in
+2.022s` — `OK`. The complete 13-case isolation module then passed: `Ran 13
+tests in 2.679s` — `OK`.
+
+Mandated focused command:
+
+```text
+.venv/bin/python -m unittest \
+  tests.test_recall_capture_isolation \
+  tests.integration.test_on_demand_capture_core \
+  tests.integration.test_central_web_vertical -v
+```
+
+Result: `Ran 36 tests in 13.150s` — `OK`.
+
+Per the fix-round instruction, the complete 838-test suite was not rerun for
+these test-only changes. The one mandated production baseline remains the
+earlier `.venv/bin/python -m unittest discover -s tests -v` result: `Ran 838
+tests` — `OK (skipped=3)`.

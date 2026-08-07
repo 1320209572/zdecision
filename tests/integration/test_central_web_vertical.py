@@ -458,17 +458,18 @@ class CentralWebVerticalTest(unittest.TestCase):
     def assert_forbidden_fields_rejected(
         self, method: str, path: str, valid_body: dict[str, object]
     ) -> None:
-        response = self._record(
-            self.active_client.request(
-                method,
-                path,
-                json={**valid_body, **FORBIDDEN_FIELDS},
-            )
-        )
-        self.assertEqual(422, response.status_code, response.text)
-        self.assertEqual({"error": "invalid_request"}, response.json())
-        for sentinel in FORBIDDEN_FIELDS.values():
-            self.assertNotIn(sentinel, response.text)
+        for field, sentinel in FORBIDDEN_FIELDS.items():
+            with self.subTest(path=path, forbidden_field=field):
+                response = self.active_client.request(
+                    method,
+                    path,
+                    json={**valid_body, field: sentinel},
+                )
+                self.assertEqual(422, response.status_code, response.text)
+                self.assertEqual({"error": "invalid_request"}, response.json())
+                self.assertNotIn(sentinel, response.text)
+                for other_sentinel in FORBIDDEN_FIELDS.values():
+                    self.assertNotIn(other_sentinel, response.text)
 
     def publication_commit_count(self, preview_id: str) -> int:
         messages = self._git("log", "--format=%B", "--all").decode("utf-8")
@@ -850,11 +851,23 @@ class CentralWebVerticalTest(unittest.TestCase):
         )
 
         self.active_store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        accepted_v1_records = tuple(
+            row[0]
+            for row in self.active_store.connection.execute(
+                "SELECT record_json FROM candidate_revisions ORDER BY revision_id"
+            ).fetchall()
+        )
+        self.assertTrue(accepted_v1_records)
+        self.assertTrue(
+            all('"protocol":"candidate-provenance-v1"' in record for record in accepted_v1_records)
+        )
         sqlite_bytes = self.database_path.read_bytes()
+        accepted_record_bytes = "\n".join(accepted_v1_records).encode("utf-8")
         response_bytes = "\n".join(self.http_fixture_json).encode("utf-8")
         git_blobs = self.all_git_blob_bytes()
         for sentinel in FORBIDDEN_FIELDS.values():
             encoded = sentinel.encode("utf-8")
+            self.assertNotIn(encoded, accepted_record_bytes)
             self.assertNotIn(encoded, sqlite_bytes)
             self.assertNotIn(encoded, response_bytes)
             self.assertNotIn(encoded, git_blobs)

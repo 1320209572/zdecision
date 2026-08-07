@@ -28,4 +28,5 @@ Task 7 provenance Task 4: complete (commits 2ad11fa..5dd141d; final 5dd141d)
 Task 7 provenance Task 5 focused verification: `.venv/bin/python -m unittest tests.test_recall_capture_isolation tests.integration.test_on_demand_capture_core tests.integration.test_central_web_vertical -v` — Ran 36 tests, OK.
 Task 7 provenance Task 5 full verification: `.venv/bin/python -m unittest discover -s tests -v` — Ran 838 tests, OK (skipped=3).
 Task 7: complete — all six provenance hard-stop audit statements passed; `capture_evidence_provenance_unavailable` was not recorded.
+Task 7 provenance Task 5 fix round 1: acceptance evidence strengthened in tests only; amended RED ran 8 tests and failed 8 at the five documented gaps; `.venv/bin/python -m unittest tests.test_recall_capture_isolation tests.integration.test_on_demand_capture_core tests.integration.test_central_web_vertical -v` then ran 36 tests in 13.150s, OK. Production unchanged; the previously mandated single full run remains `Ran 838 tests, OK (skipped=3)` and was not rerun.
 Task 8 has not started.
