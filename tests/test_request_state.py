@@ -12,11 +12,13 @@ from zdecision.capture.reconciliation import (
     CandidateFamilyRevision,
     ReconciliationResult,
 )
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.ids import candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CandidateBatchUpload,
     CandidateRevisionUpload,
+    CandidateSliceBatchUpload,
     UploadReceipt,
 )
 
@@ -28,6 +30,8 @@ DECISION_SPACE_ID = "dsp_66666666666666666666666666666666"
 FAMILY_ID = "cfm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 INPUT_DIGEST = "1" * 64
 NOW = "2026-07-31T08:00:00Z"
+SLICE_ID = "csl_" + "7" * 32
+ROUTE_ID = "drr_" + "8" * 32
 
 
 def _content(claim: str) -> CandidateContent:
@@ -47,6 +51,7 @@ def _revision(
     *,
     revision: int = 1,
     supersedes: str | None = None,
+    provenance: CandidateProvenanceSummary | None = None,
 ) -> CandidateFamilyRevision:
     content = _content(claim)
     content_digest = hashlib.sha256(
@@ -62,6 +67,7 @@ def _revision(
         content_digest=content_digest,
         evidence_digest="e" * 64,
         supersedes_revision_id=supersedes,
+        provenance=provenance,
     )
 
 
@@ -122,6 +128,37 @@ def candidate_batch(
                 {"items": [item.to_dict() for item in items]}
             )
         ).hexdigest(),
+    )
+
+
+def candidate_slice_batch(
+    result: ReconciliationResult,
+    *,
+    request_id: str = REQUEST_ID,
+) -> CandidateSliceBatchUpload:
+    items = tuple(
+        CandidateRevisionUpload(
+            family_id=revision.family_id,
+            revision_id=revision.revision_id,
+            revision=revision.revision,
+            content=revision.content,
+            content_digest=revision.content_digest,
+            evidence_digest=revision.evidence_digest,
+            provenance=revision.provenance,
+        )
+        for revision in result.uploadable_revisions
+    )
+    return CandidateSliceBatchUpload(
+        request_id=request_id,
+        slice_id=SLICE_ID,
+        route_id=ROUTE_ID,
+        route_configuration_version=1,
+        decision_space_id=result.decision_space_id,
+        items=items,
+        batch_digest=hashlib.sha256(
+            canonical_json_bytes({"items": [item.to_dict() for item in items]})
+        ).hexdigest(),
+        item_protocol="candidate-provenance-v1",
     )
 
 
@@ -299,6 +336,58 @@ class RequestStateStoreTests(unittest.TestCase):
         with self.assertRaises(BatchConflict):
             self.store.commit_candidate_result(
                 REQUEST_ID, empty, candidate_batch(empty)
+            )
+
+    def test_slice_outbox_replays_exact_provenance_and_rejects_digest_only_conflict(self) -> None:
+        from zdecision.agent.request_state import BatchConflict, RequestStateStore
+
+        summary = CandidateProvenanceSummary(
+            "candidate-provenance-v1",
+            "host_observed_user_prompt_anchor",
+            "a" * 64,
+        )
+        revision = _revision("winner", provenance=summary)
+        result = ReconciliationResult(
+            REPOSITORY_ID,
+            DECISION_SPACE_ID,
+            (revision,),
+            (revision,),
+            (revision,),
+            (),
+            (),
+        )
+        batch = candidate_slice_batch(result)
+        self.store.store_slice_reconciliation(REQUEST_ID, SLICE_ID, result)
+        self.store.commit_slice_result(REQUEST_ID, SLICE_ID, result, batch)
+        self.store.close()
+        self._cleanups.pop()
+        self.store = RequestStateStore.open(self.path)
+        self.addCleanup(self.store.close)
+
+        self.assertEqual(batch, self.store.staged_slice_batch(REQUEST_ID, SLICE_ID))
+        self.assertEqual(summary, self.store.staged_slice_batch(REQUEST_ID, SLICE_ID).items[0].provenance)
+
+        changed_summary = CandidateProvenanceSummary(
+            "candidate-provenance-v1",
+            "host_observed_user_prompt_anchor",
+            "b" * 64,
+        )
+        changed_revision = _revision("winner", provenance=changed_summary)
+        changed_result = ReconciliationResult(
+            REPOSITORY_ID,
+            DECISION_SPACE_ID,
+            (changed_revision,),
+            (changed_revision,),
+            (changed_revision,),
+            (),
+            (),
+        )
+        with self.assertRaises(BatchConflict):
+            self.store.commit_slice_result(
+                REQUEST_ID,
+                SLICE_ID,
+                changed_result,
+                candidate_slice_batch(changed_result),
             )
 
     def test_later_request_moves_family_head_only_forward(self) -> None:

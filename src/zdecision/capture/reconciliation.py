@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 from zdecision.capture.models import Candidate, CandidateContent
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.ids import candidate_family_id, candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
 
@@ -116,6 +117,7 @@ class CandidateFamilyRevision:
     content_digest: str
     evidence_digest: str
     supersedes_revision_id: str | None
+    provenance: CandidateProvenanceSummary | None = None
 
     def __post_init__(self) -> None:
         _pattern(self.family_id, _FAMILY_ID, "family_id")
@@ -150,9 +152,13 @@ class CandidateFamilyRevision:
                 _REVISION_ID,
                 "supersedes_revision_id",
             )
+        if self.provenance is not None and not isinstance(
+            self.provenance, CandidateProvenanceSummary
+        ):
+            raise ValueError("provenance is invalid")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "family_id": self.family_id,
             "revision_id": self.revision_id,
             "revision": self.revision,
@@ -161,26 +167,28 @@ class CandidateFamilyRevision:
             "evidence_digest": self.evidence_digest,
             "supersedes_revision_id": self.supersedes_revision_id,
         }
+        if self.provenance is not None:
+            value["provenance"] = self.provenance.to_dict()
+        return value
 
     @classmethod
     def from_dict(
         cls, value: Mapping[str, object]
     ) -> "CandidateFamilyRevision":
-        _exact_fields(
-            value,
-            frozenset(
-                (
-                    "family_id",
-                    "revision_id",
-                    "revision",
-                    "content",
-                    "content_digest",
-                    "evidence_digest",
-                    "supersedes_revision_id",
-                )
-            ),
-            "CandidateFamilyRevision",
+        legacy_fields = frozenset(
+            (
+                "family_id",
+                "revision_id",
+                "revision",
+                "content",
+                "content_digest",
+                "evidence_digest",
+                "supersedes_revision_id",
+            )
         )
+        fields = frozenset(value)
+        if fields not in (legacy_fields, legacy_fields | {"provenance"}):
+            raise ValueError("CandidateFamilyRevision fields are invalid")
         raw_content = value["content"]
         if not isinstance(raw_content, Mapping):
             raise ValueError("content is invalid")
@@ -192,6 +200,11 @@ class CandidateFamilyRevision:
             content_digest=value["content_digest"],
             evidence_digest=value["evidence_digest"],
             supersedes_revision_id=value["supersedes_revision_id"],
+            provenance=(
+                None
+                if "provenance" not in value
+                else CandidateProvenanceSummary.from_dict(value["provenance"])
+            ),
         )
 
 
@@ -475,6 +488,7 @@ def apply_reconciliation(
     observations: Sequence[Candidate],
     current: Sequence[CandidateFamilyRevision],
     decisions: Sequence[ReconciliationDecision],
+    candidate_provenance: Mapping[str, CandidateProvenanceSummary] | None = None,
 ) -> ReconciliationResult:
     repository = _pattern(
         repository_id, _REPOSITORY_ID, "repository_id"
@@ -485,6 +499,9 @@ def apply_reconciliation(
         "decision_space_id",
     )
     ordered = _ordered_observations(observations)
+    provenance_by_observation = _provenance_map(
+        ordered, candidate_provenance
+    )
     if (
         not isinstance(decisions, Sequence)
         or isinstance(decisions, (str, bytes))
@@ -531,6 +548,9 @@ def apply_reconciliation(
                 content=observation_value.content,
                 observation=observation_value,
                 supersedes=None,
+                provenance=provenance_by_observation.get(
+                    observation_value.candidate_id
+                ),
             )
             heads[decision.family_id] = revision
             new_revisions.append(revision)
@@ -544,6 +564,12 @@ def apply_reconciliation(
             same_ids.append(observation_value.candidate_id)
             continue
         previous = heads[decision.family_id]
+        provenance = provenance_by_observation.get(
+            observation_value.candidate_id
+        )
+        if provenance is not None and previous.provenance is None:
+            ambiguous_ids.append(observation_value.candidate_id)
+            continue
         assert decision.effective_content is not None
         revision = _new_revision(
             family_id=decision.family_id,
@@ -551,6 +577,7 @@ def apply_reconciliation(
             content=decision.effective_content,
             observation=observation_value,
             supersedes=previous.revision_id,
+            provenance=provenance,
         )
         heads[decision.family_id] = revision
         new_revisions.append(revision)
@@ -584,6 +611,7 @@ def _new_revision(
     content: CandidateContent,
     observation: Candidate,
     supersedes: str | None,
+    provenance: CandidateProvenanceSummary | None,
 ) -> CandidateFamilyRevision:
     content_digest = _sha256(content.to_dict())
     evidence_digest = _sha256(
@@ -599,7 +627,25 @@ def _new_revision(
         content_digest=content_digest,
         evidence_digest=evidence_digest,
         supersedes_revision_id=supersedes,
+        provenance=provenance,
     )
+
+
+def _provenance_map(
+    observations: tuple[Candidate, ...],
+    value: Mapping[str, CandidateProvenanceSummary] | None,
+) -> dict[str, CandidateProvenanceSummary]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("candidate provenance is invalid")
+    expected = {item.candidate_id for item in observations}
+    if set(value) != expected or any(
+        not isinstance(item, CandidateProvenanceSummary)
+        for item in value.values()
+    ):
+        raise ValueError("candidate provenance is invalid")
+    return dict(value)
 
 
 def _ordered_observations(

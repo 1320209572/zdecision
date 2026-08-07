@@ -753,6 +753,7 @@ class RequestStateStore:
                 content=revision.content,
                 content_digest=revision.content_digest,
                 evidence_digest=revision.evidence_digest,
+                provenance=revision.provenance,
             )
             for revision in result.uploadable_revisions
         )
@@ -1488,6 +1489,7 @@ class RequestStateStore:
                 content=revision.content,
                 content_digest=revision.content_digest,
                 evidence_digest=revision.evidence_digest,
+                provenance=revision.provenance,
             )
             for revision in result.uploadable_revisions
         )

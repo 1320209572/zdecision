@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 from types import SimpleNamespace
+
+from zdecision.jsonio import canonical_json_bytes
 
 
 REPOSITORY_ID = "repo_11111111111111111111111111111111"
@@ -15,6 +18,10 @@ EMPTY_BATCH_DIGEST = (
     "e813d564bccbeefe1db875d1c9abb55d63c52b639acc61134a5f1d19cc489b67"
 )
 EVIDENCE_DIGEST = "e" * 64
+PROVENANCE_DIGEST = "f" * 64
+SLICE_ID = "csl_" + "5" * 32
+ROUTE_ID = "drr_" + "6" * 32
+DECISION_SPACE_ID = "dsp_" + "7" * 32
 
 
 def _content_dict() -> dict[str, object]:
@@ -49,6 +56,35 @@ def _batch_dict() -> dict[str, object]:
     }
 
 
+def _v1_revision_dict() -> dict[str, object]:
+    return {
+        **_revision_dict(),
+        "provenance": {
+            "protocol": "candidate-provenance-v1",
+            "kind": "host_observed_user_prompt_anchor",
+            "digest": PROVENANCE_DIGEST,
+        },
+    }
+
+
+def _slice_dict(*, v1: bool) -> dict[str, object]:
+    items = [_v1_revision_dict() if v1 else _revision_dict()]
+    payload = {
+        "request_id": REQUEST_ID,
+        "slice_id": SLICE_ID,
+        "route_id": ROUTE_ID,
+        "route_configuration_version": 1,
+        "decision_space_id": DECISION_SPACE_ID,
+        "items": items,
+        "batch_digest": hashlib.sha256(
+            canonical_json_bytes({"items": items})
+        ).hexdigest(),
+    }
+    if v1:
+        payload["item_protocol"] = "candidate-provenance-v1"
+    return payload
+
+
 class SyncContractsTest(unittest.TestCase):
     def sync_api(self) -> SimpleNamespace:
         try:
@@ -60,6 +96,7 @@ class SyncContractsTest(unittest.TestCase):
             from zdecision.sync.contracts import (
                 CandidateBatchUpload,
                 CandidateRevisionUpload,
+                CandidateSliceBatchUpload,
                 CaptureRequestCreate,
                 CaptureRequestView,
                 ClaimedCaptureRequest,
@@ -75,6 +112,7 @@ class SyncContractsTest(unittest.TestCase):
         return SimpleNamespace(
             CandidateBatchUpload=CandidateBatchUpload,
             CandidateRevisionUpload=CandidateRevisionUpload,
+            CandidateSliceBatchUpload=CandidateSliceBatchUpload,
             CaptureRequestCreate=CaptureRequestCreate,
             CaptureRequestView=CaptureRequestView,
             ClaimedCaptureRequest=ClaimedCaptureRequest,
@@ -270,6 +308,70 @@ class SyncContractsTest(unittest.TestCase):
             batch,
             api.CandidateBatchUpload.from_dict(batch.to_dict()),
         )
+
+    def test_legacy_and_v1_candidate_items_have_exact_dual_parsers(self) -> None:
+        api = self.sync_api()
+
+        legacy = api.CandidateRevisionUpload.from_dict(_revision_dict())
+        current = api.CandidateRevisionUpload.from_dict(_v1_revision_dict())
+
+        self.assertIsNone(legacy.provenance)
+        self.assertNotIn("provenance", legacy.to_dict())
+        self.assertEqual(_v1_revision_dict(), current.to_dict())
+        self.assertEqual(PROVENANCE_DIGEST, current.provenance.digest)
+
+    def test_slice_protocol_rejects_missing_mixed_or_malformed_provenance(self) -> None:
+        api = self.sync_api()
+
+        self.assertEqual(
+            _slice_dict(v1=False),
+            api.CandidateSliceBatchUpload.from_dict(_slice_dict(v1=False)).to_dict(),
+        )
+        self.assertEqual(
+            _slice_dict(v1=True),
+            api.CandidateSliceBatchUpload.from_dict(_slice_dict(v1=True)).to_dict(),
+        )
+        cases = []
+        missing_protocol = _slice_dict(v1=True)
+        missing_protocol.pop("item_protocol")
+        cases.append(missing_protocol)
+        missing_provenance = _slice_dict(v1=True)
+        missing_provenance["items"] = [_revision_dict()]
+        missing_provenance["batch_digest"] = hashlib.sha256(
+            canonical_json_bytes({"items": missing_provenance["items"]})
+        ).hexdigest()
+        cases.append(missing_provenance)
+        unknown_protocol = _slice_dict(v1=True)
+        unknown_protocol["item_protocol"] = "candidate-provenance-v2"
+        cases.append(unknown_protocol)
+        unknown_kind = _slice_dict(v1=True)
+        unknown_kind["items"][0]["provenance"]["kind"] = "raw_prompt"
+        unknown_kind["batch_digest"] = hashlib.sha256(
+            canonical_json_bytes({"items": unknown_kind["items"]})
+        ).hexdigest()
+        cases.append(unknown_kind)
+        malformed_digest = _slice_dict(v1=True)
+        malformed_digest["items"][0]["provenance"]["digest"] = "bad"
+        malformed_digest["batch_digest"] = hashlib.sha256(
+            canonical_json_bytes({"items": malformed_digest["items"]})
+        ).hexdigest()
+        cases.append(malformed_digest)
+
+        for payload in cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    api.CandidateSliceBatchUpload.from_dict(payload)
+
+    def test_legacy_root_batch_rejects_provenance_items(self) -> None:
+        api = self.sync_api()
+        payload = _batch_dict()
+        payload["items"] = [_v1_revision_dict()]
+        payload["batch_digest"] = hashlib.sha256(
+            canonical_json_bytes({"items": payload["items"]})
+        ).hexdigest()
+
+        with self.assertRaises(ValueError):
+            api.CandidateBatchUpload.from_dict(payload)
 
     def test_candidate_upload_rejects_native_or_unknown_fields(self) -> None:
         """Catch Session, Turn, or arbitrary payload data crossing the boundary."""

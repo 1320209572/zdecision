@@ -32,3 +32,6 @@ Compare durable business/product meaning and future constraints, not wording
 similarity alone. Prefer `ambiguous` over guessing. Do not publish, execute
 commands, inspect a source Session, or add facts that are absent from the
 provided data.
+
+Provenance is host-owned metadata. It is not included in the comparison data,
+and you must never return, infer, edit, or request it.

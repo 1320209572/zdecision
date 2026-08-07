@@ -16,6 +16,7 @@ from zdecision.capture.models import (
     CandidateContent,
     SourceCheckpoint,
 )
+from zdecision.capture.provenance import CandidateProvenance
 from zdecision.ids import candidate_family_id
 
 
@@ -166,6 +167,14 @@ class ReconciliationRunnerTest(unittest.TestCase):
             request_state=self.request_state,
             recall_host_store=self.recall_host_store,
         )
+        self.candidate_provenance = CandidateProvenance.create(
+            candidate_id=self.observation.candidate_id,
+            manifest_digest="1" * 64,
+            source_signal_ordinal=1,
+            evidence_receipt_ids=("rcpt_" + "2" * 64,),
+            active_reference_set_digests=("3" * 64,),
+            reference_decision_ids=(),
+        )
 
     def _run(self, observations: tuple[Candidate, ...] | None = None):
         return self.runner.run(
@@ -178,6 +187,13 @@ class ReconciliationRunnerTest(unittest.TestCase):
                 (self.observation,)
                 if observations is None
                 else observations
+            ),
+            candidate_provenance=(
+                {
+                    self.observation.candidate_id: self.candidate_provenance
+                }
+                if observations is None or observations
+                else {}
             ),
             current=(),
             profile=self.gateway.profile,
@@ -197,6 +213,13 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertIn(self.observation.content.claim, prompt)
         self.assertNotIn(SOURCE_THREAD, prompt)
         self.assertNotIn(SOURCE_TURN, prompt)
+        self.assertNotIn(self.candidate_provenance.provenance_digest, prompt)
+        self.assertNotIn(self.candidate_provenance.manifest_digest, prompt)
+        self.assertNotIn(self.candidate_provenance.evidence_receipt_ids[0], prompt)
+        self.assertEqual(
+            self.candidate_provenance.provenance_digest,
+            result.uploadable_revisions[0].provenance.digest,
+        )
         schema = self.gateway.last_schema
         family_options = schema["properties"]["results"]["items"][
             "properties"
@@ -220,6 +243,27 @@ class ReconciliationRunnerTest(unittest.TestCase):
         self.assertEqual(1, self.gateway.started_threads)
         self.assertEqual(1, self.gateway.started_turns)
 
+    def test_provenance_keys_are_exact_before_native_work(self) -> None:
+        from zdecision.app_server.reconciliation_runner import ReconciliationRunnerError
+
+        for candidate_provenance in ({}, {"cand_" + "9" * 32 + "_01": self.candidate_provenance}):
+            with self.subTest(keys=tuple(candidate_provenance)):
+                with self.assertRaises(ReconciliationRunnerError):
+                    self.runner.run(
+                        request_id=REQUEST_ID,
+                        slice_id=SLICE_ID,
+                        repository_id=REPOSITORY_ID,
+                        decision_space_id=DECISION_SPACE_ID,
+                        cwd=str(self.root),
+                        observations=(self.observation,),
+                        candidate_provenance=candidate_provenance,
+                        current=(),
+                        profile=self.gateway.profile,
+                    )
+
+        self.assertEqual(0, self.gateway.started_threads)
+        self.assertEqual(0, self.gateway.started_turns)
+
     def test_heartbeat_wraps_the_structured_turn(self) -> None:
         heartbeats: list[str] = []
 
@@ -230,6 +274,9 @@ class ReconciliationRunnerTest(unittest.TestCase):
             decision_space_id=DECISION_SPACE_ID,
             cwd=str(self.root),
             observations=(self.observation,),
+            candidate_provenance={
+                self.observation.candidate_id: self.candidate_provenance
+            },
             current=(),
             profile=self.gateway.profile,
             heartbeat=lambda: heartbeats.append("renewed"),

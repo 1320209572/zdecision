@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Literal, cast
 
 from zdecision.capture.models import CandidateContent
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.ids import candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.central.decision_spaces import (
@@ -637,6 +638,7 @@ class CandidateRevisionUpload:
     content: CandidateContent
     content_digest: str
     evidence_digest: str
+    provenance: CandidateProvenanceSummary | None = None
 
     def __post_init__(self) -> None:
         _pattern(self.family_id, _FAMILY_ID, "family_id")
@@ -654,9 +656,13 @@ class CandidateRevisionUpload:
         )
         if self.revision_id != expected_revision_id:
             raise ValueError("revision_id does not match Candidate revision")
+        if self.provenance is not None and not isinstance(
+            self.provenance, CandidateProvenanceSummary
+        ):
+            raise ValueError("provenance is invalid")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "family_id": self.family_id,
             "revision_id": self.revision_id,
             "revision": self.revision,
@@ -664,23 +670,28 @@ class CandidateRevisionUpload:
             "content_digest": self.content_digest,
             "evidence_digest": self.evidence_digest,
         }
+        if self.provenance is not None:
+            value["provenance"] = self.provenance.to_dict()
+        return value
 
     @classmethod
     def from_dict(cls, value: object) -> CandidateRevisionUpload:
-        item = _mapping(
-            value,
-            frozenset(
-                (
-                    "family_id",
-                    "revision_id",
-                    "revision",
-                    "content",
-                    "content_digest",
-                    "evidence_digest",
-                )
-            ),
-            "CandidateRevisionUpload",
+        legacy_fields = frozenset(
+            (
+                "family_id",
+                "revision_id",
+                "revision",
+                "content",
+                "content_digest",
+                "evidence_digest",
+            )
         )
+        if not isinstance(value, Mapping):
+            raise ValueError("CandidateRevisionUpload is invalid")
+        fields = frozenset(value)
+        if fields not in (legacy_fields, legacy_fields | {"provenance"}):
+            raise ValueError("CandidateRevisionUpload fields are invalid")
+        item = value
         content = _content(item["content"])
         return cls(
             family_id=item["family_id"],
@@ -689,6 +700,11 @@ class CandidateRevisionUpload:
             content=content,
             content_digest=item["content_digest"],
             evidence_digest=item["evidence_digest"],
+            provenance=(
+                None
+                if "provenance" not in item
+                else CandidateProvenanceSummary.from_dict(item["provenance"])
+            ),
         )
 
 
@@ -708,6 +724,10 @@ class CandidateBatchUpload:
             or any(not isinstance(item, CandidateRevisionUpload) for item in self.items)
         ):
             raise ValueError("Candidate batch items are invalid")
+        if any(item.provenance is not None for item in self.items):
+            raise ValueError(
+                "Legacy Candidate batch cannot contain provenance"
+            )
         serialized_items = []
         for item in self.items:
             serialized = item.to_dict()
@@ -769,6 +789,7 @@ class CandidateSliceBatchUpload:
     decision_space_id: str
     items: tuple[CandidateRevisionUpload, ...]
     batch_digest: str
+    item_protocol: Literal["candidate-provenance-v1"] | None = None
 
     def __post_init__(self) -> None:
         _pattern(self.request_id, _REQUEST_ID, "request_id")
@@ -782,6 +803,18 @@ class CandidateSliceBatchUpload:
             or any(not isinstance(item, CandidateRevisionUpload) for item in self.items)
         ):
             raise ValueError("Candidate slice batch items are invalid")
+        if self.item_protocol is None:
+            if any(item.provenance is not None for item in self.items):
+                raise ValueError(
+                    "Legacy Candidate slice items cannot contain provenance"
+                )
+        elif self.item_protocol == "candidate-provenance-v1":
+            if any(item.provenance is None for item in self.items):
+                raise ValueError(
+                    "v1 Candidate slice items require provenance"
+                )
+        else:
+            raise ValueError("Candidate item protocol is invalid")
         serialized_items: list[dict[str, object]] = []
         for item in self.items:
             serialized = item.to_dict()
@@ -794,7 +827,7 @@ class CandidateSliceBatchUpload:
             raise ValueError("Candidate batch exceeds 1 MiB")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "request_id": self.request_id,
             "slice_id": self.slice_id,
             "route_id": self.route_id,
@@ -803,14 +836,23 @@ class CandidateSliceBatchUpload:
             "items": [item.to_dict() for item in self.items],
             "batch_digest": self.batch_digest,
         }
+        if self.item_protocol is not None:
+            value["item_protocol"] = self.item_protocol
+        return value
 
     @classmethod
     def from_dict(cls, value: object) -> "CandidateSliceBatchUpload":
-        item = _mapping(value, frozenset(("request_id", "slice_id", "route_id", "route_configuration_version", "decision_space_id", "items", "batch_digest")), "CandidateSliceBatchUpload")
+        legacy_fields = frozenset(("request_id", "slice_id", "route_id", "route_configuration_version", "decision_space_id", "items", "batch_digest"))
+        if not isinstance(value, Mapping):
+            raise ValueError("CandidateSliceBatchUpload is invalid")
+        fields = frozenset(value)
+        if fields not in (legacy_fields, legacy_fields | {"item_protocol"}):
+            raise ValueError("CandidateSliceBatchUpload fields are invalid")
+        item = value
         raw_items = item["items"]
         if not isinstance(raw_items, list):
             raise ValueError("Candidate slice batch items are invalid")
-        return cls(item["request_id"], item["slice_id"], item["route_id"], item["route_configuration_version"], item["decision_space_id"], tuple(CandidateRevisionUpload.from_dict(member) for member in raw_items), item["batch_digest"])
+        return cls(item["request_id"], item["slice_id"], item["route_id"], item["route_configuration_version"], item["decision_space_id"], tuple(CandidateRevisionUpload.from_dict(member) for member in raw_items), item["batch_digest"], item.get("item_protocol"))
 
 
 @dataclass(frozen=True)

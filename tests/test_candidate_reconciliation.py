@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import unittest
+from dataclasses import replace
 
 from zdecision.capture.models import (
     Candidate,
@@ -10,6 +11,7 @@ from zdecision.capture.models import (
 )
 from zdecision.ids import candidate_family_id, candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.capture.provenance import CandidateProvenanceSummary
 
 
 REPOSITORY_ID = "repo_11111111111111111111111111111111"
@@ -81,6 +83,14 @@ CURRENT_FAMILY = candidate_family_id(
 CURRENT_DIGEST = hashlib.sha256(
     canonical_json_bytes(CURRENT_CONTENT.to_dict())
 ).hexdigest()
+
+
+def provenance(seed: str) -> CandidateProvenanceSummary:
+    return CandidateProvenanceSummary(
+        protocol="candidate-provenance-v1",
+        kind="host_observed_user_prompt_anchor",
+        digest=seed * 64,
+    )
 
 
 class CandidateReconciliationTest(unittest.TestCase):
@@ -184,6 +194,7 @@ class CandidateReconciliationTest(unittest.TestCase):
                     None,
                 ),
             ),
+            {OBSERVATION_A.candidate_id: provenance("a")},
         )
 
         self.assertEqual(1, result.current_revisions[0].revision)
@@ -232,6 +243,94 @@ class CandidateReconciliationTest(unittest.TestCase):
         )
         self.assertEqual((revision,), result.new_revisions)
         self.assertEqual((revision,), result.uploadable_revisions)
+
+    def test_new_and_changed_revisions_bind_triggering_provenance(self) -> None:
+        (
+            current,
+            ReconciliationDecision,
+            apply_reconciliation,
+            _,
+            _,
+        ) = self._api()
+        cases = (
+            ("unrelated", (), OBSERVATION_A, OBSERVATION_A.content),
+            ("refine", (current,), OBSERVATION_B, OBSERVATION_B.content),
+            ("replace", (current,), REVERSED_OBSERVATION, REVERSED_OBSERVATION.content),
+        )
+
+        for relation, current_values, item, effective in cases:
+            with self.subTest(relation=relation):
+                if current_values:
+                    current_values = (
+                        replace(current, provenance=provenance("e")),
+                    )
+                family_id = (
+                    candidate_family_id(
+                        REPOSITORY_ID, DECISION_SPACE_ID, item.candidate_id
+                    )
+                    if relation == "unrelated"
+                    else current.family_id
+                )
+                summary = provenance(item.candidate_id[5])
+                result = apply_reconciliation(
+                    REPOSITORY_ID,
+                    DECISION_SPACE_ID,
+                    (item,),
+                    current_values,
+                    (
+                        ReconciliationDecision(
+                            item.candidate_id,
+                            relation,
+                            family_id,
+                            None if relation == "unrelated" else effective,
+                        ),
+                    ),
+                    {item.candidate_id: summary},
+                )
+
+                self.assertEqual(summary, result.new_revisions[0].provenance)
+                self.assertEqual(
+                    summary.to_dict(),
+                    result.new_revisions[0].to_dict()["provenance"],
+                )
+
+    def test_legacy_family_cannot_be_refined_or_replaced_by_v1_observation(self) -> None:
+        current, ReconciliationDecision, apply_reconciliation, _, _ = self._api()
+
+        for relation in ("refine", "replace"):
+            with self.subTest(relation=relation):
+                result = apply_reconciliation(
+                    REPOSITORY_ID,
+                    DECISION_SPACE_ID,
+                    (OBSERVATION_B,),
+                    (current,),
+                    (
+                        ReconciliationDecision(
+                            OBSERVATION_B.candidate_id,
+                            relation,
+                            current.family_id,
+                            OBSERVATION_B.content,
+                        ),
+                    ),
+                    {OBSERVATION_B.candidate_id: provenance("b")},
+                )
+
+                self.assertEqual((current,), result.current_revisions)
+                self.assertEqual((), result.new_revisions)
+                self.assertEqual((), result.uploadable_revisions)
+                self.assertEqual(
+                    (OBSERVATION_B.candidate_id,),
+                    result.ambiguous_observation_ids,
+                )
+
+    def test_legacy_revision_round_trips_without_provenance_field(self) -> None:
+        current, _, _, _, _ = self._api()
+        from zdecision.capture.reconciliation import CandidateFamilyRevision
+
+        payload = current.to_dict()
+
+        self.assertNotIn("provenance", payload)
+        self.assertEqual(current, CandidateFamilyRevision.from_dict(payload))
 
     def test_later_reversal_replaces_with_monotonic_revision(self) -> None:
         (
@@ -293,6 +392,7 @@ class CandidateReconciliationTest(unittest.TestCase):
                     None,
                 ),
             ),
+            {OBSERVATION_B.candidate_id: provenance("b")},
         )
 
         self.assertEqual((), result.uploadable_revisions)

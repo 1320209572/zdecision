@@ -570,6 +570,27 @@ class CentralApiTest(unittest.TestCase):
             {"error": "batch_conflict"}, conflict.json()
         )
 
+    def test_legacy_root_endpoint_rejects_provenance_bearing_items(self) -> None:
+        request_id, lease_token = self.start_request("web_action_legacy_root_provenance")
+        payload = candidate_batch(request_id).to_dict()
+        payload["items"][0]["provenance"] = {
+            "protocol": "candidate-provenance-v1",
+            "kind": "host_observed_user_prompt_anchor",
+            "digest": "f" * 64,
+        }
+        payload["batch_digest"] = hashlib.sha256(
+            canonical_json_bytes({"items": payload["items"]})
+        ).hexdigest()
+
+        response = self.client.post(
+            f"/api/v1/agent/capture-requests/{request_id}/candidates",
+            headers=self.authorization,
+            json={"lease_token": lease_token, "batch": payload},
+        )
+
+        self.assertEqual(422, response.status_code, response.text)
+        self.assertEqual({"error": "invalid_request"}, response.json())
+
     def test_page_lists_only_current_repository_candidates(
         self,
     ) -> None:

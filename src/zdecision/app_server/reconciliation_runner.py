@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
@@ -26,6 +26,10 @@ from zdecision.app_server.models import (
     FeasibilityModelProfile,
 )
 from zdecision.capture.models import Candidate
+from zdecision.capture.provenance import (
+    CandidateProvenance,
+    CandidateProvenanceSummary,
+)
 from zdecision.capture.reconciliation import (
     CandidateFamilyRevision,
     ReconciliationResult,
@@ -78,6 +82,7 @@ class ReconciliationRunner:
         current: tuple[CandidateFamilyRevision, ...],
         profile: FeasibilityModelProfile,
         heartbeat: Callable[[], None] | None = None,
+        candidate_provenance: Mapping[str, CandidateProvenance] | None = None,
     ) -> ReconciliationResult:
         if not isinstance(cwd, str) or not Path(cwd).is_absolute():
             raise ValueError("cwd must be an absolute path")
@@ -89,6 +94,17 @@ class ReconciliationRunner:
             )
         ):
             raise TypeError("observations must be Candidate values")
+        ordered = tuple(sorted(
+            observations, key=lambda item: item.candidate_id
+        ))
+        observation_ids = tuple(
+            item.candidate_id for item in ordered
+        )
+        if len(set(observation_ids)) != len(observation_ids):
+            raise ValueError("observations contain duplicate ids")
+        provenance = _candidate_provenance_summaries(
+            observation_ids, candidate_provenance
+        )
         if (
             not isinstance(current, tuple)
             or any(
@@ -118,14 +134,6 @@ class ReconciliationRunner:
                 )
             return persisted
 
-        ordered = tuple(sorted(
-            observations, key=lambda item: item.candidate_id
-        ))
-        observation_ids = tuple(
-            item.candidate_id for item in ordered
-        )
-        if len(set(observation_ids)) != len(observation_ids):
-            raise ValueError("observations contain duplicate ids")
         if not ordered:
             empty = ReconciliationResult.empty(
                 repository_id, decision_space_id
@@ -203,6 +211,7 @@ class ReconciliationRunner:
                 ordered,
                 current,
                 decisions,
+                provenance,
             )
         except (
             AppServerError,
@@ -288,18 +297,17 @@ class ReconciliationRunner:
             "repository_id": repository_id,
             "decision_space_id": decision_space_id,
             "current_families": [
-                item.to_dict() for item in current
+                {
+                    "family_id": item.family_id,
+                    "content": item.content.to_dict(),
+                }
+                for item in current
             ],
             "observations": [
                 {
                     "observation_id": observation.candidate_id,
                     "proposed_family_id": proposed_family_id,
                     "content": observation.content.to_dict(),
-                    "evidence_digest": hashlib.sha256(
-                        canonical_json_bytes(
-                            {"observation": observation.to_dict()}
-                        )
-                    ).hexdigest(),
                 }
                 for observation, proposed_family_id in zip(
                     observations,
@@ -330,6 +338,30 @@ def _verify_receipt(
         raise ReconciliationRunnerError(
             "Structured Turn returned the wrong model profile"
         )
+
+
+def _candidate_provenance_summaries(
+    observation_ids: tuple[str, ...],
+    value: Mapping[str, CandidateProvenance] | None,
+) -> dict[str, CandidateProvenanceSummary]:
+    if value is None:
+        return {}
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != set(observation_ids)
+        or any(not isinstance(item, CandidateProvenance) for item in value.values())
+    ):
+        raise ReconciliationRunnerError(
+            "Candidate provenance does not match observations"
+        )
+    return {
+        candidate_id: CandidateProvenanceSummary(
+            protocol="candidate-provenance-v1",
+            kind="host_observed_user_prompt_anchor",
+            digest=item.provenance_digest,
+        )
+        for candidate_id, item in value.items()
+    }
 
 
 def _input_digest(

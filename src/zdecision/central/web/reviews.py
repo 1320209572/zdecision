@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from zdecision.capture.models import CandidateContent
 from zdecision.capture.reviews import ApprovalRef
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
@@ -38,6 +39,10 @@ from zdecision.sync.contracts import CandidateRevisionUpload
 
 _CANDIDATE_ITEM_LIMIT = 16 * 1024
 _STATES = frozenset(("pending", "accepted", "rejected", "published", "all"))
+
+
+def _candidate_content_size_valid(content: CandidateContent) -> bool:
+    return len(canonical_json_bytes(content.to_dict())) <= _CANDIDATE_ITEM_LIMIT
 
 
 class CentralReviewError(Exception):
@@ -477,23 +482,7 @@ class CentralReviewService:
             or effective.repositories != candidate.content.repositories
         ):
             raise ValueError("edited product scope is invalid")
-        digest = hashlib.sha256(
-            canonical_json_bytes(effective.to_dict())
-        ).hexdigest()
-        effective_revision = CandidateRevisionUpload(
-            family_id=item.family_id,
-            revision_id=candidate_revision_id(
-                item.family_id, item.revision, digest
-            ),
-            revision=item.revision,
-            content=effective,
-            content_digest=digest,
-            evidence_digest="0" * 64,
-        )
-        if (
-            len(canonical_json_bytes(effective_revision.to_dict()))
-            > _CANDIDATE_ITEM_LIMIT
-        ):
+        if not _candidate_content_size_valid(effective):
             raise ValueError("effective_content is invalid")
 
     def _require_space(
@@ -505,7 +494,6 @@ class CentralReviewService:
                 raise DecisionSpaceNotLeaf()
             raise DecisionSpaceNotFound()
         return space
-
     def _require_repository(
         self, principal: Principal, decision_space_id: str,
         repository_id: str

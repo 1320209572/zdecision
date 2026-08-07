@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from zdecision.capture.models import CandidateContent
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import LeafDecisionSpace
 from zdecision.central.registry_projection import RegistryProjectionStore
@@ -461,6 +462,53 @@ class CentralWebReviewTest(unittest.TestCase):
                 ),
                 NOW,
             )
+
+    def test_review_records_never_copy_candidate_provenance(self) -> None:
+        provenanced = replace(
+            self.current,
+            provenance=CandidateProvenanceSummary(
+                "candidate-provenance-v1",
+                "host_observed_user_prompt_anchor",
+                "f" * 64,
+            ),
+        )
+        payload = canonical_json_bytes(provenanced.to_dict())
+        with self.store.connection:
+            self.store.connection.execute(
+                """UPDATE candidate_revisions
+                SET record_json = ?, record_digest = ?
+                WHERE organization_id = 'org_demo' AND repository_id = ?
+                  AND family_id = ? AND revision_id = ?""",
+                (
+                    payload.decode("utf-8"),
+                    hashlib.sha256(payload).hexdigest(),
+                    REPOSITORY_ID,
+                    FAMILY_ID,
+                    self.current.revision_id,
+                ),
+            )
+        edited = replace(provenanced.content, claim="reviewed content")
+        action = self.draft_item(
+            provenanced,
+            REPOSITORY_ID,
+            action="edit_accept",
+            effective_content=edited,
+        )
+        self.service.save_draft(self.user, PRODUCT_ID, 0, (action,), NOW)
+
+        result = self.service.submit(
+            self.user,
+            PRODUCT_ID,
+            "web_action_review-neutral",
+            1,
+            (action,),
+            NOW,
+        )
+
+        serialized = json.dumps(result.batch.to_dict(), sort_keys=True)
+        self.assertNotIn('"provenance":', serialized)
+        self.assertNotIn("candidate-provenance-v1", serialized)
+        self.assertNotIn("f" * 64, serialized)
 
     def test_search_and_repository_filters_are_bounded_and_owned(self) -> None:
         self.assertEqual(

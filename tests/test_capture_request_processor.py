@@ -16,6 +16,7 @@ from zdecision.app_server.models import FeasibilityModelProfile
 from zdecision.app_server.requested_capture import SessionCaptureResult
 from zdecision.capture.models import Candidate, CandidateContent, SourceCheckpoint
 from zdecision.capture.reconciliation import ReconciliationDecision, apply_reconciliation
+from zdecision.capture.provenance import CandidateProvenance, CandidateProvenanceSummary
 from zdecision.central.decision_spaces import EnabledRepository, RepositoryDecisionRoute
 from zdecision.ids import candidate_family_id
 from zdecision.jsonio import canonical_json_bytes
@@ -117,13 +118,24 @@ class FakeCaptureRunner:
                 source.session_id, "extractor-v5"
             ),
             signal_provenance=(),
-            candidate_provenance=(),
+            candidate_provenance=(
+                CandidateProvenance.create(
+                    candidate_id=observation.candidate_id,
+                    manifest_digest="1" * 64,
+                    source_signal_ordinal=1,
+                    evidence_receipt_ids=("rcpt_" + "2" * 64,),
+                    active_reference_set_digests=(),
+                    reference_decision_ids=(),
+                ),
+            ),
         )
 
 
 class FakeReconciliationRunner:
     def __init__(self) -> None:
         self.calls = 0
+        self.observation_ids: list[tuple[str, ...]] = []
+        self.provenance_keys: list[tuple[str, ...]] = []
 
     def sweep_archives(self) -> None:
         pass
@@ -137,11 +149,14 @@ class FakeReconciliationRunner:
         decision_space_id,
         cwd,
         observations,
+        candidate_provenance,
         current,
         profile,
         heartbeat=None,
     ):
         self.calls += 1
+        self.observation_ids.append(tuple(item.candidate_id for item in observations))
+        self.provenance_keys.append(tuple(sorted(candidate_provenance)))
         decisions = tuple(
             ReconciliationDecision(
                 item.candidate_id,
@@ -159,6 +174,14 @@ class FakeReconciliationRunner:
             observations,
             current,
             decisions,
+            {
+                candidate_id: CandidateProvenanceSummary(
+                    protocol="candidate-provenance-v1",
+                    kind="host_observed_user_prompt_anchor",
+                    digest=sidecar.provenance_digest,
+                )
+                for candidate_id, sidecar in candidate_provenance.items()
+            },
         )
 
 
@@ -395,6 +418,48 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             tuple(self.capture_runner.calls),
         )
         self.assertEqual(1, len(client.completed))
+        self.assertTrue(
+            all(batch.item_protocol == "candidate-provenance-v1" for batch in client.uploads)
+        )
+        self.assertTrue(
+            all(
+                item.provenance.to_dict()
+                == {
+                    "protocol": "candidate-provenance-v1",
+                    "kind": "host_observed_user_prompt_anchor",
+                    "digest": item.provenance.digest,
+                }
+                for batch in client.uploads
+                for item in batch.items
+            )
+        )
+
+    def test_only_observations_with_candidate_provenance_are_reconciled(self) -> None:
+        original_run = self.capture_runner.run
+
+        def run_with_unrelated_observation(*args, **kwargs):
+            capture = original_run(*args, **kwargs)
+            extra = Candidate(
+                candidate_id="cand_" + "f" * 32 + "_01",
+                capture_id="cap_" + "f" * 32,
+                ordinal=1,
+                content=capture.observations[0].content,
+                source=capture.observations[0].source,
+            )
+            return SessionCaptureResult(
+                **{**capture.__dict__, "observations": capture.observations + (extra,)}
+            )
+
+        self.capture_runner.run = run_with_unrelated_observation
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        self.assertTrue(all(len(ids) == 1 for ids in self.reconciliation_runner.observation_ids))
+        self.assertEqual(
+            self.reconciliation_runner.observation_ids,
+            self.reconciliation_runner.provenance_keys,
+        )
 
     def test_route_digest_mismatch_stops_before_git_or_model(self) -> None:
         invalid = object.__new__(ClaimedCaptureGroup)

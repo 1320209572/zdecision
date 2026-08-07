@@ -40,6 +40,7 @@ from zdecision.app_server.requested_capture import (
     SourceNotInteractive,
 )
 from zdecision.capture.on_demand import FrozenCaptureRouteContext
+from zdecision.capture.provenance import CandidateProvenance
 from zdecision.capture.reconciliation import CandidateFamilyRevision, ReconciliationResult
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
@@ -247,6 +248,10 @@ class OnDemandCaptureProcessor:
         result = self.request_state.slice_reconciliation(
             group.request_id, slice_view.slice_id
         )
+        item_protocol = (
+            _result_item_protocol(result) if result is not None else None
+        )
+        item_protocol_known = result is not None
         profile: FeasibilityModelProfile | None = None
         if result is None and sources:
             profile = self._request_profile(
@@ -262,11 +267,36 @@ class OnDemandCaptureProcessor:
                 excluded_source_keys,
                 client,
             )
-            observations = tuple(
-                observation
+            v5 = bool(captures) and all(
+                capture.protocol_revision.startswith("extractor-v5")
                 for _, capture in captures
-                for observation in capture.observations
             )
+            if v5:
+                candidate_provenance: dict[str, CandidateProvenance] = {}
+                observations = tuple(
+                    observation
+                    for _, capture in captures
+                    for observation in capture.observations
+                    if observation.candidate_id
+                    in {item.candidate_id for item in capture.candidate_provenance}
+                )
+                for _, capture in captures:
+                    for provenance in capture.candidate_provenance:
+                        if provenance.candidate_id in candidate_provenance:
+                            raise ValueError("candidate_provenance_repeated")
+                        candidate_provenance[provenance.candidate_id] = provenance
+                item_protocol = "candidate-provenance-v1"
+                item_protocol_known = True
+            else:
+                observations = tuple(
+                    observation
+                    for _, capture in captures
+                    for observation in capture.observations
+                )
+                candidate_provenance = {}
+                if captures:
+                    item_protocol = None
+                    item_protocol_known = True
             if observations:
                 client.progress(
                     group.request_id,
@@ -281,6 +311,9 @@ class OnDemandCaptureProcessor:
                     decision_space_id=route_context.decision_space_id,
                     cwd=min(source.cwd for source, _ in captures),
                     observations=observations,
+                    candidate_provenance=(
+                        candidate_provenance if v5 else None
+                    ),
                     current=self.request_state.slice_current_families(
                         group.repository_id,
                         route_context.decision_space_id,
@@ -306,7 +339,14 @@ class OnDemandCaptureProcessor:
                 "reconciliation_ownership_mismatch"
             )
         batch = _candidate_slice_batch(
-            group.request_id, slice_view, result.uploadable_revisions
+            group.request_id,
+            slice_view,
+            result.uploadable_revisions,
+            item_protocol=(
+                item_protocol
+                if item_protocol_known
+                else "candidate-provenance-v1"
+            ),
         )
         batch = self.request_state.commit_slice_result(
             group.request_id, slice_view.slice_id, result, batch
@@ -506,6 +546,8 @@ def _candidate_slice_batch(
     request_id: str,
     slice_view: CaptureSliceView,
     revisions: tuple[CandidateFamilyRevision, ...],
+    *,
+    item_protocol: str | None,
 ) -> CandidateSliceBatchUpload:
     items = tuple(
         CandidateRevisionUpload(
@@ -515,6 +557,7 @@ def _candidate_slice_batch(
             content=revision.content,
             content_digest=revision.content_digest,
             evidence_digest=revision.evidence_digest,
+            provenance=revision.provenance,
         )
         for revision in revisions
     )
@@ -532,4 +575,14 @@ def _candidate_slice_batch(
                 {"items": [item.to_dict() for item in items]}
             )
         ).hexdigest(),
+        item_protocol=item_protocol,
     )
+
+
+def _result_item_protocol(
+    result: ReconciliationResult,
+) -> str | None:
+    revisions = result.uploadable_revisions
+    if revisions and all(item.provenance is None for item in revisions):
+        return None
+    return "candidate-provenance-v1"

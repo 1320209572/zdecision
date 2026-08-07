@@ -7,6 +7,7 @@ import unittest
 import httpx
 
 from zdecision.capture.models import CandidateContent
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.central.decision_spaces import RepositoryDecisionRoute
 from zdecision.ids import candidate_family_id, candidate_revision_id
 from zdecision.jsonio import canonical_json_bytes
@@ -211,6 +212,7 @@ class CentralClientTest(unittest.TestCase):
             decision_space_id=ROUTE.decision_space_id,
             items=(),
             batch_digest=EMPTY_BATCH_DIGEST,
+            item_protocol="candidate-provenance-v1",
         )
         receipt = SliceUploadReceipt(
             REQUEST_ID, slice_view.slice_id, 0, "b" * 64
@@ -248,6 +250,60 @@ class CentralClientTest(unittest.TestCase):
             b"/Users/",
         ):
             self.assertNotIn(forbidden, bodies)
+
+    def test_slice_upload_serializes_only_central_safe_provenance(self) -> None:
+        group = ClaimedCaptureGroup.from_dict(claimed_payload())
+        content = valid_upload_batch().items[0].content
+        digest = hashlib.sha256(canonical_json_bytes(content.to_dict())).hexdigest()
+        family_id = candidate_family_id(REPOSITORY_ID, "cand_" + "4" * 32 + "_01")
+        item = CandidateRevisionUpload(
+            family_id=family_id,
+            revision_id=candidate_revision_id(family_id, 1, digest),
+            revision=1,
+            content=content,
+            content_digest=digest,
+            evidence_digest="5" * 64,
+            provenance=CandidateProvenanceSummary(
+                "candidate-provenance-v1",
+                "host_observed_user_prompt_anchor",
+                "f" * 64,
+            ),
+        )
+        batch = CandidateSliceBatchUpload(
+            REQUEST_ID,
+            "csl_" + "a" * 32,
+            ROUTE.route_id,
+            1,
+            ROUTE.decision_space_id,
+            (item,),
+            hashlib.sha256(
+                canonical_json_bytes({"items": [item.to_dict()]})
+            ).hexdigest(),
+            "candidate-provenance-v1",
+        )
+        receipt = SliceUploadReceipt(REQUEST_ID, batch.slice_id, 1, "b" * 64)
+        transport = RecordingTransport([httpx.Response(200, json=receipt.to_dict())])
+        client = CentralClient(
+            BASE_URL,
+            DEVICE_TOKEN,
+            transport=httpx.MockTransport(transport),
+        )
+        try:
+            client.upload_slice(group, batch)
+        finally:
+            client.close()
+
+        body = json.loads(transport.requests[0].content)
+        self.assertEqual(
+            {
+                "protocol": "candidate-provenance-v1",
+                "kind": "host_observed_user_prompt_anchor",
+                "digest": "f" * 64,
+            },
+            body["batch"]["items"][0]["provenance"],
+        )
+        for forbidden in ("manifest_digest", "receipt_id", "session_id", "turn_id", '"prompt":'):
+            self.assertNotIn(forbidden, transport.requests[0].content.decode())
 
     def test_group_completion_requires_matching_terminal_success(self) -> None:
         group = ClaimedCaptureGroup.from_dict(claimed_payload())

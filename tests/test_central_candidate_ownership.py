@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from zdecision.capture.models import CandidateContent
+from zdecision.capture.provenance import CandidateProvenanceSummary
 from zdecision.central.auth import Principal
 from zdecision.central.decision_spaces import (
     CatalogGroup,
@@ -181,6 +182,11 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
             content=content,
             content_digest=content_digest,
             evidence_digest="e" * 64,
+            provenance=CandidateProvenanceSummary(
+                "candidate-provenance-v1",
+                "host_observed_user_prompt_anchor",
+                "f" * 64,
+            ),
         )
         return CandidateSliceBatchUpload(
             request_id=slice_view.request_id,
@@ -196,6 +202,7 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
             batch_digest=hashlib.sha256(
                 canonical_json_bytes({"items": [item.to_dict()]})
             ).hexdigest(),
+            item_protocol="candidate-provenance-v1",
         )
 
     def complete_group(self, request_id: str, lease_token: str, receipts) -> None:
@@ -297,6 +304,49 @@ class CentralCandidateOwnershipTest(unittest.TestCase):
                 (REPOSITORY_ID, batch.items[0].family_id),
             ).fetchone()["decision_space_id"],
         )
+
+    def test_central_record_retains_only_minimized_provenance(self) -> None:
+        slice_view, lease_token = self.plan_theme_slice()
+        batch = self.batch(slice_view)
+
+        first = self.service.accept_slice_batch(
+            self.device,
+            slice_view.request_id,
+            slice_view.slice_id,
+            lease_token,
+            batch,
+            NOW,
+        )
+        replay = self.service.accept_slice_batch(
+            self.device,
+            slice_view.request_id,
+            slice_view.slice_id,
+            lease_token,
+            batch,
+            NOW,
+        )
+        stored = self.store.connection.execute(
+            "SELECT record_json FROM candidate_revisions WHERE revision_id = ?",
+            (batch.items[0].revision_id,),
+        ).fetchone()["record_json"]
+
+        self.assertEqual(first, replay)
+        self.assertIn(
+            '"provenance":{"digest":"' + "f" * 64
+            + '","kind":"host_observed_user_prompt_anchor",'
+            '"protocol":"candidate-provenance-v1"}',
+            stored,
+        )
+        for forbidden in (
+            "manifest_digest",
+            "receipt_id",
+            "reference_set",
+            "session_id",
+            "turn_id",
+            '"prompt":',
+            "/Users/",
+        ):
+            self.assertNotIn(forbidden, stored)
 
     def test_later_route_version_keeps_family_in_same_decision_space(self) -> None:
         first_group = self.service.create_group(

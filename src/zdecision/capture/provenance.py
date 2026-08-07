@@ -11,6 +11,8 @@ from zdecision.jsonio import canonical_json_bytes
 
 
 EvidenceKind = Literal["hook_observed_user_prompt_anchor"]
+CandidateProvenanceProtocol = Literal["candidate-provenance-v1"]
+CandidateProvenanceKind = Literal["host_observed_user_prompt_anchor"]
 SignalDisposition = Literal[
     "candidate_eligible",
     "existing_decision_adoption",
@@ -28,6 +30,12 @@ _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{32}_(?:0[1-9]|1[0-9]|20)$")
 _DECISION_ID = re.compile(r"^dec_[0-9a-f]{32}$")
 _MAX_ANCHORS = 100
 _EVIDENCE_KIND: EvidenceKind = "hook_observed_user_prompt_anchor"
+_CANDIDATE_PROVENANCE_PROTOCOL: CandidateProvenanceProtocol = (
+    "candidate-provenance-v1"
+)
+_CANDIDATE_PROVENANCE_KIND: CandidateProvenanceKind = (
+    "host_observed_user_prompt_anchor"
+)
 _SIGNAL_DISPOSITIONS = frozenset(
     (
         "candidate_eligible",
@@ -38,6 +46,40 @@ _SIGNAL_DISPOSITIONS = frozenset(
         "excluded_unverified",
     )
 )
+
+
+@dataclass(frozen=True)
+class CandidateProvenanceSummary:
+    """The complete minimized provenance value allowed to reach Central."""
+
+    protocol: CandidateProvenanceProtocol
+    kind: CandidateProvenanceKind
+    digest: str
+
+    def __post_init__(self) -> None:
+        if self.protocol != _CANDIDATE_PROVENANCE_PROTOCOL:
+            raise ValueError("candidate provenance protocol is invalid")
+        if self.kind != _CANDIDATE_PROVENANCE_KIND:
+            raise ValueError("candidate provenance kind is invalid")
+        _require_digest(self.digest, "digest")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "protocol": self.protocol,
+            "kind": self.kind,
+            "digest": self.digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "CandidateProvenanceSummary":
+        fields = {"protocol", "kind", "digest"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ValueError("candidate provenance summary fields are invalid")
+        return cls(
+            protocol=cast(CandidateProvenanceProtocol, value["protocol"]),
+            kind=cast(CandidateProvenanceKind, value["kind"]),
+            digest=cast(str, value["digest"]),
+        )
 
 
 @dataclass(frozen=True)
