@@ -57,6 +57,25 @@ def v5_inventory(manifest: CaptureEvidenceManifest) -> dict[str, object]:
     return value
 
 
+def multi_receipt_manifest() -> CaptureEvidenceManifest:
+    anchors = tuple(
+        PromptAnchor(
+            receipt_id=prompt_anchor_receipt_id("evt_" + digit * 32),
+            hook_event_id="evt_" + digit * 32,
+            turn_id=f"turn-{ordinal}",
+            anchor_ordinal=ordinal,
+            active_reference_set_digest=None,
+        )
+        for ordinal, digit in enumerate(("3", "4"), start=1)
+    )
+    return CaptureEvidenceManifest.create(
+        source_session_id="session-1",
+        previous_handled_event_id=None,
+        upper_stop_event_id="evt_" + "5" * 32,
+        anchors=anchors,
+    )
+
+
 class InventoryValidationTests(unittest.TestCase):
     def inventory_api(self):
         try:
@@ -301,6 +320,52 @@ class InventoryValidationTests(unittest.TestCase):
         self.assertNotEqual(
             "candidate_eligible", uncertain_provenance[0].disposition
         )
+
+    def test_v5_rejects_reordered_cross_manifest_and_noncanonical_ordinals(self) -> None:
+        """This catches receipt borrowing or ordinal rewriting before Extraction."""
+        from zdecision.capture.inventory import (
+            InventoryValidationError,
+            validate_inventory_v5,
+        )
+
+        manifest = multi_receipt_manifest()
+        for mutation in (
+            lambda value: value["signals"][0].update(
+                {
+                    "evidence_receipt_ids": [
+                        manifest.anchors[1].receipt_id,
+                        manifest.anchors[0].receipt_id,
+                    ]
+                }
+            ),
+            lambda value: value["signals"][0].update({"signal_ordinal": 2}),
+            lambda value: value["signals"][0].update(
+                {"evidence_receipt_ids": [evidence_manifest().anchors[0].receipt_id]}
+            ),
+        ):
+            value = v5_inventory(manifest)
+            mutation(value)
+            with self.assertRaises(InventoryValidationError):
+                validate_inventory_v5(value, manifest)
+
+    def test_v5_only_direct_current_direction_is_eligible(self) -> None:
+        """This catches non-current, adoption, reference-only, and code-only inputs."""
+        from zdecision.capture.inventory import validate_inventory_v5
+
+        manifest = evidence_manifest(active_reference_set_digest="c" * 64)
+        cases = (
+            {"status": "unresolved"},
+            {"confirmation_basis": "uncertain"},
+            {"confirmation_basis": "explicit_user_confirmation"},
+            {"confirmation_basis": "adopted_decision_contract"},
+            {"status": "superseded", "evidence_receipt_ids": []},
+        )
+        for change in cases:
+            with self.subTest(change=change):
+                value = v5_inventory(manifest)
+                value["signals"][0].update(change)
+                _, provenance = validate_inventory_v5(value, manifest)
+                self.assertNotEqual("candidate_eligible", provenance[0].disposition)
 
 
 if __name__ == "__main__":

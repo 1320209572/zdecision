@@ -1724,6 +1724,82 @@ class EvidenceFirstExtractionTests(unittest.TestCase):
                 manifest,
             )
 
+    def test_v5_extraction_rejects_duplicate_or_noneligible_ordinals(self) -> None:
+        """This catches Extraction reusing or promoting an Inventory signal."""
+        from tests.test_inventory import evidence_manifest, v5_inventory
+        from zdecision.capture.inventory import validate_inventory_v5
+        from zdecision.capture.models import SourceCheckpoint
+        from zdecision.capture.service import (
+            ExtractionValidationError,
+            validate_extraction_output_v5,
+        )
+
+        manifest = evidence_manifest()
+        inventory, provenance = validate_inventory_v5(v5_inventory(manifest), manifest)
+        duplicated = {
+            "candidates": [
+                {**valid_candidate(), "source_signal_ordinal": 1},
+                {
+                    **valid_candidate(claim="another rule"),
+                    "source_signal_ordinal": 1,
+                },
+            ]
+        }
+        with self.assertRaises(ExtractionValidationError):
+            validate_extraction_output_v5(
+                "cap_" + "a" * 32,
+                SourceCheckpoint("thread-1", "turn-1"),
+                "anheng",
+                duplicated,
+                inventory,
+                provenance,
+                manifest,
+            )
+
+    def test_v5_extraction_preserves_multi_receipt_manifest_order(self) -> None:
+        """This catches Candidate sidecars reordering a selected receipt set."""
+        from tests.test_inventory import multi_receipt_manifest, v5_inventory
+        from zdecision.capture.inventory import validate_inventory_v5
+        from zdecision.capture.models import SourceCheckpoint
+        from zdecision.capture.service import (
+            ExtractionValidationError,
+            validate_extraction_output_v5,
+        )
+
+        manifest = multi_receipt_manifest()
+        value = v5_inventory(manifest)
+        value["signals"][0]["evidence_receipt_ids"] = [
+            anchor.receipt_id for anchor in manifest.anchors
+        ]
+        inventory, provenance = validate_inventory_v5(value, manifest)
+        _, candidate_provenance = validate_extraction_output_v5(
+            "cap_" + "a" * 32,
+            SourceCheckpoint("thread-1", "turn-1"),
+            "anheng",
+            {"candidates": [{**valid_candidate(), "source_signal_ordinal": 1}]},
+            inventory,
+            provenance,
+            manifest,
+        )
+        self.assertEqual(
+            tuple(anchor.receipt_id for anchor in manifest.anchors),
+            candidate_provenance[0].evidence_receipt_ids,
+        )
+
+        ineligible = v5_inventory(manifest)
+        ineligible["signals"][0]["status"] = "unresolved"
+        inventory, provenance = validate_inventory_v5(ineligible, manifest)
+        with self.assertRaises(ExtractionValidationError):
+            validate_extraction_output_v5(
+                "cap_" + "a" * 32,
+                SourceCheckpoint("thread-1", "turn-1"),
+                "anheng",
+                {"candidates": [{**valid_candidate(), "source_signal_ordinal": 1}]},
+                inventory,
+                provenance,
+                manifest,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import tempfile
 import sqlite3
 import unittest
@@ -16,13 +17,18 @@ from zdecision.capture.on_demand import (
     FrozenCaptureInput,
     FrozenCaptureRouteContext,
     ValidatedCaptureResult,
+    _result_v2_core,
 )
 from zdecision.capture.provenance import (
+    CandidateProvenance,
     CaptureEvidenceManifest,
     PromptAnchor,
     prompt_anchor_receipt_id,
 )
+from zdecision.capture.models import Candidate
 from zdecision.capture.templates import TemplateCatalog
+from zdecision.ids import capture_candidate_id, on_demand_capture_operation_id
+from zdecision.jsonio import canonical_json_bytes
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -137,7 +143,124 @@ def v5_manifest(event_digit: str = "e") -> CaptureEvidenceManifest:
     )
 
 
+def legacy_frozen_input(record_version: int = 4) -> FrozenCaptureInput:
+    current = frozen_input()
+    identity = current._identity_payload()
+    identity["protocol"] = f"extractor-v{record_version}"
+    identity.pop("evidence_manifest")
+    if record_version == 3:
+        identity.pop("route_context")
+    payload = current.to_dict()
+    payload["record_version"] = record_version
+    payload["protocol_revision"] = f"extractor-v{record_version}"
+    payload["operation_id"] = on_demand_capture_operation_id(identity)
+    payload.pop("evidence_manifest")
+    if record_version == 3:
+        payload.pop("route_context")
+    return FrozenCaptureInput.from_dict(payload)
+
+
+def v1_result_for_operation(operation_id: str) -> ValidatedCaptureResult:
+    candidate = valid_candidate()
+    inventory = copy.deepcopy(VALID_INVENTORY)
+    inventory_sha256 = hashlib.sha256(canonical_json_bytes(inventory)).hexdigest()
+    extraction = {"candidates": [candidate]}
+    extraction_sha256 = hashlib.sha256(canonical_json_bytes(extraction)).hexdigest()
+    observation = {
+        "candidate_id": capture_candidate_id(operation_id, 1),
+        "capture_id": operation_id,
+        "ordinal": 1,
+        "content": {
+            "product": candidate["product"],
+            "claim": candidate["claim"],
+            "future_action": candidate["future_action"],
+            "scope_summary": candidate["scope"]["summary"],
+            "repositories": candidate["scope"]["repositories"],
+            "paths": candidate["scope"]["paths"],
+            "invalidation_conditions": candidate["invalidation_conditions"],
+        },
+        "source": {
+            "thread_id": "019fb100-0000-7000-8000-000000000001",
+            "turn_id": "019fb100-0000-7000-8000-000000000003",
+        },
+    }
+    core = {
+        "operation_id": operation_id,
+        "inventory": inventory,
+        "inventory_sha256": inventory_sha256,
+        "extraction_sha256": extraction_sha256,
+        "observations": [observation],
+    }
+    return ValidatedCaptureResult.from_dict(
+        {
+            **core,
+            "result_digest": hashlib.sha256(canonical_json_bytes(core)).hexdigest(),
+        }
+    )
+
+
+def v2_result_for_operation(operation_id: str) -> ValidatedCaptureResult:
+    original = validated_result()
+    observation_value = original.observations[0].to_dict()
+    observation_value["candidate_id"] = capture_candidate_id(operation_id, 1)
+    observation_value["capture_id"] = operation_id
+    observation = Candidate.from_dict(observation_value)
+    source_sidecar = original.signal_provenance[0]
+    candidate_sidecar = CandidateProvenance.create(
+        candidate_id=observation.candidate_id,
+        manifest_digest=original.evidence_manifest.manifest_digest,
+        source_signal_ordinal=source_sidecar.signal_ordinal,
+        evidence_receipt_ids=source_sidecar.evidence_receipt_ids,
+        active_reference_set_digests=source_sidecar.active_reference_set_digests,
+    )
+    core = _result_v2_core(
+        operation_id,
+        original.inventory,
+        original.inventory_sha256,
+        original.extraction_sha256,
+        (observation,),
+        original.evidence_manifest,
+        original.signal_provenance,
+        (candidate_sidecar,),
+    )
+    return ValidatedCaptureResult(
+        result_version=2,
+        operation_id=operation_id,
+        inventory=original.inventory,
+        inventory_sha256=original.inventory_sha256,
+        extraction_sha256=original.extraction_sha256,
+        observations=(observation,),
+        evidence_manifest=original.evidence_manifest,
+        signal_provenance=original.signal_provenance,
+        candidate_provenance=(candidate_sidecar,),
+        result_digest=hashlib.sha256(canonical_json_bytes(core)).hexdigest(),
+    )
+
+
 class FrozenCaptureInputTests(unittest.TestCase):
+    def test_historical_v3_and_v4_frozen_bytes_round_trip_exactly(self) -> None:
+        """This catches v5 serialization rewriting previously frozen inputs."""
+        for record_version in (3, 4):
+            with self.subTest(record_version=record_version):
+                historical = legacy_frozen_input(record_version)
+                encoded = canonical_json_bytes(historical.to_dict())
+                self.assertEqual(
+                    encoded,
+                    canonical_json_bytes(
+                        FrozenCaptureInput.from_dict(historical.to_dict()).to_dict()
+                    ),
+                )
+                result = ValidatedCaptureResult.create(
+                    historical,
+                    VALID_INVENTORY,
+                    {"candidates": [valid_candidate()]},
+                )
+                self.assertEqual(1, result.result_version)
+                self.assertEqual(
+                    result.to_dict(),
+                    ValidatedCaptureResult.from_dict(result.to_dict()).to_dict(),
+                )
+
     def test_v5_frozen_input_requires_manifest_and_commits_sidecars(self) -> None:
         """This catches silently producing a legacy result for evidence-first input."""
         manifest = v5_manifest()
@@ -242,6 +365,30 @@ class CaptureOperationStoreTests(unittest.TestCase):
         )
         self.store = CaptureOperationStore.open(self.database_path)
         self.addCleanup(self.store.close)
+
+    def test_v5_operation_rejects_a_legacy_result_before_persistence(self) -> None:
+        """This catches v5 operations accepting a provenance-free v1 result."""
+        operation = self.store.ensure_operation(frozen_input())
+        attempt = self.store.begin_attempt(operation.operation_id, NOW)
+
+        with self.assertRaises(ValueError):
+            self.store.store_validated_attempt(
+                attempt.attempt_id,
+                v1_result_for_operation(operation.operation_id),
+                NOW,
+            )
+
+    def test_legacy_operation_rejects_a_v2_result_before_persistence(self) -> None:
+        """This catches legacy operations accepting an evidence-first result."""
+        operation = self.store.ensure_operation(legacy_frozen_input())
+        attempt = self.store.begin_attempt(operation.operation_id, NOW)
+
+        with self.assertRaises(ValueError):
+            self.store.store_validated_attempt(
+                attempt.attempt_id,
+                v2_result_for_operation(operation.operation_id),
+                NOW,
+            )
 
     def test_exact_operation_reopens_after_process_restart(self) -> None:
         frozen = frozen_input()

@@ -445,7 +445,12 @@ class CaptureOperationStore:
     ) -> ExecutionAttempt:
         if not isinstance(result, ValidatedCaptureResult):
             raise TypeError("result must be a ValidatedCaptureResult")
-        validated_result = ValidatedCaptureResult.from_dict(result.to_dict())
+        operation = self._operation(
+            self._required_operation_row(result.operation_id)
+        )
+        validated_result = ValidatedCaptureResult.from_dict(
+            result.to_dict(), operation.frozen
+        )
         if validated_result != result:
             raise CaptureAttemptConflict(
                 "Validated result is not canonical"
@@ -845,7 +850,10 @@ class CaptureOperationStore:
             )
         try:
             result = ValidatedCaptureResult.from_dict(
-                _json_object(raw, "ValidatedCaptureResult")
+                _json_object(raw, "ValidatedCaptureResult"),
+                self._operation(
+                    self._required_operation_row(row["operation_id"])
+                ).frozen,
             )
         except (TypeError, ValueError) as error:
             raise CaptureOperationCorrupt(
@@ -873,7 +881,8 @@ class CaptureOperationStore:
             )
         try:
             result = ValidatedCaptureResult.from_dict(
-                _json_object(raw, "ValidatedCaptureResult")
+                _json_object(raw, "ValidatedCaptureResult"),
+                self._operation(row).frozen,
             )
         except (TypeError, ValueError) as error:
             raise CaptureOperationCorrupt(
