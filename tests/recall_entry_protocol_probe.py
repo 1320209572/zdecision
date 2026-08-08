@@ -36,30 +36,50 @@ def forbid_controlled_process() -> AppServerTransport:
     raise AppServerUnavailable("Controlled app-server fallback is forbidden for Gate 0A")
 
 
+class _CloseOnceTransport:
+    def __init__(self, transport: AppServerTransport) -> None:
+        self._transport = transport
+        self._closed = False
+
+    def send(self, message: dict[str, object]) -> None:
+        self._transport.send(message)
+
+    def receive(self, timeout_seconds: float) -> dict[str, object]:
+        return self._transport.receive(timeout_seconds)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._transport.close()
+
+
 def probe_known_thread(
     *, thread_id: str, transport: AppServerTransport
 ) -> dict[str, object]:
     """Read one known Thread through the Desktop host route and sanitize the result."""
-    _validate_thread_id(thread_id)
-    with tempfile.TemporaryDirectory() as directory:
-        database = AgentDatabase.open(Path(directory) / "agent.sqlite3")
-        gateway: AppServerGateway | None = None
-        try:
-            gateway = AppServerGateway.connect(
-                database=database,
-                host_transport=transport,
-                process_factory=forbid_controlled_process,
-            )
-            gateway.read_thread_identity(thread_id)
-            if gateway.route != "host":
-                raise AppServerUnavailable("Desktop host route is unavailable")
-            return dict(_SANITIZED_RESULT)
-        finally:
-            if gateway is not None:
-                gateway.close()
-            else:
-                transport.close()
-            database.close()
+    owned_transport = _CloseOnceTransport(transport)
+    gateway: AppServerGateway | None = None
+    try:
+        _validate_thread_id(thread_id)
+        with tempfile.TemporaryDirectory() as directory:
+            database = AgentDatabase.open(Path(directory) / "agent.sqlite3")
+            try:
+                gateway = AppServerGateway.connect(
+                    database=database,
+                    host_transport=owned_transport,
+                    process_factory=forbid_controlled_process,
+                )
+                gateway.read_thread_identity(thread_id)
+                if gateway.route != "host":
+                    raise AppServerUnavailable("Desktop host route is unavailable")
+                return dict(_SANITIZED_RESULT)
+            finally:
+                database.close()
+    finally:
+        if gateway is not None:
+            gateway.close()
+        owned_transport.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -72,16 +92,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command != "thread":
         parser.error("unsupported probe command")
 
-    transport: AppServerTransport | None = None
     try:
         transport = launch_desktop_proxy(_desktop_proxy_popen)
         result = probe_known_thread(thread_id=arguments.thread_id, transport=transport)
     except Exception:
         print(json.dumps({"gate": "0A", "status": "FAIL"}, separators=(",", ":")))
         return 1
-    finally:
-        if transport is not None:
-            transport.close()
     print(json.dumps(result, separators=(",", ":")))
     return 0
 

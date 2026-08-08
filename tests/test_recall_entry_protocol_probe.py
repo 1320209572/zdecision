@@ -46,6 +46,7 @@ class ThreadReadTransport:
         self.reply = reply
         self.incoming: queue.Queue[object] = queue.Queue()
         self.closed = False
+        self.close_calls = 0
 
     def send(self, message: dict[str, object]) -> None:
         if message["method"] == "initialize":
@@ -64,6 +65,7 @@ class ThreadReadTransport:
 
     def close(self) -> None:
         self.closed = True
+        self.close_calls += 1
         self.incoming.put(AppServerEOF("fixture closed"))
 
 
@@ -76,6 +78,14 @@ class FailingTransport:
 
     def close(self) -> None:
         pass
+
+
+class CloseCountingFailingTransport(FailingTransport):
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class ImmediateFailureTransport:
@@ -138,6 +148,34 @@ class RecallEntryProtocolProbeTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), '{"gate":"0A","status":"FAIL"}\n')
         self.assertNotIn(PEER_TEXT, output.getvalue())
 
+    def test_main_closes_a_successful_proxy_once(self) -> None:
+        """This catches main closing a proxy that probe_known_thread already owns."""
+        transport = ThreadReadTransport(self.thread_reply())
+        output = io.StringIO()
+        with patch(
+            "tests.recall_entry_protocol_probe.launch_desktop_proxy",
+            return_value=transport,
+        ):
+            with redirect_stdout(output):
+                result = main(["thread", "--thread-id", THREAD_ID])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(transport.close_calls, 1)
+
+    def test_main_closes_a_failed_proxy_once(self) -> None:
+        """This catches repeated close calls after a host connection failure."""
+        transport = CloseCountingFailingTransport()
+        output = io.StringIO()
+        with patch(
+            "tests.recall_entry_protocol_probe.launch_desktop_proxy",
+            return_value=transport,
+        ):
+            with redirect_stdout(output):
+                result = main(["thread", "--thread-id", THREAD_ID])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(transport.close_calls, 1)
+
     def test_probe_never_falls_back_to_a_controlled_app_server(self) -> None:
         """This catches host-route failure silently starting a controlled process."""
         controlled_process_launches = 0
@@ -171,6 +209,16 @@ class RecallEntryProtocolProbeTests(unittest.TestCase):
                 transport=ThreadReadTransport(self.thread_reply()),
             )
         self.assertNotIn(PEER_TEXT, str(error.exception))
+
+    def test_probe_closes_invalid_task_id_transport_once(self) -> None:
+        """This catches invalid task-ID validation leaking its supplied transport."""
+        transport = ThreadReadTransport(self.thread_reply())
+        with self.assertRaises(ValueError):
+            probe_known_thread(
+                thread_id="not-the-bound-gate-task", transport=transport
+            )
+
+        self.assertEqual(transport.close_calls, 1)
 
     def test_different_valid_uuid_is_rejected_as_not_the_gate_task(self) -> None:
         """This catches probing a valid UUID other than the bound Gate 0A task."""
