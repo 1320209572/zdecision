@@ -6,7 +6,6 @@ import argparse
 import json
 import subprocess
 import tempfile
-import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from zdecision.app_server.jsonl import AppServerTransport, ProcessJsonlTransport
 
 
 _DESKTOP_PROXY_COMMAND = ("codex", "app-server", "proxy")
+_GATE_0A_THREAD_ID = "019fdf3f-2b42-79f1-b049-c8e464c330ab"
 _SANITIZED_RESULT = {
     "gate": "0A",
     "route": "host_unix",
@@ -57,6 +57,8 @@ def probe_known_thread(
         finally:
             if gateway is not None:
                 gateway.close()
+            else:
+                transport.close()
             database.close()
 
 
@@ -70,12 +72,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command != "thread":
         parser.error("unsupported probe command")
 
-    transport = launch_desktop_proxy(_desktop_proxy_popen)
+    transport: AppServerTransport | None = None
     try:
+        transport = launch_desktop_proxy(_desktop_proxy_popen)
         result = probe_known_thread(thread_id=arguments.thread_id, transport=transport)
     except Exception:
         print(json.dumps({"gate": "0A", "status": "FAIL"}, separators=(",", ":")))
         return 1
+    finally:
+        if transport is not None:
+            transport.close()
     print(json.dumps(result, separators=(",", ":")))
     return 0
 
@@ -94,14 +100,8 @@ def _desktop_proxy_popen(command: Sequence[str]) -> subprocess.Popen[str]:
 
 
 def _validate_thread_id(thread_id: str) -> None:
-    if not isinstance(thread_id, str):
-        raise ValueError("thread_id must be a canonical UUID")
-    try:
-        parsed = uuid.UUID(thread_id)
-    except (AttributeError, ValueError):
-        raise ValueError("thread_id must be a canonical UUID") from None
-    if str(parsed) != thread_id:
-        raise ValueError("thread_id must be a canonical UUID")
+    if thread_id != _GATE_0A_THREAD_ID:
+        raise ValueError("thread_id must equal the Gate 0A task ID")
 
 
 if __name__ == "__main__":

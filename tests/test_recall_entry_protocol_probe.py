@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import queue
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from zdecision.app_server.gateway import AppServerUnavailable, InvalidAppServerResponse
 from zdecision.app_server.jsonl import AppServerEOF, AppServerTimeout
@@ -10,6 +12,7 @@ from zdecision.app_server.jsonl import AppServerEOF, AppServerTimeout
 from tests.recall_entry_protocol_probe import (
     forbid_controlled_process,
     launch_desktop_proxy,
+    main,
     probe_known_thread,
 )
 
@@ -89,6 +92,20 @@ class ImmediateFailureTransport:
         pass
 
 
+class CloseTrackingTransport:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def send(self, message: dict[str, object]) -> None:
+        raise AssertionError("connect fixture must not send")
+
+    def receive(self, timeout_seconds: float) -> object:
+        raise AssertionError("connect fixture must not receive")
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class RecallEntryProtocolProbeTests(unittest.TestCase):
     def fake_process(
         self, command: tuple[str, ...], commands: list[tuple[str, ...]]
@@ -106,6 +123,20 @@ class RecallEntryProtocolProbeTests(unittest.TestCase):
             self.assertEqual(commands, [("codex", "app-server", "proxy")])
         finally:
             transport.close()
+
+    def test_main_prints_bounded_json_when_proxy_launch_fails(self) -> None:
+        """This catches proxy launch errors escaping without a canonical result."""
+        output = io.StringIO()
+        with patch(
+            "tests.recall_entry_protocol_probe.launch_desktop_proxy",
+            side_effect=OSError(PEER_TEXT),
+        ):
+            with redirect_stdout(output):
+                result = main(["thread", "--thread-id", THREAD_ID])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), '{"gate":"0A","status":"FAIL"}\n')
+        self.assertNotIn(PEER_TEXT, output.getvalue())
 
     def test_probe_never_falls_back_to_a_controlled_app_server(self) -> None:
         """This catches host-route failure silently starting a controlled process."""
@@ -140,6 +171,31 @@ class RecallEntryProtocolProbeTests(unittest.TestCase):
                 transport=ThreadReadTransport(self.thread_reply()),
             )
         self.assertNotIn(PEER_TEXT, str(error.exception))
+
+    def test_different_valid_uuid_is_rejected_as_not_the_gate_task(self) -> None:
+        """This catches probing a valid UUID other than the bound Gate 0A task."""
+        different_thread_id = "019fdf3f-2b42-79f1-b049-c8e464c330ac"
+        reply = self.thread_reply(thread_id=different_thread_id)
+        thread = reply["thread"]
+        assert isinstance(thread, dict)
+        thread["sessionId"] = different_thread_id
+        with self.assertRaises(ValueError):
+            probe_known_thread(
+                thread_id=different_thread_id,
+                transport=ThreadReadTransport(reply),
+            )
+
+    def test_probe_closes_transport_when_gateway_connection_fails(self) -> None:
+        """This catches a connection failure leaking the supplied host transport."""
+        transport = CloseTrackingTransport()
+        with patch(
+            "tests.recall_entry_protocol_probe.AppServerGateway.connect",
+            side_effect=AppServerUnavailable("fixture failure"),
+        ):
+            with self.assertRaises(AppServerUnavailable):
+                probe_known_thread(thread_id=THREAD_ID, transport=transport)
+
+        self.assertTrue(transport.closed)
 
     def test_non_object_reply_is_a_bounded_failure(self) -> None:
         """This catches accepting an invalid thread/read response shape."""
