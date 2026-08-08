@@ -91,15 +91,18 @@ class CloseCountingFailingTransport(FailingTransport):
 class ImmediateFailureTransport:
     def __init__(self, failure: BaseException) -> None:
         self.failure = failure
+        self.closed = False
 
     def send(self, message: dict[str, object]) -> None:
         raise self.failure
 
     def receive(self, timeout_seconds: float) -> object:
+        if self.closed:
+            raise AppServerEOF("fixture closed")
         raise self.failure
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class CloseTrackingTransport:
