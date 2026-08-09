@@ -39,11 +39,16 @@ database.
 
 ## Automated command status
 
-- Probe unit suite: 27 tests, OK.
-- Exact client-without-form-capability test: 1 test, OK.
-- Desktop assertion with live opt-in disabled: 1 test, OK with 1 expected skip.
-- Recall host, Hook, Skill, and Plugin regression suites: 60 tests, OK.
-- Probe and acceptance module compilation: exit 0.
+- `.venv/bin/python -m unittest tests.test_recall_elicitation_probe -v`:
+  27 tests, OK.
+- `.venv/bin/python -m unittest tests.test_recall_elicitation_probe.RecallElicitationProtocolTest.test_client_without_form_capability_returns_unavailable_without_eliciting -v`:
+  1 test, OK.
+- `.venv/bin/python -m unittest tests.integration.test_recall_elicitation_desktop -v`:
+  1 test, OK with 1 expected skip because live opt-in was disabled.
+- `.venv/bin/python -m unittest tests.test_mcp_recall_host_gate tests.test_recall_hook_gate tests.test_recall_skill_contract tests.test_plugin_contract -v`:
+  60 tests, OK.
+- `.venv/bin/python -m compileall -q tests/recall_elicitation_probe.py tests/test_recall_elicitation_probe.py tests/integration/test_recall_elicitation_desktop.py`:
+  exit 0.
 - Opt-in live Desktop assertion: not run because the initial Desktop case
   triggered the hard stop before the four required receipts existed.
 - Privacy scan of this report and the private receipt database: no test
@@ -51,13 +56,14 @@ database.
 
 ## Temporary MCP cleanup
 
-- The preflight temporary-name lookup was collision-free.
-- The temporary server was verified as the exact enabled stdio test probe
+- The preflight lookup for `zdecision-elicitation-e0` was collision-free.
+- `zdecision-elicitation-e0` was verified as the exact enabled stdio test probe
   before the live case.
-- After the failure, removal succeeded and the temporary name was absent both
-  before and after the cleanup Desktop restart.
-- The private receipt database was retained only to verify and commit this
-  sanitized evidence and is to be deleted immediately after the commit.
+- After the failure, removal of `zdecision-elicitation-e0` succeeded. The name
+  was absent immediately after removal and remained absent after the cleanup
+  Desktop restart.
+- The private receipt database was deleted after the sanitized evidence commit;
+  a final filesystem check confirmed it is absent.
 
 No production ZDecision service, tool, state, Candidate, Capture, Central,
 Registry, or Recall lifecycle was invoked or changed by this acceptance run.
