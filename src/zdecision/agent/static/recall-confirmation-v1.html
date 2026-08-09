@@ -318,10 +318,10 @@
         try {
           await request("ui/message", {
             role: "user",
-            content: {
+            content: [{
               type: "text",
               text: "继续当前任务，并执行已启用的 ZDecision Recall。",
-            },
+            }],
           }, 3000);
         } catch {
           // The visible native-message instruction is the bounded fallback.
@@ -351,7 +351,11 @@
           }, 5000);
           const value = boundedResult(result);
           const expected = action === "enable" ? "committed" : "declined";
-          if (!value.valid || value.state !== expected) {
+          if (
+            !value.valid
+            || value.state !== expected
+            || value.attempt !== activationAttemptId
+          ) {
             setTerminal("blocked");
             return;
           }

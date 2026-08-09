@@ -128,6 +128,13 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             REPOSITORY_NAME,
             result.meta["zdecision/repository_display_name"],
         )
+        self.assertEqual(
+            {
+                "zdecision/activation_attempt_id",
+                "zdecision/repository_display_name",
+            },
+            set(result.meta),
+        )
         model_visible = json.dumps(
             {
                 "content": [item.model_dump() for item in result.content],
@@ -161,6 +168,17 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             ATTEMPT_ID,
             result.meta["zdecision/activation_attempt_id"],
+        )
+        self.assertEqual(
+            {
+                "zdecision/activation_attempt_id",
+                "zdecision/repository_display_name",
+            },
+            set(result.meta),
+        )
+        self.assertEqual(
+            REPOSITORY_NAME,
+            result.meta["zdecision/repository_display_name"],
         )
         self.assertEqual("active", self.store.get_session("private-session").state)
 
@@ -277,12 +295,14 @@ class RecallConfirmationCardTests(unittest.TestCase):
   check(messages.length === 1, "committed enable sent more than one ui/message");
   check(messages[0].params?.role === "user", "ui/message used the wrong role");
   const continuation = messages[0].params?.content;
-  check(continuation?.type === "text", "ui/message was not bounded text");
+  check(Array.isArray(continuation), "ui/message content was not an array");
+  check(continuation.length === 1, "ui/message content was not bounded");
+  check(continuation[0]?.type === "text", "ui/message was not bounded text");
   check(
-    continuation.text === "继续当前任务，并执行已启用的 ZDecision Recall。",
+    continuation[0].text === "继续当前任务，并执行已启用的 ZDecision Recall。",
     "ui/message text changed",
   );
-  check(!continuation.text.includes(attemptId), "ui/message exposed the attempt");
+  check(!continuation[0].text.includes(attemptId), "ui/message exposed the attempt");
   const messageTimeout = widget.takeTimer(3000);
   if (messageTimeout) messageTimeout();
   await flush();
@@ -324,6 +344,52 @@ class RecallConfirmationCardTests(unittest.TestCase):
         )
         self.assertEqual("decline-is-terminal-ok", output)
 
+    def test_decision_results_require_the_current_attempt_for_both_actions(
+        self,
+    ) -> None:
+        output = self._run_card(
+            """
+  const cases = [
+    { action: "enable", state: "committed", button: "enable" },
+    { action: "decline", state: "declined", button: "decline" },
+  ];
+  const mutations = [
+    { label: "missing", responseAttempt: null, includeAttempt: false },
+    {
+      label: "mismatch",
+      responseAttempt: "activation_99999999999999999999999999999999",
+      includeAttempt: true,
+    },
+  ];
+
+  for (const item of cases) {
+    for (const mutation of mutations) {
+      const widget = await mount();
+      widget.deliverRender();
+      await flush();
+      const click = widget.elements[item.button].dispatch("click");
+      const decision = widget.toolCalls()[0];
+      widget.respond(
+        decision,
+        result(item.state, mutation.responseAttempt, mutation.includeAttempt),
+      );
+      await click;
+      await flush();
+      check(
+        widget.elements["card-state"].textContent === "无法确认",
+        `${item.action}/${mutation.label} displayed terminal success`,
+      );
+      check(
+        widget.messages().length === 0,
+        `${item.action}/${mutation.label} requested continuation`,
+      );
+    }
+  }
+  process.stdout.write("attempt-bound-decisions-ok");
+""",
+        )
+        self.assertEqual("attempt-bound-decisions-ok", output)
+
     def _run_card(self, scenario: str) -> str:
         self.assertTrue(WIDGET_PATH.is_file(), f"missing card: {WIDGET_PATH}")
         html = WIDGET_PATH.read_text("utf-8")
@@ -342,14 +408,17 @@ async function flush() {
   for (let index = 0; index < 6; index += 1) await Promise.resolve();
 }
 
-function result(state) {
+function result(state, responseAttempt = attemptId, includeAttempt = true) {
+  const meta = {
+    "zdecision/repository_display_name": repositoryName,
+  };
+  if (includeAttempt) {
+    meta["zdecision/activation_attempt_id"] = responseAttempt;
+  }
   return {
     content: [{ type: "text", text: "bounded" }],
     structuredContent: { state },
-    _meta: {
-      "zdecision/activation_attempt_id": attemptId,
-      "zdecision/repository_display_name": repositoryName,
-    },
+    _meta: meta,
   };
 }
 

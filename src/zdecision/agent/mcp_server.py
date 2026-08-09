@@ -616,7 +616,6 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         if key
         in (
             "zdecision/activation_attempt_id",
-            "zdecision/repository_id",
             "zdecision/repository_display_name",
         )
         and isinstance(item, str)
