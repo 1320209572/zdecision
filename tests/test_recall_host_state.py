@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+import json
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -178,6 +179,188 @@ class RecallHostStoreTests(unittest.TestCase):
             self.store.decide_activation_attempt(
                 attempt.attempt_id, action="enable", now=NOW
             )
+
+    def test_confirmation_render_replay_returns_original_attempt_and_expiry(self) -> None:
+        """This catches a clock tick or new generated ID denying a safe card replay."""
+
+        created = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "6" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+
+        replay = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "7" * 32,
+            now=NOW + timedelta(seconds=30),
+            expires_at=NOW + timedelta(minutes=15, seconds=30),
+            plugin_root=None,
+        )
+
+        self.assertEqual(created.attempt_id, replay.attempt_id)
+        self.assertEqual(created.expires_at, replay.expires_at)
+        self.assertEqual("pending_confirmation", replay.state)
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+
+    def test_confirmation_attempt_rejects_changed_trusted_coordinates(self) -> None:
+        """This catches a retry reusing a Turn for another repository or CWD."""
+
+        created = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "8" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+        for cwd, repository_id in (
+            ("/tmp/other", "repo_" + "1" * 32),
+            ("/tmp/recall", "repo_" + "2" * 32),
+        ):
+            with self.subTest(cwd=cwd, repository_id=repository_id):
+                with self.assertRaises(RecallGateConflict):
+                    self.store.create_activation_attempt(
+                        session_id=SESSION_ID,
+                        turn_id=TURN_ID,
+                        cwd=cwd,
+                        repository_id=repository_id,
+                        repository_display_name="recall",
+                        attempt_id="activation_" + "9" * 32,
+                        now=NOW + timedelta(seconds=1),
+                        expires_at=NOW + timedelta(minutes=15, seconds=1),
+                        plugin_root=None,
+                    )
+                frozen = self.store.get_activation_attempt(created.attempt_id)
+                self.assertEqual("/tmp/recall", frozen.cwd)
+                self.assertEqual("repo_" + "1" * 32, frozen.repository_id)
+                self.assertIsNone(self.store.get_session(SESSION_ID))
+
+    def test_confirmation_attempt_rejects_changed_trusted_bundle(self) -> None:
+        """This catches a retry replacing the Hook-verified plugin bundle."""
+
+        def plugin_root(name: str) -> Path:
+            root = Path(self.temporary_directory.name) / name
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "skills/decision-recall").mkdir(parents=True)
+            (root / ".codex-plugin/plugin.json").write_text(
+                json.dumps(
+                    {
+                        "name": "zdecision",
+                        "skills": "./skills/",
+                        "mcpServers": "./.mcp.json",
+                    }
+                ),
+                "utf-8",
+            )
+            (root / ".mcp.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "zdecision-local": {
+                                "command": "zdecision-agent",
+                                "args": ["mcp"],
+                            }
+                        }
+                    }
+                ),
+                "utf-8",
+            )
+            (root / "skills/decision-recall/SKILL.md").write_text(name, "utf-8")
+            return root
+
+        original_root = plugin_root("plugin-a")
+        changed_root = plugin_root("plugin-b")
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "d" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(original_root),
+        )
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.create_activation_attempt(
+                session_id=SESSION_ID,
+                turn_id=TURN_ID,
+                cwd="/tmp/recall",
+                repository_id="repo_" + "1" * 32,
+                repository_display_name="recall",
+                attempt_id="activation_" + "e" * 32,
+                now=NOW + timedelta(seconds=1),
+                expires_at=NOW + timedelta(minutes=15, seconds=1),
+                plugin_root=str(changed_root),
+            )
+
+        frozen = self.store.get_activation_attempt(attempt.attempt_id)
+        self.assertEqual(str(original_root.resolve()), frozen.plugin_root)
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+
+    def test_expired_confirmation_fails_without_creating_consent(self) -> None:
+        """This catches a timed-out enable creating an active Session."""
+
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "a" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.decide_activation_attempt(
+                attempt.attempt_id, action="enable", now=NOW + timedelta(minutes=15)
+            )
+
+        self.assertEqual(
+            "failed", self.store.get_activation_attempt(attempt.attempt_id).state
+        )
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+
+    def test_confirmation_attempt_survives_store_reopen(self) -> None:
+        """This catches a restart losing a pending card or its frozen digest."""
+
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "b" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+        self.store.close()
+        self.store = RecallHostStore.open(self.path)
+
+        recovered = self.store.get_activation_attempt(attempt.attempt_id)
+
+        self.assertEqual("pending_confirmation", recovered.state)
+        self.assertEqual("a" * 64, recovered.ui_digest)
+        self.assertIsNone(self.store.get_session(SESSION_ID))
 
     def test_session_end_retires_pending_confirmation_without_consent(self) -> None:
         """This catches a closed Session retaining an actionable confirmation card."""

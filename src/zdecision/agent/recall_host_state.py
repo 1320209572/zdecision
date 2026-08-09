@@ -319,15 +319,15 @@ class RecallHostStore:
                 (attempt,),
             ).fetchone()
             if existing is not None:
-                if (
-                    existing["session_id"] != session
-                    or existing["turn_id"] != turn
-                    or existing["cwd"] != working_directory
-                    or existing["repository_id"] != repository
-                    or existing["repository_display_name"] != display_name
-                    or existing["expires_at"] != _timestamp(expiry)
-                    or existing["plugin_root"] != installed_root
-                    or existing["plugin_bundle_digest"] != bundle_digest
+                if not _matching_activation_attempt(
+                    existing,
+                    session_id=session,
+                    turn_id=turn,
+                    cwd=working_directory,
+                    repository_id=repository,
+                    repository_display_name=display_name,
+                    plugin_root=installed_root,
+                    plugin_bundle_digest=bundle_digest,
                 ):
                     raise RecallGateConflict("activation attempt is already frozen")
                 result = _activation_attempt(existing)
@@ -337,13 +337,26 @@ class RecallHostStore:
                 raise RecallGateConflict("session already has recall consent")
             current = self._connection.execute(
                 """
-                SELECT attempt_id FROM recall_activation_attempts
+                SELECT * FROM recall_activation_attempts
                 WHERE session_id = ? AND turn_id = ?
                 """,
                 (session, turn),
             ).fetchone()
             if current is not None:
-                raise RecallGateConflict("turn already has an activation attempt")
+                if not _matching_activation_attempt(
+                    current,
+                    session_id=session,
+                    turn_id=turn,
+                    cwd=working_directory,
+                    repository_id=repository,
+                    repository_display_name=display_name,
+                    plugin_root=installed_root,
+                    plugin_bundle_digest=bundle_digest,
+                ):
+                    raise RecallGateConflict("turn already has an activation attempt")
+                result = _activation_attempt(current)
+                self._connection.commit()
+                return result
             self._connection.execute(
                 """
                 INSERT INTO recall_activation_attempts(
@@ -1116,6 +1129,28 @@ def _activation_attempt(row: sqlite3.Row) -> RecallActivationAttempt:
         plugin_bundle_digest=row["plugin_bundle_digest"],
         ui_digest=row["ui_digest"],
         result_digest=row["result_digest"],
+    )
+
+
+def _matching_activation_attempt(
+    row: sqlite3.Row,
+    *,
+    session_id: str,
+    turn_id: str,
+    cwd: str,
+    repository_id: str,
+    repository_display_name: str,
+    plugin_root: str | None,
+    plugin_bundle_digest: str | None,
+) -> bool:
+    return (
+        row["session_id"] == session_id
+        and row["turn_id"] == turn_id
+        and row["cwd"] == cwd
+        and row["repository_id"] == repository_id
+        and row["repository_display_name"] == repository_display_name
+        and row["plugin_root"] == plugin_root
+        and row["plugin_bundle_digest"] == plugin_bundle_digest
     )
 
 

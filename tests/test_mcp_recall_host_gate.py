@@ -6,6 +6,7 @@ import gc
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import warnings
@@ -312,6 +313,104 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, session.intent_epoch)
         self.assertIsNone(session.active_intent_digest)
         self.assertIsNone(session.active_set_digest)
+        self.assertEqual(0, provider.activation_calls)
+        self.assertEqual(0, provider.gate_calls)
+
+    def test_confirmation_rejects_wrong_card_and_conflicting_choice(self) -> None:
+        """This catches a stale card or second click authorizing a new consent."""
+
+        attempt_id = self.confirmation_attempt()
+        provider = StaticProvider(_probe())
+        tools = self.tools(provider)
+        tools.show_recall_confirmation(
+            activation_attempt_id=attempt_id, ui_digest="a" * 64
+        )
+
+        wrong_card = tools.decide_recall_confirmation(
+            activation_attempt_id=attempt_id,
+            action="enable",
+            current_ui_digest="b" * 64,
+        )
+        declined = tools.decide_recall_confirmation(
+            activation_attempt_id=attempt_id,
+            action="decline",
+            current_ui_digest="a" * 64,
+        )
+        conflicting = tools.decide_recall_confirmation(
+            activation_attempt_id=attempt_id,
+            action="enable",
+            current_ui_digest="a" * 64,
+        )
+
+        self.assertEqual({"state": "blocked", "code": "invalid_confirmation"}, wrong_card)
+        self.assertEqual("declined", declined["state"])
+        self.assertEqual({"state": "blocked", "code": "invalid_confirmation"}, conflicting)
+        self.assertIsNone(self.store.get_session(PRIVATE_SESSION))
+        self.assertEqual(0, provider.activation_calls)
+        self.assertEqual(0, provider.gate_calls)
+
+    def test_confirmation_failure_paths_never_authorize(self) -> None:
+        """This catches expiry, CWD/bundle mismatch, or SQLite failure granting consent."""
+
+        expired = self.store.create_activation_attempt(
+            session_id=PRIVATE_SESSION,
+            turn_id=PRIVATE_TURN,
+            cwd=self.cwd,
+            repository_id=REPOSITORY_ID,
+            repository_display_name="repository",
+            attempt_id="activation_" + "c" * 32,
+            now=NOW - timedelta(minutes=16),
+            expires_at=NOW - timedelta(minutes=1),
+            plugin_root=str(self.installed_plugin_root),
+        )
+        self.store.attach_activation_card(expired.attempt_id, ui_digest="a" * 64)
+        provider = StaticProvider(_probe())
+        tools = self.tools(provider)
+        wrong_cwd_tools = RecallMcpTools(
+            host_store=self.store,
+            provider=provider,
+            cwd="/tmp/other-repository",
+            clock=lambda: NOW,
+        )
+
+        expired_result = tools.decide_recall_confirmation(
+            activation_attempt_id=expired.attempt_id,
+            action="enable",
+            current_ui_digest="a" * 64,
+        )
+        wrong_cwd = wrong_cwd_tools.show_recall_confirmation(
+            activation_attempt_id=expired.attempt_id, ui_digest="a" * 64
+        )
+        bundle_attempt = self.store.create_activation_attempt(
+            session_id="bundle-session",
+            turn_id="bundle-turn",
+            cwd=self.cwd,
+            repository_id=REPOSITORY_ID,
+            repository_display_name="repository",
+            attempt_id="activation_" + "d" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(self.installed_plugin_root),
+        )
+        self.recall_skill_path.write_text("tampered", "utf-8")
+        wrong_bundle = tools.show_recall_confirmation(
+            activation_attempt_id=bundle_attempt.attempt_id, ui_digest="a" * 64
+        )
+        with patch.object(
+            self.store, "get_activation_attempt", side_effect=sqlite3.OperationalError()
+        ):
+            unavailable = tools.show_recall_confirmation(
+                activation_attempt_id=expired.attempt_id, ui_digest="a" * 64
+            )
+
+        blocked = {"state": "blocked", "code": "invalid_confirmation"}
+        self.assertEqual(blocked, expired_result)
+        self.assertEqual(blocked, wrong_cwd)
+        self.assertEqual(blocked, wrong_bundle)
+        self.assertEqual(blocked, unavailable)
+        self.assertEqual("failed", self.store.get_activation_attempt(expired.attempt_id).state)
+        self.assertIsNone(self.store.get_session(PRIVATE_SESSION))
+        self.assertIsNone(self.store.get_session("bundle-session"))
         self.assertEqual(0, provider.activation_calls)
         self.assertEqual(0, provider.gate_calls)
 

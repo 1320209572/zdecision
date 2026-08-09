@@ -130,11 +130,11 @@ class RecallHookGateTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def _handle(self, raw: object):
+    def _handle(self, raw: object, *, now: datetime = NOW):
         return handle_hook(
             raw,
             database=self.database,
-            clock=lambda: NOW,
+            clock=lambda: now,
             repository_resolver=self.resolver,
             worker_waker=lambda _: None,
             control_store=self.control_store,
@@ -182,6 +182,7 @@ class RecallHookGateTests(unittest.TestCase):
         turn_id: object = "turn-a",
         cwd: object = _DEFAULT_CWD,
         tool_input: object | None = None,
+        now: datetime = NOW,
         **extra: object,
     ):
         value: dict[str, object] = {
@@ -203,7 +204,7 @@ class RecallHookGateTests(unittest.TestCase):
             ),
         }
         value.update(extra)
-        return self._handle(value)
+        return self._handle(value, now=now)
 
     def _activate(self, *, session_id: str = "session-a", turn_id: str = "turn-a"):
         self._prompt(session_id=session_id, turn_id=turn_id)
@@ -293,6 +294,27 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual("pending_confirmation", attempt.state)
         self.assertEqual(self.repository.name, attempt.repository_display_name)
         self.assert_private_values_absent(response)
+
+    def test_confirmation_render_replay_keeps_the_frozen_attempt(self) -> None:
+        """This catches a normal retried render being denied after the clock advances."""
+
+        self._prompt()
+        first = self._pre_tool(ACTIVATE_RECALL_TOOL, now=NOW)
+        attempt = self.recall_store.get_activation_attempt(ACTIVATION_ID)
+
+        replay = self._pre_tool(
+            ACTIVATE_RECALL_TOOL, now=NOW.replace(minute=NOW.minute + 1)
+        )
+        frozen = self.recall_store.get_activation_attempt(ACTIVATION_ID)
+
+        self.assertEqual("allow", self._decision(first))
+        self.assertEqual("allow", self._decision(replay))
+        self.assertEqual(
+            {"activation_attempt_id": ACTIVATION_ID},
+            replay.output["hookSpecificOutput"]["updatedInput"],
+        )
+        self.assertEqual(attempt.expires_at, frozen.expires_at)
+        self.assertIsNone(self.recall_store.get_session("session-a"))
 
     def test_activation_denies_an_unverified_plugin_root(self) -> None:
         """This catches arbitrary Hook environment paths becoming authority."""
