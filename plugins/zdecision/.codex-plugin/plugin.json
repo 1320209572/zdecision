@@ -1,6 +1,6 @@
 {
   "name": "zdecision",
-  "version": "0.1.0+codex.20260809110423",
+  "version": "0.1.0+codex.20260809230632",
   "description": "Inline Session-opt-in Recall confirmation; Candidate refresh remains explicit",
   "author": {
     "name": "ZDecision"

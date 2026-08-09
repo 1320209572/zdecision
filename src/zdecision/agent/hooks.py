@@ -35,7 +35,15 @@ RECALL_MUTATION_MATCHER = "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
 _CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _HOOK_STORE_TIMEOUT_SECONDS = 0.05
+_RECALL_BINDING_STORE_TIMEOUT_SECONDS = 1.0
 _CONFIRMATION_LIFETIME = timedelta(minutes=15)
+_RECALL_BINDING_DENIED_REASON = (
+    "ZDecision could not create a trusted Recall binding. "
+    "Do not retry or guess identifiers."
+)
+_RECALL_GATE_DENIED_REASON = (
+    "ZDecision Recall has not completed the required gate for this action."
+)
 _ACTIVE_GATE_INSTRUCTION = (
     "ZDecision recall is active. Call gate_zdecision_turn before substantive "
     "output or development tools in this Turn."
@@ -165,7 +173,12 @@ def handle_pre_tool_hook(
         store = recall_store
         if store is None:
             owned_store = RecallHostStore.open(
-                database.path, timeout_seconds=_HOOK_STORE_TIMEOUT_SECONDS
+                database.path,
+                timeout_seconds=(
+                    _RECALL_BINDING_STORE_TIMEOUT_SECONDS
+                    if recall_binding
+                    else _HOOK_STORE_TIMEOUT_SECONDS
+                ),
             )
             store = owned_store
         if recall_binding:
@@ -183,7 +196,9 @@ def handle_pre_tool_hook(
         return guard_active_turn_tool(value, database=database, recall_store=store)
     except Exception:
         if recall_binding:
-            return _pre_tool_response("deny")
+            return _pre_tool_response(
+                "deny", reason=_RECALL_BINDING_DENIED_REASON
+            )
         return HookResponse(event_id="", output={})
     finally:
         if owned_store is not None:
@@ -264,7 +279,7 @@ def bind_recall_tool_call(
             "allow", updated_input={"turn_gate_id": gate_id}
         )
     except Exception:
-        return _pre_tool_response("deny")
+        return _pre_tool_response("deny", reason=_RECALL_BINDING_DENIED_REASON)
 
 
 def guard_active_turn_tool(
@@ -283,7 +298,7 @@ def guard_active_turn_tool(
     if session is None or session.state not in ("active", "activating"):
         return HookResponse(event_id="", output={})
     if session.state != "active":
-        return _pre_tool_response("deny")
+        return _pre_tool_response("deny", reason=_RECALL_GATE_DENIED_REASON)
     try:
         turn_id = _safe_host_identifier(value.get("turn_id"))
         cwd = _safe_absolute_cwd(value.get("cwd"))
@@ -293,7 +308,7 @@ def guard_active_turn_tool(
             raise RecallGateConflict("host Turn is not current")
         recall_store.require_committed_gate(session_id, turn_id)
     except Exception:
-        return _pre_tool_response("deny")
+        return _pre_tool_response("deny", reason=_RECALL_GATE_DENIED_REASON)
     return HookResponse(event_id="", output={})
 
 
@@ -602,6 +617,7 @@ def _pre_tool_response(
     decision: str,
     *,
     updated_input: Mapping[str, object] | None = None,
+    reason: str | None = None,
 ) -> HookResponse:
     output: dict[str, object] = {
         "hookEventName": "PreToolUse",
@@ -609,6 +625,10 @@ def _pre_tool_response(
     }
     if updated_input is not None:
         output["updatedInput"] = dict(updated_input)
+    if decision == "deny":
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("denied PreToolUse response requires a reason")
+        output["permissionDecisionReason"] = reason
     return HookResponse(event_id="", output={"hookSpecificOutput": output})
 
 

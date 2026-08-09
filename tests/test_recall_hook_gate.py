@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -294,6 +297,62 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual("pending_confirmation", attempt.state)
         self.assertEqual(self.repository.name, attempt.repository_display_name)
         self.assert_private_values_absent(response)
+
+    def test_confirmation_binding_waits_through_a_short_sqlite_writer_lock(
+        self,
+    ) -> None:
+        """This catches the explicit confirmation path using the generic 50ms budget."""
+
+        self._prompt()
+        lock_acquired = threading.Event()
+        holder_errors: list[BaseException] = []
+
+        def hold_writer_lock() -> None:
+            connection = sqlite3.connect(self.database_path, timeout=1.0)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                lock_acquired.set()
+                time.sleep(0.2)
+                connection.rollback()
+            except BaseException as error:
+                holder_errors.append(error)
+                lock_acquired.set()
+            finally:
+                connection.close()
+
+        holder = threading.Thread(target=hold_writer_lock)
+        holder.start()
+        self.addCleanup(holder.join, 2.0)
+        self.assertTrue(lock_acquired.wait(1.0), "writer lock was not acquired")
+
+        response = handle_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-a",
+                "turn_id": "turn-a",
+                "cwd": str(self.repository),
+                "tool_name": ACTIVATE_RECALL_TOOL,
+                "tool_input": {"activation_attempt_id": "model-binding"},
+            },
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.resolver,
+            worker_waker=lambda _: None,
+            activation_attempt_id_factory=lambda: ACTIVATION_ID,
+        )
+        holder.join(2.0)
+
+        self.assertEqual([], holder_errors)
+        self.assertEqual("allow", self._decision(response))
+        self.assertEqual(
+            {"activation_attempt_id": ACTIVATION_ID},
+            response.output["hookSpecificOutput"]["updatedInput"],
+        )
+        verifier = RecallHostStore.open(self.database_path)
+        self.addCleanup(verifier.close)
+        attempt = verifier.get_activation_attempt(ACTIVATION_ID)
+        self.assertIsNotNone(attempt)
+        self.assertEqual("pending_confirmation", attempt.state)
 
     def test_confirmation_render_replay_keeps_the_frozen_attempt(self) -> None:
         """This catches a normal retried render being denied after the clock advances."""
@@ -634,8 +693,24 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual({}, read_failure.output)
         self.assertEqual("deny", self._decision(activation_response))
         self.assertEqual("deny", self._decision(gate_response))
-        for call in open_store.call_args_list:
-            self.assertLessEqual(call.kwargs["timeout_seconds"], 0.1)
+        for response in (activation_response, gate_response):
+            hook_output = response.output["hookSpecificOutput"]
+            self.assertEqual("PreToolUse", hook_output["hookEventName"])
+            self.assertNotIn("updatedInput", hook_output)
+            reason = hook_output.get(
+                "permissionDecisionReason"
+            )
+            self.assertIsInstance(reason, str)
+            self.assertTrue(reason)
+            self.assertIn("Do not retry", reason)
+            self.assertNotIn("store unavailable", reason)
+        self.assertEqual(3, len(open_store.call_args_list))
+        self.assertLessEqual(
+            open_store.call_args_list[0].kwargs["timeout_seconds"], 0.1
+        )
+        for call in open_store.call_args_list[1:]:
+            self.assertGreaterEqual(call.kwargs["timeout_seconds"], 0.2)
+            self.assertLessEqual(call.kwargs["timeout_seconds"], 1.0)
 
     def test_startup_resume_and_session_end_preserve_candidate_lifecycle(self) -> None:
         self._activate()

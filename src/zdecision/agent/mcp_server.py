@@ -511,7 +511,10 @@ def create_mcp_server(
 
         @server.tool(
             title="Show ZDecision Recall confirmation",
-            description="Display the trusted Recall confirmation for this task.",
+            description=(
+                "Display the trusted Recall confirmation for this task. "
+                "The host supplies its attempt ID; never invent or retry IDs."
+            ),
             annotations=recall_action,
             meta={
                 "ui": {
@@ -520,7 +523,7 @@ def create_mcp_server(
                 },
                 "openai/outputTemplate": RECALL_CONFIRMATION_URI,
                 "openai/toolInvocation/invoking": "Opening Recall confirmation…",
-                "openai/toolInvocation/invoked": "Recall confirmation ready",
+                "openai/toolInvocation/invoked": "Recall confirmation checked",
             },
         )
         def show_zdecision_recall_confirmation(
@@ -620,15 +623,25 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         )
         and isinstance(item, str)
     }
+    invalid_confirmation = (
+        state == "blocked" and structured.get("code") == "invalid_confirmation"
+    )
+    model_text = (
+        "ZDecision Recall confirmation is unavailable. "
+        "Do not retry or guess an activation attempt ID."
+        if invalid_confirmation
+        else "ZDecision Recall confirmation is ready."
+    )
     return CallToolResult(
         content=[
             TextContent(
                 type="text",
-                text="ZDecision Recall confirmation is ready.",
+                text=model_text,
             )
         ],
         structuredContent=structured,
         _meta=safe_meta,
+        isError=invalid_confirmation,
     )
 
 

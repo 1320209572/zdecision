@@ -150,6 +150,27 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             self.store.get_activation_attempt(ATTEMPT_ID).ui_digest,
         )
 
+    async def test_missing_trusted_attempt_is_an_unambiguous_tool_error(
+        self,
+    ) -> None:
+        """This catches a blocked confirmation masquerading as a ready card."""
+
+        result = await self.server.call_tool(
+            "show_zdecision_recall_confirmation",
+            {"activation_attempt_id": "activation_" + "9" * 32},
+        )
+
+        self.assertTrue(result.isError)
+        self.assertEqual(
+            {"state": "blocked", "code": "invalid_confirmation"},
+            result.structuredContent,
+        )
+        model_text = " ".join(item.text for item in result.content)
+        self.assertIn("unavailable", model_text.lower())
+        self.assertIn("Do not retry or guess", model_text)
+        self.assertNotIn("confirmation is ready", model_text.lower())
+        self.assertEqual({}, result.meta)
+
     async def test_decision_uses_the_same_card_digest_and_commits_consent(
         self,
     ) -> None:
