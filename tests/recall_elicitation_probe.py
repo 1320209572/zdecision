@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import hashlib
+import json
 import re
 import sqlite3
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Iterator, Literal, Sequence
+
+from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel, ConfigDict
 
 
 ProbeCase = Literal[
@@ -25,7 +33,8 @@ ProbeState = Literal[
     "transport_lost",
 ]
 
-_CASES = frozenset(("accept", "decline", "cancel", "capability_unavailable", "restart"))
+_CASE_CHOICES = ("accept", "decline", "cancel", "capability_unavailable", "restart")
+_CASES = frozenset(_CASE_CHOICES)
 _STATES = frozenset(
     (
         "armed",
@@ -43,6 +52,16 @@ _COMPLETION_STATES = frozenset(
 )
 _CLIENT_ACTION_STATES = frozenset(("accept", "decline", "cancel"))
 _REQUEST_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_REQUEST_DIGEST_DOMAIN = b"zdecision-elicitation-e0-request-v1"
+
+ELICITATION_MESSAGE = (
+    "是否启用本任务的 ZDecision 正式决策召回？"
+    "确认后仅对当前 Codex Session 生效。"
+)
+
+
+class EmptyConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class ProbeConflict(RuntimeError):
@@ -292,3 +311,175 @@ def _timestamp(value: object) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def supports_form_elicitation(context: Context) -> bool:
+    params = context.session.client_params
+    elicitation = None if params is None else params.capabilities.elicitation
+    return bool(elicitation is not None and elicitation.form is not None)
+
+
+def request_digest(request_id: object) -> str:
+    digest = hashlib.sha256()
+    digest.update(_REQUEST_DIGEST_DOMAIN)
+    digest.update(b"\x00")
+    digest.update(str(request_id).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def build_probe_server(database_path: Path) -> FastMCP:
+    server = FastMCP("ZDecision Recall E0 Probe")
+
+    @server.tool(
+        title="Probe ZDecision user confirmation",
+        description="Run the test-only ZDecision E0 native confirmation probe.",
+    )
+    async def probe_zdecision_elicitation(
+        context: Context,
+    ) -> dict[str, object]:
+        return await _run_probe(context=context, database_path=database_path)
+
+    return server
+
+
+async def _run_probe(*, context: Context, database_path: Path) -> dict[str, object]:
+    store = ProbeReceiptStore.open(database_path)
+    try:
+        receipt = store.current()
+        if receipt is None:
+            return _bounded_result(
+                state="unavailable",
+                replayed=False,
+                prompt_count=0,
+                completion_count=0,
+            )
+        if receipt.state == "pending":
+            return _result_for_receipt(receipt, replayed=True)
+        if receipt.state != "armed":
+            return _result_for_receipt(receipt, replayed=True)
+        if not supports_form_elicitation(context):
+            receipt = store.mark_armed_unavailable(now=datetime.now(UTC))
+            return _result_for_receipt(receipt, replayed=False)
+
+        pending = store.claim_armed(
+            request_digest=request_digest(context.request_id),
+            now=datetime.now(UTC),
+        )
+        try:
+            result = await context.elicit(
+                message=ELICITATION_MESSAGE,
+                schema=EmptyConfirmation,
+            )
+            if result.action not in {"accept", "decline", "cancel"}:
+                raise ValueError("invalid elicitation action")
+            receipt = store.complete(
+                pending.case_id,
+                state=result.action,
+                now=datetime.now(UTC),
+            )
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(_complete_failed(store, pending.case_id))
+            except Exception:
+                pass
+            raise
+        except Exception:
+            receipt = store.complete(
+                pending.case_id,
+                state="failed",
+                now=datetime.now(UTC),
+            )
+        return _result_for_receipt(receipt, replayed=False)
+    finally:
+        store.close()
+
+
+async def _complete_failed(
+    store: ProbeReceiptStore, case_id: ProbeCase
+) -> ProbeReceipt:
+    return store.complete(case_id, state="failed", now=datetime.now(UTC))
+
+
+def _result_for_receipt(
+    receipt: ProbeReceipt, *, replayed: bool
+) -> dict[str, object]:
+    return _bounded_result(
+        state=receipt.state,
+        replayed=replayed,
+        prompt_count=receipt.prompt_count,
+        completion_count=receipt.completion_count,
+    )
+
+
+def _bounded_result(
+    *,
+    state: ProbeState,
+    replayed: bool,
+    prompt_count: int,
+    completion_count: int,
+) -> dict[str, object]:
+    return {
+        "gate": "E0",
+        "action": state,
+        "authorized": state == "accept",
+        "replayed": replayed,
+        "prompt_count": prompt_count,
+        "completion_count": completion_count,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="recall_elicitation_probe")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    arm_parser = subparsers.add_parser("arm")
+    arm_parser.add_argument("--database", type=Path, required=True)
+    arm_parser.add_argument("--case", choices=_CASE_CHOICES, required=True)
+
+    serve_parser = subparsers.add_parser("serve")
+    serve_parser.add_argument("--database", type=Path, required=True)
+
+    report_parser = subparsers.add_parser("report")
+    report_parser.add_argument("--database", type=Path, required=True)
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "arm":
+            store = ProbeReceiptStore.open(args.database)
+            try:
+                store.arm(args.case, now=datetime.now(UTC))
+            finally:
+                store.close()
+            return 0
+
+        if args.command == "report":
+            store = ProbeReceiptStore.open(args.database)
+            try:
+                report = store.report()
+            finally:
+                store.close()
+            json.dump(
+                report,
+                sys.stdout,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            sys.stdout.write("\n")
+            return 0
+
+        store = ProbeReceiptStore.open(args.database)
+        try:
+            store.recover_pending(now=datetime.now(UTC))
+        finally:
+            store.close()
+        build_probe_server(args.database).run(transport="stdio")
+        return 0
+    except Exception:
+        print("probe_error", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

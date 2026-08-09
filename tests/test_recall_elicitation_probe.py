@@ -2,14 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import tempfile
 import unittest
+import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from mcp import types
+from mcp.server.fastmcp import Context
+from mcp.shared.context import RequestContext
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from zdecision.jsonio import canonical_json_bytes
 
-from tests.recall_elicitation_probe import ProbeConflict, ProbeReceiptStore
+from tests.recall_elicitation_probe import (
+    ELICITATION_MESSAGE,
+    EmptyConfirmation,
+    ProbeConflict,
+    ProbeReceiptStore,
+    _run_probe,
+    build_probe_server,
+    request_digest,
+    supports_form_elicitation,
+)
 
 
 NOW = datetime(2026, 8, 9, 3, 0, tzinfo=UTC)
@@ -183,6 +203,295 @@ class ProbeReceiptStoreTest(unittest.TestCase):
 
         with self.assertRaises(ProbeConflict):
             self.store.complete("restart", state="accept", now=LATER)
+
+
+class RecallElicitationProtocolTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database_path = Path(self.temporary_directory.name) / "probe.sqlite3"
+        self.store = ProbeReceiptStore.open(self.database_path)
+        self.addCleanup(self.store.close)
+        previous_logging_disable = logging.root.manager.disable
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, previous_logging_disable)
+
+    async def _call_server(self, elicitation_callback) -> dict[str, object]:
+        server = build_probe_server(self.database_path)
+        async with create_connected_server_and_client_session(
+            server,
+            elicitation_callback=elicitation_callback,
+            raise_exceptions=True,
+        ) as session:
+            result = await session.call_tool("probe_zdecision_elicitation", {})
+        return json.loads(result.content[0].text)
+
+    async def _call_with_action(self, action: str) -> dict[str, object]:
+        seen: list[types.ElicitRequestParams] = []
+
+        async def elicitation_callback(context, params):
+            seen.append(params)
+            return types.ElicitResult(
+                action=action,
+                content={} if action == "accept" else None,
+            )
+
+        result = await self._call_server(elicitation_callback)
+        self.assertEqual(len(seen), 1)
+        return result
+
+    def test_empty_confirmation_schema_is_closed_and_has_no_properties(self):
+        schema = EmptyConfirmation.model_json_schema()
+        self.assertEqual(schema["properties"], {})
+        self.assertIs(schema["additionalProperties"], False)
+
+    def test_capability_detection_requires_declared_form_support(self):
+        form_context = SimpleNamespace(
+            session=SimpleNamespace(
+                client_params=SimpleNamespace(
+                    capabilities=SimpleNamespace(
+                        elicitation=SimpleNamespace(form=object())
+                    )
+                )
+            )
+        )
+        url_only_context = SimpleNamespace(
+            session=SimpleNamespace(
+                client_params=SimpleNamespace(
+                    capabilities=SimpleNamespace(
+                        elicitation=SimpleNamespace(form=None)
+                    )
+                )
+            )
+        )
+        absent_context = SimpleNamespace(
+            session=SimpleNamespace(client_params=None)
+        )
+
+        self.assertTrue(supports_form_elicitation(form_context))
+        self.assertFalse(supports_form_elicitation(url_only_context))
+        self.assertFalse(supports_form_elicitation(absent_context))
+
+    def test_request_digest_is_stable_bounded_and_domain_separated(self):
+        first = request_digest("tool-request-17")
+
+        self.assertRegex(first, r"[0-9a-f]{64}\Z")
+        self.assertEqual(first, request_digest("tool-request-17"))
+        self.assertNotEqual(first, request_digest("tool-request-18"))
+        self.assertNotIn("tool-request-17", first)
+
+    async def test_accept_decline_and_cancel_remain_distinct(self):
+        for case_id, action in (("accept", "accept"), ("decline", "decline"), ("cancel", "cancel")):
+            self.store.arm(case_id, now=NOW)
+            response = await self._call_with_action(action)
+            self.assertEqual(response["action"], action)
+            self.assertEqual(response["authorized"], action == "accept")
+
+    async def test_client_without_form_capability_returns_unavailable_without_eliciting(self):
+        self.store.arm("capability_unavailable", now=NOW)
+        server = build_probe_server(self.database_path)
+        async with create_connected_server_and_client_session(
+            server, raise_exceptions=True
+        ) as session:
+            result = await session.call_tool("probe_zdecision_elicitation", {})
+        response = json.loads(result.content[0].text)
+        self.assertEqual(response["action"], "unavailable")
+        receipt = self.store.receipt("capability_unavailable")
+        self.assertEqual((receipt.state, receipt.prompt_count), ("unavailable", 0))
+
+    async def test_terminal_replay_returns_one_receipt_without_second_elicitation(self):
+        self.store.arm("accept", now=NOW)
+        calls = 0
+
+        async def accept_callback(context, params):
+            nonlocal calls
+            calls += 1
+            return types.ElicitResult(action="accept", content={})
+
+        first = await self._call_server(accept_callback)
+        first_digest = self.store.receipt("accept").request_digest
+        replay = await self._call_server(accept_callback)
+        self.assertEqual((first["action"], replay["action"]), ("accept", "accept"))
+        self.assertEqual((first["replayed"], replay["replayed"]), (False, True))
+        self.assertEqual(calls, 1)
+        receipt = self.store.receipt("accept")
+        self.assertEqual((receipt.prompt_count, receipt.completion_count), (1, 1))
+        self.assertEqual(receipt.request_digest, first_digest)
+
+    async def test_context_elicit_relates_response_to_originating_tool_request(self):
+        session = SimpleNamespace(
+            elicit_form=AsyncMock(
+                return_value=types.ElicitResult(action="decline", content=None)
+            )
+        )
+        request_context = RequestContext(
+            request_id="tool-request-17",
+            meta=None,
+            session=session,
+            lifespan_context=None,
+        )
+        context = Context(request_context=request_context)
+        result = await context.elicit(
+            message=ELICITATION_MESSAGE,
+            schema=EmptyConfirmation,
+        )
+        self.assertEqual(result.action, "decline")
+        self.assertEqual(
+            session.elicit_form.await_args.kwargs["related_request_id"],
+            "tool-request-17",
+        )
+
+    async def test_callback_receives_exact_message_and_closed_empty_schema(self):
+        seen: list[types.ElicitRequestParams] = []
+
+        async def decline_callback(context, params):
+            seen.append(params)
+            return types.ElicitResult(action="decline", content=None)
+
+        self.store.arm("decline", now=NOW)
+        response = await self._call_server(decline_callback)
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].message, ELICITATION_MESSAGE)
+        self.assertEqual(seen[0].requestedSchema.get("properties"), {})
+        self.assertIs(seen[0].requestedSchema.get("additionalProperties"), False)
+        database = self.database_path.read_bytes()
+        report = canonical_json_bytes(self.store.report())
+        for retained_value in (
+            ELICITATION_MESSAGE.encode(),
+            b"additionalProperties",
+        ):
+            self.assertNotIn(retained_value, database)
+            self.assertNotIn(retained_value, canonical_json_bytes(response))
+            self.assertNotIn(retained_value, report)
+
+    async def test_callback_exception_is_non_authorizing_and_sanitized(self):
+        sentinel = "PRIVATE_ELICITATION_EXCEPTION_SENTINEL"
+
+        async def failing_callback(context, params):
+            raise RuntimeError(sentinel)
+
+        self.store.arm("accept", now=NOW)
+        response = await self._call_server(failing_callback)
+        self.assertEqual(response["action"], "failed")
+        self.assertFalse(response["authorized"])
+        self.assertNotIn(sentinel, json.dumps(response))
+        self.assertNotIn(sentinel.encode(), self.database_path.read_bytes())
+        self.assertNotIn(sentinel.encode(), canonical_json_bytes(self.store.report()))
+
+    async def test_protocol_failures_are_non_authorizing_and_sanitized(self):
+        failure_cases = (
+            ("PRIVATE_PROMPT_TIMEOUT_SENTINEL", TimeoutError),
+            ("PRIVATE_SOURCE_EOF_SENTINEL", EOFError),
+            (
+                "PRIVATE_DIFF_MALFORMED_SENTINEL",
+                lambda message: types.ElicitResult.model_construct(
+                    action=message,
+                    content=None,
+                ),
+            ),
+            ("PRIVATE_DECISION_RUNTIME_SENTINEL", RuntimeError),
+        )
+
+        for sentinel, failure in failure_cases:
+            with self.subTest(failure=sentinel), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "probe.sqlite3"
+                store = ProbeReceiptStore.open(database_path)
+                try:
+                    store.arm("accept", now=NOW)
+
+                    async def failing_callback(context, params):
+                        if isinstance(failure, type):
+                            raise failure(sentinel)
+                        return failure(sentinel)
+
+                    server = build_probe_server(database_path)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        async with create_connected_server_and_client_session(
+                            server,
+                            elicitation_callback=failing_callback,
+                            raise_exceptions=True,
+                        ) as session:
+                            result = await session.call_tool(
+                                "probe_zdecision_elicitation", {}
+                            )
+                    response = json.loads(result.content[0].text)
+                    receipt = store.receipt("accept")
+                    report = canonical_json_bytes(store.report())
+
+                    self.assertEqual(response["action"], "failed")
+                    self.assertFalse(response["authorized"])
+                    self.assertEqual(receipt.completion_count, 0)
+                    self.assertNotIn(sentinel.encode(), database_path.read_bytes())
+                    self.assertNotIn(sentinel, json.dumps(response))
+                    self.assertNotIn(sentinel.encode(), report)
+                finally:
+                    store.close()
+
+    async def test_cancellation_persists_failed_then_reraises(self):
+        self.store.arm("accept", now=NOW)
+        session = SimpleNamespace(
+            client_params=SimpleNamespace(
+                capabilities=SimpleNamespace(
+                    elicitation=SimpleNamespace(form=object())
+                )
+            ),
+            elicit_form=AsyncMock(side_effect=asyncio.CancelledError),
+        )
+        context = Context(
+            request_context=RequestContext(
+                request_id="cancelled-tool-request",
+                meta=None,
+                session=session,
+                lifespan_context=None,
+            )
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await _run_probe(context=context, database_path=self.database_path)
+
+        receipt = self.store.receipt("accept")
+        self.assertEqual((receipt.state, receipt.completion_count), ("failed", 0))
+
+    async def test_tool_schema_has_no_model_authored_fields(self):
+        tools = await build_probe_server(self.database_path).list_tools()
+        self.assertEqual(len(tools), 1)
+        probe = next(item for item in tools if item.name == "probe_zdecision_elicitation")
+        self.assertEqual(probe.inputSchema.get("properties"), {})
+        self.assertEqual(probe.inputSchema.get("required", []), [])
+
+    async def test_missing_current_case_fails_closed_without_prompt(self):
+        calls = 0
+
+        async def accept_callback(context, params):
+            nonlocal calls
+            calls += 1
+            return types.ElicitResult(action="accept", content={})
+
+        response = await self._call_server(accept_callback)
+
+        self.assertEqual(response["action"], "unavailable")
+        self.assertFalse(response["authorized"])
+        self.assertEqual(calls, 0)
+
+    async def test_pending_case_is_not_reprompted(self):
+        self.store.arm("restart", now=NOW)
+        pending = self.store.claim_armed(request_digest="c" * 64, now=NOW)
+        calls = 0
+
+        async def accept_callback(context, params):
+            nonlocal calls
+            calls += 1
+            return types.ElicitResult(action="accept", content={})
+
+        response = await self._call_server(accept_callback)
+
+        self.assertEqual(response["action"], "pending")
+        self.assertFalse(response["authorized"])
+        self.assertEqual(response["replayed"], True)
+        self.assertEqual(calls, 0)
+        self.assertEqual(self.store.current(), pending)
 
 
 if __name__ == "__main__":
