@@ -84,21 +84,24 @@ ID and `action = enable | decline`. The model cannot call this action tool or
 supply Session, Turn, CWD, repository, product, actor, confirmation, or intent
 coordinates to it.
 
-The render call carries the bounded typed `RecallIntent` needed after an
-asynchronous click. The local server validates and freezes its canonical bytes
-inside the private activation attempt before enabling either button. Raw
-Prompt, PRD, transcript, source, diff, tool output, and absolute local paths
-are not stored. The card never sends the intent back from the browser.
+The render call carries no `RecallIntent` or task content. The pending attempt
+stores only trusted coordinates and the exact card-byte digest. Product routing
+and `RecallIntent` derivation occur only after consent, in the next Codex Turn;
+raw Prompt, PRD, transcript, source, diff, tool output, and absolute local paths
+are not stored by the confirmation entry.
 
 Only the app-only `enable` transition grants consent. `decline`, dismissal,
 expiry, malformed input, missing UI capability, timeout, MCP restart, or
 transport loss grant no authority. The card never calls `enable` on load,
 retry, remount, restoration, or polling.
 
-After a committed enable result, the app may use the MCP Apps `ui/message`
-method to request that Codex continue the current development request. That
+After a committed enable result, the app uses the MCP Apps `ui/message` method
+once to request that Codex continue the current development request. That
 message carries only a bounded activation outcome and cannot authorize Recall;
-the already committed app-only action remains the sole authority.
+the already committed app-only action remains the sole authority. If the host
+does not start a follow-up Turn, the card tells the user that Recall is enabled
+and the next native user message will perform routing and retrieval. ZDecision
+must not persist task intent or fabricate a user Turn to hide that host limit.
 
 This is an explicit trust-boundary decision, not a claim that the host
 cryptographically attests a physical click. Safety comes from the trusted
@@ -181,15 +184,14 @@ An activation attempt is bound to exactly:
 - one opaque operation ID; and
 - one request state/version.
 
-The private activation-attempt state is exactly
-`pending_confirmation`, `accepted_pending_activation`, `declined`,
-`cancelled`, `failed`, or `committed`. It is separate from
+The private activation-attempt state is exactly `pending_confirmation`,
+`declined`, `cancelled`, `failed`, or `committed`. It is separate from
 `RecallSessionState`. Before acceptance there is no Recall Session row.
 
-The render tool validates and freezes one canonical `RecallIntent` against the
-exact pending attempt. A conflicting render, intent replacement, repository
-change, expired attempt, or bundle change disables the card and cannot create
-a second current attempt for the same Session and Turn.
+The render tool freezes the exact card-byte digest against the pending attempt.
+A conflicting render, repository change, expired attempt, or bundle change
+disables the card and cannot create a second current attempt for the same
+Session and Turn.
 
 The Hook must stop calling the current `bind_activation()` behavior that marks
 the Session active before the MCP operation succeeds.
@@ -205,7 +207,7 @@ Result mapping is exact:
 
 | Card/action result | State and behavior |
 | --- | --- |
-| app-only `enable` | Record consent, continue the same operation into routing and Recall preparation |
+| app-only `enable` | Atomically record consent and create an active consent Session with no Intent Epoch or injected set |
 | `decline` | Commit a declined receipt, create no Recall Session, release the Turn for ordinary work |
 | dismiss/no click until expiry or SessionEnd | Retire as cancelled; create no Recall Session |
 | unavailable, timeout, malformed, transport loss | Commit or recover a non-authorizing failure; create no active Session |
@@ -217,28 +219,33 @@ ZDecision again. Lifecycle Hooks and ordinary Prompts do not retry it.
 ### 5.3 After acceptance
 
 Acceptance authorizes Recall but does not manufacture applicable Decisions.
-In one transaction it first changes the attempt from `pending_confirmation`
-to `accepted_pending_activation` and creates an `activating` Recall Session.
-The same operation then:
+In one transaction it changes the attempt from `pending_confirmation` to
+`committed` and creates an active consent Session with `intent_epoch = 0`, no
+active intent, and no injected set. The original render Turn may not continue
+with affected development merely because the click committed.
+
+The app sends one bounded `ui/message` continuation request. The resulting
+follow-up Turn, or the next native user Turn if the host does not continue
+automatically, then:
 
 1. validates that the repository remains registered and enabled;
-2. derives the product; when routing is ambiguous, returns the bounded product
-   display-name choices and keeps the Session `activating` until the user
-   chooses or explicitly bypasses Recall;
+2. derives the typed `RecallIntent` and product; when routing is ambiguous,
+   returns the bounded product display-name choices and keeps the current Turn
+   gate unresolved until the user chooses or explicitly bypasses Recall;
 3. resolves the trusted ready/LKG Decision bundle locally;
 4. performs hybrid retrieval, reranking, and bounded applicability;
-5. commits the active Recall Session, the `committed` activation attempt, and
-   the first result receipt atomically in the Recall host store; and
+5. commits the first Turn result receipt and active set atomically in the
+   Recall host store; and
 6. returns only complete published-Decision envelopes that passed the existing
    gates.
 
-An accepted operation that has not completed these checks is `activating` and
-supplies no Decision context. Sensitive development tools remain gated until
-the accepted operation reaches an allowed applied, empty, clarified, or
-explicit-bypass result under the existing Recall contract.
+An accepted Session that has not completed its first Turn gate supplies no
+Decision context. Sensitive development tools remain gated until the Turn
+reaches an allowed applied, empty, clarified, or explicit-bypass result under
+the existing Recall contract.
 
-An accepted operation with a valid empty applicable set becomes `active` with
-an empty active set and releases ordinary work. A post-acceptance validation,
+An accepted Session with a valid empty applicable set remains `active` with an
+empty active set and releases ordinary work. A post-acceptance validation,
 freshness, routing, or provider failure becomes `blocked` and requires the
 existing explicit retry/bypass path; it never degrades silently to development
 without Decisions.
@@ -270,16 +277,14 @@ without Decisions.
 
 - No result other than the app-only `enable` transition may be interpreted as
   consent.
-- No active state may exist before acceptance and successful post-acceptance
-  validation.
+- No Recall Session may exist before acceptance, and no Decision set may be
+  applied before the first post-acceptance Turn gate commits.
 - A failure before the user responds must not block ordinary development
   forever; it returns a bounded unavailable outcome and leaves Recall disabled.
 - A failure after acceptance must not silently continue as if Decisions were
   applied. It follows the existing fail-closed Recall/bypass contract.
-- Confirmation receipts contain only opaque IDs, bounded state, timestamps,
-  schema/version, repository binding, and digests. The private pending attempt
-  may contain the normalized typed Recall Intent required for the asynchronous
-  action, but receipts contain only its digest. Neither contains a raw Prompt,
+- Confirmation attempts and receipts contain only opaque IDs, bounded state,
+  timestamps, schema/version, repository binding, and digests. Neither contains a raw Prompt,
   transcript, PRD, source, diff, tool arguments/output, Decision text, or
   absolute Plugin path.
 - `recall-confirmation-v1.html` is part of the frozen installed Recall bundle.
@@ -307,13 +312,14 @@ Desktop acceptance after automated tests.
 Focused automated tests must prove:
 
 - Hook binding creates only a pending activation attempt;
-- the render tool freezes one validated local Recall Intent and exposes the
-  attempt ID only through `_meta`;
+- the render tool freezes the exact card digest and exposes the attempt ID only
+  through `_meta` without accepting Recall Intent or task content;
 - the app-only action is absent from model-visible tools and accepts no
   model-authored Session, repository, intent, or confirmation field;
 - exact enable/decline/dismiss/failure mappings and idempotent recovery;
 - load, retry, remount, restoration, and polling never call `enable`;
-- no Session is active before accepted post-validation commits;
+- no Session exists before `enable`; the committed consent Session has no
+  active Intent or injected set until the next Turn gate commits;
 - no-selection and Candidate-only tasks display no confirmation and create no
   Recall state;
 - first- and later-Turn confirmation, ordinary later-Turn reuse, compaction,
@@ -324,9 +330,16 @@ Focused automated tests must prove:
 - privacy sentinels remain absent from SQLite, logs, reports, Central traffic,
   cache metadata, and receipts.
 
-Real Desktop acceptance must then prove the complete visible flow:
+The entry implementation's real Desktop acceptance must prove:
 
-`select ZDecision -> inline confirmation card -> click enable -> relevant published Decisions -> ordinary development`
+`select ZDecision -> inline confirmation card -> click enable -> committed current-task consent -> bounded follow-up request or next-native-Turn instruction`
+
+This entry acceptance may truthfully end at the existing readiness provider's
+bounded `blocked` result. It must not claim that formal Decisions were applied.
+After the retrieval provider is complete, the full Recall acceptance must prove
+the complete visible flow:
+
+`select ZDecision -> inline confirmation card -> click enable -> bounded follow-up Turn -> relevant published Decisions -> ordinary development`
 
 and the negative flows:
 
