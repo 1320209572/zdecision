@@ -254,7 +254,7 @@ class RecallHostStoreTests(unittest.TestCase):
         def plugin_root(name: str) -> Path:
             root = Path(self.temporary_directory.name) / name
             (root / ".codex-plugin").mkdir(parents=True)
-            (root / "skills/decision-recall").mkdir(parents=True)
+            (root / "skills/zdecision").mkdir(parents=True)
             (root / ".codex-plugin/plugin.json").write_text(
                 json.dumps(
                     {
@@ -278,7 +278,7 @@ class RecallHostStoreTests(unittest.TestCase):
                 ),
                 "utf-8",
             )
-            (root / "skills/decision-recall/SKILL.md").write_text(name, "utf-8")
+            (root / "skills/zdecision/SKILL.md").write_text(name, "utf-8")
             return root
 
         original_root = plugin_root("plugin-a")

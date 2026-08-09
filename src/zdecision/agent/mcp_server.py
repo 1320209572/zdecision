@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
@@ -45,6 +47,11 @@ UPDATE_CANDIDATES_URI = "ui://zdecision/update-candidates-v3.html"
 UPDATE_CANDIDATES_MIME_TYPE = "text/html;profile=mcp-app"
 UPDATE_CANDIDATES_PATH = (
     Path(__file__).resolve().parent / "static" / "update-candidates-v1.html"
+)
+RECALL_CONFIRMATION_URI = "ui://zdecision/recall-confirmation-v1.html"
+RECALL_CONFIRMATION_MIME_TYPE = "text/html;profile=mcp-app"
+RECALL_CONFIRMATION_PATH = (
+    Path(__file__).resolve().parent / "static" / "recall-confirmation-v1.html"
 )
 
 _CAPTURING_PROGRESS = frozenset(
@@ -419,6 +426,28 @@ def create_mcp_server(
     def update_candidates_resource() -> str:
         return UPDATE_CANDIDATES_PATH.read_text("utf-8")
 
+    @server.resource(
+        RECALL_CONFIRMATION_URI,
+        name="zdecision-recall-confirmation",
+        title="ZDecision Recall confirmation",
+        description="One-task confirmation for ZDecision Recall.",
+        mime_type=RECALL_CONFIRMATION_MIME_TYPE,
+        meta={
+            "ui": {
+                "prefersBorder": True,
+                "csp": {
+                    "connectDomains": [],
+                    "resourceDomains": [],
+                },
+            },
+            "openai/widgetDescription": (
+                "A compact confirmation for enabling Recall in the current task."
+            ),
+        },
+    )
+    def recall_confirmation_resource() -> str:
+        return RECALL_CONFIRMATION_PATH.read_bytes().decode("utf-8")
+
     @server.tool(annotations=read_only)
     def zdecision_status() -> dict[str, object]:
         """Return local registration, event, and Session-binding status."""
@@ -481,18 +510,44 @@ def create_mcp_server(
     if recall_tools is not None:
 
         @server.tool(
-            title="Activate ZDecision Recall",
-            description="Activate Recall through one trusted host binding.",
+            title="Show ZDecision Recall confirmation",
+            description="Display the trusted Recall confirmation for this task.",
             annotations=recall_action,
+            meta={
+                "ui": {
+                    "resourceUri": RECALL_CONFIRMATION_URI,
+                    "visibility": ["model", "app"],
+                },
+                "openai/outputTemplate": RECALL_CONFIRMATION_URI,
+                "openai/toolInvocation/invoking": "Opening Recall confirmation…",
+                "openai/toolInvocation/invoked": "Recall confirmation ready",
+            },
         )
-        def activate_zdecision_recall(
-            activation_binding_id: str,
-            intent: object,
-        ) -> dict[str, object]:
-            return recall_tools.activate_zdecision_recall(
-                activation_binding_id=activation_binding_id,
-                intent=intent,
+        def show_zdecision_recall_confirmation(
+            activation_attempt_id: str,
+        ) -> CallToolResult:
+            result = recall_tools.show_recall_confirmation(
+                activation_attempt_id=activation_attempt_id,
+                ui_digest=_recall_confirmation_digest(),
             )
+            return _confirmation_call_result(result)
+
+        @server.tool(
+            title="Decide ZDecision Recall",
+            description="Commit the confirmation action selected in the app.",
+            annotations=recall_action,
+            meta={"ui": {"visibility": ["app"]}},
+        )
+        def decide_zdecision_recall(
+            activation_attempt_id: str,
+            action: Literal["enable", "decline"],
+        ) -> CallToolResult:
+            result = recall_tools.decide_recall_confirmation(
+                activation_attempt_id=activation_attempt_id,
+                action=action,
+                current_ui_digest=_recall_confirmation_digest(),
+            )
+            return _confirmation_call_result(result)
 
         @server.tool(
             title="Gate ZDecision Recall Turn",
@@ -508,7 +563,10 @@ def create_mcp_server(
                 intent=intent,
             )
 
-        _forbid_extra_tool_input(server, "activate_zdecision_recall")
+        _forbid_extra_tool_input(
+            server, "show_zdecision_recall_confirmation"
+        )
+        _forbid_extra_tool_input(server, "decide_zdecision_recall")
         _forbid_extra_tool_input(server, "gate_zdecision_turn")
 
     return server
@@ -527,6 +585,52 @@ def _forbid_extra_tool_input(server: object, tool_name: str) -> None:
     )
     argument_model.model_rebuild(force=True)
     tool.parameters = argument_model.model_json_schema(by_alias=True)
+
+
+def _recall_confirmation_digest() -> str:
+    return hashlib.sha256(RECALL_CONFIRMATION_PATH.read_bytes()).hexdigest()
+
+
+def _confirmation_call_result(value: object) -> CallToolResult:
+    if not isinstance(value, dict):
+        value = {"state": "blocked", "code": "invalid_confirmation"}
+    state = value.get("state")
+    if state not in (
+        "pending_confirmation",
+        "committed",
+        "declined",
+        "cancelled",
+        "failed",
+        "blocked",
+    ):
+        state = "blocked"
+    structured: dict[str, object] = {"state": state}
+    if state == "blocked" and value.get("code") == "invalid_confirmation":
+        structured["code"] = "invalid_confirmation"
+    meta = value.get("_meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    safe_meta = {
+        key: item
+        for key, item in meta.items()
+        if key
+        in (
+            "zdecision/activation_attempt_id",
+            "zdecision/repository_id",
+            "zdecision/repository_display_name",
+        )
+        and isinstance(item, str)
+    }
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="ZDecision Recall confirmation is ready.",
+            )
+        ],
+        structuredContent=structured,
+        _meta=safe_meta,
+    )
 
 
 def run_mcp(

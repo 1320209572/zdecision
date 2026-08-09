@@ -1,0 +1,6 @@
+interface:
+  display_name: "ZDecision Candidate Refresh"
+  short_description: "Refresh reviewed decision candidates"
+  default_prompt: "更新候选决策"
+policy:
+  allow_implicit_invocation: true

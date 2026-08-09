@@ -10,8 +10,9 @@ Do not continue plans or specifications marked Superseded.
 ## Product routing
 
 - The Plugin product interface is the ZDecision page, the approved inline
-  Codex Candidate-refresh card, and automatic Codex recall; it is not a
-  CLI-first workflow.
+  Codex Candidate-refresh card, and the explicit inline Recall confirmation;
+  it is not a CLI-first workflow. Recall is enabled only by that current-task
+  card click before later native Turn gating.
 - The Plugin observes enabled repositories locally. Candidate extraction starts
   only when the user clicks the page update control or one of the inline
   **当前 Session** / **所有有效 Session** controls.

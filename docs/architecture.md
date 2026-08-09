@@ -592,7 +592,9 @@ are the only workflow output written to Git.
 
 The technical operator commands `zdecision-central run` and
 `zdecision-agent service run` are deployment diagnostics, not end-user Capture
-UX. Automatic Decision recall remains a later packet. The separately excluded
+UX. The current Recall slice adds only an inline current-task confirmation and
+the later native Turn gate; complete automatic Decision retrieval remains a
+later packet. The separately excluded
 Dashboard Git-fetch optimization, Registry V2, SSO, Git-role authorization,
 route-administration UI, comments, and notifications are not part of this
 vertical.

@@ -131,10 +131,10 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         Path(self.cwd).mkdir()
         self.recall_skill_path = (
             self.root
-            / "installed/zdecision/skills/decision-recall/SKILL.md"
+            / "installed/zdecision/skills/zdecision/SKILL.md"
         )
         self.recall_skill_path.parent.mkdir(parents=True)
-        self.recall_skill_path.write_text("---\nname: decision-recall\n---\n", "utf-8")
+        self.recall_skill_path.write_text("---\nname: zdecision\n---\n", "utf-8")
         self.installed_plugin_root = self.recall_skill_path.parents[2]
         (self.installed_plugin_root / ".codex-plugin").mkdir()
         (self.installed_plugin_root / ".codex-plugin/plugin.json").write_text(
@@ -202,7 +202,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             selected_skills=(
                 SelectedSkill(
                     selection_type="skill",
-                    name="decision-recall",
+                    name="zdecision",
                     path=str((selected_path or self.recall_skill_path).resolve()),
                 ),
             ),
@@ -618,7 +618,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         self.bind_activation()
         source_skill = (
             Path(mcp_server.__file__).resolve().parents[3]
-            / "plugins/zdecision/skills/decision-recall/SKILL.md"
+            / "plugins/zdecision/skills/zdecision/SKILL.md"
         )
         self.assertNotEqual(source_skill.resolve(), self.recall_skill_path.resolve())
         provider = StaticProvider(_probe())
@@ -656,7 +656,7 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
 
         self.bind_activation()
         self.recall_skill_path.write_text(
-            "---\nname: decision-recall\n---\nTAMPERED\n", "utf-8"
+            "---\nname: zdecision\n---\nTAMPERED\n", "utf-8"
         )
         provider = StaticProvider(_probe())
         result = RecallMcpTools(
@@ -1171,17 +1171,21 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(self.store.get_session(PRIVATE_SESSION).active_set_digest)
 
-    async def test_mcp_composition_registers_exact_recall_tools_without_app_ui(self) -> None:
-        """This catches missing, open-world, or UI-bound Recall tool registration."""
+    async def test_mcp_composition_registers_confirmation_and_turn_gate_only(self) -> None:
+        """This catches a model-visible decision action or legacy activation registration."""
 
         local = mcp_server.LocalMcpTools(database=self.database, cwd=self.cwd)
         server = mcp_server.create_mcp_server(local, self.tools())
         resources = await server.list_resources()
         tools = {tool.name: tool for tool in await server.list_tools()}
 
-        self.assertEqual(7, len(tools))
+        self.assertEqual(8, len(tools))
         self.assertEqual(
-            {"activate_zdecision_recall", "gate_zdecision_turn"},
+            {
+                "show_zdecision_recall_confirmation",
+                "decide_zdecision_recall",
+                "gate_zdecision_turn",
+            },
             set(tools) - {
                 "zdecision_status",
                 "show_zdecision_update",
@@ -1190,13 +1194,24 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
                 "open_zdecision_dashboard",
             },
         )
-        self.assertEqual(1, len(resources))
-        for name in ("activate_zdecision_recall", "gate_zdecision_turn"):
+        self.assertEqual(2, len(resources))
+        self.assertNotIn("activate_zdecision_recall", tools)
+        self.assertEqual(
+            ["model", "app"],
+            tools["show_zdecision_recall_confirmation"].meta["ui"]["visibility"],
+        )
+        self.assertEqual(
+            ["app"], tools["decide_zdecision_recall"].meta["ui"]["visibility"]
+        )
+        for name in (
+            "show_zdecision_recall_confirmation",
+            "decide_zdecision_recall",
+            "gate_zdecision_turn",
+        ):
             tool = tools[name]
             self.assertTrue(tool.annotations.idempotentHint)
             self.assertFalse(tool.annotations.openWorldHint)
             self.assertFalse(tool.annotations.destructiveHint)
-            self.assertNotIn("ui", tool.meta or {})
             self.assertFalse(tool.inputSchema.get("additionalProperties", True))
             forbidden = {"session_id", "turn_id", "cwd", "product", "generation"}
             self.assertTrue(forbidden.isdisjoint(tool.inputSchema["properties"]))

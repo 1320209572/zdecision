@@ -66,9 +66,9 @@ class RecallHookGateTests(unittest.TestCase):
         )
         self.database_path = self.root / "state" / "zdecision.sqlite3"
         self.plugin_root = self.root / "plugin-cache/zdecision/0.1.0"
-        recall_skill = self.plugin_root / "skills/decision-recall/SKILL.md"
+        recall_skill = self.plugin_root / "skills/zdecision/SKILL.md"
         recall_skill.parent.mkdir(parents=True)
-        recall_skill.write_text("---\nname: decision-recall\n---\n", "utf-8")
+        recall_skill.write_text("---\nname: zdecision\n---\n", "utf-8")
         (self.plugin_root / ".codex-plugin").mkdir()
         (self.plugin_root / ".codex-plugin/plugin.json").write_text(
             json.dumps(

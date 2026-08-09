@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZDecision 决策召回确认</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --surface: light-dark(#ffffff, #17191c);
+        --surface-soft: light-dark(#f5f7fa, #202329);
+        --text: light-dark(#1f2329, #f2f3f5);
+        --muted: light-dark(#646a73, #aeb4bd);
+        --border: light-dark(#d9dde4, #3c414a);
+        --primary: light-dark(#1368e8, #6aa4ff);
+        --primary-ink: #ffffff;
+        --sans: "Avenir Next", "PingFang SC", "Noto Sans CJK SC",
+          ui-sans-serif, sans-serif;
+        --mono: "SFMono-Regular", "Cascadia Mono", "Menlo", ui-monospace,
+          monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 8px;
+        background: transparent;
+        color: var(--text);
+        font-family: var(--sans);
+      }
+
+      main {
+        width: min(100%, 440px);
+        overflow: hidden;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: 0 4px 16px color-mix(in srgb, #000000 9%, transparent);
+      }
+
+      header {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 16px;
+        align-items: start;
+        padding: 16px 18px 12px;
+      }
+
+      .eyebrow,
+      #card-state,
+      #repository {
+        font-family: var(--mono);
+      }
+
+      .eyebrow {
+        margin: 0 0 5px;
+        color: var(--primary);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 650;
+        letter-spacing: -0.02em;
+        line-height: 1.25;
+      }
+
+      #card-state {
+        padding-top: 2px;
+        color: var(--muted);
+        font-size: 10px;
+        white-space: nowrap;
+      }
+
+      .context {
+        margin: 0 18px;
+        padding: 11px 12px;
+        border-left: 3px solid var(--primary);
+        background: var(--surface-soft);
+      }
+
+      .context p {
+        margin: 0;
+      }
+
+      #repository {
+        margin-bottom: 5px;
+        font-size: 11px;
+        font-weight: 650;
+        overflow-wrap: anywhere;
+      }
+
+      .lifetime {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .actions {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(104px, auto);
+        gap: 8px;
+        padding: 14px 18px;
+      }
+
+      button {
+        min-height: 38px;
+        padding: 8px 13px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 650;
+        cursor: pointer;
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      #enable {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: var(--primary-ink);
+      }
+
+      #enable:hover:not(:disabled) {
+        filter: brightness(0.94);
+      }
+
+      #decline {
+        background: transparent;
+        color: var(--muted);
+      }
+
+      #decline:hover:not(:disabled) {
+        border-color: var(--muted);
+        color: var(--text);
+      }
+
+      footer {
+        min-height: 42px;
+        padding: 10px 18px 12px;
+        border-top: 1px solid var(--border);
+      }
+
+      #status {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      @media (max-width: 360px) {
+        .actions {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main aria-labelledby="title">
+      <header>
+        <div>
+          <p class="eyebrow">ZDecision / Recall</p>
+          <h1 id="title">为当前任务启用决策召回？</h1>
+        </div>
+        <span id="card-state" aria-live="polite">等待确认</span>
+      </header>
+
+      <section class="context" aria-label="确认范围">
+        <p id="repository">正在读取仓库</p>
+        <p class="lifetime">仅在当前任务期间生效；选择本身不会执行召回。</p>
+      </section>
+
+      <div class="actions" aria-label="决策召回选择">
+        <button id="enable" type="button" disabled>启用本任务决策召回</button>
+        <button id="decline" type="button" disabled>暂不启用</button>
+      </div>
+
+      <footer>
+        <p id="status" role="status" aria-live="polite">
+          请明确选择后继续。
+        </p>
+      </footer>
+    </main>
+
+    <script>
+      const enableButton = document.getElementById("enable");
+      const declineButton = document.getElementById("decline");
+      const repository = document.getElementById("repository");
+      const status = document.getElementById("status");
+      const cardState = document.getElementById("card-state");
+      const pending = new Map();
+
+      let nextRequestId = 1;
+      let initialized = false;
+      let renderAccepted = false;
+      let decisionStarted = false;
+      let continuationSent = false;
+      let activationAttemptId = null;
+
+      function request(method, params, timeoutMs = null) {
+        const id = nextRequestId++;
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+        return new Promise((resolve, reject) => {
+          let timeoutId = null;
+          pending.set(id, {
+            resolve(value) {
+              if (timeoutId !== null) clearTimeout(timeoutId);
+              resolve(value);
+            },
+            reject(error) {
+              if (timeoutId !== null) clearTimeout(timeoutId);
+              reject(error);
+            },
+          });
+          if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+            timeoutId = setTimeout(() => {
+              if (!pending.delete(id)) return;
+              reject(new Error("request_timeout"));
+            }, timeoutMs);
+          }
+        });
+      }
+
+      function notify(method, params) {
+        window.parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+      }
+
+      function lockActions() {
+        enableButton.disabled = true;
+        declineButton.disabled = true;
+      }
+
+      function boundedResult(result) {
+        const toolResult = result?.structuredContent
+          ? result
+          : result?.toolResult;
+        const state = toolResult?.structuredContent?.state;
+        const meta = toolResult?._meta;
+        const attempt = meta?.["zdecision/activation_attempt_id"];
+        const displayName = meta?.["zdecision/repository_display_name"];
+        const knownState = [
+          "pending_confirmation", "committed", "declined", "cancelled",
+          "failed", "blocked",
+        ].includes(state);
+        return {
+          valid: toolResult?.isError !== true && knownState,
+          state: knownState ? state : "blocked",
+          attempt: typeof attempt === "string" ? attempt : null,
+          displayName: typeof displayName === "string" ? displayName : null,
+        };
+      }
+
+      function setTerminal(state) {
+        lockActions();
+        if (state === "committed") {
+          cardState.textContent = "已启用";
+          status.textContent =
+            "Recall 已为当前任务启用。若任务未自动继续，请发送下一条原生消息触发 Recall。";
+        } else if (state === "declined") {
+          cardState.textContent = "未启用";
+          status.textContent = "当前任务不会启用决策召回。";
+        } else {
+          cardState.textContent = "无法确认";
+          status.textContent = "暂时无法完成确认，请重新打开确认卡。";
+        }
+      }
+
+      function acceptRenderResult(result) {
+        if (decisionStarted) return;
+        const value = boundedResult(result);
+        if (!value.valid) {
+          setTerminal("blocked");
+          return;
+        }
+        if (value.displayName !== null) {
+          repository.textContent = value.displayName;
+        }
+        if (value.state !== "pending_confirmation") {
+          setTerminal(value.state);
+          return;
+        }
+        if (value.attempt === null) {
+          setTerminal("blocked");
+          return;
+        }
+        if (renderAccepted && value.attempt !== activationAttemptId) {
+          setTerminal("blocked");
+          return;
+        }
+        renderAccepted = true;
+        activationAttemptId = value.attempt;
+        cardState.textContent = "等待确认";
+        status.textContent = "请明确选择后继续。";
+        const enabled = initialized && !decisionStarted;
+        enableButton.disabled = !enabled;
+        declineButton.disabled = !enabled;
+      }
+
+      async function sendContinuationOnce() {
+        if (continuationSent) return;
+        continuationSent = true;
+        try {
+          await request("ui/message", {
+            role: "user",
+            content: {
+              type: "text",
+              text: "继续当前任务，并执行已启用的 ZDecision Recall。",
+            },
+          }, 3000);
+        } catch {
+          // The visible native-message instruction is the bounded fallback.
+        }
+      }
+
+      async function decide(action) {
+        if (
+          decisionStarted
+          || !initialized
+          || !renderAccepted
+          || typeof activationAttemptId !== "string"
+        ) return;
+        decisionStarted = true;
+        lockActions();
+        cardState.textContent = "正在确认";
+        status.textContent = action === "enable"
+          ? "正在启用当前任务的决策召回。"
+          : "正在记录本次选择。";
+        try {
+          const result = await request("tools/call", {
+            name: "decide_zdecision_recall",
+            arguments: {
+              activation_attempt_id: activationAttemptId,
+              action,
+            },
+          }, 5000);
+          const value = boundedResult(result);
+          const expected = action === "enable" ? "committed" : "declined";
+          if (!value.valid || value.state !== expected) {
+            setTerminal("blocked");
+            return;
+          }
+          setTerminal(value.state);
+          if (value.state === "committed") sendContinuationOnce();
+        } catch {
+          cardState.textContent = "结果未知";
+          status.textContent =
+            "无法确认操作结果；不会自动重试。请重新打开确认卡后再选择。";
+          lockActions();
+        }
+      }
+
+      window.addEventListener(
+        "message",
+        (event) => {
+          if (event.source !== window.parent) return;
+          const message = event.data;
+          if (!message || message.jsonrpc !== "2.0") return;
+          if (Object.hasOwn(message, "id")) {
+            const waiter = pending.get(message.id);
+            if (!waiter) return;
+            pending.delete(message.id);
+            if (message.error) waiter.reject(message.error);
+            else waiter.resolve(message.result);
+            return;
+          }
+          if (message.method === "ui/notifications/tool-result") {
+            acceptRenderResult(message.params);
+          }
+        },
+        { passive: true },
+      );
+
+      enableButton.addEventListener("click", () => decide("enable"));
+      declineButton.addEventListener("click", () => decide("decline"));
+
+      request("ui/initialize", {
+        appInfo: { name: "zdecision-recall-confirmation", version: "0.1.0" },
+        appCapabilities: {},
+        protocolVersion: "2026-01-26",
+      })
+        .then(() => {
+          initialized = true;
+          notify("ui/notifications/initialized", {});
+          if (renderAccepted && !decisionStarted) {
+            enableButton.disabled = false;
+            declineButton.disabled = false;
+          }
+        })
+        .catch(() => setTerminal("blocked"));
+    </script>
+  </body>
+</html>

@@ -112,7 +112,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(
             (
                 "mcp__zdecision_local__show_zdecision_update|"
-                "mcp__zdecision_local__activate_zdecision_recall|"
+                "mcp__zdecision_local__show_zdecision_recall_confirmation|"
                 "mcp__zdecision_local__gate_zdecision_turn|"
                 "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
             ),
@@ -127,12 +127,23 @@ class PluginContractTests(unittest.TestCase):
         for event_name in ("PreCompact", "PostCompact"):
             self.assertEqual("manual|auto", hooks[event_name][0]["matcher"])
 
-    def test_plugin_skill_describes_the_page_authorized_workflow(self) -> None:
-        skill_path = PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
+    def test_plugin_exposes_separate_recall_and_candidate_skills(self) -> None:
+        skill_names = {
+            path.parent.name
+            for path in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")
+        }
+
+        self.assertEqual({"zdecision", "candidate-refresh"}, skill_names)
+        self.assertFalse(
+            (PLUGIN_ROOT / "skills" / "decision-recall").exists()
+        )
+
+    def test_candidate_skill_describes_the_page_authorized_workflow(self) -> None:
+        skill_path = PLUGIN_ROOT / "skills" / "candidate-refresh" / "SKILL.md"
         self.assertTrue(skill_path.is_file(), f"missing plugin skill: {skill_path}")
         text = skill_path.read_text("utf-8")
 
-        self.assertTrue(text.startswith("---\nname: zdecision\n"))
+        self.assertTrue(text.startswith("---\nname: candidate-refresh\n"))
         self.assertIn("zdecision_status", text)
         self.assertIn("更新候选决策", text)
         self.assertIn("enabled repositories", text)
@@ -144,11 +155,11 @@ class PluginContractTests(unittest.TestCase):
         self.assertIn("capture CLI", text)
         self.assertNotIn("AGENTS.md", text)
 
-    def test_plugin_skill_presents_the_inline_control_at_approved_boundaries(
+    def test_candidate_skill_presents_the_inline_control_at_approved_boundaries(
         self,
     ) -> None:
         text = (
-            PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
+            PLUGIN_ROOT / "skills" / "candidate-refresh" / "SKILL.md"
         ).read_text("utf-8")
 
         for required in (
@@ -188,12 +199,14 @@ class PluginContractTests(unittest.TestCase):
             "`repository_enabled`, and `active_session_bound` are all exactly true",
             text,
         )
+        self.assertNotIn("show_zdecision_recall_confirmation", text)
+        self.assertNotIn("decide_zdecision_recall", text)
 
-    def test_plugin_defaults_to_the_explicit_inline_refresh_phrase(self) -> None:
+    def test_candidate_skill_defaults_to_the_explicit_inline_refresh_phrase(self) -> None:
         agent_config = (
             PLUGIN_ROOT
             / "skills"
-            / "zdecision"
+            / "candidate-refresh"
             / "agents"
             / "openai.yaml"
         ).read_text("utf-8")
@@ -213,6 +226,7 @@ class PluginContractTests(unittest.TestCase):
         serialized = json.dumps(manifest, sort_keys=True)
 
         self.assertIn("Session opt-in", serialized)
+        self.assertIn("confirmation", serialized.lower())
         self.assertIn("Candidate refresh remains explicit", serialized)
         self.assertNotIn("automatically recalls", serialized)
 
@@ -220,7 +234,7 @@ class PluginContractTests(unittest.TestCase):
         self,
     ) -> None:
         text = (
-            PLUGIN_ROOT / "skills" / "zdecision" / "SKILL.md"
+            PLUGIN_ROOT / "skills" / "candidate-refresh" / "SKILL.md"
         ).read_text("utf-8")
 
         for forbidden in (

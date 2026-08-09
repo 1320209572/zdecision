@@ -218,7 +218,10 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
         resources = await server.list_resources()
         tools = {tool.name: tool for tool in await server.list_tools()}
 
-        self.assertEqual([WIDGET_URI], [str(item.uri) for item in resources])
+        self.assertEqual(
+            [WIDGET_URI, mcp_server.RECALL_CONFIRMATION_URI],
+            [str(item.uri) for item in resources],
+        )
         self.assertEqual(WIDGET_MIME_TYPE, resources[0].mimeType)
         self.assertEqual(
             {"connectDomains": [], "resourceDomains": []},
@@ -872,7 +875,10 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
                 Path(mcp_server.__file__).resolve().parent / "static"
             ).glob("*.html")
         }
-        self.assertEqual({"update-candidates-v1.html"}, static_files)
+        self.assertEqual(
+            {"update-candidates-v1.html", "recall-confirmation-v1.html"},
+            static_files,
+        )
 
     async def test_widget_ignores_app_tool_result_notifications_after_render(
         self,

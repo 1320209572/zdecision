@@ -1306,7 +1306,7 @@ def _installed_recall_bundle(
             strict=True
         )
         mcp_path = (root / ".mcp.json").resolve(strict=True)
-        skill_path = (root / "skills/decision-recall/SKILL.md").resolve(
+        skill_path = (root / "skills/zdecision/SKILL.md").resolve(
             strict=True
         )
         if (

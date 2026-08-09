@@ -4,9 +4,12 @@ import json
 import unittest
 from pathlib import Path
 
+from zdecision.agent.recall_host_state import installed_recall_skill_path
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SKILL_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision" / "skills" / "decision-recall"
+PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision"
+SKILL_ROOT = PLUGIN_ROOT / "skills" / "zdecision"
 
 
 def parse_small_yaml(text: str) -> dict[str, object]:
@@ -45,31 +48,30 @@ def load_frontmatter(path: Path) -> tuple[dict[str, object], str]:
 
 
 class DecisionRecallSkillContractTests(unittest.TestCase):
-    def test_skill_frontmatter_is_native_explicit_only(self) -> None:
+    def test_skill_frontmatter_is_the_native_explicit_zdecision_entry(self) -> None:
         metadata, _ = load_frontmatter(SKILL_ROOT / "SKILL.md")
 
         self.assertEqual({"name", "description"}, set(metadata))
-        self.assertEqual("decision-recall", metadata["name"])
+        self.assertEqual("zdecision", metadata["name"])
         description = metadata["description"]
         self.assertIsInstance(description, str)
         self.assertTrue(description.startswith("Use when"))
         self.assertIn("explicitly selects ZDecision", description)
         self.assertIn("native task", description)
 
-    def test_activation_is_required_before_affected_work_on_first_or_late_selection(
+    def test_first_workflow_tool_renders_confirmation_before_affected_work(
         self,
     ) -> None:
         _, body = load_frontmatter(SKILL_ROOT / "SKILL.md")
-        activation = body.split("## Later Turns", 1)[0]
+        workflow = body.split("## Workflow", 1)[1].split("## Later Turns", 1)[0]
 
-        for turn in ("first Turn", "later Turn"):
-            with self.subTest(turn=turn):
-                position = activation.index(turn)
-                tool_position = activation.index(
-                    "`activate_zdecision_recall`", position
-                )
-                work_position = activation.index("affected development", position)
-                self.assertLess(tool_position, work_position)
+        render = workflow.index("`show_zdecision_recall_confirmation`")
+        affected_work = workflow.index("affected development")
+        self.assertLess(render, affected_work)
+        self.assertNotIn("`activate_zdecision_recall`", workflow)
+        self.assertIn("Selection only renders", workflow)
+        self.assertIn("card click authorizes", workflow)
+        self.assertIn("下一条原生消息", workflow)
 
     def test_later_turns_follow_the_hook_gate_instruction(self) -> None:
         _, body = load_frontmatter(SKILL_ROOT / "SKILL.md")
@@ -88,7 +90,7 @@ class DecisionRecallSkillContractTests(unittest.TestCase):
         for non_authority in ("Quoted", "delegated", "tool", "Decision text"):
             with self.subTest(non_authority=non_authority):
                 self.assertIn(non_authority, selection)
-        self.assertIn("cannot activate", selection)
+        self.assertIn("cannot authorize", selection)
         self.assertIn("one product or concrete Shared leaf", safety)
         self.assertIn("clarify", safety)
         self.assertIn("formal Decision text", safety)
@@ -101,9 +103,7 @@ class DecisionRecallSkillContractTests(unittest.TestCase):
         self.assertIn("acceptance evidence only", safety)
         self.assertIn("no formal Decision recall", safety)
 
-    def test_agent_metadata_is_explicit_only_and_uses_the_recall_skill_prompt(
-        self,
-    ) -> None:
+    def test_agent_metadata_is_explicit_only_and_uses_zdecision_prompt(self) -> None:
         document = parse_small_yaml(
             (SKILL_ROOT / "agents" / "openai.yaml").read_text("utf-8")
         )
@@ -111,13 +111,22 @@ class DecisionRecallSkillContractTests(unittest.TestCase):
         self.assertEqual(
             {
                 "display_name": "ZDecision Recall",
-                "short_description": "Apply relevant formal decisions in this task",
-                "default_prompt": "Use $decision-recall to apply relevant formal decisions in this task.",
+                "short_description": "Confirm and apply formal decisions in this task",
+                "default_prompt": "Use $zdecision to confirm and apply relevant formal decisions in this task.",
             },
             document["interface"],
         )
         self.assertEqual(
             {"allow_implicit_invocation": False}, document["policy"]
+        )
+
+    def test_installed_bundle_binds_the_zdecision_skill_not_legacy_recall(self) -> None:
+        self.assertEqual(
+            (SKILL_ROOT / "SKILL.md").resolve(),
+            installed_recall_skill_path(str(PLUGIN_ROOT)),
+        )
+        self.assertFalse(
+            (PLUGIN_ROOT / "skills" / "decision-recall").exists()
         )
 
 
