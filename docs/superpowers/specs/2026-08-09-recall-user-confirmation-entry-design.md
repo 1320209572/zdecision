@@ -1,24 +1,25 @@
 # ZDecision Recall User-Confirmation Entry Design
 
-Status: Approved for Gate E0 planning and execution on 2026-08-09.
-Production activation remains gated on E0 passing and a separately reviewed
-implementation plan.
+Status: Approved for implementation planning and execution on 2026-08-09.
+Native Elicitation Gate E0 failed; the user explicitly approved the MCP Apps
+inline confirmation card as the production entry mechanism.
 
 Date: 2026-08-09
 
 ## 1. Decision
 
 ZDecision Recall no longer treats Plugin attachment, Skill selection, Prompt
-text, or model intent as authorization. Those signals may start the workflow,
-but only a native MCP user-confirmation result with `action = accept` may
-authorize Recall for the current Codex Session.
+text, or model intent as authorization. Those signals may render the workflow,
+but only the app-only action emitted by ZDecision's trusted inline confirmation
+card after the user clicks **启用本任务决策召回** may authorize Recall for the
+current Codex Session.
 
 The user-facing flow is:
 
 1. The user selects or attaches ZDecision on the first or any later Turn and
    writes the normal development request.
-2. ZDecision's first workflow action requests native confirmation from Codex:
-   **启用本任务决策召回** or **暂不启用**.
+2. ZDecision's first workflow action renders one inline MCP App with exactly
+   **启用本任务决策召回** and **暂不启用**.
 3. Only **启用本任务决策召回** starts product routing, retrieval, Decision
    applicability, and injection.
 4. One accepted confirmation remains effective for the current Session under
@@ -42,8 +43,16 @@ identity required by that design.
 
 That failure does not mean the user lacked intent. It means ZDecision could
 not convert Plugin or Skill selection into a host-verifiable authorization
-fact. This design moves the authorization boundary to a user response that the
-MCP client returns directly to the originating MCP tool call.
+fact.
+
+The follow-up native form-Elicitation Gate E0 also failed on Codex Desktop
+`26.803.41515`: the first requested human `accept` case completed as `cancel`
+in about 14 milliseconds without displaying a human confirmation surface. The
+bounded evidence is recorded in
+`docs/superpowers/acceptance/2026-08-09-recall-elicitation-e0.md`. This result
+rejects native form Elicitation for this slice; it does not test or reject MCP
+Apps inline UI, which the existing Candidate control has already rendered and
+called successfully in the same host.
 
 This document supersedes the entry authority, Gate 0A/0B, Skill-selection
 proof, and activation-order requirements in
@@ -52,45 +61,58 @@ approved Recall Intent, trusted Decision distribution, hybrid retrieval,
 reranking, applicability, active-set, context restoration, Fork, Capture,
 Candidate Review, publication, Registry, or Central contracts.
 
-## 3. Chosen mechanism and fallback
+## 3. Chosen mechanism
 
-### 3.1 Chosen: native MCP form elicitation
+### 3.1 Chosen: MCP Apps app-only confirmation card
 
-`activate_zdecision_recall` becomes an asynchronous MCP tool. During that tool
-call, the server uses the request-scoped MCP context to issue a form-mode
-elicitation with a bounded confirmation schema.
+`show_zdecision_recall_confirmation` is the model-visible render tool. It is
+read-only and returns `ui://zdecision/recall-confirmation-v1.html`. Its trusted
+`PreToolUse` Hook creates one opaque activation attempt and replaces any
+model-authored attempt coordinate before the render result is produced.
 
-The confirmation contains no Prompt or Decision content. Its message contains
-exactly:
+The card contains no Prompt or Decision content. It displays exactly:
 
 - the action: enable published-Decision Recall for this task;
 - the already verified repository display name;
 - the lifetime: current Codex Session; and
-- the two semantic outcomes: enable or do not enable.
+- the two buttons **启用本任务决策召回** and **暂不启用**.
 
-The requested form schema is a closed empty object: the user is not asked to
-type or supply any value. Codex owns the visible action labels and returns
-`accept`, `decline`, or `cancel`; E0 records the actual Desktop presentation
-without assuming that the host uses ZDecision's preferred Chinese button
-labels.
+The UI receives the opaque attempt ID only through tool-result `_meta`, not
+model-visible content. A click calls `decide_zdecision_recall`, whose MCP tool
+visibility is exactly `app`. Its closed input contains only that opaque attempt
+ID and `action = enable | decline`. The model cannot call this action tool or
+supply Session, Turn, CWD, repository, product, actor, confirmation, or intent
+coordinates to it.
 
-The server consumes the MCP result directly. The model does not receive or
-supply a `confirmed` boolean, confirmation token, Session ID, Turn ID, CWD,
-repository ID, product ID, or actor identity as tool input.
+The render call carries the bounded typed `RecallIntent` needed after an
+asynchronous click. The local server validates and freezes its canonical bytes
+inside the private activation attempt before enabling either button. Raw
+Prompt, PRD, transcript, source, diff, tool output, and absolute local paths
+are not stored. The card never sends the intent back from the browser.
 
-Only `action = accept` grants consent. `decline`, `cancel`, malformed results,
-missing client capability, timeout, MCP restart, or transport loss grant no
-authority.
+Only the app-only `enable` transition grants consent. `decline`, dismissal,
+expiry, malformed input, missing UI capability, timeout, MCP restart, or
+transport loss grant no authority. The card never calls `enable` on load,
+retry, remount, restoration, or polling.
 
-### 3.2 Fallback: MCP Apps app-only confirmation card
+After a committed enable result, the app may use the MCP Apps `ui/message`
+method to request that Codex continue the current development request. That
+message carries only a bounded activation outcome and cannot authorize Recall;
+the already committed app-only action remains the sole authority.
 
-The existing Candidate-control pattern proves that Codex can render an MCP UI
-resource whose action tool is visible to the app but not callable by the
-model. That mechanism is the fallback only if the native Elicitation gate
-fails.
+This is an explicit trust-boundary decision, not a claim that the host
+cryptographically attests a physical click. Safety comes from the trusted
+installed UI resource, exact app-only tool visibility, an unguessable
+single-attempt binding, server-side Session/repository/bundle validation, and
+the prohibition on automatic enable calls. If the host cannot render the MCP
+App, Recall stays disabled; there is no automatic fallback.
 
-Fallback is not automatic. It requires a new user decision and an amended
-design because it changes the visible interaction and replay contract.
+### 3.2 Rejected native confirmation mechanism
+
+Native MCP form Elicitation is rejected for the current Desktop slice because
+Gate E0 did not present a usable human confirmation. It may be reconsidered
+only after a later documented host contract and a new explicit product
+decision; the production path must not probe or retry it.
 
 ### 3.3 Rejected
 
@@ -99,7 +121,7 @@ The following remain non-authoritative:
 - whole-Plugin attachment alone;
 - a structured or textual Skill mention;
 - `$decision-recall`, `@zdecision`, Plugin URI text, or Prompt markers;
-- a model-authored confirmation value;
+- a model-authored confirmation value or direct call to an activation action;
 - a Hook inference that the user probably intended Recall;
 - a second controlled App Server process; and
 - post-hoc transcript or rollout parsing.
@@ -110,10 +132,11 @@ ZDecision remains one installed Plugin with independent Recall and Candidate
 capabilities.
 
 For the product flow, selecting ZDecision for an ordinary development request
-must route to the Recall entry instructions. Their first visible action is the
-activation MCP call. No Decision retrieval, injection, command, file change,
-delegation, Candidate operation, or substantive assistant answer may precede
-the confirmation result.
+must route to the Recall entry instructions. Their first workflow action is
+`show_zdecision_recall_confirmation`. No Decision retrieval, injection,
+command, file change, delegation, Candidate operation, or substantive
+assistant answer may precede the card. The model may then emit only a bounded
+instruction to use the card while the attempt is pending.
 
 Candidate refresh remains independent:
 
@@ -133,12 +156,12 @@ The installed Skill topology is fixed for this change:
   metadata are consolidated into `skills/zdecision`, so two Recall entries
   cannot compete.
 
-Native acceptance must prove that selecting the user-visible ZDecision entry
-loads `skills/zdecision` and causes the activation MCP call before substantive
+Real acceptance must prove that selecting the user-visible ZDecision entry
+loads `skills/zdecision` and causes the render tool call before substantive
 work. If the current host does not route that selection reliably, stop and
 present an explicit Recall-Skill interaction for user approval; do not infer
 the selection from Prompt text. Selection is only a trigger for displaying
-confirmation; the elicitation response is the authority.
+confirmation; the later app-only click is the authority.
 
 ## 5. Trusted activation flow
 
@@ -163,26 +186,31 @@ The private activation-attempt state is exactly
 `cancelled`, `failed`, or `committed`. It is separate from
 `RecallSessionState`. Before acceptance there is no Recall Session row.
 
+The render tool validates and freezes one canonical `RecallIntent` against the
+exact pending attempt. A conflicting render, intent replacement, repository
+change, expired attempt, or bundle change disables the card and cannot create
+a second current attempt for the same Session and Turn.
+
 The Hook must stop calling the current `bind_activation()` behavior that marks
 the Session active before the MCP operation succeeds.
 
-### 5.2 Confirmation
+### 5.2 Confirmation card action
 
-The MCP tool claims the exact pending operation and requests one elicitation.
-The operation prevents concurrent or repeated prompts. A retry may reclaim the
-same operation only when it can prove the original result was not committed;
-it may never turn an unknown result into acceptance.
+The app-only action tool claims the exact pending operation. The operation
+prevents concurrent or repeated decisions. A retry may read the same terminal
+receipt, but it may never replace the first choice or turn an unknown result
+into acceptance.
 
 Result mapping is exact:
 
-| Elicitation result | State and behavior |
+| Card/action result | State and behavior |
 | --- | --- |
-| `accept` | Record consent, continue the same operation into routing and Recall preparation |
+| app-only `enable` | Record consent, continue the same operation into routing and Recall preparation |
 | `decline` | Commit a declined receipt, create no Recall Session, release the Turn for ordinary work |
-| `cancel` | Commit a cancelled receipt, create no Recall Session, release the Turn for ordinary work |
+| dismiss/no click until expiry or SessionEnd | Retire as cancelled; create no Recall Session |
 | unavailable, timeout, malformed, transport loss | Commit or recover a non-authorizing failure; create no active Session |
 
-Decline and cancel are not permanent opt-outs. A later native user Turn may
+Decline and cancellation are not permanent opt-outs. A later native user Turn may
 create a new activation attempt only after the user explicitly selects
 ZDecision again. Lifecycle Hooks and ordinary Prompts do not retry it.
 
@@ -240,7 +268,8 @@ without Decisions.
 
 ## 7. Failure and privacy rules
 
-- No result other than `accept` may be interpreted as consent.
+- No result other than the app-only `enable` transition may be interpreted as
+  consent.
 - No active state may exist before acceptance and successful post-acceptance
   validation.
 - A failure before the user responds must not block ordinary development
@@ -248,49 +277,42 @@ without Decisions.
 - A failure after acceptance must not silently continue as if Decisions were
   applied. It follows the existing fail-closed Recall/bypass contract.
 - Confirmation receipts contain only opaque IDs, bounded state, timestamps,
-  schema/version, repository binding, and digests. They contain no Prompt,
+  schema/version, repository binding, and digests. The private pending attempt
+  may contain the normalized typed Recall Intent required for the asynchronous
+  action, but receipts contain only its digest. Neither contains a raw Prompt,
   transcript, PRD, source, diff, tool arguments/output, Decision text, or
   absolute Plugin path.
+- `recall-confirmation-v1.html` is part of the frozen installed Recall bundle.
+  A different UI byte sequence, resource URI, or action-tool contract cannot
+  reuse an existing attempt.
 - Central receives no confirmation Prompt, current task content, or Recall
   query. Identity and authorization continue to be derived server-side.
 
-## 8. Feasibility Gate E0
+## 8. Native Elicitation Gate E0 result
 
-Production behavior must not change until one minimal Desktop probe proves the
-actual native Elicitation contract for the installed Codex version.
+Gate E0 is complete and failed. The first Desktop `accept` case returned
+`cancel` without a usable human confirmation surface. Its hard stop prevented
+the remaining native Elicitation cases and production code was not changed.
 
-The probe uses a test-only MCP tool and runs exactly these cases:
+The failure permanently blocks native Elicitation for this implementation
+slice. It does not block the explicitly approved MCP Apps card path, and it
+must not be rerun or reinterpreted as an inline-card result.
 
-1. accept;
-2. decline;
-3. cancel/dismiss;
-4. client capability unavailable; and
-5. MCP process restart or transport loss while awaiting input.
+There is no replacement feasibility Gate. Implementation reuses the already
+proven Candidate MCP App transport and proceeds directly to one focused real
+Desktop acceptance after automated tests.
 
-The gate passes only if:
-
-- Codex visibly asks the human user instead of letting the model synthesize a
-  response;
-- the server receives distinct `accept`, `decline`, and `cancel` actions tied
-  to the exact originating tool request;
-- the model cannot call the continuation with a fabricated answer;
-- accept is returned at most once under replay/retry;
-- decline, cancel, timeout, restart, and unavailable never produce active
-  Recall state; and
-- no Prompt, transcript, source, diff, Decision text, credentials, or raw UI
-  response is persisted in the bounded acceptance report.
-
-If E0 fails, stop. Do not implement production activation and do not silently
-fall back to Plugin-selection proof, Prompt parsing, or a model-authored
-boolean. Present the MCP Apps app-only card fallback for explicit approval.
-
-## 9. Production verification after E0
+## 9. Production verification
 
 Focused automated tests must prove:
 
 - Hook binding creates only a pending activation attempt;
-- the MCP tool accepts no model-authored confirmation field;
-- exact accept/decline/cancel/failure mappings and idempotent recovery;
+- the render tool freezes one validated local Recall Intent and exposes the
+  attempt ID only through `_meta`;
+- the app-only action is absent from model-visible tools and accepts no
+  model-authored Session, repository, intent, or confirmation field;
+- exact enable/decline/dismiss/failure mappings and idempotent recovery;
+- load, retry, remount, restoration, and polling never call `enable`;
 - no Session is active before accepted post-validation commits;
 - no-selection and Candidate-only tasks display no confirmation and create no
   Recall state;
@@ -304,20 +326,26 @@ Focused automated tests must prove:
 
 Real Desktop acceptance must then prove the complete visible flow:
 
-`select ZDecision -> confirmation -> accept -> relevant published Decisions -> ordinary development`
+`select ZDecision -> inline confirmation card -> click enable -> relevant published Decisions -> ordinary development`
 
 and the negative flows:
 
 - no ZDecision selection -> no confirmation and no Recall;
 - Candidate refresh -> Candidate controls only;
-- decline/cancel -> ordinary development without Recall;
+- decline/dismiss -> ordinary development without Recall;
 - later explicit retry -> one new confirmation; and
 - accepted but ambiguous product -> visible clarification before Decision
   application.
 
 ## 10. Stop rule
 
-This design authorizes only Gate E0 planning and execution after user review.
-It does not authorize production implementation before E0 passes. After E0,
-write a replacement implementation plan scoped to the activation entry and
-reuse the existing retrieval and lifecycle architecture unchanged.
+This design authorizes one production implementation plan scoped to the
+inline confirmation entry, the accepted activation handoff, and their direct
+Desktop acceptance. Reuse the existing Candidate MCP App transport and Recall
+retrieval/lifecycle architecture unchanged.
+
+Do not create another temporary confirmation Gate, re-run native Elicitation,
+expand the retrieval algorithm, redesign Central, or start a new broad review.
+If the inline card cannot render, its app-only action is model-visible, or the
+real enable click cannot be bound to the current Session and enabled
+repository, stop and report that exact failure.
