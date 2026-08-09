@@ -55,7 +55,14 @@ class PluginContractTests(unittest.TestCase):
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
 
         self.assertEqual("zdecision", manifest["name"])
-        self.assertEqual("0.1.0", manifest["version"])
+        version = manifest["version"]
+        self.assertIsInstance(version, str)
+        base_version, separator, build_metadata = version.partition("+")
+        self.assertEqual("0.1.0", base_version)
+        if separator:
+            self.assertTrue(build_metadata.startswith("codex."))
+            self.assertTrue(build_metadata.removeprefix("codex."))
+            self.assertNotIn("+", build_metadata)
         self.assertEqual("./skills/", manifest["skills"])
         self.assertEqual("./.mcp.json", manifest["mcpServers"])
         self.assertNotIn("hooks", manifest)

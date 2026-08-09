@@ -1,6 +1,6 @@
 {
   "name": "zdecision",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260809110423",
   "description": "Inline Session-opt-in Recall confirmation; Candidate refresh remains explicit",
   "author": {
     "name": "ZDecision"
@@ -13,10 +13,12 @@
     "longDescription": "Session opt-in uses an inline confirmation before enabling the Recall gate; Candidate refresh remains explicit. Installing the Plugin does not automatically recall Decisions.",
     "developerName": "ZDecision",
     "category": "Productivity",
-    "capabilities": ["Read"],
+    "capabilities": [
+      "Read"
+    ],
     "defaultPrompt": [
-      "更新候选决策",
-      "使用 ZDecision Recall 应用相关正式决策"
+      "\u66f4\u65b0\u5019\u9009\u51b3\u7b56",
+      "\u4f7f\u7528 ZDecision Recall \u5e94\u7528\u76f8\u5173\u6b63\u5f0f\u51b3\u7b56"
     ]
   }
 }
