@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 import unittest
 from pathlib import Path
@@ -18,6 +19,9 @@ EXPECTED_LIFECYCLE_HOOKS = {
     "Stop",
     "SessionEnd",
 }
+PLUGIN_VERSION_PATTERN = re.compile(
+    r"0\.1\.0(?:\+codex\.[a-z0-9]+(?:-[a-z0-9]+)*)?"
+)
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -28,6 +32,12 @@ def load_json(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise AssertionError(f"{path} must contain a JSON object")
     return value
+
+
+def is_valid_plugin_version(version: object) -> bool:
+    return isinstance(version, str) and bool(
+        PLUGIN_VERSION_PATTERN.fullmatch(version)
+    )
 
 
 class PluginContractTests(unittest.TestCase):
@@ -55,19 +65,38 @@ class PluginContractTests(unittest.TestCase):
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
 
         self.assertEqual("zdecision", manifest["name"])
-        version = manifest["version"]
-        self.assertIsInstance(version, str)
-        base_version, separator, build_metadata = version.partition("+")
-        self.assertEqual("0.1.0", base_version)
-        if separator:
-            self.assertTrue(build_metadata.startswith("codex."))
-            self.assertTrue(build_metadata.removeprefix("codex."))
-            self.assertNotIn("+", build_metadata)
+        self.assertTrue(is_valid_plugin_version(manifest["version"]))
         self.assertEqual("./skills/", manifest["skills"])
         self.assertEqual("./.mcp.json", manifest["mcpServers"])
         self.assertNotIn("hooks", manifest)
         self.assertTrue((PLUGIN_ROOT / "hooks" / "hooks.json").is_file())
         self.assertFalse((PLUGIN_ROOT / "AGENTS.md").exists())
+
+    def test_manifest_version_rejects_invalid_cachebuster_mutations(self) -> None:
+        invalid_versions = (
+            "0.2.0+codex.valid",
+            "0.1.0+other.valid",
+            "0.1.0+codex.first+codex.second",
+            "0.1.0+codex.foo.bar",
+            "0.1.0+codex.UPPER",
+            "0.1.0+codex.-leading",
+            "0.1.0+codex.trailing-",
+            "0.1.0+codex.repeated--hyphen",
+            "0.1.0+codex.",
+        )
+
+        for version in invalid_versions:
+            with self.subTest(version=version):
+                self.assertFalse(is_valid_plugin_version(version))
+
+    def test_manifest_version_allows_optional_sanitized_cachebuster(self) -> None:
+        for version in (
+            "0.1.0",
+            "0.1.0+codex.a",
+            "0.1.0+codex.release-20260809",
+        ):
+            with self.subTest(version=version):
+                self.assertTrue(is_valid_plugin_version(version))
 
     def test_bundled_mcp_invokes_the_lazy_local_agent_entrypoint(self) -> None:
         document = load_json(PLUGIN_ROOT / ".mcp.json")
