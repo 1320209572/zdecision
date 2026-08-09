@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -136,6 +137,7 @@ class RecallMcpTools:
         evidence_gateway_factory: Callable[[], ActiveTurnEvidenceGateway]
         | None = None,
         recall_skill_path: Path | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.host_store = host_store
         self.provider = provider
@@ -147,7 +149,51 @@ class RecallMcpTools:
             if recall_skill_path is None
             else Path(recall_skill_path).resolve(strict=False)
         )
+        self.clock = clock or (lambda: datetime.now(UTC))
         self._ensure_receipt_schema()
+
+    def show_recall_confirmation(
+        self, *, activation_attempt_id: str, ui_digest: str
+    ) -> dict[str, object]:
+        """Freeze the card shown for one Hook-owned confirmation attempt."""
+
+        attempt = self._confirmation_attempt(activation_attempt_id)
+        if attempt is None or not _valid_ui_digest(ui_digest):
+            return _blocked("invalid_confirmation")
+        if attempt.state != "pending_confirmation":
+            return _confirmation_output(attempt)
+        try:
+            attached = self.host_store.attach_activation_card(
+                attempt.attempt_id, ui_digest=ui_digest
+            )
+        except (OSError, sqlite3.Error, RecallGateConflict, ValueError):
+            return _blocked("invalid_confirmation")
+        return _confirmation_output(attached)
+
+    def decide_recall_confirmation(
+        self,
+        *,
+        activation_attempt_id: str,
+        action: str,
+        current_ui_digest: str,
+    ) -> dict[str, object]:
+        """Commit a user confirmation without routing, retrieval, or provider work."""
+
+        attempt = self._confirmation_attempt(activation_attempt_id)
+        if (
+            attempt is None
+            or action not in ("enable", "decline")
+            or not _valid_ui_digest(current_ui_digest)
+            or attempt.ui_digest != current_ui_digest
+        ):
+            return _blocked("invalid_confirmation")
+        try:
+            decided = self.host_store.decide_activation_attempt(
+                attempt.attempt_id, action=action, now=self.clock()
+            )
+        except (OSError, sqlite3.Error, RecallGateConflict, ValueError):
+            return _blocked("invalid_confirmation")
+        return _confirmation_output(decided)
 
     def activate_zdecision_recall(
         self, *, activation_binding_id: str, intent: object
@@ -186,6 +232,23 @@ class RecallMcpTools:
             activation=True,
             invoke=lambda: self.provider.activate(parsed),
         )
+
+    def _confirmation_attempt(self, attempt_id: object):
+        if not _valid_binding_id(attempt_id):
+            return None
+        try:
+            attempt = self.host_store.get_activation_attempt(attempt_id)
+            if attempt is None or os.path.normpath(attempt.cwd) != self.cwd:
+                return None
+            if (
+                attempt.plugin_root is not None
+                and self.host_store.bound_recall_skill_path("attempt", attempt.attempt_id)
+                is None
+            ):
+                return None
+            return attempt
+        except (OSError, sqlite3.Error, RecallGateConflict, ValueError):
+            return None
 
     def _active_turn_barrier_proven(
         self,
@@ -670,6 +733,34 @@ def _valid_binding_id(value: object) -> bool:
         and 1 <= len(value) <= 256
         and "\x00" not in value
     )
+
+
+def _valid_ui_digest(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _confirmation_output(attempt: object) -> dict[str, object]:
+    state = getattr(attempt, "state", None)
+    attempt_id = getattr(attempt, "attempt_id", None)
+    repository_id = getattr(attempt, "repository_id", None)
+    repository_display_name = getattr(attempt, "repository_display_name", None)
+    if not all(
+        isinstance(value, str)
+        for value in (state, attempt_id, repository_id, repository_display_name)
+    ):
+        raise ValueError("confirmation attempt is invalid")
+    return {
+        "state": state,
+        "_meta": {
+            "zdecision/activation_attempt_id": attempt_id,
+            "zdecision/repository_id": repository_id,
+            "zdecision/repository_display_name": repository_display_name,
+        },
+    }
 
 
 def _valid_result(

@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 import warnings
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -244,7 +244,76 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             live_acceptance=live_acceptance,
             evidence_gateway_factory=evidence_gateway_factory,
             recall_skill_path=self.recall_skill_path,
+            clock=lambda: NOW,
         )
+
+    def confirmation_attempt(self) -> str:
+        attempt = self.store.create_activation_attempt(
+            session_id=PRIVATE_SESSION,
+            turn_id=PRIVATE_TURN,
+            cwd=self.cwd,
+            repository_id=REPOSITORY_ID,
+            repository_display_name="repository",
+            attempt_id="activation_" + "3" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(self.installed_plugin_root),
+        )
+        return attempt.attempt_id
+
+    def test_confirmation_is_bounded_idempotent_and_never_calls_provider(self) -> None:
+        """This catches a confirmation click invoking Recall retrieval or leaking host data."""
+
+        attempt_id = self.confirmation_attempt()
+        provider = StaticProvider(_probe())
+        tools = self.tools(provider)
+
+        rendered = tools.show_recall_confirmation(
+            activation_attempt_id=attempt_id, ui_digest="a" * 64
+        )
+        declined = tools.decide_recall_confirmation(
+            activation_attempt_id=attempt_id,
+            action="decline",
+            current_ui_digest="a" * 64,
+        )
+        replay = tools.decide_recall_confirmation(
+            activation_attempt_id=attempt_id,
+            action="decline",
+            current_ui_digest="a" * 64,
+        )
+
+        self.assertEqual("pending_confirmation", rendered["state"])
+        self.assertEqual("declined", declined["state"])
+        self.assertEqual(declined, replay)
+        self.assertEqual(0, provider.activation_calls)
+        self.assertEqual(0, provider.gate_calls)
+        self.assertIsNone(self.store.get_session(PRIVATE_SESSION))
+        self.assert_private_absent(rendered)
+
+    def test_confirmation_enable_creates_empty_consent_without_provider(self) -> None:
+        """This catches an enable click deriving an intent or starting retrieval."""
+
+        attempt_id = self.confirmation_attempt()
+        provider = StaticProvider(_probe())
+        tools = self.tools(provider)
+        tools.show_recall_confirmation(
+            activation_attempt_id=attempt_id, ui_digest="a" * 64
+        )
+
+        enabled = tools.decide_recall_confirmation(
+            activation_attempt_id=attempt_id,
+            action="enable",
+            current_ui_digest="a" * 64,
+        )
+        session = self.store.get_session(PRIVATE_SESSION)
+
+        self.assertEqual("committed", enabled["state"])
+        self.assertEqual("active", session.state)
+        self.assertEqual(0, session.intent_epoch)
+        self.assertIsNone(session.active_intent_digest)
+        self.assertIsNone(session.active_set_digest)
+        self.assertEqual(0, provider.activation_calls)
+        self.assertEqual(0, provider.gate_calls)
 
     def seed_pending_turn(self) -> None:
         self.bind_activation()

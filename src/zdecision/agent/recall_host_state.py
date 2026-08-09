@@ -16,6 +16,9 @@ from zdecision.recall.session import RecallSessionState, TurnGateResult
 
 
 TurnGateState = Literal["pending", "committed", "blocked"]
+ActivationAttemptState = Literal[
+    "pending_confirmation", "declined", "cancelled", "failed", "committed"
+]
 ContextSource = Literal["compact", "clear"]
 InternalThreadPurpose = Literal["capture", "reconciliation"]
 
@@ -31,6 +34,23 @@ class RecallSession:
     active_intent_digest: str | None
     active_set_digest: str | None
     last_gate_turn_id: str | None
+
+
+@dataclass(frozen=True)
+class RecallActivationAttempt:
+    attempt_id: str
+    session_id: str
+    turn_id: str
+    cwd: str
+    repository_id: str
+    repository_display_name: str
+    state: ActivationAttemptState
+    created_at: str
+    expires_at: str
+    plugin_root: str | None
+    plugin_bundle_digest: str | None
+    ui_digest: str | None
+    result_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +141,26 @@ class RecallHostStore:
                     created_at TEXT NOT NULL,
                     plugin_root TEXT,
                     plugin_bundle_digest TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS recall_activation_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    repository_display_name TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'pending_confirmation', 'declined', 'cancelled',
+                        'failed', 'committed'
+                    )),
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    plugin_root TEXT,
+                    plugin_bundle_digest TEXT,
+                    ui_digest TEXT,
+                    result_digest TEXT,
+                    UNIQUE(session_id, turn_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS recall_turn_gates (
@@ -233,6 +273,209 @@ class RecallHostStore:
             return None
         row = self._gate_for_turn(session, turn)
         return None if row is None else _gate(row)
+
+    def get_activation_attempt(
+        self, attempt_id: str
+    ) -> RecallActivationAttempt | None:
+        attempt = _text(attempt_id, "attempt_id")
+        row = self._connection.execute(
+            "SELECT * FROM recall_activation_attempts WHERE attempt_id = ?",
+            (attempt,),
+        ).fetchone()
+        return None if row is None else _activation_attempt(row)
+
+    def create_activation_attempt(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        cwd: str,
+        repository_id: str,
+        repository_display_name: str,
+        attempt_id: str,
+        now: datetime,
+        expires_at: datetime,
+        plugin_root: str | None,
+    ) -> RecallActivationAttempt:
+        """Freeze one host-rendered confirmation request without activating Recall."""
+
+        session = _text(session_id, "session_id")
+        turn = _text(turn_id, "turn_id")
+        working_directory = _absolute_path(cwd)
+        repository = _repository_id(repository_id)
+        display_name = _display_name(repository_display_name)
+        attempt = _text(attempt_id, "attempt_id")
+        created = _aware_utc(now, "now")
+        expiry = _aware_utc(expires_at, "expires_at")
+        if expiry <= created:
+            raise ValueError("expires_at is invalid")
+        installed_root, bundle_digest = _optional_installed_plugin_binding(plugin_root)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._is_internal_thread(session):
+                raise RecallGateConflict("internal threads are recall-disabled")
+            existing = self._connection.execute(
+                "SELECT * FROM recall_activation_attempts WHERE attempt_id = ?",
+                (attempt,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["session_id"] != session
+                    or existing["turn_id"] != turn
+                    or existing["cwd"] != working_directory
+                    or existing["repository_id"] != repository
+                    or existing["repository_display_name"] != display_name
+                    or existing["expires_at"] != _timestamp(expiry)
+                    or existing["plugin_root"] != installed_root
+                    or existing["plugin_bundle_digest"] != bundle_digest
+                ):
+                    raise RecallGateConflict("activation attempt is already frozen")
+                result = _activation_attempt(existing)
+                self._connection.commit()
+                return result
+            if self._session_row(session) is not None:
+                raise RecallGateConflict("session already has recall consent")
+            current = self._connection.execute(
+                """
+                SELECT attempt_id FROM recall_activation_attempts
+                WHERE session_id = ? AND turn_id = ?
+                """,
+                (session, turn),
+            ).fetchone()
+            if current is not None:
+                raise RecallGateConflict("turn already has an activation attempt")
+            self._connection.execute(
+                """
+                INSERT INTO recall_activation_attempts(
+                    attempt_id, session_id, turn_id, cwd, repository_id,
+                    repository_display_name, state, created_at, expires_at,
+                    plugin_root, plugin_bundle_digest, ui_digest, result_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending_confirmation', ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    attempt, session, turn, working_directory, repository, display_name,
+                    _timestamp(created), _timestamp(expiry), installed_root, bundle_digest,
+                ),
+            )
+            result = _activation_attempt(
+                self._connection.execute(
+                    "SELECT * FROM recall_activation_attempts WHERE attempt_id = ?",
+                    (attempt,),
+                ).fetchone()
+            )
+            self._connection.commit()
+            return result
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def attach_activation_card(
+        self, attempt_id: str, *, ui_digest: str
+    ) -> RecallActivationAttempt:
+        """Bind a pending trusted attempt to exactly one rendered card."""
+
+        attempt = _text(attempt_id, "attempt_id")
+        digest = _digest(ui_digest, "ui_digest")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._required_activation_attempt(attempt)
+            if row["ui_digest"] is None:
+                if row["state"] != "pending_confirmation":
+                    raise RecallGateConflict("activation attempt is terminal")
+                self._connection.execute(
+                    "UPDATE recall_activation_attempts SET ui_digest = ? WHERE attempt_id = ?",
+                    (digest, attempt),
+                )
+            elif row["ui_digest"] != digest:
+                raise RecallGateConflict("activation card is already frozen")
+            result = _activation_attempt(self._required_activation_attempt(attempt))
+            self._connection.commit()
+            return result
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def decide_activation_attempt(
+        self, attempt_id: str, *, action: str, now: datetime
+    ) -> RecallActivationAttempt:
+        """Atomically record an app decision and, for enable, create consent."""
+
+        attempt = _text(attempt_id, "attempt_id")
+        if action not in ("enable", "decline"):
+            raise ValueError("action is invalid")
+        decided = _aware_utc(now, "now")
+        result_digest = hashlib.sha256(
+            canonical_json_bytes({"action": action})
+        ).hexdigest()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._required_activation_attempt(attempt)
+            expected_state = "committed" if action == "enable" else "declined"
+            if row["state"] != "pending_confirmation":
+                if row["state"] == expected_state and row["result_digest"] == result_digest:
+                    result = _activation_attempt(row)
+                    self._connection.commit()
+                    return result
+                raise RecallGateConflict("activation attempt decision is already frozen")
+            if row["ui_digest"] is None:
+                raise RecallGateConflict("activation card was not rendered")
+            if decided >= _parse_timestamp(row["expires_at"]):
+                self._connection.execute(
+                    "UPDATE recall_activation_attempts SET state = 'failed', result_digest = ? WHERE attempt_id = ?",
+                    (hashlib.sha256(canonical_json_bytes({"action": "expired"})).hexdigest(), attempt),
+                )
+                self._connection.commit()
+                raise RecallGateConflict("activation attempt expired")
+            if action == "enable":
+                if self._session_row(row["session_id"]) is not None:
+                    raise RecallGateConflict("session already has recall consent")
+                self._connection.execute(
+                    """
+                    INSERT INTO recall_sessions(
+                        session_id, state, authorization_turn_id, cwd,
+                        context_epoch, intent_epoch, active_intent_digest,
+                        active_set_digest, last_gate_turn_id, ended_at, resumed_at
+                    ) VALUES (?, 'active', ?, ?, 0, 0, NULL, NULL, NULL, NULL, NULL)
+                    """,
+                    (row["session_id"], row["turn_id"], row["cwd"]),
+                )
+            self._connection.execute(
+                "UPDATE recall_activation_attempts SET state = ?, result_digest = ? WHERE attempt_id = ?",
+                (expected_state, result_digest, attempt),
+            )
+            result = _activation_attempt(self._required_activation_attempt(attempt))
+            self._connection.commit()
+            return result
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def retire_activation_attempts(
+        self, session_id: str, *, now: datetime
+    ) -> tuple[RecallActivationAttempt, ...]:
+        """Cancel outstanding confirmation cards when their native Session ends."""
+
+        session = _text(session_id, "session_id")
+        _aware_utc(now, "now")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                """
+                UPDATE recall_activation_attempts
+                SET state = 'cancelled', result_digest = ?
+                WHERE session_id = ? AND state = 'pending_confirmation'
+                """,
+                (hashlib.sha256(canonical_json_bytes({"action": "cancelled"})).hexdigest(), session),
+            )
+            rows = self._connection.execute(
+                "SELECT * FROM recall_activation_attempts WHERE session_id = ? ORDER BY created_at",
+                (session,),
+            ).fetchall()
+            self._connection.commit()
+            return tuple(_activation_attempt(row) for row in rows)
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def bind_activation(
         self,
@@ -406,6 +649,9 @@ class RecallHostStore:
         if binding_kind == "activation":
             table = "recall_activation_bindings"
             id_column = "binding_id"
+        elif binding_kind == "attempt":
+            table = "recall_activation_attempts"
+            id_column = "attempt_id"
         elif binding_kind == "turn":
             table = "recall_turn_gates"
             id_column = "gate_id"
@@ -811,6 +1057,15 @@ class RecallHostStore:
             "SELECT * FROM recall_sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
 
+    def _required_activation_attempt(self, attempt_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT * FROM recall_activation_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise RecallGateConflict("activation attempt does not exist")
+        return row
+
     def _required_session(self, session_id: str) -> RecallSession:
         row = self._session_row(session_id)
         if row is None:
@@ -843,6 +1098,24 @@ def _session(row: sqlite3.Row) -> RecallSession:
         active_intent_digest=row["active_intent_digest"],
         active_set_digest=row["active_set_digest"],
         last_gate_turn_id=row["last_gate_turn_id"],
+    )
+
+
+def _activation_attempt(row: sqlite3.Row) -> RecallActivationAttempt:
+    return RecallActivationAttempt(
+        attempt_id=row["attempt_id"],
+        session_id=row["session_id"],
+        turn_id=row["turn_id"],
+        cwd=row["cwd"],
+        repository_id=row["repository_id"],
+        repository_display_name=row["repository_display_name"],
+        state=row["state"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        plugin_root=row["plugin_root"],
+        plugin_bundle_digest=row["plugin_bundle_digest"],
+        ui_digest=row["ui_digest"],
+        result_digest=row["result_digest"],
     )
 
 
@@ -936,6 +1209,29 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError(f"{name} is invalid")
     return value
+
+
+def _repository_id(value: object) -> str:
+    repository = _text(value, "repository_id")
+    if len(repository) != 37 or not repository.startswith("repo_"):
+        raise ValueError("repository_id is invalid")
+    if any(character not in "0123456789abcdef" for character in repository[5:]):
+        raise ValueError("repository_id is invalid")
+    return repository
+
+
+def _display_name(value: object) -> str:
+    display_name = _text(value, "repository_display_name")
+    if len(display_name) > 255 or "/" in display_name or "\\" in display_name:
+        raise ValueError("repository_display_name is invalid")
+    return display_name
+
+
+def _digest(value: object, name: str) -> str:
+    digest = _text(value, name)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{name} is invalid")
+    return digest
 
 
 def _optional_text(value: object, name: str) -> str | None:
@@ -1050,3 +1346,11 @@ def _aware_utc(value: object, name: str) -> datetime:
 
 def _timestamp(value: datetime) -> str:
     return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RecallGateConflict("stored timestamp is invalid") from error
+    return _aware_utc(parsed, "stored timestamp")

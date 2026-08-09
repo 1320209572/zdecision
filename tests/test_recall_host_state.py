@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from zdecision.agent.recall_host_state import (
@@ -104,6 +104,104 @@ class RecallHostStoreTests(unittest.TestCase):
         """This catches creating recall state before a trusted activation."""
 
         self.assertIsNone(self.store.get_session(SESSION_ID))
+
+    def test_confirmation_attempt_commits_active_consent_only_after_enable(self) -> None:
+        """This catches a rendered confirmation activating Recall before consent."""
+
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "2" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+
+        self.assertEqual("pending_confirmation", attempt.state)
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+        self.assertEqual(
+            "a" * 64,
+            self.store.attach_activation_card(
+                attempt.attempt_id, ui_digest="a" * 64
+            ).ui_digest,
+        )
+        committed = self.store.decide_activation_attempt(
+            attempt.attempt_id, action="enable", now=NOW
+        )
+        session = self.store.get_session(SESSION_ID)
+
+        self.assertEqual("committed", committed.state)
+        self.assertIsNotNone(session)
+        self.assertEqual("active", session.state)
+        self.assertEqual(0, session.intent_epoch)
+        self.assertIsNone(session.active_intent_digest)
+        self.assertIsNone(session.active_set_digest)
+
+    def test_confirmation_attempt_freezes_card_and_terminal_choice(self) -> None:
+        """This catches a retry replacing the card digest or the user's first choice."""
+
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "4" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+        self.assertEqual(
+            attempt,
+            self.store.create_activation_attempt(
+                session_id=SESSION_ID,
+                turn_id=TURN_ID,
+                cwd="/tmp/recall",
+                repository_id="repo_" + "1" * 32,
+                repository_display_name="recall",
+                attempt_id="activation_" + "4" * 32,
+                now=NOW,
+                expires_at=NOW + timedelta(minutes=15),
+                plugin_root=None,
+            ),
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+        with self.assertRaises(RecallGateConflict):
+            self.store.attach_activation_card(attempt.attempt_id, ui_digest="b" * 64)
+        self.store.decide_activation_attempt(
+            attempt.attempt_id, action="decline", now=NOW
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.store.decide_activation_attempt(
+                attempt.attempt_id, action="enable", now=NOW
+            )
+
+    def test_session_end_retires_pending_confirmation_without_consent(self) -> None:
+        """This catches a closed Session retaining an actionable confirmation card."""
+
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id="repo_" + "1" * 32,
+            repository_display_name="recall",
+            attempt_id="activation_" + "5" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+
+        retired = self.store.retire_activation_attempts(SESSION_ID, now=NOW)
+
+        self.assertEqual("cancelled", retired[0].state)
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+        with self.assertRaises(RecallGateConflict):
+            self.store.decide_activation_attempt(
+                attempt.attempt_id, action="enable", now=NOW
+            )
 
     def test_activation_is_frozen_to_its_trusted_binding(self) -> None:
         """This catches activation replay changing its Session, Turn, or CWD."""

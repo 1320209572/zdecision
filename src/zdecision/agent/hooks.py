@@ -29,12 +29,13 @@ UNAVAILABLE_HOOK_OUTPUT = {
     "systemMessage": "ZDecision could not record this lifecycle event."
 }
 CONTROL_BINDING_TOOL = "mcp__zdecision_local__show_zdecision_update"
-ACTIVATE_RECALL_TOOL = "mcp__zdecision_local__activate_zdecision_recall"
+SHOW_RECALL_CONFIRMATION_TOOL = "mcp__zdecision_local__show_zdecision_recall_confirmation"
 TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
 RECALL_MUTATION_MATCHER = "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
 _CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _HOOK_STORE_TIMEOUT_SECONDS = 0.05
+_CONFIRMATION_LIFETIME = timedelta(minutes=15)
 _ACTIVE_GATE_INSTRUCTION = (
     "ZDecision recall is active. Call gate_zdecision_turn before substantive "
     "output or development tools in this Turn."
@@ -54,6 +55,7 @@ def handle_hook(
     control_store: ControlBindingStore | None = None,
     control_id_factory: Callable[[], str] | None = None,
     recall_store: RecallHostStore | None = None,
+    activation_attempt_id_factory: Callable[[], str] | None = None,
     activation_binding_id_factory: Callable[[], str] | None = None,
     turn_gate_id_factory: Callable[..., str] | None = None,
     session_lease_seconds: float = 120.0,
@@ -71,7 +73,9 @@ def handle_hook(
                 control_store=control_store,
                 control_id_factory=control_id_factory,
                 recall_store=recall_store,
-                activation_binding_id_factory=activation_binding_id_factory,
+                activation_attempt_id_factory=(
+                    activation_attempt_id_factory or activation_binding_id_factory
+                ),
                 turn_gate_id_factory=turn_gate_id_factory,
             )
         observed_at = clock()
@@ -139,6 +143,7 @@ def handle_pre_tool_hook(
     control_store: ControlBindingStore | None = None,
     control_id_factory: Callable[[], str] | None = None,
     recall_store: RecallHostStore | None = None,
+    activation_attempt_id_factory: Callable[[], str] | None = None,
     activation_binding_id_factory: Callable[[], str] | None = None,
     turn_gate_id_factory: Callable[..., str] | None = None,
 ) -> HookResponse:
@@ -154,7 +159,7 @@ def handle_pre_tool_hook(
             control_store=control_store,
             control_id_factory=control_id_factory,
         )
-    recall_binding = tool_name in (ACTIVATE_RECALL_TOOL, TURN_GATE_TOOL)
+    recall_binding = tool_name in (SHOW_RECALL_CONFIRMATION_TOOL, TURN_GATE_TOOL)
     owned_store: RecallHostStore | None = None
     try:
         store = recall_store
@@ -170,7 +175,9 @@ def handle_pre_tool_hook(
                 clock=clock,
                 repository_resolver=repository_resolver,
                 recall_store=store,
-                activation_binding_id_factory=activation_binding_id_factory,
+                activation_attempt_id_factory=(
+                    activation_attempt_id_factory or activation_binding_id_factory
+                ),
                 turn_gate_id_factory=turn_gate_id_factory,
             )
         return guard_active_turn_tool(value, database=database, recall_store=store)
@@ -193,7 +200,7 @@ def bind_recall_tool_call(
     clock: Callable[[], datetime | str],
     repository_resolver: RepositoryResolver | None,
     recall_store: RecallHostStore,
-    activation_binding_id_factory: Callable[[], str] | None,
+    activation_attempt_id_factory: Callable[[], str] | None,
     turn_gate_id_factory: Callable[..., str] | None,
 ) -> HookResponse:
     """Replace model-authored recall coordinates with one trusted binding."""
@@ -206,23 +213,30 @@ def bind_recall_tool_call(
         )
         plugin_root = _trusted_plugin_root()
         tool_name = value.get("tool_name")
-        if tool_name == ACTIVATE_RECALL_TOOL:
-            binding_id = (
-                activation_binding_id_factory()
-                if activation_binding_id_factory is not None
+        if tool_name == SHOW_RECALL_CONFIRMATION_TOOL:
+            attempt_id = (
+                activation_attempt_id_factory()
+                if activation_attempt_id_factory is not None
                 else _opaque_id("activation", session_id, turn_id, cwd)
             )
-            binding_id = _safe_generated_identifier(binding_id)
-            recall_store.bind_activation(
+            attempt_id = _safe_generated_identifier(attempt_id)
+            repository = (repository_resolver or RepositoryResolver()).resolve(cwd)
+            if repository is None:
+                raise ValueError("repository is unresolved")
+            now = _parse_time(_format_time(clock()))
+            recall_store.create_activation_attempt(
                 session_id=session_id,
                 turn_id=turn_id,
                 cwd=cwd,
-                binding_id=binding_id,
-                now=_parse_time(_format_time(clock())),
+                repository_id=repository.repository_id,
+                repository_display_name=Path(repository.worktree_root).name,
+                attempt_id=attempt_id,
+                now=now,
+                expires_at=now + _CONFIRMATION_LIFETIME,
                 plugin_root=plugin_root,
             )
             return _pre_tool_response(
-                "allow", updated_input={"activation_binding_id": binding_id}
+                "allow", updated_input={"activation_attempt_id": attempt_id}
             )
         if tool_name != TURN_GATE_TOOL:
             raise ValueError("recall tool is invalid")
@@ -308,6 +322,7 @@ def _handle_recall_lifecycle(
             store = owned_store
         session = store.get_session(invocation.session_id)
         if invocation.event_name == "SessionEnd":
+            store.retire_activation_attempts(invocation.session_id, now=now)
             if session is not None:
                 store.mark_dormant(invocation.session_id, ended_at=now)
             return {}

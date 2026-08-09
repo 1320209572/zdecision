@@ -22,7 +22,7 @@ from zdecision.recall.session import TurnGateResult
 
 
 NOW = datetime(2026, 8, 6, 4, 0, tzinfo=UTC)
-ACTIVATE_RECALL_TOOL = "mcp__zdecision_local__activate_zdecision_recall"
+ACTIVATE_RECALL_TOOL = "mcp__zdecision_local__show_zdecision_recall_confirmation"
 TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
 ACTIVATION_ID = "activation-hook-bound"
 GATE_ID = "gate-hook-bound"
@@ -211,6 +211,13 @@ class RecallHookGateTests(unittest.TestCase):
             ACTIVATE_RECALL_TOOL, session_id=session_id, turn_id=turn_id
         )
         self.assertEqual("allow", self._decision(response))
+        attempt_id = response.output["hookSpecificOutput"]["updatedInput"][
+            "activation_attempt_id"
+        ]
+        self.recall_store.attach_activation_card(attempt_id, ui_digest="a" * 64)
+        self.recall_store.decide_activation_attempt(
+            attempt_id, action="enable", now=NOW
+        )
         return response
 
     @staticmethod
@@ -272,22 +279,19 @@ class RecallHookGateTests(unittest.TestCase):
         response = self._pre_tool(ACTIVATE_RECALL_TOOL)
         self.assertEqual("deny", self._decision(response))
 
-    def test_activation_replaces_model_coordinates_with_host_binding_only(self) -> None:
+    def test_confirmation_render_replaces_model_coordinates_with_host_attempt_only(self) -> None:
         self._prompt()
 
         response = self._pre_tool(ACTIVATE_RECALL_TOOL)
 
         self.assertEqual(
-            {"activation_binding_id": ACTIVATION_ID},
+            {"activation_attempt_id": ACTIVATION_ID},
             response.output.get("hookSpecificOutput", {}).get("updatedInput"),
         )
-        self.assertEqual("active", self.recall_store.get_session("session-a").state)
-        self.assertEqual(
-            (self.plugin_root / "skills/decision-recall/SKILL.md").resolve(),
-            self.recall_store.bound_recall_skill_path(
-                "activation", ACTIVATION_ID
-            ),
-        )
+        self.assertIsNone(self.recall_store.get_session("session-a"))
+        attempt = self.recall_store.get_activation_attempt(ACTIVATION_ID)
+        self.assertEqual("pending_confirmation", attempt.state)
+        self.assertEqual(self.repository.name, attempt.repository_display_name)
         self.assert_private_values_absent(response)
 
     def test_activation_denies_an_unverified_plugin_root(self) -> None:
