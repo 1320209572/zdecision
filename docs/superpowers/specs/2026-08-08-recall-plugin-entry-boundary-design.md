@@ -1,7 +1,9 @@
 # ZDecision Recall Explicit-Skill Entry Boundary Design
 
-Status: Approved for Gate 0A/0B planning and execution on 2026-08-08. The
-contingent activation implementation remains gated on both probes passing.
+Status: Superseded on 2026-08-09 by
+`2026-08-09-recall-user-confirmation-entry-design.md`. Gate 0A remains useful
+historical failure evidence, but its App Server and Skill-selection proof are
+no longer an implementation prerequisite.
 
 Date: 2026-08-08
 
