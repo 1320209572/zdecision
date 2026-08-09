@@ -1,6 +1,8 @@
 # ZDecision Recall User-Confirmation Entry Design
 
-Status: Draft for user review.
+Status: Approved for Gate E0 planning and execution on 2026-08-09.
+Production activation remains gated on E0 passing and a separately reviewed
+implementation plan.
 
 Date: 2026-08-09
 
@@ -229,7 +231,10 @@ without Decisions.
   on a native user Turn.
 - **Subagent or internal Thread:** remains recall-disabled and cannot inherit or
   obtain confirmation.
-- **SessionEnd:** close the Recall Session and retire pending attempts.
+- **SessionEnd:** move an active Session to the existing `dormant` state and
+  retire pending attempts. A trusted resume revalidates and reuses consent.
+- **Terminal close:** move the Recall Session to `closed`; a later new Session
+  requires new confirmation.
 - **Explicit bypass:** preserve the approved bypass semantics. Re-enabling
   later requires a new explicit selection and confirmation.
 
