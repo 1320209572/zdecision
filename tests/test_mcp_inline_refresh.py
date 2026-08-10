@@ -879,7 +879,6 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             {
                 "update-candidates-v1.html",
                 "recall-confirmation-v1.html",
-                "recall-host-capability-probe-v1.html",
             },
             static_files,
         )

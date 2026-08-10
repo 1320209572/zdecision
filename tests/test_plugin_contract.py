@@ -9,7 +9,6 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision"
-PROBE_PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision-host-probe"
 MARKETPLACE_PATH = REPOSITORY_ROOT / ".agents" / "plugins" / "marketplace.json"
 EXPECTED_LIFECYCLE_HOOKS = {
     "SessionStart",
@@ -42,7 +41,7 @@ def is_valid_plugin_version(version: object) -> bool:
 
 
 class PluginContractTests(unittest.TestCase):
-    def test_repository_marketplace_exposes_production_and_probe_plugins(
+    def test_repository_marketplace_exposes_production_plugin(
         self,
     ) -> None:
         marketplace = load_json(MARKETPLACE_PATH)
@@ -51,7 +50,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(
             {"displayName": "ZDecision Local"}, marketplace["interface"]
         )
-        self.assertEqual(2, len(marketplace["plugins"]))
+        self.assertEqual(1, len(marketplace["plugins"]))
         plugin = marketplace["plugins"][0]
         self.assertEqual(
             {
@@ -68,60 +67,6 @@ class PluginContractTests(unittest.TestCase):
             },
             plugin,
         )
-        probe = marketplace["plugins"][1]
-        self.assertEqual("zdecision-host-probe", probe["name"])
-        self.assertEqual(
-            {"source": "local", "path": "./plugins/zdecision-host-probe"},
-            probe["source"],
-        )
-        self.assertEqual(
-            {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
-            probe["policy"],
-        )
-        self.assertEqual("Productivity", probe["category"])
-
-    def test_temporary_probe_plugin_has_only_one_isolated_mcp_server(self) -> None:
-        manifest = load_json(
-            PROBE_PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
-        )
-        document = load_json(PROBE_PLUGIN_ROOT / ".mcp.json")
-
-        self.assertEqual("zdecision-host-probe", manifest["name"])
-        self.assertEqual(
-            "0.1.0+codex.host-probe-20260810",
-            manifest["version"],
-        )
-        self.assertEqual("./.mcp.json", manifest["mcpServers"])
-        self.assertNotIn("skills", manifest)
-        self.assertNotIn("hooks", manifest)
-        self.assertEqual({"mcpServers"}, set(document))
-        servers = document["mcpServers"]
-        self.assertEqual({"zdecision-host-probe"}, set(servers))
-        self.assertEqual(
-            "zdecision-agent",
-            servers["zdecision-host-probe"]["command"],
-        )
-        self.assertEqual(
-            ["host-probe-mcp"],
-            servers["zdecision-host-probe"]["args"],
-        )
-        serialized = json.dumps(
-            {"manifest": manifest, "mcp": document},
-            sort_keys=True,
-        ).lower()
-        for forbidden in (
-            "device_token",
-            "central_url",
-            "organization_id",
-            "repository_id",
-            "session_id",
-            "turn_id",
-            "decision_id",
-            "candidate_id",
-        ):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, serialized)
-
     def test_manifest_points_only_to_bundled_components(self) -> None:
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
 
