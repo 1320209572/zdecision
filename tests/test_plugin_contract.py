@@ -41,9 +41,7 @@ def is_valid_plugin_version(version: object) -> bool:
 
 
 class PluginContractTests(unittest.TestCase):
-    def test_repository_marketplace_exposes_production_plugin(
-        self,
-    ) -> None:
+    def test_repository_marketplace_exposes_one_available_plugin(self) -> None:
         marketplace = load_json(MARKETPLACE_PATH)
 
         self.assertEqual("zdecision-local", marketplace["name"])
@@ -52,21 +50,17 @@ class PluginContractTests(unittest.TestCase):
         )
         self.assertEqual(1, len(marketplace["plugins"]))
         plugin = marketplace["plugins"][0]
+        self.assertEqual("zdecision", plugin["name"])
         self.assertEqual(
-            {
-                "name": "zdecision",
-                "source": {
-                    "source": "local",
-                    "path": "./plugins/zdecision",
-                },
-                "policy": {
-                    "installation": "AVAILABLE",
-                    "authentication": "ON_INSTALL",
-                },
-                "category": "Productivity",
-            },
-            plugin,
+            {"source": "local", "path": "./plugins/zdecision"},
+            plugin["source"],
         )
+        self.assertEqual(
+            {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+            plugin["policy"],
+        )
+        self.assertEqual("Productivity", plugin["category"])
+
     def test_manifest_points_only_to_bundled_components(self) -> None:
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
 

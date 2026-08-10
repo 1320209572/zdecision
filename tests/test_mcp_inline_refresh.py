@@ -876,10 +876,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             ).glob("*.html")
         }
         self.assertEqual(
-            {
-                "update-candidates-v1.html",
-                "recall-confirmation-v1.html",
-            },
+            {"update-candidates-v1.html", "recall-confirmation-v1.html"},
             static_files,
         )
 
