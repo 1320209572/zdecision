@@ -955,6 +955,53 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(0, provider.gate_calls)
 
+    def test_gate_ignores_prior_failed_attempts_before_current_bound_call(
+        self,
+    ) -> None:
+        """This catches argument-validation retries poisoning the valid Gate call."""
+
+        self.seed_pending_turn()
+        provider = StaticProvider(_probe("probe-turn"))
+        evidence = self.active_evidence(
+            ordered_items=(
+                TurnItemEvidence("hookPrompt", "hook-current"),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "gate-invalid-string",
+                    tool_name="gate_zdecision_turn",
+                    operation_id=None,
+                ),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "gate-invalid-object",
+                    tool_name="gate_zdecision_turn",
+                    operation_id=None,
+                ),
+                TurnItemEvidence(
+                    "mcpToolCall",
+                    "gate-current",
+                    tool_name="gate_zdecision_turn",
+                    operation_id=TURN_GATE,
+                ),
+            )
+        )
+        tools = self.tools(
+            provider,
+            evidence_gateway_factory=lambda: StaticEvidenceGateway(evidence),
+        )
+
+        result = tools.gate_zdecision_turn(
+            turn_gate_id=TURN_GATE,
+            intent=_intent(),
+        )
+
+        self.assertEqual("active", result["state"])
+        self.assertEqual(1, provider.gate_calls)
+        self.assertEqual(
+            "committed",
+            self.store.get_turn_gate(PRIVATE_SESSION, PRIVATE_TURN).state,
+        )
+
     def test_gate_uses_the_exact_hook_bound_plugin_bundle(self) -> None:
         """This catches production gate calls depending on MCP cwd or environment."""
 

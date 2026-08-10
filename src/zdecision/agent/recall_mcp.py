@@ -310,13 +310,13 @@ class RecallMcpTools:
         matching_items = [
             (index, item)
             for index, item in enumerate(evidence.ordered_items)
-            if item.item_type == "mcpToolCall" and item.tool_name == tool_name
+            if item.item_type == "mcpToolCall"
+            and item.tool_name == tool_name
+            and item.operation_id == operation_id
         ]
         if len(matching_items) != 1:
             return False
-        target_index, target = matching_items[0]
-        if target.operation_id != operation_id:
-            return False
+        target_index = matching_items[0][0]
         if not any(
             item.item_type == "hookPrompt"
             for item in evidence.ordered_items[:target_index]
