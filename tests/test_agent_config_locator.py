@@ -82,6 +82,34 @@ class AgentConfigLocatorTests(unittest.TestCase):
             cwd=cwd,
         )
 
+    def test_host_probe_mcp_uses_separate_state_without_opening_agent_database(
+        self,
+    ) -> None:
+        from zdecision.agent.cli import host_probe_database_path, main
+
+        self.assertEqual(
+            self.root / "host-probe" / "zdecision-host-probe.sqlite3",
+            host_probe_database_path(
+                {"ZDECISION_STATE_DIR": str(self.root)}
+            ),
+        )
+        with (
+            patch(
+                "zdecision.agent.cli.private_state_root",
+                return_value=self.root,
+            ),
+            patch("zdecision.agent.cli.run_host_probe_mcp") as run_probe,
+            patch("zdecision.agent.db.AgentDatabase.open") as open_agent,
+        ):
+            self.assertEqual(0, main(["host-probe-mcp"]))
+
+        run_probe.assert_called_once_with(
+            database_path=(
+                self.root / "host-probe" / "zdecision-host-probe.sqlite3"
+            )
+        )
+        open_agent.assert_not_called()
+
     def test_publish_is_canonical_owner_only_and_atomically_replaceable(self) -> None:
         published = publish_agent_config_locator(self.locator, self.config)
         first_inode = self.locator.stat().st_ino

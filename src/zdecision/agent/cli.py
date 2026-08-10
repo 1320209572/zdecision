@@ -18,6 +18,14 @@ def database_path(environ: Mapping[str, str]) -> Path:
     return private_state_root(environ) / "agent" / "zdecision.sqlite3"
 
 
+def host_probe_database_path(environ: Mapping[str, str]) -> Path:
+    return (
+        private_state_root(environ)
+        / "host-probe"
+        / "zdecision-host-probe.sqlite3"
+    )
+
+
 def config_locator_path(environ: Mapping[str, str]) -> Path:
     return private_state_root(environ) / "agent" / "config-locator.json"
 
@@ -30,11 +38,25 @@ def run_mcp(**arguments: object) -> None:
     run_mcp_server(**arguments)
 
 
+def run_host_probe_mcp(**arguments: object) -> None:
+    """Load the disposable probe runtime only for its explicit command."""
+
+    from zdecision.agent.host_capability_probe_mcp import (
+        run_host_probe_mcp as run_probe_server,
+    )
+
+    run_probe_server(**arguments)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zdecision-agent")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("hook", help="record one Codex Hook JSON object from stdin")
     subparsers.add_parser("mcp", help="serve the local ZDecision MCP tools over stdio")
+    subparsers.add_parser(
+        "host-probe-mcp",
+        help="serve the disposable Recall MCP Apps host probe over stdio",
+    )
     subparsers.add_parser("worker", help="run the singleton local Agent worker")
     subparsers.add_parser("status", help="show bounded local Agent status")
     if os.environ.get("ZDECISION_LIVE_ACCEPTANCE") == "1":
@@ -84,6 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    if arguments.command == "host-probe-mcp":
+        run_host_probe_mcp(
+            database_path=host_probe_database_path(os.environ),
+        )
+        return 0
     state_path = database_path(os.environ)
     if arguments.command == "mcp":
         run_mcp(

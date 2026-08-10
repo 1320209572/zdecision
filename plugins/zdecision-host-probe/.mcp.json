@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "zdecision-host-probe": {
+      "command": "zdecision-agent",
+      "args": [
+        "host-probe-mcp"
+      ]
+    }
+  }
+}
