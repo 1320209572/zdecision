@@ -1,6 +1,6 @@
 # Recall MCP App Host-Capability Probe Design
 
-**Status:** Proposed for written-spec approval on 2026-08-10
+**Status:** Approved for implementation planning and execution on 2026-08-10
 
 **Scope:** Prove the current Codex Desktop MCP Apps handoff needed by Recall
 without changing production Recall behavior or touching real Decisions.
