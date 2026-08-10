@@ -615,6 +615,53 @@ class HostProbeCardProtocolTests(unittest.TestCase):
         )
         self.assertEqual("partial-and-failure-closed", output)
 
+    def test_empty_modality_objects_are_valid_but_text_is_unsupported(
+        self,
+    ) -> None:
+        output = self._run_card(
+            r"""
+  const emptyMessage = await readyWidget({
+    serverTools: {},
+    updateModelContext: { text: {} },
+    message: {},
+  });
+  let click = emptyMessage.clickRun();
+  await flush();
+  emptyMessage.respond(
+    emptyMessage.outbound("tools/call").at(-1), committedResult,
+  );
+  await flush();
+  emptyMessage.respond(
+    emptyMessage.outbound("ui/update-model-context")[0], {},
+  );
+  await click;
+  check(emptyMessage.outbound("ui/message").length === 0,
+    "empty message modalities sent unsupported text");
+  check(emptyMessage.element("probe-state").textContent === "部分支持",
+    "empty message modalities invalidated available operations");
+
+  const emptyContext = await readyWidget({
+    serverTools: {},
+    updateModelContext: {},
+    message: { text: {} },
+  });
+  click = emptyContext.clickRun();
+  await flush();
+  emptyContext.respond(
+    emptyContext.outbound("tools/call").at(-1), committedResult,
+  );
+  await click;
+  check(emptyContext.outbound("ui/update-model-context").length === 0,
+    "empty context modalities sent unsupported text");
+  check(emptyContext.outbound("ui/message").length === 0,
+    "message ran without a context update");
+  check(emptyContext.element("probe-state").textContent === "部分支持",
+    "empty context modalities invalidated app-only operation");
+  process.stdout.write("empty-modalities-are-valid");
+""",
+        )
+        self.assertEqual("empty-modalities-are-valid", output)
+
     def test_timeout_duplicate_click_and_remount_never_repeat_mutation(
         self,
     ) -> None:

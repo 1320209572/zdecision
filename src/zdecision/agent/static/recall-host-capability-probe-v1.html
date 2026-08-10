@@ -141,7 +141,10 @@
         }
 
         function optionalTextCapability(value) {
-          return value === undefined || (isObject(value) && isObject(value.text));
+          return value === undefined || (
+            isObject(value)
+            && (value.text === undefined || isObject(value.text))
+          );
         }
 
         function request(method, params, timeoutMs) {
