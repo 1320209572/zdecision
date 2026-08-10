@@ -1,8 +1,7 @@
 # ZDecision Recall Next-Native-Message Handoff Design
 
-**Status:** Draft for written review. The conversational design was approved on
-2026-08-10; implementation remains prohibited until this written specification
-is reviewed and approved.
+**Status:** Approved for Gate A implementation planning on 2026-08-10. Gates B,
+C, and D retain their separate planning and acceptance boundaries.
 
 **Scope:** Replace the unsupported Recall authorization and context-handoff hot
 path with the MCP Apps capabilities proved by the current Codex Desktop:
