@@ -255,6 +255,10 @@ def bind_recall_tool_call(
             )
         if tool_name != TURN_GATE_TOOL:
             raise ValueError("recall tool is invalid")
+        tool_input = value.get("tool_input")
+        if not isinstance(tool_input, Mapping) or "intent" not in tool_input:
+            raise ValueError("recall intent is missing")
+        intent = tool_input["intent"]
         session = recall_store.get_session(session_id)
         if session is None or session.state != "active" or session.cwd != cwd:
             raise RecallGateConflict("session is not active for this CWD")
@@ -276,7 +280,8 @@ def bind_recall_tool_call(
             plugin_root=plugin_root,
         )
         return _pre_tool_response(
-            "allow", updated_input={"turn_gate_id": gate_id}
+            "allow",
+            updated_input={"turn_gate_id": gate_id, "intent": intent},
         )
     except Exception:
         return _pre_tool_response("deny", reason=_RECALL_BINDING_DENIED_REASON)

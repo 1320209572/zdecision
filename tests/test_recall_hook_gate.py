@@ -39,6 +39,15 @@ PRIVATE_SENTINELS = (
     "DIFF-SECRET",
 )
 _DEFAULT_CWD = object()
+VALID_INTENT: dict[str, object] = {
+    "target_decision_space_ids": ["dsp_" + "1" * 32],
+    "explicit_multi_space": False,
+    "feature_goal": "Continue the current product work",
+    "domain_objects": ["RecallIntent"],
+    "repository_relative_paths": ["src/zdecision/agent"],
+    "constraints": ["Apply only relevant formal decisions"],
+    "exclusions": ["Candidate generation"],
+}
 
 
 def _result(*, context_epoch: int = 0, intent_epoch: int = 1) -> TurnGateResult:
@@ -201,6 +210,7 @@ class RecallHookGateTests(unittest.TestCase):
                     "session_id": "model-session",
                     "turn_id": "model-turn",
                     "cwd": "/model/cwd",
+                    "intent": dict(VALID_INTENT),
                 }
                 if tool_input is None
                 else tool_input
@@ -412,7 +422,7 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual({}, unselected.output)
         self.assertIsNone(self.recall_store.get_session("session-other"))
 
-    def test_turn_gate_replaces_model_coordinates_with_bound_gate_only(self) -> None:
+    def test_turn_gate_preserves_intent_and_replaces_model_coordinates(self) -> None:
         self._activate()
         self._prompt(turn_id="turn-b")
 
@@ -420,8 +430,38 @@ class RecallHookGateTests(unittest.TestCase):
 
         self.assertEqual("allow", self._decision(response))
         self.assertEqual(
-            {"turn_gate_id": GATE_ID},
+            {
+                "turn_gate_id": GATE_ID,
+                "intent": {
+                    "target_decision_space_ids": ["dsp_" + "1" * 32],
+                    "explicit_multi_space": False,
+                    "feature_goal": "Continue the current product work",
+                    "domain_objects": ["RecallIntent"],
+                    "repository_relative_paths": ["src/zdecision/agent"],
+                    "constraints": ["Apply only relevant formal decisions"],
+                    "exclusions": ["Candidate generation"],
+                },
+            },
             response.output["hookSpecificOutput"]["updatedInput"],
+        )
+        self.assert_private_values_absent(response)
+
+    def test_turn_gate_without_intent_is_denied_and_remains_pending(self) -> None:
+        """This catches a trusted Gate ID being issued without semantic intent."""
+
+        self._activate()
+        self._prompt(turn_id="turn-b")
+
+        response = self._pre_tool(
+            TURN_GATE_TOOL,
+            turn_id="turn-b",
+            tool_input={"turn_gate_id": "model-gate"},
+        )
+
+        self.assertEqual("deny", self._decision(response))
+        self.assertEqual(
+            "pending",
+            self.recall_store.get_turn_gate("session-a", "turn-b").state,
         )
         self.assert_private_values_absent(response)
 
@@ -609,7 +649,10 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual(1, envelope["context_epoch"])
         self.assertEqual("allow", self._decision(gate_binding))
         self.assertEqual(
-            {"turn_gate_id": GATE_ID_C_REBASED},
+            {
+                "turn_gate_id": GATE_ID_C_REBASED,
+                "intent": VALID_INTENT,
+            },
             gate_binding.output["hookSpecificOutput"]["updatedInput"],
         )
         with self.assertRaises(RecallGateConflict):

@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from zdecision.agent import cli, mcp_server
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.recall_host_state import RecallHostStore
@@ -1215,6 +1217,80 @@ class RecallMcpToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(tool.inputSchema.get("additionalProperties", True))
             forbidden = {"session_id", "turn_id", "cwd", "product", "generation"}
             self.assertTrue(forbidden.isdisjoint(tool.inputSchema["properties"]))
+
+    async def test_gate_schema_exposes_a_closed_seven_field_intent(self) -> None:
+        """This catches the registered MCP tool degrading intent to unknown input."""
+
+        local = mcp_server.LocalMcpTools(database=self.database, cwd=self.cwd)
+        server = mcp_server.create_mcp_server(local, self.tools())
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        schema = tools["gate_zdecision_turn"].inputSchema
+        intent_schema = schema["properties"]["intent"]
+        if "$ref" in intent_schema:
+            reference = intent_schema["$ref"].removeprefix("#/").split("/")
+            resolved: object = schema
+            for part in reference:
+                resolved = resolved[part]
+            intent_schema = resolved
+
+        expected_fields = {
+            "target_decision_space_ids",
+            "explicit_multi_space",
+            "feature_goal",
+            "domain_objects",
+            "repository_relative_paths",
+            "constraints",
+            "exclusions",
+        }
+        self.assertEqual({"turn_gate_id", "intent"}, set(schema["required"]))
+        self.assertEqual("object", intent_schema["type"])
+        self.assertEqual(expected_fields, set(intent_schema["properties"]))
+        self.assertEqual(expected_fields, set(intent_schema["required"]))
+        self.assertFalse(intent_schema.get("additionalProperties", True))
+
+        self.seed_pending_turn()
+        result = await server.call_tool(
+            "gate_zdecision_turn",
+            {"turn_gate_id": TURN_GATE, "intent": _intent()},
+        )
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(
+            {
+                "state": "active",
+                "receipt": "host_probe_applied",
+                "probe": {
+                    "probe_id": "probe-fixture",
+                    "marker": "host_gate_fixture_not_formal",
+                    "instruction": "Use only this bounded host-gate fixture.",
+                },
+            },
+            result[1],
+        )
+
+    async def test_gate_schema_rejects_coercion_and_extra_intent_fields(self) -> None:
+        """This catches adapter coercion weakening the strict domain contract."""
+
+        local = mcp_server.LocalMcpTools(database=self.database, cwd=self.cwd)
+        server = mcp_server.create_mcp_server(local, self.tools())
+        self.seed_pending_turn()
+
+        coerced = _intent(explicit_multi_space=0)
+        with self.assertRaises(ToolError):
+            await server.call_tool(
+                "gate_zdecision_turn",
+                {"turn_gate_id": TURN_GATE, "intent": coerced},
+            )
+
+        extra = _intent(untrusted_coordinate="model-session")
+        with self.assertRaises(ToolError):
+            await server.call_tool(
+                "gate_zdecision_turn",
+                {"turn_gate_id": TURN_GATE, "intent": extra},
+            )
+        self.assertEqual(
+            "pending",
+            self.store.get_turn_gate(PRIVATE_SESSION, PRIVATE_TURN).state,
+        )
 
     def test_production_run_mcp_always_injects_registered_recall_tools(self) -> None:
         """This catches production silently falling back to Candidate-only MCP."""

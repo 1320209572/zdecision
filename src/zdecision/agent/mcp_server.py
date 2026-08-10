@@ -12,7 +12,7 @@ from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 from mcp.types import CallToolResult, TextContent
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict
 
 from zdecision.agent.browser_launcher import (
     BrowserLauncher,
@@ -63,6 +63,20 @@ _CAPTURING_PROGRESS = frozenset(
     )
 )
 _SYNCING_PROGRESS = frozenset(("uploading_candidates",))
+
+
+class RecallIntentInput(BaseModel):
+    """Closed model-visible shape for one Recall Turn intent."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_decision_space_ids: list[str]
+    explicit_multi_space: bool
+    feature_goal: str
+    domain_objects: list[str]
+    repository_relative_paths: list[str]
+    constraints: list[str]
+    exclusions: list[str]
 
 
 class LocalMcpTools:
@@ -559,11 +573,11 @@ def create_mcp_server(
         )
         def gate_zdecision_turn(
             turn_gate_id: str,
-            intent: object,
+            intent: RecallIntentInput,
         ) -> dict[str, object]:
             return recall_tools.gate_zdecision_turn(
                 turn_gate_id=turn_gate_id,
-                intent=intent,
+                intent=intent.model_dump(mode="python"),
             )
 
         _forbid_extra_tool_input(
