@@ -527,7 +527,7 @@ def create_mcp_server(
             },
         )
         def show_zdecision_recall_confirmation(
-            activation_attempt_id: str,
+            activation_attempt_id: str = "",
         ) -> CallToolResult:
             result = recall_tools.show_recall_confirmation(
                 activation_attempt_id=activation_attempt_id,

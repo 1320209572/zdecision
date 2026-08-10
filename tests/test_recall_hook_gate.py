@@ -286,7 +286,7 @@ class RecallHookGateTests(unittest.TestCase):
     def test_confirmation_render_replaces_model_coordinates_with_host_attempt_only(self) -> None:
         self._prompt()
 
-        response = self._pre_tool(ACTIVATE_RECALL_TOOL)
+        response = self._pre_tool(ACTIVATE_RECALL_TOOL, tool_input={})
 
         self.assertEqual(
             {"activation_attempt_id": ACTIVATION_ID},

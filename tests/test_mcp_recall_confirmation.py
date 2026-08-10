@@ -97,6 +97,9 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {"activation_attempt_id"}, set(render_schema["properties"])
         )
+        self.assertNotIn(
+            "activation_attempt_id", render_schema.get("required", [])
+        )
         self.assertEqual(
             {"activation_attempt_id", "action"},
             set(decision_schema["properties"]),
@@ -107,6 +110,22 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(render_schema.get("additionalProperties", True))
         self.assertFalse(decision_schema.get("additionalProperties", True))
+
+    async def test_render_without_hook_binding_fails_closed_after_schema_validation(
+        self,
+    ) -> None:
+        """This catches MCP validation preventing the trusted Hook from binding."""
+
+        result = await self.server.call_tool(
+            "show_zdecision_recall_confirmation",
+            {},
+        )
+
+        self.assertTrue(result.isError)
+        self.assertEqual(
+            {"state": "blocked", "code": "invalid_confirmation"},
+            result.structuredContent,
+        )
 
     async def test_render_binds_exact_html_digest_and_keeps_identity_in_meta(
         self,
