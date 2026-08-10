@@ -100,6 +100,144 @@ stop and report it rather than overwriting it.
 
 ---
 
+### Task 0: Prove the disposable Decision-application vertical
+
+**Files:**
+- Create: `tests/integration/recall_gate_a0_disposable_harness.py`
+- Create: `tests/integration/test_recall_gate_a0_disposable_vertical.py`
+- Create after real PASS:
+  `docs/superpowers/acceptance/2026-08-10-recall-gate-a0-disposable-vertical.md`
+- Do not modify: `src/zdecision/**` or `plugins/zdecision/**`
+
+**Interfaces:**
+- Consumes: only the already-proved MCP Apps capabilities and two canonical,
+  explicitly test-only `DecisionRevision` fixtures.
+- Produces: a disposable Plugin generator/server/Hook, a durable isolated test
+  database, automated protocol coverage, and one real Desktop PASS/FAIL report.
+- Hard stop: 120 minutes from implementation start. A FAIL or unavailable host
+  capability stops Gate A; it does not authorize production fixes.
+
+- [ ] **Step 1: Write failing disposable-vertical tests**
+
+Name and exercise these real behavior breaks:
+
+1. a model-visible card tool whose `PreToolUse` Hook replaces all model host
+   coordinates with the trusted task/Turn binding;
+2. one app-only enable action that commits exactly one stable delivery holding
+   two complete, canonical test `DecisionRevision` envelopes;
+3. exactly one `ui/update-model-context` request containing the complete typed
+   snapshot and zero `ui/message` requests;
+4. an app-only acknowledgement and remount status that recover the same
+   receipt without another mutation;
+5. a next-native-message application tool whose Hook preserves only the two
+   four-category classifications and injects the trusted delivery binding;
+6. a safe, test-only mutation-counter tool denied before application and
+   allowed exactly once after one fixture is `applicable` and the other is
+   `not_applicable`; and
+7. isolation from the production Plugin, production agent database, Central,
+   Candidate tables, Registry, source tree, and any App Server process.
+
+The tests must execute the generated Hook, MCP server, card JavaScript bridge,
+SQLite restart/remount path, and cleanup logic. They may mock only the Codex
+Desktop transport boundary. Expected Decision bytes and digests are literal or
+hand-checked fixtures, never computed by the production code under test.
+
+Run:
+
+```bash
+.venv/bin/python -m unittest \
+  tests.integration.test_recall_gate_a0_disposable_vertical -v
+```
+
+Expected RED: import/file failure because the disposable harness does not yet
+exist. No production file changes during RED.
+
+- [ ] **Step 2: Implement the smallest isolated harness and reach GREEN**
+
+The harness supports exact commands:
+
+```text
+create --root <temporary-absolute-path> --repository <enabled-repository>
+hook --root <temporary-absolute-path>
+mcp --root <temporary-absolute-path>
+inspect --root <temporary-absolute-path>
+cleanup --root <temporary-absolute-path>
+```
+
+Reuse the already validated app-only/state/App-bridge patterns from repository
+history commits `5cf5a55` through `8694736`; do not restore their marker-only
+acceptance or production probe surfaces. The new typed snapshot contains two
+valid fixtures, a protocol/version, one opaque delivery ID, and a literal
+application instruction. It contains no raw Prompt, task ID, Session/Turn ID,
+absolute path, or full receipt.
+
+The mutation-counter tool changes only the disposable SQLite database. It must
+not execute a shell command or edit a repository file. The Hook returns a
+non-empty denial before the exact application receipt and permits it after the
+atomic application commit. The server never imports or constructs
+`AppServerGateway`.
+
+Run the same test command until GREEN, followed by:
+
+```bash
+.venv/bin/python -m compileall -q \
+  tests/integration/recall_gate_a0_disposable_harness.py
+git diff --check
+```
+
+- [ ] **Step 3: Commit the automated disposable harness**
+
+```bash
+git add \
+  tests/integration/recall_gate_a0_disposable_harness.py \
+  tests/integration/test_recall_gate_a0_disposable_vertical.py
+git commit -m "test: add disposable Recall Gate A0 vertical"
+```
+
+- [ ] **Step 4: Run one bounded real Desktop acceptance**
+
+Create a fresh `mktemp -d` root outside the repository and production Plugin
+cache, generate/install a uniquely named **ZDecision Gate A0** Plugin, and
+restart Codex once. In an enabled repository, the user selects that disposable
+entry and performs only these bounded actions:
+
+1. render the card and click enable once;
+2. switch away and back once to prove receipt recovery without another action;
+3. keep the App attachment and send one native message;
+4. verify Codex receives both complete fixture Decisions without a read tool,
+   calls the application tool with one `applicable` and one `not_applicable`,
+   observes the safe pre-application mutation denial, and succeeds exactly once
+   after application; and
+5. send one ordinary follow-up to prove no repeated delivery or mutation.
+
+Inspect only bounded states, counts, and digest/receipt prefixes. A pass requires
+zero `ui/message`, zero App Server start/connect, one delivery, one context
+update, one application receipt, one active fixture, one permitted counter
+increment, and no production/Candidate/Registry mutation. Any missing
+capability, cross-task binding, automatic retry, duplicate mutation, or manual
+database intervention is FAIL.
+
+- [ ] **Step 5: Clean up, record the result, and decide the gate**
+
+Uninstall only the disposable selector/marketplace, stop only its processes,
+and delete only the recorded temporary root. Prove the production ZDecision
+Plugin is still installed/enabled and unchanged.
+
+Write a sanitized report with environment versions, the behavior matrix,
+bounded counts, redacted prefixes, cleanup evidence, and PASS/FAIL. It must not
+contain a Prompt, full Decision, full receipt, task/Session/Turn ID, absolute
+path, database row, or transcript.
+
+```bash
+git add docs/superpowers/acceptance/2026-08-10-recall-gate-a0-disposable-vertical.md
+git commit -m "docs: record Recall Gate A0 result"
+```
+
+Only PASS permits Task 1. FAIL appends the exact blocker to the SDD ledger and
+ends this implementation run without changing production Recall.
+
+---
+
 ### Task 1: Define canonical handoff and provider contracts
 
 **Files:**
@@ -813,7 +951,8 @@ Run:
   tests.test_mcp_recall_confirmation -v
 ```
 
-Expected: all card simulations pass; source contains no `ui/message` string.
+Expected: all card simulations pass and every exercised success, rejection,
+timeout, retry, and remount flow records zero outbound `ui/message` requests.
 
 - [ ] **Step 5: Commit Task 5**
 
@@ -1021,14 +1160,27 @@ active Decision envelopes, current application receipt, and context epoch;
 replay restores exactly once. Product change retires the old set before new
 routing. Startup/resume revalidates without another confirmation.
 
-Add negative contract assertions:
+Add negative behavior assertions:
 
 ```python
-self.assertFalse(hasattr(AppServerGateway, "read_active_turn_evidence"))
-self.assertFalse(hasattr(agent_cli.build_parser().parse_args(["status"]), "recall_host_gate_action"))
-self.assertNotIn("ZDECISION_LIVE_ACCEPTANCE", source_text)
-self.assertNotIn("HostProbeEnvelope", source_text)
+with patch.object(
+    AppServerGateway,
+    "connect",
+    side_effect=AssertionError("Recall must not connect an App Server"),
+):
+    run_recall_mcp_with_noop_transport()
+
+for environment in ({}, {"ZDECISION_LIVE_ACCEPTANCE": "1"}):
+    with patch.dict(os.environ, environment, clear=True):
+        with self.assertRaises(SystemExit):
+            agent_cli.build_parser().parse_args(["recall-host-gate", "clear"])
 ```
+
+Exercise a same-intent gate and a changed-intent gate under the same forbidden
+`AppServerGateway.connect` patch. Assert neither creates a host-probe artifact
+or reads an acceptance fixture. Code review verifies removal of the obsolete
+types; tests verify their former behavior is unreachable rather than grepping
+source text.
 
 Before deleting `tests/test_mcp_recall_host_gate.py`, port every assertion that
 does not depend on App Server evidence, native-selection proof, or the live
@@ -1147,9 +1299,9 @@ git commit -m "refactor: remove Recall App Server proof"
 - Produces: one non-contradictory active instruction set and a refreshed Plugin
   cache identity.
 
-- [ ] **Step 1: Write failing instruction and manifest tests**
+- [ ] **Step 1: Write failing executable routing/metadata tests and define Skill pressure scenarios**
 
-Require the Skill to say:
+The implemented Skill must direct Codex to:
 
 - construct the exact seven-field intent before calling the confirmation tool;
 - ask in chat when the Hook returns bounded product choices;
@@ -1161,8 +1313,15 @@ Require the Skill to say:
 - no second App Server, `thread/read`, `hookPrompt`, or `ui/message`; and
 - production may report `recall_not_ready` until Gates B/C land.
 
-Require manifest/README/architecture copy to describe next-native-message UX,
-not “later native Turn gate” backed by App Server proof. Require a new sanitized
+Contract tests exercise frontmatter discovery policy, registered tool schemas,
+manifest references, and the observable routing/result envelopes. They do not
+assert prose substrings. Use `superpowers:writing-skills` to run RED/GREEN
+pressure scenarios for the workflow above, and record those outcomes in the
+task report. The real Task 10 Desktop acceptance is the final behavioral proof
+that the installed Skill follows the workflow.
+
+Manifest/README/architecture copy must describe next-native-message UX, not a
+“later native Turn gate” backed by App Server proof. Require a new sanitized
 cachebuster version matching the repository's existing version regex.
 
 - [ ] **Step 2: Run contract tests to verify RED**
@@ -1176,8 +1335,8 @@ Run:
   tests.test_skill_contract -v
 ```
 
-Expected: current Skill still describes card `ui/message`, host-gate fixture,
-and the old post-click gate.
+Expected: current metadata/tool composition still exposes the old post-click
+gate and the Skill pressure baseline follows the unsupported continuation path.
 
 - [ ] **Step 3: Update active instructions and version**
 
