@@ -21,7 +21,12 @@ from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStor
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
-from zdecision.recall.session import TurnGateResult
+from zdecision.recall.handoff import (
+    RecallPreflightClarification,
+    RecallPreflightReady,
+    RecallPreflightUnavailable,
+)
+from zdecision.recall.session import RecallIntent, TurnGateResult
 
 
 NOW = datetime(2026, 8, 6, 4, 0, tzinfo=UTC)
@@ -48,6 +53,40 @@ VALID_INTENT: dict[str, object] = {
     "constraints": ["Apply only relevant formal decisions"],
     "exclusions": ["Candidate generation"],
 }
+
+
+def _ready_preflight(*, repository_id: str, repository_display_name: str):
+    return RecallPreflightReady(
+        repository_id=repository_id,
+        repository_display_name=repository_display_name,
+        intent=RecallIntent.from_dict(VALID_INTENT),
+        target_decision_space_ids=("dsp_" + "1" * 32,),
+        target_display_names=("Recall Hook Test",),
+        catalog_digest="a" * 64,
+        generation=7,
+        generation_digest="b" * 64,
+        retrieval_profile_digest="c" * 64,
+        index_generation=5,
+        freshness="ready",
+        expires_at="2026-08-06T05:00:00Z",
+    )
+
+
+class PreflightProvider:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.preflight_calls = 0
+        self.retrieve_calls = 0
+
+    def preflight(self, **_kwargs: object):
+        self.preflight_calls += 1
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+    def retrieve(self, _preflight: RecallPreflightReady):
+        self.retrieve_calls += 1
+        raise AssertionError("Hook preflight must not retrieve")
 
 
 def _result(*, context_epoch: int = 0, intent_epoch: int = 1) -> TurnGateResult:
@@ -142,7 +181,13 @@ class RecallHookGateTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def _handle(self, raw: object, *, now: datetime = NOW):
+    def _handle(
+        self,
+        raw: object,
+        *,
+        now: datetime = NOW,
+        recall_provider: object | None = None,
+    ):
         return handle_hook(
             raw,
             database=self.database,
@@ -152,6 +197,7 @@ class RecallHookGateTests(unittest.TestCase):
             control_store=self.control_store,
             control_id_factory=lambda: CONTROL_ID,
             recall_store=self.recall_store,
+            recall_provider=recall_provider,
             activation_binding_id_factory=lambda: ACTIVATION_ID,
             turn_gate_id_factory=(
                 lambda _session_id, turn_id, context_epoch, *_: (
@@ -195,6 +241,7 @@ class RecallHookGateTests(unittest.TestCase):
         cwd: object = _DEFAULT_CWD,
         tool_input: object | None = None,
         now: datetime = NOW,
+        recall_provider: object | None = None,
         **extra: object,
     ):
         value: dict[str, object] = {
@@ -217,22 +264,18 @@ class RecallHookGateTests(unittest.TestCase):
             ),
         }
         value.update(extra)
-        return self._handle(value, now=now)
+        return self._handle(value, now=now, recall_provider=recall_provider)
 
     def _activate(self, *, session_id: str = "session-a", turn_id: str = "turn-a"):
         self._prompt(session_id=session_id, turn_id=turn_id)
-        response = self._pre_tool(
-            ACTIVATE_RECALL_TOOL, session_id=session_id, turn_id=turn_id
+        return self.recall_store.bind_activation(
+            session_id=session_id,
+            turn_id=turn_id,
+            cwd=str(self.repository),
+            binding_id=ACTIVATION_ID,
+            now=NOW,
+            plugin_root=str(self.plugin_root),
         )
-        self.assertEqual("allow", self._decision(response))
-        attempt_id = response.output["hookSpecificOutput"]["updatedInput"][
-            "activation_attempt_id"
-        ]
-        self.recall_store.attach_activation_card(attempt_id, ui_digest="a" * 64)
-        self.recall_store.decide_activation_attempt(
-            attempt_id, action="enable", now=NOW
-        )
-        return response
 
     @staticmethod
     def _decision(response) -> object:
@@ -295,18 +338,225 @@ class RecallHookGateTests(unittest.TestCase):
 
     def test_confirmation_render_replaces_model_coordinates_with_host_attempt_only(self) -> None:
         self._prompt()
+        provider = PreflightProvider(
+            _ready_preflight(
+                repository_id=self.snapshot.repository_id,
+                repository_display_name=self.repository.name,
+            )
+        )
 
-        response = self._pre_tool(ACTIVATE_RECALL_TOOL, tool_input={})
+        response = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={
+                "activation_attempt_id": "model-attempt",
+                "intent": dict(VALID_INTENT),
+            },
+            recall_provider=provider,
+        )
 
         self.assertEqual(
-            {"activation_attempt_id": ACTIVATION_ID},
+            {"activation_attempt_id": ACTIVATION_ID, "intent": VALID_INTENT},
             response.output.get("hookSpecificOutput", {}).get("updatedInput"),
         )
         self.assertIsNone(self.recall_store.get_session("session-a"))
         attempt = self.recall_store.get_activation_attempt(ACTIVATION_ID)
         self.assertEqual("pending_confirmation", attempt.state)
         self.assertEqual(self.repository.name, attempt.repository_display_name)
+        self.assertEqual(VALID_INTENT, attempt.preflight.intent.to_dict())
         self.assert_private_values_absent(response)
+
+    def test_confirmation_ready_preflight_freezes_intent_and_trusted_attempt(self) -> None:
+        self._prompt()
+        preflight = _ready_preflight(
+            repository_id=self.snapshot.repository_id,
+            repository_display_name=self.repository.name,
+        )
+        provider = PreflightProvider(preflight)
+
+        response = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={
+                "activation_attempt_id": "model-value",
+                "intent": dict(VALID_INTENT),
+            },
+            recall_provider=provider,
+        )
+
+        self.assertEqual("allow", self._decision(response))
+        self.assertEqual(
+            {
+                "activation_attempt_id": ACTIVATION_ID,
+                "intent": VALID_INTENT,
+            },
+            response.output["hookSpecificOutput"]["updatedInput"],
+        )
+        attempt = self.recall_store.get_activation_attempt(ACTIVATION_ID)
+        self.assertEqual(preflight, attempt.preflight)
+        self.assertEqual(1, provider.preflight_calls)
+        self.assertEqual(0, provider.retrieve_calls)
+
+    def test_confirmation_clarification_denies_without_attempt_or_retrieval(self) -> None:
+        self._prompt()
+        provider = PreflightProvider(
+            RecallPreflightClarification(
+                code="ambiguous_target",
+                candidate_display_names=("ZStack UI", "ZStack Cloud"),
+            )
+        )
+
+        response = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={"intent": dict(VALID_INTENT)},
+            recall_provider=provider,
+        )
+
+        self.assertEqual("deny", self._decision(response))
+        reason = response.output["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("ZStack UI", reason)
+        self.assertIn("ZStack Cloud", reason)
+        self.assertNotIn("ambiguous_target", reason)
+        self.assertIsNone(self.recall_store.get_activation_attempt(ACTIVATION_ID))
+        self.assertEqual(1, provider.preflight_calls)
+        self.assertEqual(0, provider.retrieve_calls)
+
+    def test_confirmation_unavailable_and_provider_failure_are_generic_denials(self) -> None:
+        self._prompt()
+        default_response = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={"intent": dict(VALID_INTENT)},
+        )
+        self.assertEqual("deny", self._decision(default_response))
+        self.assertIn(
+            "Do not retry",
+            default_response.output["hookSpecificOutput"][
+                "permissionDecisionReason"
+            ],
+        )
+        self.assertIsNone(self.recall_store.get_activation_attempt(ACTIVATION_ID))
+        providers = (
+            PreflightProvider(
+                RecallPreflightUnavailable(code="private_cache_coordinate")
+            ),
+            PreflightProvider(RuntimeError("private provider failure")),
+        )
+
+        for provider in providers:
+            with self.subTest(result=type(provider.result).__name__):
+                response = self._pre_tool(
+                    ACTIVATE_RECALL_TOOL,
+                    tool_input={"intent": dict(VALID_INTENT)},
+                    recall_provider=provider,
+                )
+                self.assertEqual("deny", self._decision(response))
+                reason = response.output["hookSpecificOutput"][
+                    "permissionDecisionReason"
+                ]
+                self.assertIn("Do not retry", reason)
+                self.assertNotIn("private", reason)
+                self.assertNotIn(str(self.repository), reason)
+                self.assertIsNone(
+                    self.recall_store.get_activation_attempt(ACTIVATION_ID)
+                )
+                self.assertEqual(0, provider.retrieve_calls)
+
+    def test_confirmation_requires_exact_outer_and_seven_field_intent(self) -> None:
+        self._prompt()
+        preflight = _ready_preflight(
+            repository_id=self.snapshot.repository_id,
+            repository_display_name=self.repository.name,
+        )
+        invalid_inputs = (
+            {},
+            {"activation_attempt_id": "model-value"},
+            {"intent": dict(VALID_INTENT), "extra": "not-allowed"},
+            {
+                "intent": {
+                    key: value
+                    for key, value in VALID_INTENT.items()
+                    if key != "feature_goal"
+                }
+            },
+            {"intent": {**VALID_INTENT, "extra": "not-allowed"}},
+            {"intent": {**VALID_INTENT, "explicit_multi_space": "false"}},
+        )
+
+        for tool_input in invalid_inputs:
+            with self.subTest(tool_input=tool_input):
+                provider = PreflightProvider(preflight)
+                response = self._pre_tool(
+                    ACTIVATE_RECALL_TOOL,
+                    tool_input=tool_input,
+                    recall_provider=provider,
+                )
+                self.assertEqual("deny", self._decision(response))
+                self.assertEqual(0, provider.preflight_calls)
+                self.assertIsNone(
+                    self.recall_store.get_activation_attempt(ACTIVATION_ID)
+                )
+
+    def test_confirmation_runs_preflight_only_after_trusted_bundle_gate(self) -> None:
+        self._prompt()
+        provider = PreflightProvider(
+            _ready_preflight(
+                repository_id=self.snapshot.repository_id,
+                repository_display_name=self.repository.name,
+            )
+        )
+
+        with patch.dict(
+            "os.environ", {"PLUGIN_ROOT": str(self.repository)}, clear=False
+        ):
+            response = self._pre_tool(
+                ACTIVATE_RECALL_TOOL,
+                tool_input={"intent": dict(VALID_INTENT)},
+                recall_provider=provider,
+            )
+
+        self.assertEqual("deny", self._decision(response))
+        self.assertEqual(0, provider.preflight_calls)
+        self.assertIsNone(self.recall_store.get_activation_attempt(ACTIVATION_ID))
+
+        self.database.put_enabled_repository(
+            EnabledRepository(self.snapshot.repository_id, False)
+        )
+        disabled = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={"intent": dict(VALID_INTENT)},
+            recall_provider=provider,
+        )
+        self.assertEqual("deny", self._decision(disabled))
+        self.assertEqual(0, provider.preflight_calls)
+
+    def test_confirmation_cross_task_replay_cannot_rebind_frozen_attempt(self) -> None:
+        self._prompt()
+        preflight = _ready_preflight(
+            repository_id=self.snapshot.repository_id,
+            repository_display_name=self.repository.name,
+        )
+        provider = PreflightProvider(preflight)
+        first = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={"intent": dict(VALID_INTENT)},
+            recall_provider=provider,
+        )
+        self._prompt(session_id="session-other", turn_id="turn-other")
+
+        replay = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            session_id="session-other",
+            turn_id="turn-other",
+            tool_input={
+                "activation_attempt_id": ACTIVATION_ID,
+                "intent": dict(VALID_INTENT),
+            },
+            recall_provider=provider,
+        )
+
+        self.assertEqual("allow", self._decision(first))
+        self.assertEqual("deny", self._decision(replay))
+        attempt = self.recall_store.get_activation_attempt(ACTIVATION_ID)
+        self.assertEqual("session-a", attempt.session_id)
+        self.assert_private_values_absent(replay)
 
     def test_confirmation_binding_waits_through_a_short_sqlite_writer_lock(
         self,
@@ -335,6 +585,12 @@ class RecallHookGateTests(unittest.TestCase):
         self.addCleanup(holder.join, 2.0)
         self.assertTrue(lock_acquired.wait(1.0), "writer lock was not acquired")
 
+        provider = PreflightProvider(
+            _ready_preflight(
+                repository_id=self.snapshot.repository_id,
+                repository_display_name=self.repository.name,
+            )
+        )
         response = handle_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -342,12 +598,16 @@ class RecallHookGateTests(unittest.TestCase):
                 "turn_id": "turn-a",
                 "cwd": str(self.repository),
                 "tool_name": ACTIVATE_RECALL_TOOL,
-                "tool_input": {"activation_attempt_id": "model-binding"},
+                "tool_input": {
+                    "activation_attempt_id": "model-binding",
+                    "intent": dict(VALID_INTENT),
+                },
             },
             database=self.database,
             clock=lambda: NOW,
             repository_resolver=self.resolver,
             worker_waker=lambda _: None,
+            recall_provider=provider,
             activation_attempt_id_factory=lambda: ACTIVATION_ID,
         )
         holder.join(2.0)
@@ -355,7 +615,7 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual([], holder_errors)
         self.assertEqual("allow", self._decision(response))
         self.assertEqual(
-            {"activation_attempt_id": ACTIVATION_ID},
+            {"activation_attempt_id": ACTIVATION_ID, "intent": VALID_INTENT},
             response.output["hookSpecificOutput"]["updatedInput"],
         )
         verifier = RecallHostStore.open(self.database_path)
@@ -368,18 +628,32 @@ class RecallHookGateTests(unittest.TestCase):
         """This catches a normal retried render being denied after the clock advances."""
 
         self._prompt()
-        first = self._pre_tool(ACTIVATE_RECALL_TOOL, now=NOW)
+        provider = PreflightProvider(
+            _ready_preflight(
+                repository_id=self.snapshot.repository_id,
+                repository_display_name=self.repository.name,
+            )
+        )
+        first = self._pre_tool(
+            ACTIVATE_RECALL_TOOL,
+            tool_input={"intent": dict(VALID_INTENT)},
+            now=NOW,
+            recall_provider=provider,
+        )
         attempt = self.recall_store.get_activation_attempt(ACTIVATION_ID)
 
         replay = self._pre_tool(
-            ACTIVATE_RECALL_TOOL, now=NOW.replace(minute=NOW.minute + 1)
+            ACTIVATE_RECALL_TOOL,
+            tool_input={"intent": dict(VALID_INTENT)},
+            now=NOW.replace(minute=NOW.minute + 1),
+            recall_provider=provider,
         )
         frozen = self.recall_store.get_activation_attempt(ACTIVATION_ID)
 
         self.assertEqual("allow", self._decision(first))
         self.assertEqual("allow", self._decision(replay))
         self.assertEqual(
-            {"activation_attempt_id": ACTIVATION_ID},
+            {"activation_attempt_id": ACTIVATION_ID, "intent": VALID_INTENT},
             replay.output["hookSpecificOutput"]["updatedInput"],
         )
         self.assertEqual(attempt.expires_at, frozen.expires_at)

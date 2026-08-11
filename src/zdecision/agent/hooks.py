@@ -22,6 +22,13 @@ from zdecision.agent.recall_host_state import (
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.ids import product_id
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.recall.handoff import (
+    RecallPreflightClarification,
+    RecallPreflightReady,
+    RecallPreflightUnavailable,
+)
+from zdecision.recall.provider import RecallProvider, UnavailableRecallProvider
+from zdecision.recall.session import RecallIntent
 
 
 INVALID_HOOK_OUTPUT = {"systemMessage": "ZDecision ignored an invalid hook event."}
@@ -39,6 +46,10 @@ _RECALL_BINDING_STORE_TIMEOUT_SECONDS = 1.0
 _CONFIRMATION_LIFETIME = timedelta(minutes=15)
 _RECALL_BINDING_DENIED_REASON = (
     "ZDecision could not create a trusted Recall binding. "
+    "Do not retry or guess identifiers."
+)
+_RECALL_PREFLIGHT_UNAVAILABLE_REASON = (
+    "ZDecision Recall is unavailable for this task. "
     "Do not retry or guess identifiers."
 )
 _RECALL_GATE_DENIED_REASON = (
@@ -63,6 +74,7 @@ def handle_hook(
     control_store: ControlBindingStore | None = None,
     control_id_factory: Callable[[], str] | None = None,
     recall_store: RecallHostStore | None = None,
+    recall_provider: RecallProvider | None = None,
     activation_attempt_id_factory: Callable[[], str] | None = None,
     activation_binding_id_factory: Callable[[], str] | None = None,
     turn_gate_id_factory: Callable[..., str] | None = None,
@@ -81,6 +93,7 @@ def handle_hook(
                 control_store=control_store,
                 control_id_factory=control_id_factory,
                 recall_store=recall_store,
+                recall_provider=recall_provider,
                 activation_attempt_id_factory=(
                     activation_attempt_id_factory or activation_binding_id_factory
                 ),
@@ -151,6 +164,7 @@ def handle_pre_tool_hook(
     control_store: ControlBindingStore | None = None,
     control_id_factory: Callable[[], str] | None = None,
     recall_store: RecallHostStore | None = None,
+    recall_provider: RecallProvider | None = None,
     activation_attempt_id_factory: Callable[[], str] | None = None,
     activation_binding_id_factory: Callable[[], str] | None = None,
     turn_gate_id_factory: Callable[..., str] | None = None,
@@ -188,6 +202,7 @@ def handle_pre_tool_hook(
                 clock=clock,
                 repository_resolver=repository_resolver,
                 recall_store=store,
+                recall_provider=recall_provider,
                 activation_attempt_id_factory=(
                     activation_attempt_id_factory or activation_binding_id_factory
                 ),
@@ -217,6 +232,7 @@ def bind_recall_tool_call(
     recall_store: RecallHostStore,
     activation_attempt_id_factory: Callable[[], str] | None,
     turn_gate_id_factory: Callable[..., str] | None,
+    recall_provider: RecallProvider | None = None,
 ) -> HookResponse:
     """Replace model-authored recall coordinates with one trusted binding."""
 
@@ -229,29 +245,64 @@ def bind_recall_tool_call(
         plugin_root = _trusted_plugin_root()
         tool_name = value.get("tool_name")
         if tool_name == SHOW_RECALL_CONFIRMATION_TOOL:
+            tool_input = value.get("tool_input")
+            if (
+                not isinstance(tool_input, Mapping)
+                or frozenset(tool_input) not in (
+                    frozenset(("intent",)),
+                    frozenset(("activation_attempt_id", "intent")),
+                )
+            ):
+                raise ValueError("recall confirmation input is invalid")
+            intent = RecallIntent.from_dict(tool_input["intent"])
+            repository = (repository_resolver or RepositoryResolver()).resolve(cwd)
+            if repository is None:
+                raise ValueError("repository is unresolved")
+            now = _parse_time(_format_time(clock()))
+            provider = recall_provider or UnavailableRecallProvider()
+            preflight = provider.preflight(
+                repository_id=repository.repository_id,
+                repository_display_name=Path(repository.worktree_root).name,
+                intent=intent,
+                now=now,
+            )
+            if isinstance(preflight, RecallPreflightClarification):
+                return _pre_tool_response(
+                    "deny",
+                    reason="Clarify the Recall target: "
+                    + ", ".join(preflight.candidate_display_names),
+                )
+            if isinstance(preflight, RecallPreflightUnavailable):
+                return _pre_tool_response(
+                    "deny", reason=_RECALL_PREFLIGHT_UNAVAILABLE_REASON
+                )
+            if not isinstance(preflight, RecallPreflightReady):
+                raise ValueError("recall preflight result is invalid")
             attempt_id = (
                 activation_attempt_id_factory()
                 if activation_attempt_id_factory is not None
                 else _opaque_id("activation", session_id, turn_id, cwd)
             )
             attempt_id = _safe_generated_identifier(attempt_id)
-            repository = (repository_resolver or RepositoryResolver()).resolve(cwd)
-            if repository is None:
-                raise ValueError("repository is unresolved")
-            now = _parse_time(_format_time(clock()))
             recall_store.create_activation_attempt(
                 session_id=session_id,
                 turn_id=turn_id,
                 cwd=cwd,
                 repository_id=repository.repository_id,
-                repository_display_name=Path(repository.worktree_root).name,
+                repository_display_name=preflight.repository_display_name,
                 attempt_id=attempt_id,
                 now=now,
                 expires_at=now + _CONFIRMATION_LIFETIME,
                 plugin_root=plugin_root,
+                intent=intent,
+                preflight=preflight,
             )
             return _pre_tool_response(
-                "allow", updated_input={"activation_attempt_id": attempt_id}
+                "allow",
+                updated_input={
+                    "activation_attempt_id": attempt_id,
+                    "intent": intent.to_dict(),
+                },
             )
         if tool_name != TURN_GATE_TOOL:
             raise ValueError("recall tool is invalid")

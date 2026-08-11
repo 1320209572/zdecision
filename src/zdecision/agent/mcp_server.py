@@ -529,7 +529,7 @@ def create_mcp_server(
                 "Display the trusted Recall confirmation for this task. "
                 "The host supplies its attempt ID; never invent or retry IDs."
             ),
-            annotations=recall_action,
+            annotations=read_only,
             meta={
                 "ui": {
                     "resourceUri": RECALL_CONFIRMATION_URI,
@@ -541,10 +541,12 @@ def create_mcp_server(
             },
         )
         def show_zdecision_recall_confirmation(
+            intent: RecallIntentInput,
             activation_attempt_id: str = "",
         ) -> CallToolResult:
             result = recall_tools.show_recall_confirmation(
                 activation_attempt_id=activation_attempt_id,
+                intent=intent.model_dump(mode="python"),
                 ui_digest=_recall_confirmation_digest(),
             )
             return _confirmation_call_result(result)
@@ -627,16 +629,24 @@ def _confirmation_call_result(value: object) -> CallToolResult:
     meta = value.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
-    safe_meta = {
-        key: item
-        for key, item in meta.items()
-        if key
-        in (
-            "zdecision/activation_attempt_id",
-            "zdecision/repository_display_name",
-        )
-        and isinstance(item, str)
-    }
+    safe_meta: dict[str, object] = {}
+    for key in (
+        "zdecision/activation_attempt_id",
+        "zdecision/repository_display_name",
+    ):
+        item = meta.get(key)
+        if isinstance(item, str):
+            safe_meta[key] = item
+    freshness = meta.get("zdecision/freshness")
+    if freshness in ("ready", "degraded"):
+        safe_meta["zdecision/freshness"] = freshness
+    target_display_names = meta.get("zdecision/target_display_names")
+    if (
+        isinstance(target_display_names, list)
+        and 1 <= len(target_display_names) <= 8
+        and all(isinstance(item, str) and item for item in target_display_names)
+    ):
+        safe_meta["zdecision/target_display_names"] = list(target_display_names)
     invalid_confirmation = (
         state == "blocked" and structured.get("code") == "invalid_confirmation"
     )

@@ -15,6 +15,8 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.mcp_server import LocalMcpTools
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.recall_mcp import ReadinessRecallGateProvider, RecallMcpTools
+from zdecision.recall.handoff import RecallPreflightReady
+from zdecision.recall.session import RecallIntent
 
 
 NOW = datetime(2026, 8, 9, 4, 0, tzinfo=UTC)
@@ -28,6 +30,32 @@ WIDGET_PATH = (
     / "static"
     / "recall-confirmation-v1.html"
 )
+VALID_INTENT: dict[str, object] = {
+    "target_decision_space_ids": ["dsp_" + "3" * 32],
+    "explicit_multi_space": False,
+    "feature_goal": "Implement the Recall confirmation preflight",
+    "domain_objects": ["RecallIntent", "ConfirmationAttempt"],
+    "repository_relative_paths": ["src/zdecision/agent"],
+    "constraints": ["Use only trusted local state"],
+    "exclusions": ["Decision retrieval"],
+}
+
+
+def _ready_preflight(intent: RecallIntent) -> RecallPreflightReady:
+    return RecallPreflightReady(
+        repository_id=REPOSITORY_ID,
+        repository_display_name=REPOSITORY_NAME,
+        intent=intent,
+        target_decision_space_ids=("dsp_" + "3" * 32,),
+        target_display_names=("ZDecision",),
+        catalog_digest="a" * 64,
+        generation=4,
+        generation_digest="b" * 64,
+        retrieval_profile_digest="c" * 64,
+        index_generation=3,
+        freshness="degraded",
+        expires_at="2026-08-09T05:00:00Z",
+    )
 
 
 class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
@@ -42,6 +70,8 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.database.close)
         self.store = RecallHostStore.open(self.database_path)
         self.addCleanup(self.store.close)
+        self.intent = RecallIntent.from_dict(VALID_INTENT)
+        self.preflight = _ready_preflight(self.intent)
         self.store.create_activation_attempt(
             session_id="private-session",
             turn_id="private-turn",
@@ -52,6 +82,8 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             now=NOW,
             expires_at=NOW + timedelta(minutes=15),
             plugin_root=None,
+            intent=self.intent,
+            preflight=self.preflight,
         )
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
         recall = RecallMcpTools(
@@ -94,12 +126,21 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             "show_zdecision_recall_confirmation"
         ].inputSchema
         decision_schema = tools["decide_zdecision_recall"].inputSchema
+        self.assertTrue(
+            tools["show_zdecision_recall_confirmation"].annotations.readOnlyHint
+        )
         self.assertEqual(
-            {"activation_attempt_id"}, set(render_schema["properties"])
+            {"activation_attempt_id", "intent"},
+            set(render_schema["properties"]),
         )
         self.assertNotIn(
             "activation_attempt_id", render_schema.get("required", [])
         )
+        self.assertIn("intent", render_schema.get("required", []))
+        intent_schema = render_schema["$defs"]["RecallIntentInput"]
+        self.assertEqual(set(VALID_INTENT), set(intent_schema["properties"]))
+        self.assertEqual(set(VALID_INTENT), set(intent_schema["required"]))
+        self.assertFalse(intent_schema.get("additionalProperties", True))
         self.assertEqual(
             {"activation_attempt_id", "action"},
             set(decision_schema["properties"]),
@@ -118,7 +159,7 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.server.call_tool(
             "show_zdecision_recall_confirmation",
-            {},
+            {"intent": dict(VALID_INTENT)},
         )
 
         self.assertTrue(result.isError)
@@ -132,7 +173,10 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         result = await self.server.call_tool(
             "show_zdecision_recall_confirmation",
-            {"activation_attempt_id": ATTEMPT_ID},
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "intent": dict(VALID_INTENT),
+            },
         )
 
         self.assertFalse(result.isError)
@@ -148,9 +192,15 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             result.meta["zdecision/repository_display_name"],
         )
         self.assertEqual(
+            ["ZDecision"], result.meta["zdecision/target_display_names"]
+        )
+        self.assertEqual("degraded", result.meta["zdecision/freshness"])
+        self.assertEqual(
             {
                 "zdecision/activation_attempt_id",
                 "zdecision/repository_display_name",
+                "zdecision/target_display_names",
+                "zdecision/freshness",
             },
             set(result.meta),
         )
@@ -176,7 +226,10 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.server.call_tool(
             "show_zdecision_recall_confirmation",
-            {"activation_attempt_id": "activation_" + "9" * 32},
+            {
+                "activation_attempt_id": "activation_" + "9" * 32,
+                "intent": dict(VALID_INTENT),
+            },
         )
 
         self.assertTrue(result.isError)
@@ -190,21 +243,24 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("confirmation is ready", model_text.lower())
         self.assertEqual({}, result.meta)
 
-    async def test_decision_uses_the_same_card_digest_and_commits_consent(
+    async def test_decline_uses_the_same_card_digest_and_remains_app_only(
         self,
     ) -> None:
         await self.server.call_tool(
             "show_zdecision_recall_confirmation",
-            {"activation_attempt_id": ATTEMPT_ID},
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "intent": dict(VALID_INTENT),
+            },
         )
 
         result = await self.server.call_tool(
             "decide_zdecision_recall",
-            {"activation_attempt_id": ATTEMPT_ID, "action": "enable"},
+            {"activation_attempt_id": ATTEMPT_ID, "action": "decline"},
         )
 
         self.assertFalse(result.isError)
-        self.assertEqual({"state": "committed"}, result.structuredContent)
+        self.assertEqual({"state": "declined"}, result.structuredContent)
         self.assertEqual(
             ATTEMPT_ID,
             result.meta["zdecision/activation_attempt_id"],
@@ -213,6 +269,8 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             {
                 "zdecision/activation_attempt_id",
                 "zdecision/repository_display_name",
+                "zdecision/target_display_names",
+                "zdecision/freshness",
             },
             set(result.meta),
         )
@@ -220,7 +278,40 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             REPOSITORY_NAME,
             result.meta["zdecision/repository_display_name"],
         )
-        self.assertEqual("active", self.store.get_session("private-session").state)
+        self.assertIsNone(self.store.get_session("private-session"))
+
+    async def test_render_rejects_mismatched_intent_and_legacy_attempt(self) -> None:
+        mismatched = {**VALID_INTENT, "feature_goal": "A substituted intent"}
+        legacy_attempt_id = "activation_" + "8" * 32
+        self.store.create_activation_attempt(
+            session_id="legacy-session",
+            turn_id="legacy-turn",
+            cwd=self.cwd,
+            repository_id=REPOSITORY_ID,
+            repository_display_name=REPOSITORY_NAME,
+            attempt_id=legacy_attempt_id,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+
+        for attempt_id, intent in (
+            (ATTEMPT_ID, mismatched),
+            (legacy_attempt_id, VALID_INTENT),
+        ):
+            with self.subTest(attempt_id=attempt_id):
+                result = await self.server.call_tool(
+                    "show_zdecision_recall_confirmation",
+                    {
+                        "activation_attempt_id": attempt_id,
+                        "intent": dict(intent),
+                    },
+                )
+                self.assertTrue(result.isError)
+                self.assertEqual(
+                    {"state": "blocked", "code": "invalid_confirmation"},
+                    result.structuredContent,
+                )
 
     async def test_tools_reject_host_coordinates_and_untrusted_flags(
         self,
@@ -237,7 +328,10 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         for name, arguments in (
             (
                 "show_zdecision_recall_confirmation",
-                {"activation_attempt_id": ATTEMPT_ID},
+                {
+                    "activation_attempt_id": ATTEMPT_ID,
+                    "intent": dict(VALID_INTENT),
+                },
             ),
             (
                 "decide_zdecision_recall",

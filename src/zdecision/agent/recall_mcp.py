@@ -20,6 +20,7 @@ from zdecision.agent.recall_host_state import (
 )
 from zdecision.app_server.models import ActiveTurnEvidence
 from zdecision.jsonio import atomic_write_json, canonical_json_bytes
+from zdecision.recall.handoff import RECALL_HANDOFF_PROTOCOL, RecallPreflightReady
 from zdecision.recall.session import HostProbeEnvelope, RecallIntent, TurnGateResult
 
 
@@ -153,12 +154,21 @@ class RecallMcpTools:
         self._ensure_receipt_schema()
 
     def show_recall_confirmation(
-        self, *, activation_attempt_id: str, ui_digest: str
+        self, *, activation_attempt_id: str, intent: object, ui_digest: str
     ) -> dict[str, object]:
         """Freeze the card shown for one Hook-owned confirmation attempt."""
 
+        parsed = _parse_intent(intent)
         attempt = self._confirmation_attempt(activation_attempt_id)
-        if attempt is None or not _valid_ui_digest(ui_digest):
+        if (
+            parsed is None
+            or attempt is None
+            or attempt.protocol_version != RECALL_HANDOFF_PROTOCOL
+            or not isinstance(attempt.preflight, RecallPreflightReady)
+            or attempt.preflight.intent.digest != parsed.digest
+            or attempt.preflight.intent != parsed
+            or not _valid_ui_digest(ui_digest)
+        ):
             return _blocked("invalid_confirmation")
         if attempt.state != "pending_confirmation":
             return _confirmation_output(attempt)
@@ -746,20 +756,25 @@ def _valid_ui_digest(value: object) -> bool:
 def _confirmation_output(attempt: object) -> dict[str, object]:
     state = getattr(attempt, "state", None)
     attempt_id = getattr(attempt, "attempt_id", None)
-    repository_id = getattr(attempt, "repository_id", None)
     repository_display_name = getattr(attempt, "repository_display_name", None)
     if not all(
         isinstance(value, str)
-        for value in (state, attempt_id, repository_id, repository_display_name)
+        for value in (state, attempt_id, repository_display_name)
     ):
         raise ValueError("confirmation attempt is invalid")
+    meta: dict[str, object] = {
+        "zdecision/activation_attempt_id": attempt_id,
+        "zdecision/repository_display_name": repository_display_name,
+    }
+    preflight = getattr(attempt, "preflight", None)
+    if isinstance(preflight, RecallPreflightReady):
+        meta["zdecision/target_display_names"] = list(
+            preflight.target_display_names
+        )
+        meta["zdecision/freshness"] = preflight.freshness
     return {
         "state": state,
-        "_meta": {
-            "zdecision/activation_attempt_id": attempt_id,
-            "zdecision/repository_id": repository_id,
-            "zdecision/repository_display_name": repository_display_name,
-        },
+        "_meta": meta,
     }
 
 
