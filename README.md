@@ -31,7 +31,12 @@ No Session ID, product selector, separate compression conversation, or Capture
 CLI is part of the Plugin flow. Rendering the card does not authorize Capture;
 only one of its scope buttons or the repository page Update action does.
 Packet 1 ends at the Candidate Inbox. Web Review/publication is Packet 2, and
-automatic Decision recall is Packet 3.
+formal Decision Recall is Packet 3. Gate A implements only the current-task
+handoff: explicit ZDecision selection builds the typed intent, the trusted card
+click authorizes one frozen delivery, and the retained App attachment supplies
+that delivery to the next native message for classification and application
+before affected work. Production may report `recall_not_ready` until Gates B
+and C provide trusted Decision distribution and local hybrid retrieval.
 
 ## Technical Demo startup
 

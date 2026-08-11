@@ -10,6 +10,14 @@ SKILL_ROOT = REPOSITORY_ROOT / ".agents" / "skills" / "zdecision"
 PLUGIN_SKILL = (
     REPOSITORY_ROOT / "plugins" / "zdecision" / "skills" / "zdecision" / "SKILL.md"
 )
+CANDIDATE_PLUGIN_SKILL = (
+    REPOSITORY_ROOT
+    / "plugins"
+    / "zdecision"
+    / "skills"
+    / "candidate-refresh"
+    / "SKILL.md"
+)
 
 
 class ZDecisionSkillContractTests(unittest.TestCase):
@@ -22,7 +30,7 @@ class ZDecisionSkillContractTests(unittest.TestCase):
         )
 
     def test_installed_plugin_keeps_two_neutral_update_scopes(self) -> None:
-        text = PLUGIN_SKILL.read_text("utf-8")
+        text = CANDIDATE_PLUGIN_SKILL.read_text("utf-8")
 
         self.assertEqual(1, text.count("**当前 Session**"))
         self.assertEqual(2, text.count("**所有有效 Session**"))
@@ -335,7 +343,10 @@ class ZDecisionSkillContractTests(unittest.TestCase):
             text,
             re.compile(r"Web\s+Review/publication is Packet 2"),
         )
-        self.assertIn("automatic Decision recall is Packet 3", text)
+        self.assertIn("formal Decision Recall is Packet 3", text)
+        self.assertIn("trusted card", text)
+        self.assertIn("next native message", text)
+        self.assertIn("`recall_not_ready`", text)
         self.assertIn("zdecision-central run", text)
         self.assertIn("zdecision-agent service run", text)
         central_run = text.split("zdecision-central run", 1)[1].split(

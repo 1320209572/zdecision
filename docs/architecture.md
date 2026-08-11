@@ -592,9 +592,14 @@ are the only workflow output written to Git.
 
 The technical operator commands `zdecision-central run` and
 `zdecision-agent service run` are deployment diagnostics, not end-user Capture
-UX. The current Recall slice adds only an inline current-task confirmation and
-the later native Turn gate; complete automatic Decision retrieval remains a
-later packet. The separately excluded
+UX. The current Recall slice builds a closed intent before the inline
+current-task confirmation. The trusted card click prepares one frozen handoff,
+the App delivers it to the attached next native message, and Codex classifies
+every item and commits the application before affected mutation. Ordinary later
+Turns use the local intent gate: unchanged intent reuses the active set, while
+changed intent must apply a new complete handoff. Production remains
+`recall_not_ready` until Gates B and C provide trusted distribution and local
+hybrid retrieval. The separately excluded
 Dashboard Git-fetch optimization, Registry V2, SSO, Git-role authorization,
 route-administration UI, comments, and notifications are not part of this
 vertical.

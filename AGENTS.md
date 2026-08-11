@@ -12,7 +12,9 @@ Do not continue plans or specifications marked Superseded.
 - The Plugin product interface is the ZDecision page, the approved inline
   Codex Candidate-refresh card, and the explicit inline Recall confirmation;
   it is not a CLI-first workflow. Recall is enabled only by that current-task
-  card click before later native Turn gating.
+  card click. The App then delivers one frozen handoff for the next native
+  message, where every item is classified and atomically applied before
+  affected mutation; ordinary later Turns use the local intent gate.
 - The Plugin observes enabled repositories locally. Candidate extraction starts
   only when the user clicks the page update control or one of the inline
   **当前 Session** / **所有有效 Session** controls.

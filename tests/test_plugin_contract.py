@@ -149,6 +149,7 @@ class PluginContractTests(unittest.TestCase):
             (
                 "mcp__zdecision_local__show_zdecision_update|"
                 "mcp__zdecision_local__show_zdecision_recall_confirmation|"
+                "mcp__zdecision_local__apply_zdecision_recall_delivery|"
                 "mcp__zdecision_local__gate_zdecision_turn|"
                 "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
             ),
@@ -257,12 +258,16 @@ class PluginContractTests(unittest.TestCase):
             "allow_implicit_invocation: true", agent_config
         )
 
-    def test_manifest_describes_opt_in_recall_without_automatic_capture(self) -> None:
+    def test_manifest_describes_the_next_native_message_recall_handoff(self) -> None:
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
         serialized = json.dumps(manifest, sort_keys=True)
 
-        self.assertIn("Session opt-in", serialized)
+        self.assertIn("current-task opt-in", serialized)
         self.assertIn("confirmation", serialized.lower())
+        self.assertIn("card click", serialized)
+        self.assertIn("next native message", serialized)
+        self.assertIn("apply", serialized)
+        self.assertIn("may report unavailable", serialized)
         self.assertIn("Candidate refresh remains explicit", serialized)
         self.assertNotIn("automatically recalls", serialized)
 
