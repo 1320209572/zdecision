@@ -211,6 +211,19 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
             gate_id="gate-same",
         )
 
+        class NoRetrievalProvider:
+            retrieve_calls = 0
+
+            def preflight(self, **_kwargs):
+                raise AssertionError("same intent must not preflight")
+
+            def retrieve(self, _preflight):
+                self.retrieve_calls += 1
+                raise AssertionError("same intent must not retrieve")
+
+        provider = NoRetrievalProvider()
+        self.recall.handoff_service.provider = provider
+
         with patch.object(
             AppServerGateway,
             "connect",
@@ -223,9 +236,22 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
                     "intent": valid_intent().to_dict(),
                 },
             )
+            replay = await self.server.call_tool(
+                "gate_zdecision_turn",
+                {
+                    "turn_gate_id": "gate-same",
+                    "intent": valid_intent().to_dict(),
+                },
+            )
 
         self.assertFalse(result.isError)
         self.assertEqual("reuse", result.structuredContent["state"])
+        self.assertEqual(
+            "committed",
+            self.store.get_turn_gate("private-session", "same-turn").state,
+        )
+        self.assertEqual(result, replay)
+        self.assertEqual(0, provider.retrieve_calls)
 
     async def test_changed_intent_gate_returns_typed_handoff_without_app_server(
         self,

@@ -450,7 +450,7 @@ class RecallMcpTools:
         parsed = _parse_intent(intent)
         if parsed is None or not isinstance(explicit_refresh, bool):
             return _blocked("invalid_intent")
-        binding = self._turn_binding(turn_gate_id)
+        binding = self._turn_binding(turn_gate_id, intent=parsed)
         if binding is None:
             return _blocked("invalid_binding")
         session, turn_id = binding
@@ -594,7 +594,7 @@ class RecallMcpTools:
             return None
 
     def _turn_binding(
-        self, gate_id: object
+        self, gate_id: object, *, intent: RecallIntent | None = None
     ) -> tuple[RecallSession, str] | None:
         if not _valid_binding_id(gate_id):
             return None
@@ -634,7 +634,21 @@ class RecallMcpTools:
                 or (session.state != "active" and not recovering_intent_delivery)
             ):
                 return None
-            if row["state"] != "pending" and self._receipt("turn", gate_id) is None:
+            terminal_reuse = (
+                row["state"] == "committed"
+                and intent is not None
+                and self.host_store.replayable_reuse_gate(
+                    session_id=session.session_id,
+                    turn_id=row["turn_id"],
+                    gate_id=gate_id,
+                    intent=intent,
+                )
+            )
+            if (
+                row["state"] != "pending"
+                and self._receipt("turn", gate_id) is None
+                and not terminal_reuse
+            ):
                 return None
             return session, row["turn_id"]
         except (OSError, sqlite3.Error, ValueError):

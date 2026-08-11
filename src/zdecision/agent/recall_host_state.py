@@ -1896,6 +1896,48 @@ class RecallHostStore:
             raise RecallGateConflict("turn gate is not committed")
         return _gate(row)
 
+    def replayable_reuse_gate(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        gate_id: str,
+        intent: RecallIntent,
+    ) -> bool:
+        """Prove one terminal v1 gate is the exact active-intent reuse commit."""
+
+        session = _text(session_id, "session_id")
+        turn = _text(turn_id, "turn_id")
+        gate_identifier = _text(gate_id, "gate_id")
+        if not isinstance(intent, RecallIntent) or self._is_internal_thread(session):
+            return False
+        row = self._gate_for_turn(session, turn)
+        current = self._session_row(session)
+        if row is None or current is None:
+            return False
+        result = TurnGateResult(
+            disposition="reuse",
+            intent_digest=intent.digest,
+            context_epoch=current["context_epoch"],
+            intent_epoch=current["intent_epoch"],
+            probe=None,
+        )
+        return bool(
+            current["protocol_version"] == RECALL_HANDOFF_PROTOCOL
+            and current["state"] == "active"
+            and current["active_intent_digest"] == intent.digest
+            and current["last_gate_turn_id"] == turn
+            and row["gate_id"] == gate_identifier
+            and row["state"] == "committed"
+            and row["context_epoch"] == current["context_epoch"]
+            and row["intent_epoch"] == current["intent_epoch"]
+            and row["active_generation"] is None
+            and row["active_set_digest"] == current["active_set_digest"]
+            and row["result_digest"] == _result_digest(result)
+            and row["commit_fingerprint"]
+            == _commit_fingerprint(result, current["active_set_digest"])
+        )
+
     def begin_context_epoch(
         self,
         *,
