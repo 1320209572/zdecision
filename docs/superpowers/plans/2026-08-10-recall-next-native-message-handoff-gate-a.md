@@ -74,6 +74,9 @@ Codex Desktop.
   transitions only; no retrieval or UI.
 - `src/zdecision/agent/recall_handoff.py`: provider orchestration and bounded
   tool outcomes; no MCP registration.
+- `src/zdecision/agent/recall_plugin_identity.py`: immutable Plugin identity,
+  exact bundle/Hook validation, and production identity constant; no I/O
+  beyond bounded local bundle reads.
 - `src/zdecision/agent/recall_mcp.py`: thin MCP-facing domain adapter.
 - `src/zdecision/agent/hooks.py`: trusted host binding, lifecycle instruction,
   and mutation backstop.
@@ -82,8 +85,9 @@ Codex Desktop.
 - `src/zdecision/agent/static/recall-confirmation-v1.html`: two-button card,
   context update, explicit retry, and app-only acknowledgement.
 - `plugins/zdecision/skills/zdecision/`: model workflow instructions only.
-- `tests/integration/recall_gate_a_desktop_harness.py`: test-only provider and
-  disposable Plugin generator; never packaged into production.
+- `tests/integration/recall_gate_a_desktop_harness.py`: test-only provider,
+  disposable Plugin generator/runtime, and bounded inspector/cleanup; never
+  packaged into production.
 
 ## Execution preflight
 
@@ -1381,7 +1385,223 @@ git commit -m "docs: align Plugin with Recall handoff"
 
 ---
 
-### Task 9: Build a test-only vertical and disposable Desktop harness
+### Task 9A: Freeze production and disposable Plugin identity
+
+**Files:**
+- Create: `src/zdecision/agent/recall_plugin_identity.py`
+- Modify: `src/zdecision/agent/recall_host_state.py`
+- Modify: `src/zdecision/agent/hooks.py`
+- Modify: `src/zdecision/agent/mcp_server.py`
+- Modify: `tests/test_plugin_contract.py`
+- Modify: `tests/test_recall_host_state.py`
+- Modify: `tests/test_recall_hook_gate.py`
+- Modify: `tests/test_mcp_recall_handoff.py`
+
+**Interfaces:**
+- Consumes: design section 14's six-field immutable identity and existing
+  production Plugin bytes.
+- Produces: one production-default identity seam shared by Store, Hook, and MCP
+  composition, plus exact contract tests for production and disposable
+  identities.
+- Does not change: Plugin bytes, CLI arguments, SQLite schema, bundle-digest
+  inputs, provider behavior, or Gate B/C code.
+
+- [ ] **Step 1: Write RED identity and bundle-contract tests**
+
+Add tests that first import the missing identity module and require:
+
+```python
+PRODUCTION_RECALL_PLUGIN_IDENTITY == RecallPluginIdentity(
+    plugin_name="zdecision",
+    mcp_server_key="zdecision-local",
+    mcp_command="zdecision-agent",
+    mcp_args=("mcp",),
+    hook_command="zdecision-agent hook",
+    recall_skill_relative_path="skills/zdecision/SKILL.md",
+)
+```
+
+The RED matrix must cover every individual manifest name, MCP key, command,
+ordered argument, Skill path, Hook command, required event, matcher, timeout,
+additional-context limit, mutation coverage, and extra-Hook substitution. It
+must also reject malformed names, underscores, ambiguous namespace mappings,
+NULs, overlong values, and non-normalized Skill paths. Extend the temporary
+valid-Plugin fixtures in `test_recall_host_state.py` and
+`test_recall_hook_gate.py` with a valid default `hooks/hooks.json`; otherwise
+the new mandatory Hook validation would make unrelated tests invalid.
+
+- [ ] **Step 2: Run the focused suite to verify RED**
+
+```bash
+.venv/bin/python -m unittest \
+  tests.test_plugin_contract \
+  tests.test_recall_host_state \
+  tests.test_recall_hook_gate \
+  tests.test_mcp_recall_handoff -v
+```
+
+Expected: missing `RecallPluginIdentity`/identity injection and new
+substitution assertions fail. Existing production behavior remains unchanged.
+
+- [ ] **Step 3: Implement the immutable value and exact verifier**
+
+Create the identity module with only these stored fields and derived helpers:
+
+```python
+_HOOK_TOOL_BASENAMES = frozenset(
+    {
+        "show_zdecision_update",
+        "show_zdecision_recall_confirmation",
+        "decide_zdecision_recall",
+        "get_zdecision_recall_handoff",
+        "ack_zdecision_recall_delivery",
+        "apply_zdecision_recall_delivery",
+        "gate_zdecision_turn",
+    }
+)
+_PRE_TOOL_PREFIX_BASENAMES = (
+    "show_zdecision_update",
+    "show_zdecision_recall_confirmation",
+    "apply_zdecision_recall_delivery",
+    "gate_zdecision_turn",
+)
+
+
+@dataclass(frozen=True)
+class RecallPluginIdentity:
+    plugin_name: str
+    mcp_server_key: str
+    mcp_command: str
+    mcp_args: tuple[str, ...]
+    hook_command: str
+    recall_skill_relative_path: str
+
+    @property
+    def tool_namespace(self) -> str:
+        return self.mcp_server_key.replace("-", "_")
+
+    def tool_name(self, basename: str) -> str:
+        if basename not in _HOOK_TOOL_BASENAMES:
+            raise ValueError("unsupported identity-sensitive MCP tool")
+        return f"mcp__{self.tool_namespace}__{basename}"
+
+    @property
+    def pre_tool_matcher(self) -> str:
+        return "|".join(
+            (
+                *(self.tool_name(name) for name in _PRE_TOOL_PREFIX_BASENAMES),
+                "Bash",
+                "apply_patch",
+                "Edit",
+                "Write",
+                "Agent",
+                "mcp__.*",
+            )
+        )
+
+
+@dataclass(frozen=True)
+class VerifiedRecallPluginBundle:
+    root: Path
+    skill_path: Path
+    bundle_digest: str
+```
+
+`__post_init__` must call private validators for all six fields and enforce the
+closed grammar and byte limits from design section 14 before the value exists.
+`tool_name()` accepts only the closed Candidate/Recall basenames. Expose one
+`verify_recall_plugin_bundle(plugin_root, identity)` function returning the
+verified value or `None`; do not put mutable cache or filesystem state on the
+identity. The verifier preserves the existing digest bytes exactly:
+
+```text
+manifest raw bytes + NUL + .mcp.json raw bytes + NUL + SKILL.md raw bytes
+```
+
+It validates the resolved root and containment; exact manifest name and absent
+manifest `hooks`; one exact MCP key/command/ordered args; the exact normalized
+Skill path; and the complete eight-event Hook security projection. Hook bytes
+are mandatory for every acceptance but are not added to the digest. Return the
+resolved root explicitly so callers never reconstruct it with `parents[2]`.
+
+- [ ] **Step 4: Make Store, Hook, and MCP composition identity-owned**
+
+Give `RecallHostStore.open()` a keyword-only production-default identity and
+store it immutably for the lifetime of the Store. All attempt, delivery,
+application, restart, reuse, compact, resume, and bound-Skill revalidation must
+call the Store's verifier. A Store reopened with another identity may open the
+database but cannot authorize rows frozen under the first identity. Keep a
+production-default `installed_recall_skill_path()` compatibility wrapper if an
+existing public test needs it; the wrapper delegates to the new verifier.
+
+Thread the same production-default identity through `handle_hook()`,
+`handle_pre_tool_hook()`, Recall binding/lifecycle/guard helpers, and trusted
+root lookup. Every full Candidate/Recall MCP tool name comes from
+`identity.tool_name()`; remove independent namespace constants from branch
+decisions. Internally opened Stores receive that identity. A supplied Store
+with a different identity fails closed. Use `VerifiedRecallPluginBundle.root`
+instead of inferring a root from Skill-path depth.
+
+Freeze the composition keyword as `recall_identity` for Hook and MCP functions
+and the Store's read-only property as `identity`. Add keyword-only
+`recall_identity=PRODUCTION_RECALL_PLUGIN_IDENTITY` to `create_mcp_server()` and
+construct `FastMCP(recall_identity.mcp_server_key)`. `run_mcp()` and the
+ordinary Hook CLI retain their public signatures and explicitly use only the
+production constant; there is no CLI or environment identity selector.
+
+- [ ] **Step 5: Prove cross-identity and production-default behavior GREEN**
+
+Add focused behavior tests proving:
+
+1. an injected disposable identity accepts only its exact Hook tool namespace;
+2. the production namespace is rejected by that composition and vice versa;
+3. Store/Hook identity mismatch fails closed;
+4. a frozen attempt cannot be replayed/revalidated under another identity;
+5. attempt, gate, restart, delivery, application, reuse, and compact checks all
+   reuse the Store identity; and
+6. `create_mcp_server()` uses the injected key while `run_mcp()` composes the
+   production constant for both Store and server.
+
+Run:
+
+```bash
+.venv/bin/python -m unittest \
+  tests.test_plugin_contract \
+  tests.test_recall_host_state \
+  tests.test_recall_hook_gate \
+  tests.test_mcp_recall_handoff \
+  tests.test_recall_skill_contract \
+  tests.test_hook_latency \
+  tests.test_mcp_inline_refresh \
+  tests.test_mcp_recall_confirmation -v
+.venv/bin/python -m compileall -q src
+git diff --check
+```
+
+Expected: all pass; Hook latency remains within its existing bound; production
+Plugin files and the digest algorithm are byte-for-byte unchanged.
+
+- [ ] **Step 6: Run one scoped Task 9A review and commit exact paths**
+
+Review only Task 9A against design sections 14.2–14.3. Fix confirmed findings
+with one focused RED/GREEN loop, then commit:
+
+```bash
+git add \
+  src/zdecision/agent/recall_plugin_identity.py \
+  src/zdecision/agent/recall_host_state.py \
+  src/zdecision/agent/hooks.py \
+  src/zdecision/agent/mcp_server.py \
+  tests/test_plugin_contract.py \
+  tests/test_recall_host_state.py \
+  tests/test_recall_hook_gate.py \
+  tests/test_mcp_recall_handoff.py
+git commit -m "feat: freeze Recall Plugin identity"
+```
+
+---
+
+### Task 9: Build the production-boundary test vertical and disposable Desktop harness
 
 **Files:**
 - Create: `tests/integration/test_recall_handoff_gate_a.py`
@@ -1389,29 +1609,42 @@ git commit -m "docs: align Plugin with Recall handoff"
 - Modify: `tests/test_recall_capture_isolation.py`
 
 **Interfaces:**
-- Consumes: the production Gate A provider seam and Plugin UI.
-- Produces: one automated end-to-end fixture path and a generator/inspector for
-  an isolated disposable Desktop Plugin outside the production bundle.
+- Consumes: the reviewed Task 9A identity seam, production Gate A Store/Hook/MCP
+  composition, the production card resource, and a test-only provider.
+- Produces: one automated production-boundary vertical and a generated,
+  self-verifying disposable Desktop Plugin outside the production bundle.
+- Does not prove: real Desktop `ui/update-model-context`; Task 10 remains the
+  only host-level proof of that capability.
 
 - [ ] **Step 1: Write the failing integrated vertical**
 
-The automated integration must exercise:
+The automated integration must exercise the generated launcher and real
+production boundaries through:
 
 ```text
-enabled repository + native Turn
+enabled repository + native-Turn-shaped Hook input
   -> Hook preflight and frozen attempt
-  -> show card result
+  -> production show-card resource/result
   -> app-only enable and one frozen delivery
-  -> host-delivery ack
+  -> simulated exactly-one context-update acknowledgement
   -> next native Turn and trusted application binding
+  -> covered mutation denied before application
+  -> complete [applicable, not_applicable] submission
   -> application commit
-  -> covered tool released
+  -> covered mutation released exactly once
+  -> same-intent Turn reuse without retrieve or reinjection
   -> compact restoration with complete active envelope
+  -> Store restart and exact identity revalidation
 ```
 
-Assert Candidate tables, Capture source eligibility, Central mock transport,
-and Registry files are unchanged. Add a Capture-isolation case proving
-recalled content and handoff markers cannot become native Candidate evidence.
+Assert preflight runs once and retrieval runs once for the logical delivery;
+provider work happens outside SQLite transactions. Exact generated Hook/MCP
+names succeed; production or mixed identities fail closed. Assert Candidate
+tables, Capture state/eligibility, Central mock transport/counts, Registry
+files, the production Plugin tree, production marketplace fixture, and
+production database fixture are unchanged. Add a Capture-isolation case proving
+formal envelopes, handoff instructions/markers, receipts, and application state
+cannot become Prompt anchors, Candidate evidence, or Capture upload content.
 
 - [ ] **Step 2: Run integration test to verify RED**
 
@@ -1425,32 +1658,83 @@ Run:
 
 Expected: missing vertical harness/provider composition.
 
-- [ ] **Step 3: Implement only a test-scoped deterministic provider and harness**
+- [ ] **Step 3: Implement the deterministic provider and generated identity**
 
 Define `DeterministicGateAProvider` inside the integration test/harness. It
-returns two canonical `DecisionRevision` fixtures: one expected applicable and
-one expected not applicable. It records call counts and performs no network or
-Git operation.
+returns one fixed unambiguous `RecallPreflightReady` and two complete canonical
+`DecisionRevision` fixtures: one clearly applicable to the designated target
+and one clearly excluded. It records preflight/retrieve counts and performs no
+network, Git, Central, Registry, App Server, or production-database operation.
 
 The desktop harness supports exact subcommands:
 
 ```text
 create --root <temporary-absolute-path> --repository <enabled-repository>
-hook
-mcp
 inspect --root <temporary-absolute-path>
 cleanup --root <temporary-absolute-path>
 ```
 
 `create` writes a disposable marketplace and Plugin below the supplied
-temporary root. Its Hook/MCP commands invoke the repository `.venv` Python and
-this harness file. It uses an isolated SQLite database below the disposable
-Plugin data directory. It never modifies `plugins/zdecision`, the production
-marketplace, or the production agent database. `inspect` prints only bounded
-states, counts, digest prefixes, and receipt prefixes; it prints no full
-Decision, task text, host ID, or local path.
+fresh absolute root, outside the repository, home root, production cache, and
+production database. Generate one unique closed-grammar identity, distinct
+from `zdecision`/`zdecision-local`, and derive the Plugin folder, manifest and
+marketplace names, MCP key, Hook matcher names, commands, and Skill path only
+from it. The marketplace source is relative and resolves inside that disposable
+marketplace root. The manifest omits `hooks`; the default `hooks/hooks.json`
+exactly matches the identity verifier.
 
-- [ ] **Step 4: Run automated vertical GREEN**
+- [ ] **Step 4: Generate a self-verifying launcher and safe lifecycle**
+
+Write one minimal launcher below the disposable Plugin root. The generated MCP
+definition is exactly:
+
+```text
+command = <repository>/.venv/bin/python
+args = [<absolute-generated-launcher>, "mcp"]
+```
+
+Every Hook command is the safely quoted equivalent of:
+
+```text
+<repository>/.venv/bin/python <absolute-generated-launcher> hook
+```
+
+The launcher contains the immutable identity literals and accepts only `hook`
+or `mcp`; it accepts no root, database, provider, or identity argument. It
+derives its root from its own resolved path and validates an ownership marker
+containing launcher relative path/digest, root device/inode, and generation
+before importing the tracked harness. It compares, never rewrites,
+host-provided `PLUGIN_ROOT`. The tracked harness then directly composes
+`RecallHostStore.open(database_path, identity=identity)`,
+`handle_hook(..., recall_identity=identity)`, and
+`create_mcp_server(..., recall_identity=identity)` with one isolated database
+and the deterministic provider. It must not call `run_mcp()`, patch the
+production constant, translate tool names, copy the identity validator, or
+mutate bundle bytes after generation.
+
+`inspect` and `cleanup` revalidate that exact marker generation and launcher
+digest. Inspection returns only bounded counts/states and digest/receipt
+prefixes—never a Prompt, Decision, Session/Turn/binding ID, absolute path,
+command, trusted hash, row, or transcript. Cleanup refuses while any exact MCP
+lease is live; after all leases exit it quarantines and deletes only the
+validated root. Any mismatch is a hard failure and preserves the uncertain
+root. The disposable root/state directories are mode `0700`; marker, launcher,
+database sidecars, and lease/identity files are no broader than `0600`.
+
+- [ ] **Step 5: Add failure, replay, privacy, and cleanup coverage**
+
+Test marker/launcher/root generation mutations, each identity/bundle/Hook
+substitution, mismatched `PLUGIN_ROOT`, mixed tool namespace, missing exact MCP
+client, two concurrent MCP clients, restart replay, same-intent reuse, compact
+restoration, and cleanup races. All must stop/fail closed without translation,
+second App Server, private IPC, manual database mutation, `ui/message`, or
+production-state changes. Assert no disposable MCP child process, TCP
+connection, or named external Unix endpoint and no provider filesystem write.
+The card and resource must be the production ones;
+the application path must call production `RecallMcpTools`,
+`RecallHandoffService`, and Hook guard code.
+
+- [ ] **Step 6: Run automated vertical GREEN**
 
 Run:
 
@@ -1458,13 +1742,20 @@ Run:
 .venv/bin/python -m unittest \
   tests.integration.test_recall_handoff_gate_a \
   tests.test_recall_capture_isolation -v
-.venv/bin/python -m compileall -q src tests/integration/recall_gate_a_desktop_harness.py
+.venv/bin/python -m compileall -q \
+  src \
+  tests/integration/recall_gate_a_desktop_harness.py \
+  tests/integration/test_recall_handoff_gate_a.py
 git diff --check
 ```
 
 Expected: all pass; compile and diff checks produce no error.
 
-- [ ] **Step 5: Commit Task 9**
+- [ ] **Step 7: Run one scoped Task 9 review and commit exact paths**
+
+Review only the test-only provider, generated launcher/Plugin vertical,
+Capture isolation, privacy, and cleanup contract. Fix confirmed findings with
+one focused RED/GREEN loop, then commit:
 
 ```bash
 git add \
@@ -1486,7 +1777,8 @@ git commit -m "test: add Recall Gate A vertical"
 - Never modify: the two protected untracked paths.
 
 **Interfaces:**
-- Consumes: Task 9 disposable Plugin and one user click/native message.
+- Consumes: independently GREEN/approved Task 9A and Task 9, plus one user
+  click/native message.
 - Produces: sanitized Gate A acceptance evidence and a clean machine/repository
   state.
 
@@ -1502,6 +1794,7 @@ Run:
   tests.test_recall_handoff_service \
   tests.test_mcp_recall_confirmation \
   tests.test_mcp_recall_handoff \
+  tests.test_plugin_contract \
   tests.test_recall_capture_isolation \
   tests.integration.test_recall_handoff_gate_a -v
 ```
@@ -1513,8 +1806,17 @@ rerun this focused command; do not begin Desktop acceptance.
 
 Create a fresh exact temporary root with `mktemp -d`, record the resulting
 absolute path, run the harness `create`, add its marketplace with the supported
-Codex Plugin command, and install its unique selector. Confirm the production
-`zdecision@zdecision-local` remains installed and unchanged. Restart Codex once.
+Codex Plugin command, and install its unique selector. Verify `inspect` reports
+the exact generated identity/launcher readiness in bounded form and confirm the
+production `zdecision@zdecision-local` and all pre-existing marketplace entries
+remain installed and unchanged; only the exact disposable marketplace entry may
+be added temporarily. Before installation, record bounded read-only baselines
+for the production marketplace entry, installed Plugin bundle bytes, and
+production database. Review and trust the current disposable Plugin's exact
+Hook hash separately for each of its eight required event entries via the
+supported Codex Hook UI before starting the acceptance task; prior disposable
+Hook trust does not carry across identities or event sources. Restart Codex
+once after all eight trust records are present.
 
 Do not place the temporary root under the repository, home root, or production
 Plugin cache path. Do not reuse a prior probe database.
@@ -1538,7 +1840,10 @@ repository and send a normal code-development request. Verify:
 9. a second ordinary Prompt performs reuse with no retrieval or reinjection;
 10. one compact/clear restores the complete applicable item once; and
 11. no App Server process, Central request, Candidate mutation, or raw private
-    content appears in bounded diagnostics.
+    content appears in bounded diagnostics; and
+12. the selected turn exposes the exact generated MCP namespace, never falls
+    back to production `zdecision-local`, and never translates a mismatched
+    tool or Plugin root.
 
 If app-only tools, remount recovery, or `ui/update-model-context` regresses,
 record FAIL and stop. Do not substitute `ui/message`, a second App Server,
@@ -1546,11 +1851,14 @@ private IPC, or manual DB mutation.
 
 - [ ] **Step 4: Clean the disposable environment before writing PASS**
 
-Remove the exact disposable Plugin selector and marketplace, stop only its
-processes, and delete only the recorded temporary root. Verify the production
+Remove the exact disposable Plugin selector and marketplace, wait for every
+exact launcher/MCP lease to exit, and invoke only the harness's validated
+cleanup for the recorded temporary root. Verify the production
 Plugin remains installed/enabled and the disposable selector/process/database
-is absent. If exact cleanup cannot be proven, stop and report it rather than
-using a broad recursive deletion.
+is absent. Verify the production marketplace entry, installed bundle bytes, and
+production database exactly match their pre-install baselines. If exact cleanup
+or baseline equality cannot be proven, stop and report it rather than using a
+broad recursive deletion.
 
 - [ ] **Step 5: Write and commit the sanitized acceptance report**
 
