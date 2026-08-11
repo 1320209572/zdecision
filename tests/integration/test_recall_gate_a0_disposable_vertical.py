@@ -28,8 +28,10 @@ HARNESS_PATH = (
 PYTHON = REPOSITORY_ROOT / ".venv/bin/python"
 PROTOCOL_VERSION = "recall-handoff-v1"
 APPLICATION_INSTRUCTION = (
-    "Classify every delivered Decision exactly once, then call "
-    "apply_zdecision_gate_a0_delivery before development mutation."
+    "Classify every delivered Decision exactly once with one nonempty reason of "
+    "at most 240 UTF-8 bytes per item. Call apply_zdecision_gate_a0_delivery "
+    "before development mutation. Do not call show_zdecision_gate_a0 or guess "
+    "host-owned identifiers; the Hook supplies them."
 )
 LIVE_SESSION = "7live-session-private-sentinel"
 LIVE_RENDER_TURN = "8live-render-turn-private-sentinel"
@@ -383,6 +385,170 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
             "pending_confirmation", rendered["structuredContent"]["state"]
         )
 
+    def test_public_application_and_counter_schemas_are_model_complete(self) -> None:
+        client = self._mcp()
+        tools = client.request("tools/list", {})["tools"]
+        by_name = {tool["name"]: tool for tool in tools}
+        application_schema = by_name["apply_zdecision_gate_a0_delivery"][
+            "inputSchema"
+        ]
+        counter_schema = by_name["increment_zdecision_gate_a0_counter"][
+            "inputSchema"
+        ]
+
+        self.assertEqual(["classifications"], application_schema["required"])
+        self.assertFalse(application_schema["additionalProperties"])
+        self.assertEqual(
+            {
+                "application_binding_id",
+                "delivery_id",
+                "classifications",
+            },
+            set(application_schema["properties"]),
+        )
+        item_schema = application_schema["properties"]["classifications"]["items"]
+        if "$ref" in item_schema:
+            item_schema = application_schema["$defs"][
+                item_schema["$ref"].rsplit("/", 1)[-1]
+            ]
+        classification_fields = {
+            "decision_id",
+            "revision",
+            "digest",
+            "classification",
+            "reason",
+        }
+        self.assertEqual(classification_fields, set(item_schema["required"]))
+        self.assertEqual(classification_fields, set(item_schema["properties"]))
+        self.assertFalse(item_schema["additionalProperties"])
+        self.assertEqual(
+            r"^dec_[0-9a-f]{32}$",
+            item_schema["properties"]["decision_id"]["pattern"],
+        )
+        self.assertEqual("integer", item_schema["properties"]["revision"]["type"])
+        self.assertEqual(1, item_schema["properties"]["revision"]["minimum"])
+        self.assertEqual(
+            r"^[0-9a-f]{64}$",
+            item_schema["properties"]["digest"]["pattern"],
+        )
+        self.assertEqual(
+            ["applicable", "conflicting", "not_applicable", "uncertain"],
+            sorted(item_schema["properties"]["classification"]["enum"]),
+        )
+        self.assertEqual(1, item_schema["properties"]["reason"]["minLength"])
+        self.assertEqual(240, item_schema["properties"]["reason"]["maxLength"])
+        self.assertEqual(
+            r".*\S.*", item_schema["properties"]["reason"]["pattern"]
+        )
+        for host_field in ("application_binding_id", "delivery_id"):
+            self.assertEqual(
+                {"null", "string"},
+                {
+                    alternative["type"]
+                    for alternative in application_schema["properties"][host_field][
+                        "anyOf"
+                    ]
+                },
+            )
+        self.assertEqual([], counter_schema.get("required", []))
+        self.assertFalse(counter_schema["additionalProperties"])
+        self.assertEqual({"mutation_id"}, set(counter_schema["properties"]))
+        self.assertEqual(
+            {"null", "string"},
+            {
+                alternative["type"]
+                for alternative in counter_schema["properties"]["mutation_id"][
+                    "anyOf"
+                ]
+            },
+        )
+
+        classifications = [
+            {
+                "decision_id": FIXTURE_ONE["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_ONE_DIGEST,
+                "classification": "applicable",
+                "reason": "The first fixture governs this bounded action.",
+            },
+            {
+                "decision_id": FIXTURE_TWO["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_TWO_DIGEST,
+                "classification": "not_applicable",
+                "reason": "The second fixture does not govern this action.",
+            },
+        ]
+        direct_application = client.call(
+            "apply_zdecision_gate_a0_delivery",
+            {"classifications": classifications},
+        )
+        self.assertEqual(
+            "invalid_application", direct_application["structuredContent"]["code"]
+        )
+        direct_counter = client.call("increment_zdecision_gate_a0_counter", {})
+        self.assertEqual(
+            "mutation_denied", direct_counter["structuredContent"]["code"]
+        )
+
+    def test_public_reason_enforces_utf8_byte_boundary(self) -> None:
+        client = self._mcp()
+        classifications = [
+            {
+                "decision_id": FIXTURE_ONE["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_ONE_DIGEST,
+                "classification": "applicable",
+                "reason": "界" * 80,
+            },
+            {
+                "decision_id": FIXTURE_TWO["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_TWO_DIGEST,
+                "classification": "not_applicable",
+                "reason": "The second fixture does not govern this action.",
+            },
+        ]
+
+        at_limit = client.call(
+            "apply_zdecision_gate_a0_delivery",
+            {"classifications": classifications},
+        )
+        over_limit = client.call(
+            "apply_zdecision_gate_a0_delivery",
+            {
+                "classifications": [
+                    {**classifications[0], "reason": "界" * 81},
+                    classifications[1],
+                ]
+            },
+        )
+
+        self.assertEqual(
+            "invalid_application", at_limit["structuredContent"]["code"]
+        )
+        self.assertNotEqual(
+            "invalid_application",
+            over_limit.get("structuredContent", {}).get("code"),
+        )
+        self.assertTrue(over_limit["isError"])
+        self.assertIn("240 UTF-8 bytes", json.dumps(over_limit))
+
+        tools = client.request("tools/list", {})["tools"]
+        application_schema = next(
+            tool["inputSchema"]
+            for tool in tools
+            if tool["name"] == "apply_zdecision_gate_a0_delivery"
+        )
+        item_schema = application_schema["properties"]["classifications"]["items"]
+        if "$ref" in item_schema:
+            item_schema = application_schema["$defs"][
+                item_schema["$ref"].rsplit("/", 1)[-1]
+            ]
+        self.assertIn(
+            "240 UTF-8 bytes", item_schema["properties"]["reason"]["description"]
+        )
+
     def test_enable_commits_one_stable_delivery_with_literal_canonical_fixtures(self) -> None:
         for fixture_bytes, digest in (
             (FIXTURE_ONE_BYTES, FIXTURE_ONE_DIGEST),
@@ -695,6 +861,121 @@ function result(state, extra = {}) {
         self.assertEqual(1, inspect["application_count"])
         self.assertEqual(1, inspect["active_fixture_count"])
         self.assertEqual(1, inspect["mutation_count"])
+
+    def test_application_hook_uses_delivered_row_despite_later_pending_show(
+        self,
+    ) -> None:
+        delivered_attempt = self._render_attempt()
+        client = self._mcp()
+        enabled = self._enable_and_ack(client, delivered_attempt)
+        delivery_id = enabled["snapshot"]["delivery_id"]
+        later_show = self._hook(
+            "mcp__zdecision_gate_a0__show_zdecision_gate_a0",
+            {},
+            turn_id="later-diagnostic-show-turn",
+        )
+        later_attempt = self._updated_input(later_show)["attempt_id"]
+        classifications = [
+            {
+                "decision_id": FIXTURE_ONE["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_ONE_DIGEST,
+                "classification": "applicable",
+                "reason": "The delivered fixture governs this bounded action.",
+            },
+            {
+                "decision_id": FIXTURE_TWO["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_TWO_DIGEST,
+                "classification": "not_applicable",
+                "reason": "The second fixture does not govern this action.",
+            },
+        ]
+
+        unbound_application = client.call(
+            "apply_zdecision_gate_a0_delivery",
+            {"classifications": classifications},
+        )
+
+        binding = self._hook(
+            "mcp__zdecision_gate_a0__apply_zdecision_gate_a0_delivery",
+            {"classifications": classifications},
+            turn_id=LIVE_APPLICATION_TURN,
+        )
+        updated = self._updated_input(binding)
+        applied = client.call("apply_zdecision_gate_a0_delivery", updated)
+        unbound_mutation = client.call("increment_zdecision_gate_a0_counter", {})
+
+        self.assertNotEqual(delivered_attempt, later_attempt)
+        self.assertEqual(
+            "invalid_application",
+            unbound_application["structuredContent"]["code"],
+        )
+        self.assertEqual("allow", binding["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual(delivery_id, updated["delivery_id"])
+        self.assertRegex(
+            updated["application_binding_id"], r"^application_[0-9a-f]{32}$"
+        )
+        self.assertEqual(
+            {
+                "application_binding_id",
+                "delivery_id",
+                "classifications",
+            },
+            set(updated),
+        )
+        self.assertEqual(
+            "application_committed", applied["structuredContent"]["state"]
+        )
+        self.assertEqual(
+            "mutation_denied", unbound_mutation["structuredContent"]["code"]
+        )
+        inspect = self._run("inspect")
+        self.assertEqual(2, inspect["attempt_count"])
+        self.assertEqual(1, inspect["delivery_count"])
+        self.assertEqual(1, inspect["application_count"])
+
+    def test_application_hook_distinguishes_invalid_input_from_missing_delivery(
+        self,
+    ) -> None:
+        incomplete = [
+            {
+                "decision_id": FIXTURE_ONE["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_ONE_DIGEST,
+                "classification": "applicable",
+            },
+            {
+                "decision_id": FIXTURE_TWO["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_TWO_DIGEST,
+                "classification": "not_applicable",
+            },
+        ]
+        complete = [
+            {**incomplete[0], "reason": "The first fixture applies."},
+            {**incomplete[1], "reason": "The second fixture does not apply."},
+        ]
+
+        invalid = self._hook(
+            "mcp__zdecision_gate_a0__apply_zdecision_gate_a0_delivery",
+            {"classifications": incomplete},
+            turn_id=LIVE_APPLICATION_TURN,
+        )
+        missing = self._hook(
+            "mcp__zdecision_gate_a0__apply_zdecision_gate_a0_delivery",
+            {"classifications": complete},
+            turn_id=LIVE_APPLICATION_TURN,
+        )
+        invalid_reason = invalid["hookSpecificOutput"]["permissionDecisionReason"]
+        missing_reason = missing["hookSpecificOutput"]["permissionDecisionReason"]
+
+        self.assertEqual("deny", invalid["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual("deny", missing["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn("invalid classifications", invalid_reason)
+        self.assertIn("nonempty reason", invalid_reason)
+        self.assertIn("no delivered binding", missing_reason)
+        self.assertNotEqual(invalid_reason, missing_reason)
 
     def test_restart_recovers_receipt_without_mutation_and_cleanup_is_isolated(self) -> None:
         protected = {

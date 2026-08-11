@@ -15,17 +15,20 @@ import sqlite3
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 PROTOCOL_VERSION = "recall-handoff-v1"
 APP_PROTOCOL_VERSION = "2026-01-26"
 APPLICATION_INSTRUCTION = (
-    "Classify every delivered Decision exactly once, then call "
-    "apply_zdecision_gate_a0_delivery before development mutation."
+    "Classify every delivered Decision exactly once with one nonempty reason of "
+    "at most 240 UTF-8 bytes per item. Call apply_zdecision_gate_a0_delivery "
+    "before development mutation. Do not call show_zdecision_gate_a0 or guess "
+    "host-owned identifiers; the Hook supplies them."
 )
 RESOURCE_URI = "ui://zdecision/recall-gate-a0-v1.html"
 RESOURCE_MIME = "text/html;profile=mcp-app"
@@ -41,6 +44,41 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CATEGORIES = frozenset(("applicable", "not_applicable", "conflicting", "uncertain"))
 _MARKER_NAME = ".zdecision-gate-a0-disposable.json"
 _PROCESS_INSTANCE_PREVIEW_LIMIT = 8
+
+
+class GateA0ClassificationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: Annotated[str, Field(pattern=r"^dec_[0-9a-f]{32}$")]
+    revision: Annotated[int, Field(strict=True, ge=1)]
+    digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    classification: Literal[
+        "applicable", "not_applicable", "conflicting", "uncertain"
+    ]
+    reason: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=240,
+            pattern=r".*\S.*",
+            description="Nonempty reason of at most 240 UTF-8 bytes.",
+        ),
+    ]
+
+    @field_validator("reason")
+    @classmethod
+    def reason_fits_utf8_boundary(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 240:
+            raise ValueError("reason must be at most 240 UTF-8 bytes")
+        return value
+
+
+class InvalidClassificationsError(ValueError):
+    pass
+
+
+class NoDeliveredBindingError(ValueError):
+    pass
 
 FIXTURE_ONE_BYTES = (
     '{"claim":"Gate A0 fixture one requires server-authoritative handoff state.",'
@@ -495,7 +533,7 @@ class GateA0Store:
             (session_id, cwd),
         ).fetchone()
         if row is None:
-            raise ValueError("no delivered binding")
+            raise NoDeliveredBindingError("no delivered binding")
         delivery_id = row["delivery_id"]
         serialized = _canonical_bytes(classifications).decode("utf-8")
         existing = self.connection.execute(
@@ -695,8 +733,8 @@ class GateA0Store:
 
     def apply(
         self,
-        application_binding_id: str,
-        delivery_id: str,
+        application_binding_id: object,
+        delivery_id: object,
         classifications: list[dict[str, object]],
     ) -> sqlite3.Row | None:
         if not _valid_opaque(application_binding_id, "application") or not _valid_opaque(
@@ -778,7 +816,7 @@ class GateA0Store:
             self.connection.rollback()
             raise
 
-    def increment(self, mutation_id: str) -> int | None:
+    def increment(self, mutation_id: object) -> int | None:
         if not _valid_opaque(mutation_id, "mutation"):
             return None
         try:
@@ -883,11 +921,11 @@ def _snapshot(delivery_id: str) -> dict[str, object]:
 
 def _classifications(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list) or len(value) != len(FIXTURES):
-        raise ValueError("complete classifications are required")
+        raise InvalidClassificationsError("complete classifications are required")
     normalized: list[dict[str, object]] = []
     for supplied, (fixture, expected_digest) in zip(value, FIXTURES, strict=True):
         if not isinstance(supplied, Mapping):
-            raise ValueError("classification must be an object")
+            raise InvalidClassificationsError("classification must be an object")
         decision_id = supplied.get("decision_id")
         revision = supplied.get("revision")
         digest = supplied.get("digest")
@@ -905,7 +943,9 @@ def _classifications(value: object) -> list[dict[str, object]]:
             or not reason.strip()
             or len(reason.encode("utf-8")) > 240
         ):
-            raise ValueError("classification does not match the delivery")
+            raise InvalidClassificationsError(
+                "classification does not match the delivery"
+            )
         normalized.append(
             {
                 "decision_id": decision_id,
@@ -967,6 +1007,23 @@ def run_hook(root: Path) -> dict[str, object]:
             return {}
         finally:
             store.close()
+    except InvalidClassificationsError:
+        return _hook_response(
+            "deny",
+            reason=(
+                "ZDecision Gate A0 invalid classifications: submit both delivered "
+                "items with one nonempty reason of at most 240 UTF-8 bytes each; "
+                "do not guess host-owned identifiers."
+            ),
+        )
+    except NoDeliveredBindingError:
+        return _hook_response(
+            "deny",
+            reason=(
+                "ZDecision Gate A0 no delivered binding exists for this task; "
+                "do not call show_zdecision_gate_a0 or guess host-owned identifiers."
+            ),
+        )
     except Exception:
         return _hook_response(
             "deny",
@@ -1131,12 +1188,14 @@ def create_server(store: GateA0Store) -> FastMCP:
         meta={"ui": {"visibility": ["model", "app"]}},
     )
     def apply_zdecision_gate_a0_delivery(
-        application_binding_id: str,
-        delivery_id: str,
-        classifications: list[dict[str, object]],
+        classifications: list[GateA0ClassificationInput],
+        application_binding_id: str | None = None,
+        delivery_id: str | None = None,
     ) -> CallToolResult:
         application = store.apply(
-            application_binding_id, delivery_id, classifications
+            application_binding_id,
+            delivery_id,
+            [item.model_dump(mode="python") for item in classifications],
         )
         if application is None:
             return _failed("invalid_application")
@@ -1156,7 +1215,9 @@ def create_server(store: GateA0Store) -> FastMCP:
         annotations=action_annotations,
         meta={"ui": {"visibility": ["model", "app"]}},
     )
-    def increment_zdecision_gate_a0_counter(mutation_id: str) -> CallToolResult:
+    def increment_zdecision_gate_a0_counter(
+        mutation_id: str | None = None,
+    ) -> CallToolResult:
         counter = store.increment(mutation_id)
         if counter is None:
             return _failed("mutation_denied")
