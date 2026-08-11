@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import queue
+import re
 import shlex
 import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -355,6 +358,29 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
         )
         self.assertEqual(
             "deny", cross_task["hookSpecificOutput"]["permissionDecision"]
+        )
+
+    def test_model_visible_show_needs_no_model_supplied_opaque_id(self) -> None:
+        client = self._mcp()
+        tools = client.request("tools/list", {})["tools"]
+        show = next(
+            tool for tool in tools if tool["name"] == "show_zdecision_gate_a0"
+        )
+
+        self.assertNotIn("attempt_id", show["inputSchema"].get("required", []))
+        rejected = client.call("show_zdecision_gate_a0", {})
+        self.assertEqual("failed", rejected["structuredContent"]["state"])
+        self.assertEqual("invalid_attempt", rejected["structuredContent"]["code"])
+
+        binding = self._hook(
+            "mcp__zdecision_gate_a0__show_zdecision_gate_a0",
+            {},
+        )
+        updated = self._updated_input(binding)
+        self.assertEqual({"attempt_id"}, set(updated))
+        rendered = client.call("show_zdecision_gate_a0", updated)
+        self.assertEqual(
+            "pending_confirmation", rendered["structuredContent"]["state"]
         )
 
     def test_enable_commits_one_stable_delivery_with_literal_canonical_fixtures(self) -> None:
@@ -722,11 +748,15 @@ function result(state, extra = {}) {
         self.assertRegex(
             inspect.get("snapshot_digest_prefix", ""), r"^[0-9a-f]{12}$"
         )
-        self.assertEqual("exited", inspect["mcp_process"]["state"])
-        self.assertRegex(
-            inspect["mcp_process"]["process_id_prefix"], r"^mcp_[0-9a-f]{8}$"
-        )
-        self.assertNotIn("pid", inspect["mcp_process"])
+        instances = inspect["mcp_instances"]
+        self.assertEqual(2, instances["total_count"])
+        self.assertEqual(0, instances["running_count"])
+        self.assertEqual(2, instances["exited_count"])
+        for instance in instances["instances"]:
+            self.assertRegex(
+                instance["instance_id_prefix"], r"^mcp_[0-9a-f]{8}$"
+            )
+        self.assertNotIn("pid", json.dumps(instances))
         self.assertNotIn("ui_message_count", inspect)
         self.assertNotIn("app_server_start_count", inspect)
         database = sqlite3.connect(self.root / "state/gate-a0.sqlite3")
@@ -783,7 +813,7 @@ function result(state, extra = {}) {
         self.assertEqual(["Interactive"], manifest["interface"]["capabilities"])
         self.assertRegex(manifest["name"], r"^zdecision-gate-a0-[0-9a-f]{8}$")
         self.assertEqual({"mcpServers"}, set(mcp))
-        self.assertEqual(1, len(mcp["mcpServers"]))
+        self.assertEqual({"zdecision-gate-a0"}, set(mcp["mcpServers"]))
         generated_server = next(iter(mcp["mcpServers"].values()))
         self.assertEqual(str(PYTHON), generated_server["command"])
         self.assertEqual({"PreToolUse"}, set(hooks["hooks"]))
@@ -842,6 +872,99 @@ function result(state, extra = {}) {
 
         self.assertNotEqual(0, completed.returncode)
         self.assertEqual("bounded", sentinel.read_text("utf-8"))
+
+    def test_cleanup_quarantines_the_root_before_recursive_deletion(self) -> None:
+        script = """
+import json
+import sys
+from pathlib import Path
+from tests.integration import recall_gate_a0_disposable_harness as harness
+
+root = Path(sys.argv[1])
+events = []
+
+def audit(event, arguments):
+    if event == "os.rename" and Path(arguments[0]) == root:
+        events.append("rename")
+    elif event == "shutil.rmtree":
+        events.append("rmtree")
+
+sys.addaudithook(audit)
+result = harness.cleanup(root)
+print(json.dumps({"events": events, "result": result}, sort_keys=True))
+"""
+        completed = subprocess.run(
+            [str(PYTHON), "-c", script, str(self.root)],
+            cwd=REPOSITORY_ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        output = json.loads(completed.stdout)
+        self.assertEqual(["rename", "rmtree"], output["events"][:2])
+        self.assertTrue(output["result"]["removed"])
+        self.assertFalse(self.root.exists())
+        self.assertEqual(
+            [], list(self.parent.glob(f".{self.root.name}.cleanup-*"))
+        )
+
+    def test_stale_cleanup_cannot_remove_a_recreated_root_generation(self) -> None:
+        ready = self.parent / "cleanup-ready"
+        resume = self.parent / "cleanup-resume"
+        script = """
+import sys
+import time
+from pathlib import Path
+from tests.integration import recall_gate_a0_disposable_harness as harness
+
+root = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+resume = Path(sys.argv[3])
+lifecycle = str(root / "state/mcp-lifecycle.lock")
+paused = False
+
+def audit(event, arguments):
+    global paused
+    if event == "open" and arguments and str(arguments[0]) == lifecycle and not paused:
+        paused = True
+        ready.touch()
+        while not resume.exists():
+            time.sleep(0.01)
+
+sys.addaudithook(audit)
+harness.cleanup(root)
+"""
+        cleanup_process = subprocess.Popen(
+            [str(PYTHON), "-c", script, str(self.root), str(ready), str(resume)],
+            cwd=REPOSITORY_ROOT,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "cleanup did not reach the lease boundary")
+
+        old_generation = self.parent / "old-root-generation"
+        self.root.rename(old_generation)
+        created = self._run("create", "--repository", str(self.repository))
+        replacement_selector = created["selector"]
+        resume.touch()
+        stdout, stderr = cleanup_process.communicate(timeout=10)
+
+        self.assertNotEqual(0, cleanup_process.returncode, stdout or stderr)
+        self.assertTrue(self.root.exists())
+        replacement = json.loads(
+            (self.root / ".zdecision-gate-a0-disposable.json").read_text("utf-8")
+        )
+        self.assertEqual(replacement_selector, replacement["selector"])
+        self.assertTrue(old_generation.exists())
 
     def test_digit_leading_host_ids_bind_render_application_and_mutation(self) -> None:
         attempt_id = self._render_attempt()
@@ -951,11 +1074,142 @@ function result(state, extra = {}) {
             "pending_confirmation", rendered["structuredContent"]["state"]
         )
 
-    def test_cleanup_requires_the_exact_generated_mcp_process_to_exit(self) -> None:
-        client = self._mcp()
-        running = self._run("inspect")["mcp_process"]
-        self.assertEqual("running", running["state"])
-        self.assertRegex(running["process_id_prefix"], r"^mcp_[0-9a-f]{8}$")
+    def test_two_generated_mcp_clients_for_one_root_remain_independently_ready(
+        self,
+    ) -> None:
+        first = self._mcp()
+        second = self._mcp()
+
+        for client in (first, second):
+            tools = client.request("tools/list", {})["tools"]
+            self.assertIn(
+                "show_zdecision_gate_a0", {tool["name"] for tool in tools}
+            )
+            self.assertIsNone(client.process.poll())
+            child_check = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            children = [
+                line
+                for line in child_check.stdout.splitlines()
+                if len(line.split()) == 2
+                and line.split()[1] == str(client.process.pid)
+            ]
+            self.assertEqual(
+                [], children, "MCP instance started a child"
+            )
+            self.assertEqual(0, child_check.returncode)
+            self.assertEqual("", child_check.stderr.strip())
+            tcp_check = subprocess.run(
+                [
+                    "lsof",
+                    "-nP",
+                    "-a",
+                    "-p",
+                    str(client.process.pid),
+                    "-iTCP",
+                    "-Fn",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                "", tcp_check.stdout.strip(), "MCP instance opened a TCP connection"
+            )
+            self.assertEqual("", tcp_check.stderr.strip())
+            unix_check = subprocess.run(
+                ["lsof", "-nP", "-a", "-p", str(client.process.pid), "-U"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            unix_lines = unix_check.stdout.splitlines()[1:]
+            self.assertEqual("", unix_check.stderr.strip())
+            endpoints = []
+            for line in unix_lines:
+                match = re.search(
+                    r"\sunix\s+(0x[0-9a-f]+)\s+\S+\s+->(0x[0-9a-f]+)$",
+                    line,
+                )
+                self.assertIsNotNone(
+                    match, f"MCP instance opened a named Unix connection: {line}"
+                )
+                endpoints.append(match.groups())
+            self.assertEqual(
+                {node for node, _ in endpoints},
+                {peer for _, peer in endpoints},
+                "MCP instance connected to an external Unix endpoint",
+            )
+
+        running = self._run("inspect")["mcp_instances"]
+        self.assertEqual(2, running["total_count"])
+        self.assertEqual(2, running["running_count"])
+        self.assertEqual(0, running["exited_count"])
+        self.assertEqual(2, len(running["instances"]))
+        prefixes = {
+            instance["instance_id_prefix"] for instance in running["instances"]
+        }
+        self.assertEqual(2, len(prefixes))
+        self.assertTrue(
+            all(instance["state"] == "running" for instance in running["instances"])
+        )
+        self.assertNotIn("pid", json.dumps(running))
+
+    def test_inspect_bounds_historical_instance_prefixes(self) -> None:
+        instances_root = self.root / "state/mcp-instances"
+        instances_root.mkdir()
+        instance_ids = [f"mcp_{index:08x}{index:024x}" for index in range(12)]
+        for index, instance_id in enumerate(instance_ids):
+            (instances_root / f"{instance_id}.json").write_text(
+                json.dumps(
+                    {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "instance_id": instance_id,
+                        "pid": 10_000 + index,
+                        "state": "exited",
+                    }
+                ),
+                "utf-8",
+            )
+            (instances_root / f"{instance_id}.lock").touch()
+
+        instances = self._run("inspect")["mcp_instances"]
+
+        self.assertEqual(12, instances["total_count"])
+        self.assertEqual(0, instances["running_count"])
+        self.assertEqual(12, instances["exited_count"])
+        self.assertEqual(8, len(instances["instances"]))
+        self.assertEqual(4, instances["omitted_count"])
+        serialized = json.dumps(instances)
+        for instance_id in instance_ids:
+            self.assertNotIn(instance_id, serialized)
+
+    def test_cleanup_waits_for_every_concurrent_mcp_instance(self) -> None:
+        first = self._mcp()
+        second = self._mcp()
+
+        records = sorted((self.root / "state/mcp-instances").glob("*.json"))
+        self.assertEqual(2, len(records))
+        identities = [json.loads(record.read_text("utf-8")) for record in records]
+        self.assertEqual(
+            {first.process.pid, second.process.pid},
+            {identity["pid"] for identity in identities},
+        )
+        self.assertTrue(
+            all(
+                re.fullmatch(r"mcp_[0-9a-f]{32}", identity["instance_id"])
+                for identity in identities
+            )
+        )
+
+        running = self._run("inspect")["mcp_instances"]
+        self.assertEqual(2, running["running_count"])
+        for identity in identities:
+            self.assertNotIn(identity["instance_id"], json.dumps(running))
 
         completed = subprocess.run(
             [
@@ -975,17 +1229,87 @@ function result(state, extra = {}) {
 
         self.assertNotEqual(0, completed.returncode)
         self.assertTrue(self.root.exists())
-        identity = json.loads(
-            (self.root / "state/mcp-process.json").read_text("utf-8")
+
+        first.close()
+        one_running = self._run("inspect")["mcp_instances"]
+        self.assertEqual(1, one_running["running_count"])
+        self.assertEqual(1, one_running["exited_count"])
+        completed = subprocess.run(
+            [
+                str(PYTHON),
+                str(HARNESS_PATH),
+                "cleanup",
+                "--root",
+                str(self.root),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
         )
-        self.assertEqual(client.process.pid, identity["pid"])
-        self.assertRegex(identity["process_id"], r"^mcp_[0-9a-f]{32}$")
-        self.assertEqual("running", identity["state"])
+        self.assertNotEqual(0, completed.returncode)
+        self.assertTrue(self.root.exists())
+
+        second.close()
+        all_exited = self._run("inspect")["mcp_instances"]
+        self.assertEqual(0, all_exited["running_count"])
+        self.assertEqual(2, all_exited["exited_count"])
+        self._run("cleanup")
+        self.assertFalse(self.root.exists())
+
+    def test_prior_root_legacy_lease_remains_safe_and_restartable(self) -> None:
+        (self.root / "state/mcp-lifecycle.lock").unlink()
+        legacy_id = "mcp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        (self.root / "state/mcp-process.json").write_text(
+            json.dumps(
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "process_id": legacy_id,
+                    "pid": os.getpid(),
+                    "state": "running",
+                }
+            ),
+            "utf-8",
+        )
+        legacy_lease = (self.root / "state/mcp-process.lock").open(
+            "a+", encoding="utf-8"
+        )
+        fcntl.flock(legacy_lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            running = self._run("inspect")["mcp_instances"]
+            self.assertEqual(1, running["running_count"])
+            self.assertEqual(legacy_id[:12], running["instances"][0]["instance_id_prefix"])
+            completed = subprocess.run(
+                [
+                    str(PYTHON),
+                    str(HARNESS_PATH),
+                    "cleanup",
+                    "--root",
+                    str(self.root),
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=self.env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(0, completed.returncode)
+            self.assertTrue(self.root.exists())
+        finally:
+            fcntl.flock(legacy_lease.fileno(), fcntl.LOCK_UN)
+            legacy_lease.close()
+
+        (self.root / "state/mcp-lifecycle.lock").unlink()
+        client = self._mcp()
+        tools = client.request("tools/list", {})["tools"]
+        self.assertIn("show_zdecision_gate_a0", {tool["name"] for tool in tools})
+        running = self._run("inspect")["mcp_instances"]
+        self.assertEqual(2, running["total_count"])
+        self.assertEqual(1, running["running_count"])
         client.close()
-        exited = json.loads(
-            (self.root / "state/mcp-process.json").read_text("utf-8")
-        )
-        self.assertEqual("exited", exited["state"])
         self._run("cleanup")
         self.assertFalse(self.root.exists())
 

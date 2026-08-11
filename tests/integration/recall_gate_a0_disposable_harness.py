@@ -40,6 +40,7 @@ _OPAQUE = re.compile(
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CATEGORIES = frozenset(("applicable", "not_applicable", "conflicting", "uncertain"))
 _MARKER_NAME = ".zdecision-gate-a0-disposable.json"
+_PROCESS_INSTANCE_PREVIEW_LIMIT = 8
 
 FIXTURE_ONE_BYTES = (
     '{"claim":"Gate A0 fixture one requires server-authoritative handoff state.",'
@@ -160,83 +161,195 @@ def _plugin_root(root: Path) -> Path:
     return root / "marketplace/plugins" / selector
 
 
-def _process_identity_path(root: Path) -> Path:
+def _legacy_process_identity_path(root: Path) -> Path:
     return root / "state/mcp-process.json"
 
 
-def _process_lock_path(root: Path) -> Path:
+def _legacy_process_lock_path(root: Path) -> Path:
     return root / "state/mcp-process.lock"
 
 
-class DisposableMcpProcessLease:
-    """Root-specific OS lease proving the exact disposable server lifetime."""
-
-    def __init__(self, root: Path) -> None:
-        lock_path = _process_lock_path(root)
-        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.root = root
-        self.stream = lock_path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BaseException:
-            self.stream.close()
-            raise
-        self.process_id = f"mcp_{secrets.token_hex(16)}"
-        _write_json(
-            _process_identity_path(root),
-            {
-                "protocol_version": PROTOCOL_VERSION,
-                "process_id": self.process_id,
-                "pid": os.getpid(),
-                "state": "running",
-            },
-        )
-
-    def close(self) -> None:
-        if self.stream.closed:
-            return
-        _write_json(
-            _process_identity_path(self.root),
-            {
-                "protocol_version": PROTOCOL_VERSION,
-                "process_id": self.process_id,
-                "pid": os.getpid(),
-                "state": "exited",
-            },
-        )
-        fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
-        self.stream.close()
+def _process_instances_root(root: Path) -> Path:
+    return root / "state/mcp-instances"
 
 
-def _process_status(root: Path) -> dict[str, object]:
-    identity_path = _process_identity_path(root)
-    identity: dict[str, object] | None = None
-    if identity_path.is_file():
-        value = json.loads(identity_path.read_text("utf-8"))
-        if (
-            isinstance(value, dict)
-            and value.get("protocol_version") == PROTOCOL_VERSION
-            and isinstance(value.get("process_id"), str)
-            and re.fullmatch(r"mcp_[0-9a-f]{32}", value["process_id"]) is not None
-            and isinstance(value.get("pid"), int)
-        ):
-            identity = value
-    lock_path = _process_lock_path(root)
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with lock_path.open("a+", encoding="utf-8") as stream:
+def _process_lifecycle_lock_path(root: Path) -> Path:
+    return root / "state/mcp-lifecycle.lock"
+
+
+def _lease_is_running(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("r+", encoding="utf-8") as stream:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            running = True
+            return True
         else:
-            running = False
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            return False
+
+
+class DisposableMcpProcessLease:
+    """One exact instance lease plus a root lifecycle read lease."""
+
+    def __init__(self, root: Path) -> None:
+        lifecycle_path = _process_lifecycle_lock_path(root)
+        self.lifecycle_stream = lifecycle_path.open("a+", encoding="utf-8")
+        os.chmod(lifecycle_path, 0o600)
+        try:
+            fcntl.flock(
+                self.lifecycle_stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB
+            )
+        except BaseException:
+            self.lifecycle_stream.close()
+            raise
+        instances_root = _process_instances_root(root)
+        self.stream = None
+        self.instance_id = ""
+        self.identity_path = instances_root / "invalid"
+        try:
+            instances_root.mkdir(exist_ok=True, mode=0o700)
+            os.chmod(instances_root, 0o700)
+            for _ in range(8):
+                instance_id = f"mcp_{secrets.token_hex(16)}"
+                lock_path = instances_root / f"{instance_id}.lock"
+                try:
+                    descriptor = os.open(
+                        lock_path,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                except FileExistsError:
+                    continue
+                self.stream = os.fdopen(descriptor, "r+", encoding="utf-8")
+                fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.instance_id = instance_id
+                self.identity_path = instances_root / f"{instance_id}.json"
+                break
+            else:
+                raise RuntimeError("could not allocate an exact MCP instance lease")
+            self._write_identity("running")
+        except BaseException:
+            if self.stream is not None:
+                fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+                self.stream.close()
+            fcntl.flock(self.lifecycle_stream.fileno(), fcntl.LOCK_UN)
+            self.lifecycle_stream.close()
+            raise
+
+    def _write_identity(self, state: str) -> None:
+        _write_json(
+            self.identity_path,
+            {
+                "protocol_version": PROTOCOL_VERSION,
+                "instance_id": self.instance_id,
+                "pid": os.getpid(),
+                "state": state,
+            },
+        )
+        os.chmod(self.identity_path, 0o600)
+
+    def close(self) -> None:
+        if self.stream is None or self.stream.closed:
+            return
+        try:
+            self._write_identity("exited")
+        finally:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+            self.stream.close()
+            fcntl.flock(self.lifecycle_stream.fileno(), fcntl.LOCK_UN)
+            self.lifecycle_stream.close()
+
+
+def _process_instances(root: Path) -> dict[str, object]:
+    instances: list[dict[str, object]] = []
+    instances_root = _process_instances_root(root)
+    if instances_root.is_dir():
+        for identity_path in sorted(instances_root.glob("*.json")):
+            instance_id = identity_path.stem
+            if re.fullmatch(r"mcp_[0-9a-f]{32}", instance_id) is None:
+                continue
+            try:
+                identity = json.loads(identity_path.read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (
+                not isinstance(identity, dict)
+                or identity.get("protocol_version") != PROTOCOL_VERSION
+                or identity.get("instance_id") != instance_id
+                or not isinstance(identity.get("pid"), int)
+                or identity.get("state") not in {"running", "exited"}
+            ):
+                continue
+            instances.append(
+                {
+                    "instance_id_prefix": instance_id[:12],
+                    "state": (
+                        "running"
+                        if _lease_is_running(
+                            instances_root / f"{instance_id}.lock"
+                        )
+                        else "exited"
+                    ),
+                }
+            )
+
+    legacy_identity_path = _legacy_process_identity_path(root)
+    legacy_lock_path = _legacy_process_lock_path(root)
+    if legacy_identity_path.is_file() or legacy_lock_path.is_file():
+        legacy_identity = None
+        if legacy_identity_path.is_file():
+            try:
+                value = json.loads(legacy_identity_path.read_text("utf-8"))
+            except (OSError, ValueError):
+                value = None
+            if (
+                isinstance(value, dict)
+                and value.get("protocol_version") == PROTOCOL_VERSION
+                and isinstance(value.get("process_id"), str)
+                and re.fullmatch(r"mcp_[0-9a-f]{32}", value["process_id"])
+                is not None
+                and isinstance(value.get("pid"), int)
+                and value.get("state") in {"running", "exited"}
+            ):
+                legacy_identity = value
+        if legacy_identity is not None:
+            instances.append(
+                {
+                    "instance_id_prefix": legacy_identity["process_id"][:12],
+                    "state": (
+                        "running" if _lease_is_running(legacy_lock_path) else "exited"
+                    ),
+                }
+            )
+
+    running_count = sum(instance["state"] == "running" for instance in instances)
+    instances.sort(
+        key=lambda instance: (
+            instance["state"] != "running",
+            instance["instance_id_prefix"],
+        )
+    )
+    preview = instances[:_PROCESS_INSTANCE_PREVIEW_LIMIT]
     return {
-        "state": "running" if running else "exited",
-        "process_id_prefix": (
-            identity["process_id"][:12] if identity is not None else None
-        ),
+        "total_count": len(instances),
+        "running_count": running_count,
+        "exited_count": len(instances) - running_count,
+        "instances": preview,
+        "omitted_count": len(instances) - len(preview),
     }
+
+
+def _any_process_instance_lease_running(root: Path) -> bool:
+    instances_root = _process_instances_root(root)
+    if not instances_root.is_dir():
+        return False
+    return any(
+        re.fullmatch(r"mcp_[0-9a-f]{32}\.lock", path.name) is not None
+        and _lease_is_running(path)
+        for path in instances_root.iterdir()
+    )
 
 
 class GateA0Store:
@@ -474,7 +587,7 @@ class GateA0Store:
             )
         return mutation_id
 
-    def render(self, attempt_id: str) -> sqlite3.Row | None:
+    def render(self, attempt_id: object) -> sqlite3.Row | None:
         if not _valid_opaque(attempt_id, "attempt"):
             return None
         return self.connection.execute(
@@ -730,7 +843,7 @@ class GateA0Store:
                 if delivery is not None
                 else None
             ),
-            "mcp_process": _process_status(self.root),
+            "mcp_instances": _process_instances(self.root),
             "delivery_id_prefix": (
                 delivery["delivery_id"][:17] if delivery is not None else None
             ),
@@ -936,7 +1049,7 @@ def create_server(store: GateA0Store) -> FastMCP:
             "openai/outputTemplate": RESOURCE_URI,
         },
     )
-    def show_zdecision_gate_a0(attempt_id: str) -> CallToolResult:
+    def show_zdecision_gate_a0(attempt_id: str | None = None) -> CallToolResult:
         attempt = store.render(attempt_id)
         if attempt is None:
             return _failed("invalid_attempt")
@@ -1331,6 +1444,9 @@ def create(root: Path, repository: Path) -> dict[str, object]:
     )
     store = GateA0Store(root)
     store.close()
+    lifecycle_lock = _process_lifecycle_lock_path(root)
+    lifecycle_lock.touch(exist_ok=True)
+    os.chmod(lifecycle_lock, 0o600)
     return {
         "protocol_version": PROTOCOL_VERSION,
         "selector": selector,
@@ -1340,12 +1456,60 @@ def create(root: Path, repository: Path) -> dict[str, object]:
 
 
 def cleanup(root: Path) -> dict[str, object]:
-    _configuration(root)
-    if _process_status(root)["state"] == "running":
-        raise RuntimeError(
-            "the exact disposable MCP process must exit before cleanup"
-        )
-    shutil.rmtree(root)
+    validated_configuration = _configuration(root)
+    validated_stat = root.stat()
+
+    def require_same_generation() -> None:
+        try:
+            before = root.stat()
+            current_configuration = _configuration(root)
+            after = root.stat()
+        except (OSError, ValueError) as error:
+            raise RuntimeError("the disposable root generation changed") from error
+        generations = {
+            (validated_stat.st_dev, validated_stat.st_ino),
+            (before.st_dev, before.st_ino),
+            (after.st_dev, after.st_ino),
+        }
+        if len(generations) != 1 or current_configuration != validated_configuration:
+            raise RuntimeError("the disposable root generation changed")
+
+    lifecycle_lock = _process_lifecycle_lock_path(root)
+    with lifecycle_lock.open("a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                "every exact disposable MCP instance must exit before cleanup"
+            ) from error
+        try:
+            require_same_generation()
+            legacy_lock = _legacy_process_lock_path(root)
+            with legacy_lock.open("a+", encoding="utf-8") as legacy_stream:
+                os.chmod(legacy_lock, 0o600)
+                try:
+                    fcntl.flock(
+                        legacy_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                except BlockingIOError as error:
+                    raise RuntimeError(
+                        "every exact disposable MCP instance must exit before cleanup"
+                    ) from error
+                try:
+                    if _any_process_instance_lease_running(root):
+                        raise RuntimeError(
+                            "every exact disposable MCP instance must exit before cleanup"
+                        )
+                    require_same_generation()
+                    quarantined_root = root.with_name(
+                        f".{root.name}.cleanup-{secrets.token_hex(8)}"
+                    )
+                    root.rename(quarantined_root)
+                    shutil.rmtree(quarantined_root)
+                finally:
+                    fcntl.flock(legacy_stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
     return {"protocol_version": PROTOCOL_VERSION, "removed": True}
 
 
