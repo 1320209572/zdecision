@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tests import test_candidate_reconciliation as reconciliation_fixtures
@@ -18,6 +18,7 @@ from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import HookInvocation, RepositorySnapshot
 from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
+from zdecision.agent.recall_mcp import delivery_id_for_attempt
 from zdecision.agent.session_index import FrozenSessionSource
 from zdecision.app_server.requested_capture import (
     RequestedCaptureRunner,
@@ -29,7 +30,8 @@ from zdecision.capture.inventory import (
     InventoryValidationError,
     validate_inventory_v5,
 )
-from zdecision.capture.models import SourceCheckpoint
+from zdecision.capture.models import CandidateContent, SourceCheckpoint
+from zdecision.capture.reviews import ApprovalRef
 from zdecision.capture.on_demand import FrozenCaptureRouteContext
 from zdecision.capture.provenance import (
     CandidateProvenanceSummary,
@@ -48,8 +50,17 @@ from zdecision.capture.service import (
     validate_extraction_output_v5,
 )
 from zdecision.capture.templates import TemplateCatalog
-from zdecision.ids import candidate_family_id
-from zdecision.recall.session import TurnGateResult
+from zdecision.ids import candidate_family_id, decision_id, product_id
+from zdecision.jsonio import canonical_json_bytes
+from zdecision.recall.handoff import (
+    RecallApplicationSubmission,
+    RecallPreflightReady,
+    RecallShortlist,
+    RecalledDecision,
+    build_handoff_context,
+)
+from zdecision.recall.session import RecallIntent, TurnGateResult
+from zdecision.registry.models import DecisionRevision, DecisionSeed
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -419,6 +430,199 @@ class RecallCaptureIsolationTest(unittest.TestCase):
         )
         self.assertEqual((), observations)
         self.assertEqual((), candidate_provenance)
+
+    def test_01c_private_recall_sentinels_never_cross_capture_runner_or_upload_boundary(self) -> None:
+        """Recall-only state is absent from anchors, model prompts, and upload bytes."""
+
+        sentinels = (
+            "FORMAL_RECALL_ENVELOPE_PRIVATE_SENTINEL",
+            "RECALL_HANDOFF_INSTRUCTION_PRIVATE_SENTINEL",
+            "RECALL_HANDOFF_MARKER_PRIVATE_SENTINEL",
+            "RECALL_APPLICATION_RECEIPT_PRIVATE_SENTINEL",
+            "RECALL_APPLICATION_STATE_PRIVATE_SENTINEL",
+        )
+        intent = RecallIntent.from_dict(
+            {
+                "target_decision_space_ids": ["space-private-recall"],
+                "explicit_multi_space": False,
+                "feature_goal": "Prove Capture cannot read Recall-only state.",
+                "domain_objects": ["Capture"],
+                "repository_relative_paths": ["packages/shared/theme/src/index.ts"],
+                "constraints": ["local only"],
+                "exclusions": ["network"],
+            }
+        )
+        preflight = RecallPreflightReady(
+            repository_id=runner_fixtures.REPOSITORY_ID,
+            repository_display_name="private-fixture",
+            intent=intent,
+            target_decision_space_ids=intent.target_decision_space_ids,
+            target_display_names=("Private Recall fixture",),
+            catalog_digest="a" * 64,
+            generation=1,
+            generation_digest="b" * 64,
+            retrieval_profile_digest="c" * 64,
+            index_generation=1,
+            freshness="ready",
+            expires_at="2026-08-07T09:00:00+00:00",
+        )
+        candidate_id = "cand_" + "1" * 32 + "_01"
+        product = "Private Recall fixture"
+        revision = DecisionRevision.from_seed(
+            DecisionSeed(
+                candidate_id=candidate_id,
+                decision_id=decision_id(candidate_id, product_id(product)),
+                product_id=product_id(product),
+                product_name=product,
+                content=CandidateContent(
+                    product=product,
+                    claim=sentinels[0],
+                    future_action=sentinels[1],
+                    scope_summary=sentinels[2],
+                    repositories=("https://example.invalid/private-recall.git",),
+                    paths=("packages/shared/theme/src/index.ts",),
+                    invalidation_conditions=(sentinels[3], sentinels[4]),
+                ),
+                source=SourceCheckpoint("private-recall", "private-turn"),
+                review_approval=ApprovalRef(
+                    actor="user",
+                    thread_id="private-review",
+                    turn_id="private-review-turn",
+                    recorded_at="2026-08-07T08:00:00Z",
+                ),
+            ),
+            "pub_" + "2" * 32,
+        )
+        item = RecalledDecision.create(
+            decision_space_id="space-private-recall",
+            revision=revision,
+            match_reason="private Recall fixture",
+        )
+        shortlist = RecallShortlist.create(preflight=preflight, items=(item,))
+        attempt_id = "activation_" + "3" * 32
+        delivery_id = delivery_id_for_attempt(attempt_id)
+        self.host.create_activation_attempt(
+            session_id=runner_fixtures.SOURCE_SESSION,
+            turn_id="turn-private-authorize",
+            cwd=str(self.root),
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id=attempt_id,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+            intent=intent,
+            preflight=preflight,
+        )
+        self.host.attach_activation_card(attempt_id, ui_digest="d" * 64)
+        claim = self.host.begin_delivery(
+            attempt_id=attempt_id,
+            delivery_id=delivery_id,
+            claim_token="claim_" + "4" * 32,
+            current_ui_digest="d" * 64,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        delivery = self.host.commit_prepared_delivery(
+            delivery_id=delivery_id,
+            claim_token=claim.claim_token,
+            shortlist=shortlist,
+            context_text=build_handoff_context(delivery_id, preflight, shortlist),
+            now=NOW,
+        )
+        self.host.ack_delivery(
+            delivery_id=delivery_id,
+            context_digest=delivery.context_digest,
+            now=NOW,
+        )
+        self.host.begin_turn_gate(
+            session_id=runner_fixtures.SOURCE_SESSION,
+            turn_id="turn-private-apply",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-private-apply",
+        )
+        self.host.commit_delivery_application(
+            session_id=runner_fixtures.SOURCE_SESSION,
+            turn_id="turn-private-apply",
+            gate_id="gate-private-apply",
+            delivery_id=delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {
+                    "delivery_id": delivery_id,
+                    "items": [
+                        {
+                            "decision_id": item.revision.decision_id,
+                            "revision": item.revision.revision,
+                            "digest": item.digest,
+                            "disposition": "applicable",
+                            "reason": "private Recall application",
+                        }
+                    ],
+                }
+            ),
+            now=NOW,
+        )
+        prompt = self._record_event(
+            "UserPromptSubmit",
+            session_id=runner_fixtures.SOURCE_SESSION,
+            turn_id="turn-private-recall",
+            occurred_at="2026-08-07T10:00:00Z",
+            prompt="Capture only this explicit user direction.",
+        )
+        stop = self._record_event(
+            "Stop",
+            session_id=runner_fixtures.SOURCE_SESSION,
+            turn_id="turn-private-recall",
+            occurred_at="2026-08-07T10:00:01Z",
+        )
+        source = self._source(
+            stop.event_id,
+            seed="d",
+            session_id=runner_fixtures.SOURCE_SESSION,
+            upper_turn_id="turn-private-recall",
+        )
+
+        manifest = self.runner._build_manifest(source)
+        self.assertEqual(
+            (prompt_anchor_receipt_id(prompt.event_id),),
+            tuple(anchor.receipt_id for anchor in manifest.anchors),
+        )
+        self.assertTrue(
+            all(sentinel.encode("utf-8") not in canonical_json_bytes(manifest.to_dict()) for sentinel in sentinels)
+        )
+        self.gateway.extraction_output["candidates"][0]["product"] = (
+            self.route_context.decision_space_name
+        )
+        result = self.runner.run(
+            source,
+            route_context=self.route_context,
+            matched_paths=runner_fixtures.MATCHED_PATHS,
+            template_id="business",
+            model_profile=self.gateway.profile,
+        )
+        self.assertEqual("completed", result.status)
+        self.assertTrue(
+            all(
+                sentinel not in prompt_text
+                for sentinel in sentinels
+                for prompt_text in self.gateway.prompts
+            )
+        )
+        self.assertTrue(
+            all(sentinel in delivery.context_text for sentinel in sentinels)
+        )
+
+        fixture = processor_fixtures.CaptureRequestProcessorTest()
+        fixture.setUp()
+        try:
+            client = processor_fixtures.FakeCentralClient(fixture.group, fixture.views())
+            fixture.processor().process(fixture.group, client)
+            emitted = b"".join(canonical_json_bytes(batch.to_dict()) for batch in client.uploads)
+            self.assertTrue(all(sentinel.encode("utf-8") not in emitted for sentinel in sentinels))
+        finally:
+            fixture.doCleanups()
 
     def test_02_non_prompt_sources_alone_yield_zero_candidates(self) -> None:
         cases = (

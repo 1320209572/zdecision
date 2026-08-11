@@ -144,7 +144,7 @@ def _hooks(identity: RecallPluginIdentity) -> dict[str, object]:
 
 
 def _launcher_source(
-    *, root_relative_launcher: str, repository: Path, identity: RecallPluginIdentity
+    *, root_relative_launcher: str, repository: Path, identity: RecallPluginIdentity, generation: str
 ) -> str:
     fields = repr(
         (
@@ -166,6 +166,7 @@ from pathlib import Path
 IDENTITY = {fields}
 REPOSITORY = {str(repository)!r}
 LAUNCHER_RELATIVE_PATH = {root_relative_launcher!r}
+GENERATION = {generation!r}
 
 def _fail(message: str) -> None:
     raise SystemExit(message)
@@ -183,6 +184,7 @@ def _root() -> tuple[Path, Path]:
     if (
         marker.get("launcher_relative_path") != LAUNCHER_RELATIVE_PATH
         or marker.get("launcher_digest") != digest
+        or marker.get("generation") != GENERATION
         or marker.get("root_device") != root_stat.st_dev
         or marker.get("root_inode") != root_stat.st_ino
         or not isinstance(marker.get("generation"), str)
@@ -236,6 +238,8 @@ def _marker(root: Path) -> dict[str, object]:
         raise RuntimeError("disposable launcher is unavailable") from error
     if digest != marker["launcher_digest"]:
         raise RuntimeError("disposable launcher changed")
+    if _read_configuration(root)["generation"] != marker["generation"]:
+        raise RuntimeError("disposable root generation changed")
     return marker
 
 
@@ -244,7 +248,7 @@ def _read_configuration(root: Path) -> dict[str, object]:
         value = json.loads((root / _CONFIGURATION).read_text("utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("disposable configuration is invalid") from error
-    if not isinstance(value, dict) or set(value) != {"repository", "identity"}:
+    if not isinstance(value, dict) or set(value) != {"repository", "identity", "generation"} or not isinstance(value["generation"], str):
         raise RuntimeError("disposable configuration is invalid")
     return value
 
@@ -463,6 +467,7 @@ def create(*, root: Path, repository: Path) -> dict[str, object]:
     launcher = plugin / _LAUNCHER_NAME
     relative_launcher = launcher.relative_to(root).as_posix()
     identity = _identity(plugin_name, launcher, repository)
+    generation = secrets.token_hex(16)
     for directory in (plugin, plugin / "skills" / "recall", plugin / "hooks", root / _STATE, root / _LEASES):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
@@ -478,11 +483,11 @@ def create(*, root: Path, repository: Path) -> dict[str, object]:
         "plugins": [{"name": identity.plugin_name, "source": {"path": f"plugins/{identity.plugin_name}"}}],
     })
     launcher_source = _launcher_source(
-        root_relative_launcher=relative_launcher, repository=repository, identity=identity
+        root_relative_launcher=relative_launcher, repository=repository, identity=identity, generation=generation
     )
     _write(launcher, launcher_source)
     marker = {
-        "generation": secrets.token_hex(16),
+        "generation": generation,
         "root_device": root.stat().st_dev,
         "root_inode": root.stat().st_ino,
         "launcher_relative_path": relative_launcher,
@@ -491,6 +496,7 @@ def create(*, root: Path, repository: Path) -> dict[str, object]:
     _write_json(root / _MARKER, marker)
     _write_json(root / _CONFIGURATION, {
         "repository": str(repository),
+        "generation": generation,
         "identity": list((identity.plugin_name, identity.mcp_server_key, identity.mcp_command, list(identity.mcp_args), identity.hook_command, identity.recall_skill_relative_path)),
     })
     if verify_recall_plugin_bundle(plugin, identity) is None:
