@@ -826,7 +826,7 @@ class RecallConfirmationCardTests(unittest.TestCase):
   const click = widget.elements.enable.dispatch("click");
   const decision = widget.toolCalls()[0];
   widget.respond(decision, deliveryClaimedResult());
-  await flush();
+  await waitFor(() => widget.contextUpdates()[0], "missing context update");
   const updates = widget.contextUpdates();
   check(updates.length === 1, "missing single context update");
   check(
@@ -837,7 +837,7 @@ class RecallConfirmationCardTests(unittest.TestCase):
   );
   check(widget.messages().length === 0, "ui/message must not be used");
   widget.respond(updates[0], {});
-  await flush();
+  await waitFor(() => widget.toolCalls()[1], "missing delivery ack");
   const calls = widget.toolCalls();
   check(calls.length === 2, "ack did not follow context update");
   check(
@@ -919,12 +919,13 @@ class RecallConfirmationCardTests(unittest.TestCase):
   const retry = remount.toolCalls()[1];
   check(retry.params?.name === "decide_zdecision_recall", "retry used wrong tool");
   remount.respond(retry, deliveryClaimedResult());
-  await flush();
-  const update = remount.contextUpdates()[0];
+  const update = await waitFor(
+    () => remount.contextUpdates()[0],
+    "missing retry context update",
+  );
   check(update.params?.content?.[0]?.text === contextText, "retry bytes changed");
   remount.respond(update, {});
-  await flush();
-  const ack = remount.toolCalls()[2];
+  const ack = await waitFor(() => remount.toolCalls()[2], "missing retry ack");
   check(ack.params?.arguments?.delivery_id === deliveryId, "retry delivery changed");
   check(
     ack.params?.arguments?.context_digest === contextDigest,
@@ -959,8 +960,10 @@ class RecallConfirmationCardTests(unittest.TestCase):
   await flush();
   const failedClick = updateFailed.elements.enable.dispatch("click");
   updateFailed.respond(updateFailed.toolCalls()[0], deliveryClaimedResult());
-  await flush();
-  const failedUpdate = updateFailed.contextUpdates()[0];
+  const failedUpdate = await waitFor(
+    () => updateFailed.contextUpdates()[0],
+    "missing rejected context update",
+  );
   updateFailed.reject(failedUpdate, { code: -32603, message: "rejected" });
   await failedClick;
   await flush();
@@ -975,7 +978,10 @@ class RecallConfirmationCardTests(unittest.TestCase):
   await flush();
   const timedOutClick = updateTimedOut.elements.enable.dispatch("click");
   updateTimedOut.respond(updateTimedOut.toolCalls()[0], deliveryClaimedResult());
-  await flush();
+  await waitFor(
+    () => updateTimedOut.contextUpdates()[0],
+    "missing timed out context update",
+  );
   updateTimedOut.takeTimer(5000)();
   await timedOutClick;
   await flush();
@@ -988,9 +994,12 @@ class RecallConfirmationCardTests(unittest.TestCase):
   await flush();
   const unknownClick = ackUnknown.elements.enable.dispatch("click");
   ackUnknown.respond(ackUnknown.toolCalls()[0], deliveryClaimedResult());
-  await flush();
-  ackUnknown.respond(ackUnknown.contextUpdates()[0], {});
-  await flush();
+  const unknownUpdate = await waitFor(
+    () => ackUnknown.contextUpdates()[0],
+    "missing ack-timeout context update",
+  );
+  ackUnknown.respond(unknownUpdate, {});
+  await waitFor(() => ackUnknown.toolCalls()[1], "missing timed out ack");
   check(
     ackUnknown.toolCalls()[1].params?.name === "ack_zdecision_recall_delivery",
     "ack was not attempted once",
@@ -1013,9 +1022,12 @@ class RecallConfirmationCardTests(unittest.TestCase):
   await flush();
   const rejectedClick = ackRejected.elements.enable.dispatch("click");
   ackRejected.respond(ackRejected.toolCalls()[0], deliveryClaimedResult());
-  await flush();
-  ackRejected.respond(ackRejected.contextUpdates()[0], {});
-  await flush();
+  const rejectedUpdate = await waitFor(
+    () => ackRejected.contextUpdates()[0],
+    "missing ack-rejected context update",
+  );
+  ackRejected.respond(rejectedUpdate, {});
+  await waitFor(() => ackRejected.toolCalls()[1], "missing rejected ack");
   ackRejected.reject(
     ackRejected.toolCalls()[1],
     { code: -32603, message: "ack rejected" },
@@ -1029,6 +1041,43 @@ class RecallConfirmationCardTests(unittest.TestCase):
     ackRejected.elements["card-state"].textContent === "交付状态未知",
     "ack rejection did not display unknown",
   );
+
+  const unusableAckResults = [
+    {
+      content: [{ type: "text", text: "bounded" }],
+      structuredContent: { state: "blocked", code: "invalid_delivery" },
+      _meta: {},
+      isError: true,
+    },
+    {
+      content: [{ type: "text", text: "bounded" }],
+      structuredContent: { state: "host_delivered" },
+      _meta: { "zdecision/activation_attempt_id": attemptId },
+    },
+  ];
+  for (const unusable of unusableAckResults) {
+    const widget = await mount();
+    widget.deliverRender();
+    await flush();
+    const click = widget.elements.enable.dispatch("click");
+    widget.respond(widget.toolCalls()[0], deliveryClaimedResult());
+    const update = await waitFor(
+      () => widget.contextUpdates()[0],
+      "missing unusable-ack context update",
+    );
+    widget.respond(update, {});
+    await waitFor(() => widget.toolCalls()[1], "missing unusable ack");
+    widget.respond(widget.toolCalls()[1], unusable);
+    await click;
+    await flush();
+    check(widget.toolCalls().length === 2, "unusable ack resent a tool call");
+    check(widget.contextUpdates().length === 1, "unusable ack resent context");
+    check(widget.messages().length === 0, "unusable ack sent ui/message");
+    check(
+      widget.elements["card-state"].textContent === "交付状态未知",
+      "unusable ack did not display unknown",
+    );
+  }
   process.stdout.write("failure-no-resend-ok");
 """,
         )
@@ -1041,6 +1090,7 @@ class RecallConfirmationCardTests(unittest.TestCase):
     ["zdecision/delivery_id", "delivery_99999999999999999999999999999999"],
     ["zdecision/snapshot_digest", "9".repeat(64)],
     ["zdecision/context_digest", "9".repeat(64)],
+    ["zdecision/context_text", "substituted Recall context bytes"],
   ];
   for (const [key, replacement] of mutations) {
     const widget = await mount();
@@ -1062,6 +1112,20 @@ class RecallConfirmationCardTests(unittest.TestCase):
       `${key} substitution did not fail closed`,
     );
   }
+
+  const cryptoUnavailable = await mount(undefined, null);
+  cryptoUnavailable.deliverRender();
+  await flush();
+  const cryptoClick = cryptoUnavailable.elements.enable.dispatch("click");
+  cryptoUnavailable.respond(
+    cryptoUnavailable.toolCalls()[0],
+    deliveryClaimedResult(),
+  );
+  await cryptoClick;
+  await flush();
+  check(cryptoUnavailable.contextUpdates().length === 0, "crypto failure updated context");
+  check(cryptoUnavailable.toolCalls().length === 1, "crypto failure sent ack");
+  check(cryptoUnavailable.messages().length === 0, "crypto failure sent ui/message");
   process.stdout.write("retry-substitution-closed-ok");
 """,
         )
@@ -1159,12 +1223,14 @@ class RecallConfirmationCardTests(unittest.TestCase):
         script = html.split("<script>", 1)[1].split("</script>", 1)[0]
         harness = r"""
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
+const { TextEncoder } = require("node:util");
 const shippedScript = __SHIPPED_SCRIPT__;
 const attemptId = "activation_11111111111111111111111111111111";
 const repositoryName = "zdecision";
 const deliveryId = "delivery_44444444444444444444444444444444";
 const snapshotDigest = "5".repeat(64);
-const contextDigest = "6".repeat(64);
+const contextDigest = "93b7dd65fec8ecb7149dce23056ec66b64cab469f5f5e5072de73300bd999076";
 const contextText = "ZDecision Recall handoff snapshot\ncomplete bytes";
 
 function check(condition, message) {
@@ -1172,7 +1238,19 @@ function check(condition, message) {
 }
 
 async function flush() {
-  for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  for (let index = 0; index < 6; index += 1) {
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+async function waitFor(read, message) {
+  for (let index = 0; index < 100; index += 1) {
+    const value = read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(message);
 }
 
 function result(state, responseAttempt = attemptId, includeAttempt = true) {
@@ -1226,7 +1304,7 @@ function deliveryStateResult(state) {
 
 async function mount(capabilities = {
   serverTools: {}, updateModelContext: { text: {} },
-}) {
+}, hostCrypto = webcrypto) {
   const outbound = [];
   const timers = new Map();
   let nextTimerId = 1;
@@ -1263,6 +1341,7 @@ async function mount(capabilities = {
     document: { getElementById: (id) => elements[id] },
     window: {
       parent: host,
+      crypto: hostCrypto,
       addEventListener(name, listener) {
         if (name === "message") messageHandler = listener;
       },
@@ -1273,6 +1352,7 @@ async function mount(capabilities = {
       return id;
     },
     clearTimeout(id) { timers.delete(id); },
+    TextEncoder,
   };
   vm.runInNewContext(shippedScript, sandbox);
 

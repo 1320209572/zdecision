@@ -289,7 +289,20 @@
         return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
       }
 
-      function validClaim(value) {
+      async function contextMatchesDigest(contextText, contextDigest) {
+        try {
+          const bytes = new TextEncoder().encode(contextText);
+          const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+          const actual = Array.from(new Uint8Array(digest), (byte) =>
+            byte.toString(16).padStart(2, "0")
+          ).join("");
+          return actual === contextDigest;
+        } catch {
+          return false;
+        }
+      }
+
+      async function validClaim(value) {
         const valid = value.valid
           && value.state === "delivery_claimed"
           && value.attempt === activationAttemptId
@@ -298,14 +311,18 @@
           && validDigest(value.contextDigest)
           && typeof value.contextText === "string"
           && value.contextText.length > 0;
-        return valid && (
-          retryTuple === null
+        if (
+          !valid
           || (
-            value.deliveryId === retryTuple.deliveryId
-            && value.snapshotDigest === retryTuple.snapshotDigest
-            && value.contextDigest === retryTuple.contextDigest
+            retryTuple !== null
+            && (
+              value.deliveryId !== retryTuple.deliveryId
+              || value.snapshotDigest !== retryTuple.snapshotDigest
+              || value.contextDigest !== retryTuple.contextDigest
+            )
           )
-        );
+        ) return false;
+        return contextMatchesDigest(value.contextText, value.contextDigest);
       }
 
       function validAcknowledgement(value, claim) {
@@ -461,6 +478,12 @@
         setTerminal("blocked");
       }
 
+      function showDeliveryUnknown() {
+        cardState.textContent = "交付状态未知";
+        status.textContent = "交付确认结果未知；不会自动重发。重新打开可只读恢复。";
+        lockActions();
+      }
+
       async function deliverClaim(claim) {
         try {
           const updated = await request("ui/update-model-context", {
@@ -486,14 +509,12 @@
             },
           }, 5000);
         } catch {
-          cardState.textContent = "交付状态未知";
-          status.textContent = "交付确认结果未知；不会自动重发。重新打开可只读恢复。";
-          lockActions();
+          showDeliveryUnknown();
           return;
         }
         const value = boundedResult(acknowledged);
         if (!validAcknowledgement(value, claim)) {
-          setTerminal("blocked");
+          showDeliveryUnknown();
           return;
         }
         setTerminal("host_delivered");
@@ -535,7 +556,7 @@
             setTerminal("declined");
             return;
           }
-          if (!validClaim(value)) {
+          if (!(await validClaim(value))) {
             setTerminal("blocked");
             return;
           }
