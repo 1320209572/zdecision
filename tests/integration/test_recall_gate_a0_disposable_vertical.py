@@ -28,11 +28,25 @@ HARNESS_PATH = (
 PYTHON = REPOSITORY_ROOT / ".venv/bin/python"
 PROTOCOL_VERSION = "recall-handoff-v1"
 APPLICATION_INSTRUCTION = (
-    "Classify every delivered Decision exactly once with one nonempty reason of "
-    "at most 240 UTF-8 bytes per item. Call apply_zdecision_gate_a0_delivery "
-    "before development mutation. Do not call show_zdecision_gate_a0 or guess "
-    "host-owned identifiers; the Hook supplies them."
+    "1. Use only the typed intent and delivered Decisions. "
+    "2. Call the disposable counter before application and observe denial. "
+    "3. Submit complete classifications once. "
+    "4. Call the disposable counter once after application_committed and observe "
+    "counter == 1. "
+    "5. Do not call shell, search, file-read, status, or render tools. "
+    "6. Do not guess host-owned identifiers."
 )
+TEST_INTENT = {
+    "target_decision_space_ids": ["prod_4d7b16e1616dd4cd1aeb2411836fd687"],
+    "explicit_multi_space": False,
+    "feature_goal": "Validate Recall handoff for the security-services application",
+    "domain_objects": ["security-services", "Recall handoff"],
+    "repository_relative_paths": [
+        "packages/products/third-party-services/apps/security-services/"
+    ],
+    "constraints": ["Apply only Decisions governing this feature scope"],
+    "exclusions": ["backup-services"],
+}
 LIVE_SESSION = "7live-session-private-sentinel"
 LIVE_RENDER_TURN = "8live-render-turn-private-sentinel"
 LIVE_APPLICATION_TURN = "9live-application-turn-private-sentinel"
@@ -41,11 +55,11 @@ MODEL_TURN = "model-turn-must-be-discarded"
 MODEL_CWD = "/model-authored/cwd/must-be-discarded"
 
 FIXTURE_ONE_BYTES = (
-    '{"claim":"Gate A0 fixture one requires server-authoritative handoff state.",'
+    '{"claim":"Security-services Recall handoff applies only to security-services feature work.",'
     '"decision_id":"dec_11111111111111111111111111111111",'
     '"format":"zdecision-decision/v1",'
-    '"future_action":"Keep the disposable delivery stable across remounts.",'
-    '"invalidation_conditions":["The Gate A0 protocol version changes."],'
+    '"future_action":"Use this Decision when validating Recall handoff for security-services.",'
+    '"invalidation_conditions":["The security-services Recall handoff contract changes."],'
     '"lifecycle":"active",'
     '"product_id":"prod_4d7b16e1616dd4cd1aeb2411836fd687",'
     '"product_name":"安恒",'
@@ -55,19 +69,19 @@ FIXTURE_ONE_BYTES = (
     '"thread_id":"fixture-review-one",'
     '"turn_id":"fixture-review-turn-one"},'
     '"revision":1,"schema_version":1,'
-    '"scope":{"paths":["tests/integration/"],'
+    '"scope":{"paths":["packages/products/third-party-services/apps/security-services/"],'
     '"repositories":["https://example.invalid/zdecision-gate-a0.git"],'
-    '"summary":"Disposable Gate A0 delivery behavior"},'
+    '"summary":"Security-services Recall handoff validation"},'
     '"source":{"thread_id":"fixture-source-one",'
     '"turn_id":"fixture-turn-one"},'
     '"supersedes":[],"variant_of":[]}\n'
 )
 FIXTURE_TWO_BYTES = (
-    '{"claim":"Gate A0 fixture two limits application to validated classifications.",'
+    '{"claim":"Backup-services Recall handoff applies only to backup-services feature work.",'
     '"decision_id":"dec_22222222222222222222222222222222",'
     '"format":"zdecision-decision/v1",'
-    '"future_action":"Deny disposable mutation until application commits atomically.",'
-    '"invalidation_conditions":["The Gate A0 application contract changes."],'
+    '"future_action":"Apply backup-services-specific Recall handoff procedures only to backup-services.",'
+    '"invalidation_conditions":["The backup-services Recall handoff contract changes."],'
     '"lifecycle":"active",'
     '"product_id":"prod_4d7b16e1616dd4cd1aeb2411836fd687",'
     '"product_name":"安恒",'
@@ -77,15 +91,15 @@ FIXTURE_TWO_BYTES = (
     '"thread_id":"fixture-review-two",'
     '"turn_id":"fixture-review-turn-two"},'
     '"revision":1,"schema_version":1,'
-    '"scope":{"paths":["tests/integration/"],'
+    '"scope":{"paths":["packages/products/third-party-services/apps/backup-services/"],'
     '"repositories":["https://example.invalid/zdecision-gate-a0.git"],'
-    '"summary":"Disposable Gate A0 application guard"},'
+    '"summary":"Backup-services Recall handoff validation"},'
     '"source":{"thread_id":"fixture-source-two",'
     '"turn_id":"fixture-turn-two"},'
     '"supersedes":[],"variant_of":[]}\n'
 )
-FIXTURE_ONE_DIGEST = "30dc189935dd11c1f9e87a900235dcc693479cbdf69106d139c2320d194ab63a"
-FIXTURE_TWO_DIGEST = "4dfba3631e4a669ac024759525c868125111142aaeafb238fcad57e2af16c99a"
+FIXTURE_ONE_DIGEST = "e6400d33b97e9281e407abfe5825e9be93501f42cea06e93ca90081f280e0696"
+FIXTURE_TWO_DIGEST = "64145131255fd0647b9d44d079a30829dc30c4a907855d33bbcae72f5ec2326e"
 FIXTURE_ONE = json.loads(FIXTURE_ONE_BYTES)
 FIXTURE_TWO = json.loads(FIXTURE_TWO_BYTES)
 
@@ -199,7 +213,7 @@ class McpProcess:
                 stream.close()
 
 
-class DisposableRecallGateA0VerticalTests(unittest.TestCase):
+class GateA0DisposableVerticalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -548,6 +562,111 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
         self.assertIn(
             "240 UTF-8 bytes", item_schema["properties"]["reason"]["description"]
         )
+
+    def test_snapshot_freezes_intent_and_one_obvious_negative_control(self) -> None:
+        for fixture_bytes, digest in (
+            (FIXTURE_ONE_BYTES, FIXTURE_ONE_DIGEST),
+            (FIXTURE_TWO_BYTES, FIXTURE_TWO_DIGEST),
+        ):
+            self.assertEqual(digest, hashlib.sha256(fixture_bytes.encode()).hexdigest())
+            self.assertEqual(
+                json.loads(fixture_bytes),
+                DecisionRevision.from_dict(json.loads(fixture_bytes)).to_dict(),
+            )
+        attempt_id = self._render_attempt()
+        snapshot = self._mcp().call(
+            "enable_zdecision_gate_a0_delivery", {"attempt_id": attempt_id}
+        )["structuredContent"]["snapshot"]
+
+        self.assertEqual(TEST_INTENT, snapshot["intent"])
+        self.assertEqual(
+            ["packages/products/third-party-services/apps/security-services/"],
+            snapshot["decisions"][0]["decision_revision"]["scope"]["paths"],
+        )
+        self.assertEqual(
+            ["packages/products/third-party-services/apps/backup-services/"],
+            snapshot["decisions"][1]["decision_revision"]["scope"]["paths"],
+        )
+        self.assertIn("backup-services", TEST_INTENT["exclusions"])
+
+    def test_wrong_semantic_vector_is_terminal_without_application(self) -> None:
+        attempt_id = self._render_attempt()
+        client = self._mcp()
+        snapshot = self._enable_and_ack(client, attempt_id)["snapshot"]
+        first, second = snapshot["decisions"]
+        wrong = [
+            {
+                "decision_id": first["decision_id"],
+                "revision": first["revision"],
+                "digest": first["digest"],
+                "classification": "applicable",
+                "reason": "The security-services Decision governs this feature.",
+            },
+            {
+                "decision_id": second["decision_id"],
+                "revision": second["revision"],
+                "digest": second["digest"],
+                "classification": "applicable",
+                "reason": "The backup-services Decision was retrieved.",
+            },
+        ]
+        bound = self._hook(
+            "mcp__zdecision_gate_a0__apply_zdecision_gate_a0_delivery",
+            {"classifications": wrong},
+            turn_id=LIVE_APPLICATION_TURN,
+        )
+
+        result = client.call(
+            "apply_zdecision_gate_a0_delivery", self._updated_input(bound)
+        )
+        inspect = self._run("inspect")
+
+        self.assertEqual(
+            "classification_oracle_mismatch", result["structuredContent"]["code"]
+        )
+        self.assertEqual(0, inspect["application_count"])
+        self.assertEqual(0, inspect["mutation_count"])
+
+    def test_handoff_instruction_requires_the_complete_counter_sequence(self) -> None:
+        attempt_id = self._render_attempt()
+        snapshot = self._mcp().call(
+            "enable_zdecision_gate_a0_delivery", {"attempt_id": attempt_id}
+        )["structuredContent"]["snapshot"]
+        instruction = snapshot["application_instruction"]
+        required_steps = (
+            "1. Use only the typed intent and delivered Decisions.",
+            "2. Call the disposable counter before application and observe denial.",
+            "3. Submit complete classifications once.",
+            "4. Call the disposable counter once after application_committed and observe counter == 1.",
+            "5. Do not call shell, search, file-read, status, or render tools.",
+            "6. Do not guess host-owned identifiers.",
+        )
+
+        self.assertEqual(APPLICATION_INSTRUCTION, instruction)
+        positions = [instruction.index(step) for step in required_steps]
+        self.assertEqual(sorted(positions), positions)
+
+    def test_inspect_reports_exact_hook_trust_readiness(self) -> None:
+        selector = json.loads(
+            (self.root / ".zdecision-gate-a0-disposable.json").read_text("utf-8")
+        )["selector"]
+        source = f"{selector}@{selector}-marketplace:hooks/hooks.json:pre_tool_use:0:0"
+        config = self.root / "codex-home/config.toml"
+
+        absent = self._run("inspect")
+
+        self.assertEqual(source, absent["hook_trust_source"])
+        self.assertFalse(absent["hook_trust_record_present"])
+        config.parent.mkdir()
+        config.write_text(f'[hooks.state]\n"{source}" = "trusted"\n', "utf-8")
+
+        present = self._run("inspect")
+
+        self.assertEqual(source, present["hook_trust_source"])
+        self.assertTrue(present["hook_trust_record_present"])
+        diagnostic = json.dumps(present, sort_keys=True)
+        self.assertNotIn("trusted", diagnostic)
+        self.assertNotIn(str(config.parent), diagnostic)
 
     def test_enable_commits_one_stable_delivery_with_literal_canonical_fixtures(self) -> None:
         for fixture_bytes, digest in (

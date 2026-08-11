@@ -13,6 +13,7 @@ import shlex
 import shutil
 import sqlite3
 import sys
+import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Literal
@@ -25,10 +26,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PROTOCOL_VERSION = "recall-handoff-v1"
 APP_PROTOCOL_VERSION = "2026-01-26"
 APPLICATION_INSTRUCTION = (
-    "Classify every delivered Decision exactly once with one nonempty reason of "
-    "at most 240 UTF-8 bytes per item. Call apply_zdecision_gate_a0_delivery "
-    "before development mutation. Do not call show_zdecision_gate_a0 or guess "
-    "host-owned identifiers; the Hook supplies them."
+    "1. Use only the typed intent and delivered Decisions. "
+    "2. Call the disposable counter before application and observe denial. "
+    "3. Submit complete classifications once. "
+    "4. Call the disposable counter once after application_committed and observe "
+    "counter == 1. "
+    "5. Do not call shell, search, file-read, status, or render tools. "
+    "6. Do not guess host-owned identifiers."
 )
 RESOURCE_URI = "ui://zdecision/recall-gate-a0-v1.html"
 RESOURCE_MIME = "text/html;profile=mcp-app"
@@ -80,12 +84,16 @@ class InvalidClassificationsError(ValueError):
 class NoDeliveredBindingError(ValueError):
     pass
 
+
+class ClassificationOracleMismatchError(ValueError):
+    pass
+
 FIXTURE_ONE_BYTES = (
-    '{"claim":"Gate A0 fixture one requires server-authoritative handoff state.",'
+    '{"claim":"Security-services Recall handoff applies only to security-services feature work.",'
     '"decision_id":"dec_11111111111111111111111111111111",'
     '"format":"zdecision-decision/v1",'
-    '"future_action":"Keep the disposable delivery stable across remounts.",'
-    '"invalidation_conditions":["The Gate A0 protocol version changes."],'
+    '"future_action":"Use this Decision when validating Recall handoff for security-services.",'
+    '"invalidation_conditions":["The security-services Recall handoff contract changes."],'
     '"lifecycle":"active",'
     '"product_id":"prod_4d7b16e1616dd4cd1aeb2411836fd687",'
     '"product_name":"安恒",'
@@ -95,19 +103,19 @@ FIXTURE_ONE_BYTES = (
     '"thread_id":"fixture-review-one",'
     '"turn_id":"fixture-review-turn-one"},'
     '"revision":1,"schema_version":1,'
-    '"scope":{"paths":["tests/integration/"],'
+    '"scope":{"paths":["packages/products/third-party-services/apps/security-services/"],'
     '"repositories":["https://example.invalid/zdecision-gate-a0.git"],'
-    '"summary":"Disposable Gate A0 delivery behavior"},'
+    '"summary":"Security-services Recall handoff validation"},'
     '"source":{"thread_id":"fixture-source-one",'
     '"turn_id":"fixture-turn-one"},'
     '"supersedes":[],"variant_of":[]}\n'
 )
 FIXTURE_TWO_BYTES = (
-    '{"claim":"Gate A0 fixture two limits application to validated classifications.",'
+    '{"claim":"Backup-services Recall handoff applies only to backup-services feature work.",'
     '"decision_id":"dec_22222222222222222222222222222222",'
     '"format":"zdecision-decision/v1",'
-    '"future_action":"Deny disposable mutation until application commits atomically.",'
-    '"invalidation_conditions":["The Gate A0 application contract changes."],'
+    '"future_action":"Apply backup-services-specific Recall handoff procedures only to backup-services.",'
+    '"invalidation_conditions":["The backup-services Recall handoff contract changes."],'
     '"lifecycle":"active",'
     '"product_id":"prod_4d7b16e1616dd4cd1aeb2411836fd687",'
     '"product_name":"安恒",'
@@ -117,9 +125,9 @@ FIXTURE_TWO_BYTES = (
     '"thread_id":"fixture-review-two",'
     '"turn_id":"fixture-review-turn-two"},'
     '"revision":1,"schema_version":1,'
-    '"scope":{"paths":["tests/integration/"],'
+    '"scope":{"paths":["packages/products/third-party-services/apps/backup-services/"],'
     '"repositories":["https://example.invalid/zdecision-gate-a0.git"],'
-    '"summary":"Disposable Gate A0 application guard"},'
+    '"summary":"Backup-services Recall handoff validation"},'
     '"source":{"thread_id":"fixture-source-two",'
     '"turn_id":"fixture-turn-two"},'
     '"supersedes":[],"variant_of":[]}\n'
@@ -127,11 +135,11 @@ FIXTURE_TWO_BYTES = (
 FIXTURES = (
     (
         json.loads(FIXTURE_ONE_BYTES),
-        "30dc189935dd11c1f9e87a900235dcc693479cbdf69106d139c2320d194ab63a",
+        "e6400d33b97e9281e407abfe5825e9be93501f42cea06e93ca90081f280e0696",
     ),
     (
         json.loads(FIXTURE_TWO_BYTES),
-        "4dfba3631e4a669ac024759525c868125111142aaeafb238fcad57e2af16c99a",
+        "64145131255fd0647b9d44d079a30829dc30c4a907855d33bbcae72f5ec2326e",
     ),
 )
 
@@ -774,6 +782,14 @@ class GateA0Store:
             ):
                 self.connection.commit()
                 return None
+            if tuple(item["classification"] for item in normalized) != (
+                "applicable",
+                "not_applicable",
+            ):
+                self.connection.commit()
+                raise ClassificationOracleMismatchError(
+                    "classification oracle mismatch"
+                )
             receipt = f"application_receipt_{secrets.token_hex(16)}"
             active_count = sum(
                 item["classification"] == "applicable" for item in normalized
@@ -860,6 +876,23 @@ class GateA0Store:
         application = self.connection.execute(
             "SELECT receipt FROM applications ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
+        selector = self.configuration["selector"]
+        hook_trust_source = (
+            f"{selector}@{selector}-marketplace:hooks/hooks.json:pre_tool_use:0:0"
+        )
+        hook_trust_record_present = False
+        config = self.root / "codex-home/config.toml"
+        if config.is_file():
+            try:
+                with config.open("rb") as stream:
+                    hooks = tomllib.load(stream).get("hooks")
+                if isinstance(hooks, Mapping):
+                    state = hooks.get("state")
+                    hook_trust_record_present = (
+                        isinstance(state, Mapping) and hook_trust_source in state
+                    )
+            except (OSError, tomllib.TOMLDecodeError):
+                pass
         return {
             "protocol_version": PROTOCOL_VERSION,
             "attempt_count": scalar("SELECT COUNT(*) FROM attempts"),
@@ -891,6 +924,8 @@ class GateA0Store:
             "application_receipt_prefix": (
                 application["receipt"][:23] if application is not None else None
             ),
+            "hook_trust_source": hook_trust_source,
+            "hook_trust_record_present": hook_trust_record_present,
         }
 
 
@@ -906,6 +941,21 @@ def _snapshot(delivery_id: str) -> dict[str, object]:
     return {
         "protocol_version": PROTOCOL_VERSION,
         "delivery_id": delivery_id,
+        "intent": {
+            "target_decision_space_ids": [
+                "prod_4d7b16e1616dd4cd1aeb2411836fd687"
+            ],
+            "explicit_multi_space": False,
+            "feature_goal": (
+                "Validate Recall handoff for the security-services application"
+            ),
+            "domain_objects": ["security-services", "Recall handoff"],
+            "repository_relative_paths": [
+                "packages/products/third-party-services/apps/security-services/"
+            ],
+            "constraints": ["Apply only Decisions governing this feature scope"],
+            "exclusions": ["backup-services"],
+        },
         "application_instruction": APPLICATION_INSTRUCTION,
         "decisions": [
             {
@@ -1192,11 +1242,14 @@ def create_server(store: GateA0Store) -> FastMCP:
         application_binding_id: str | None = None,
         delivery_id: str | None = None,
     ) -> CallToolResult:
-        application = store.apply(
-            application_binding_id,
-            delivery_id,
-            [item.model_dump(mode="python") for item in classifications],
-        )
+        try:
+            application = store.apply(
+                application_binding_id,
+                delivery_id,
+                [item.model_dump(mode="python") for item in classifications],
+            )
+        except ClassificationOracleMismatchError:
+            return _failed("classification_oracle_mismatch")
         if application is None:
             return _failed("invalid_application")
         return _tool_result(
