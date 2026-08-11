@@ -1,7 +1,8 @@
 # ZDecision Recall Next-Native-Message Handoff Design
 
-**Status:** Approved for Gate A implementation planning on 2026-08-10. Gates B,
-C, and D retain their separate planning and acceptance boundaries.
+**Status:** Approved for Gate A implementation planning on 2026-08-10. The
+Gate A disposable-identity amendment in section 14 was approved on 2026-08-11.
+Gates B, C, and D retain their separate planning and acceptance boundaries.
 
 **Scope:** Replace the unsupported Recall authorization and context-handoff hot
 path with the MCP Apps capabilities proved by the current Codex Desktop:
@@ -493,3 +494,230 @@ distribution, or the four-category quality gate stops the current Gate. It
 does not authorize a second App Server, private IPC, transcript parsing,
 Central task queries, whole-corpus injection, or fabricated Decision data as a
 fallback.
+
+## 14. Gate A disposable Plugin identity amendment
+
+### 14.1 Problem and selected approach
+
+The Gate A automated vertical and real Desktop acceptance must exercise the
+production Hook, Plugin-bundle, Store, MCP, App, and application boundaries
+without replacing or disabling the installed production Plugin. A disposable
+Plugin cannot honestly do that while those boundaries hard-code the production
+Plugin name, MCP server key, command, arguments, and Recall Skill path. Giving
+the disposable bundle the production identity would collide with the installed
+Plugin. Rewriting `PLUGIN_ROOT`, tool names, or bundle bytes in the harness
+would test an adapter rather than the production trust boundary.
+
+Three approaches were considered:
+
+- **Reuse the production Plugin identity for the disposable bundle** was
+  rejected because the installed production and disposable Plugins could not
+  remain distinct stable components.
+- **Keep production constants and translate disposable values inside the test
+  harness** was rejected because a passing result would bypass the trust
+  relationship that Gate A is intended to prove.
+- **Inject one immutable, closed Plugin-identity value at code composition
+  time** is selected. Production uses an exact constant. The disposable
+  harness supplies its own exact value to the same production validators and
+  composition functions.
+
+This amendment changes no user-facing production identity and adds no runtime
+configuration surface.
+
+### 14.2 Closed identity value
+
+`RecallPluginIdentity` is an immutable value containing exactly:
+
+- `plugin_name` — the manifest and marketplace-entry name;
+- `mcp_server_key` — the exact `.mcp.json` server-map key;
+- `mcp_command` — the exact configured command string;
+- `mcp_args` — the exact ordered tuple of configured argument strings;
+- `hook_command` — the exact command string used by every required Hook; and
+- `recall_skill_relative_path` — the normalized POSIX path to the Recall
+  `SKILL.md` below the Plugin root.
+
+The production constant is exactly:
+
+```text
+plugin_name = zdecision
+mcp_server_key = zdecision-local
+mcp_command = zdecision-agent
+mcp_args = [mcp]
+hook_command = zdecision-agent hook
+recall_skill_relative_path = skills/zdecision/SKILL.md
+```
+
+The value is accepted only as an explicit in-process dependency of the Store,
+Hook handler, and MCP server composition. It must never be selected or
+overridden by an environment variable, CLI flag, model-visible tool input,
+Hook input, Plugin manifest extension, database value, or remote response.
+Production entry points always construct or use the production constant.
+
+Plugin names and MCP server keys are 1–128 ASCII characters and use the closed
+grammar `[a-z][a-z0-9]*(?:-[a-z0-9]+)*`. Underscores, consecutive separators,
+leading or trailing separators, Unicode, and case folding are rejected. Within
+this grammar the Codex tool namespace is the server key with each hyphen
+replaced by one underscore. Because underscores are excluded from source keys,
+the mapping is collision-free. Every full Plugin MCP tool name that the Hook
+handler references individually for Candidate control or Recall is derived
+from this same namespace and one member of the following closed basename sets;
+no independent tool-prefix constant is permitted. Other MCP tools remain
+covered by the generic `mcp__.*` matcher and are not identity-sensitive Hook
+branches.
+
+```text
+Candidate:
+  show_zdecision_update
+
+Recall:
+  show_zdecision_recall_confirmation
+  decide_zdecision_recall
+  get_zdecision_recall_handoff
+  ack_zdecision_recall_delivery
+  apply_zdecision_recall_delivery
+  gate_zdecision_turn
+```
+
+The Recall Skill path must end in `SKILL.md`, contain at most 512 UTF-8 bytes,
+be relative and normalized, contain no empty, `.` or `..` segment, and resolve
+beneath the verified Plugin root. The command contains 1–4,096 UTF-8 bytes.
+The ordered argument tuple contains at most 16 entries, each containing
+1–4,096 UTF-8 bytes and no NUL, with at most 16,384 aggregate UTF-8 bytes. The
+Hook command also contains 1–4,096 UTF-8 bytes. Both commands contain no NUL.
+Bundle validation compares the manifest name, exact MCP key, exact command and
+ordered arguments, and exact Recall Skill path to the injected identity before
+computing or accepting the existing bundle digest. The validator returns the
+verified Plugin root explicitly; callers must not reconstruct it from a fixed
+number of Skill-path parents.
+
+The manifest `hooks` field must be absent so the fixed default
+`hooks/hooks.json` path is authoritative. That file's security structure is
+exactly:
+
+| Event | Matcher | Timeout | Additional-context limit |
+|---|---|---:|---:|
+| `SessionStart` | `startup|resume|clear|compact` | 3 | 0 |
+| `UserPromptSubmit` | absent | 3 | 4000 |
+| `PreCompact` | `manual|auto` | 3 | absent |
+| `PostCompact` | `manual|auto` | 3 | absent |
+| `PreToolUse` | derived rule below | 3 | absent |
+| `PostToolUse` | absent | 3 | absent |
+| `Stop` | absent | 3 | absent |
+| `SessionEnd` | `other` | 3 | absent |
+
+Each event has exactly one entry containing exactly one `type = command` Hook
+with the injected `hook_command`. The `PreToolUse` matcher contains, in this
+order, the injected namespace's Candidate show, Recall confirmation show,
+Recall application, and Recall turn-gate names, followed by
+`Bash|apply_patch|Edit|Write|Agent|mcp__.*`. The app-only Recall actions are
+covered by the final MCP matcher while their Hook-handler names still derive
+from the same identity. Missing events, commands, names, mutation coverage,
+changed order or limits, or additional Hook entries fail validation.
+Non-security display copy may vary, but it grants no authority.
+
+Hook security fields are parsed and validated before every initial or later
+Plugin-root or bundle acceptance. They are not added to the existing content
+digest, so existing production rows and the digest algorithm remain unchanged;
+durable authorization still fails after any Hook security-field change because
+the root cannot pass the mandatory identity validation that precedes digest
+comparison.
+
+### 14.3 Production and persistence behavior
+
+The Store owns one immutable identity for its lifetime. Initial attempt
+binding, later delivery/application transitions, restart/replay, active-set
+reuse, compact restoration, and bundle/root revalidation all use that same
+identity. A Store reopened with an identity that does not validate the frozen
+Plugin root and bytes fails closed. Cross-identity attempt, delivery, gate,
+receipt, or active-set replay never adopts the caller's identity.
+
+No identity field is added to SQLite and the existing bundle-digest algorithm
+and protocol version remain unchanged. The frozen Plugin root plus bundle
+digest continue to be durable state; every later check recomputes that digest
+only after the root has passed the current Store identity's exact manifest,
+MCP, command, argument, Hook-security, and Skill-path validation. Thus existing
+production rows remain valid under the production constant while a differently
+composed Store cannot authorize them.
+
+The production `run_mcp` and Hook CLI accept no identity option. The production
+Plugin manifest, `.mcp.json`, Hook command and matcher security fields, command,
+arguments, Skill path, and user-visible name remain governed by the production
+constant. The identity seam exists to compose verified local code, not to make
+the production Plugin dynamically configurable.
+
+### 14.4 Disposable Gate A composition
+
+Task 9 generates one test-only disposable identity that is unique relative to
+the production Plugin and uses the same closed grammar. `create` writes one
+minimal launcher module below the disposable Plugin root containing the exact
+immutable identity fields. The Plugin folder, manifest name, marketplace entry
+name, selector, MCP server key, Hook full tool names, Hook command, MCP command,
+arguments, and Recall Skill path must all agree with that value. Variable
+version, database, and lease values are not identity fields. The marketplace
+source resolves inside the fresh disposable root, and all harness processes use
+one isolated database below that root.
+
+The root's immutable ownership marker records the launcher's relative path,
+byte digest, root device/inode, and generation. Each separate Hook or MCP
+process derives the root from the launcher's own resolved path, revalidates the
+marker and launcher bytes before importing the identity, and then refuses any
+identity mutation. No database row, generic CLI option, environment option, or
+manifest extension may construct, override, or substitute identity fields.
+The generated command and arguments identify only that launcher and its closed
+`hook` or `mcp` subcommand; they accept no root or identity argument.
+
+The harness may inject the validated launcher identity only while directly
+composing the production `RecallHostStore`, Hook handler, and
+`create_mcp_server` functions. It must not call production `run_mcp`, modify the
+production identity constant, rewrite host-provided `PLUGIN_ROOT`, translate
+tool names after receipt, copy the trust validator, or monkeypatch bundle
+bytes. The deterministic provider remains test-only and performs no network,
+Git, Central, Registry, or App Server operation. Inspection and cleanup
+revalidate the same root generation and launcher digest; mismatch is a hard
+FAIL and cleanup preserves the uncertain root.
+
+Automated tests must prove at least:
+
+1. the production constant preserves every current production name, path, and
+   generated full Hook tool name;
+2. a valid unique disposable identity accepts only its matching generated
+   bundle and Hook/MCP namespace;
+3. manifest-name, server-key, command, ordered-argument, Skill-path, and
+   namespace substitutions each fail closed;
+4. Hook-command, required-event, matcher, timeout, additional-context-limit,
+   missing-mutation-coverage, and added-Hook substitutions each fail closed;
+5. two server keys cannot normalize to the same accepted tool namespace;
+6. a state frozen under one identity cannot be replayed or revalidated through
+   another identity;
+7. initial binding and restart, delivery, application, reuse, and compact
+   revalidation all use the Store's same immutable identity; and
+8. the Task 9 automated vertical and Task 10 Desktop run leave the installed
+   production Plugin, its marketplace entry, bundle bytes, and production
+   database unchanged.
+
+Task 9 stops rather than weakening this contract if Codex does not expose the
+exact disposable MCP client, if the host supplies a mismatched Plugin root or
+tool namespace, or if acceptance would require a second App Server, private
+IPC, manual database mutation, identity translation, or disabling the
+production Plugin.
+
+### 14.5 Implementation-plan boundary
+
+Before the existing Task 9 vertical is implemented, its plan must add one
+reviewable Task 9A that introduces the production identity seam and its focused
+contract tests. Task 9A may add one focused identity module and modify only the
+production Store, Hook, MCP composition, and exact tests needed to prove
+sections 14.2 and 14.3. It changes no Plugin bytes, CLI surface, SQLite schema,
+bundle-digest algorithm, provider behavior, or Gate B/C code.
+
+This amendment supersedes Task 9's earlier statement that generated Hook and
+MCP commands invoke the repository harness file directly. Both commands invoke
+the repository Python executable with the generated launcher path as the first
+argument and the closed `hook` or `mcp` subcommand as the second. The launcher
+performs its root, marker, generation, and self-digest verification before it
+imports and delegates to the tracked repository harness.
+
+The original Task 9 then composes its deterministic provider and disposable
+Plugin through that reviewed seam. It must not absorb Task 9A into a test-only
+adapter. Task 10 begins only after Task 9A and Task 9 are independently GREEN
+and approved.
