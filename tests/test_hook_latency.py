@@ -138,6 +138,15 @@ class HookLatencyTests(unittest.TestCase):
             ),
             "utf-8",
         )
+        hooks_path = self.plugin_root / "hooks/hooks.json"
+        hooks_path.parent.mkdir()
+        hooks_path.write_text(
+            (
+                Path(__file__).resolve().parents[1]
+                / "plugins/zdecision/hooks/hooks.json"
+            ).read_text("utf-8"),
+            "utf-8",
+        )
         self.environment = patch.dict(
             "os.environ", {"PLUGIN_ROOT": str(self.plugin_root)}, clear=False
         )

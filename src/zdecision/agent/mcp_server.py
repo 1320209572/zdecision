@@ -31,6 +31,10 @@ from zdecision.agent.repository import RepositoryResolver
 from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_mcp import RecallMcpTools, delivery_id_for_attempt
 from zdecision.agent.recall_host_state import RecallHostStore
+from zdecision.agent.recall_plugin_identity import (
+    PRODUCTION_RECALL_PLUGIN_IDENTITY,
+    RecallPluginIdentity,
+)
 from zdecision.agent.service import load_agent_config
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.recall.provider import UnavailableRecallProvider
@@ -398,13 +402,15 @@ class LocalMcpTools:
 def create_mcp_server(
     tools: LocalMcpTools,
     recall_tools: RecallMcpTools | None = None,
+    *,
+    recall_identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
 ):
     """Create the local server and its isolated Candidate refresh card."""
 
     from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
 
-    server = FastMCP("zdecision-local")
+    server = FastMCP(recall_identity.mcp_server_key)
     read_only = ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -905,7 +911,9 @@ def run_mcp(
     """Start the MCP SDK only for the explicit `mcp` subcommand."""
 
     database = AgentDatabase.open(database_path)
-    recall_store = RecallHostStore.open(database_path)
+    recall_store = RecallHostStore.open(
+        database_path, identity=PRODUCTION_RECALL_PLUGIN_IDENTITY
+    )
     binding_store: ControlBindingStore | None = None
     client: CentralClient | None = None
     central_base_url: str | None = None

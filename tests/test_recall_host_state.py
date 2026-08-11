@@ -1193,6 +1193,15 @@ class RecallHostStoreTests(unittest.TestCase):
                 ),
                 "utf-8",
             )
+            hooks_path = root / "hooks/hooks.json"
+            hooks_path.parent.mkdir()
+            hooks_path.write_text(
+                (
+                    Path(__file__).resolve().parents[1]
+                    / "plugins/zdecision/hooks/hooks.json"
+                ).read_text("utf-8"),
+                "utf-8",
+            )
             (root / "skills/zdecision/SKILL.md").write_text(name, "utf-8")
             return root
 

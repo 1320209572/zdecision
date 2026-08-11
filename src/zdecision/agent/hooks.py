@@ -17,7 +17,11 @@ from zdecision.agent.events import HookInvocation, HookResponse, InvalidHookInvo
 from zdecision.agent.recall_host_state import (
     RecallGateConflict,
     RecallHostStore,
-    installed_recall_skill_path,
+)
+from zdecision.agent.recall_plugin_identity import (
+    PRODUCTION_RECALL_PLUGIN_IDENTITY,
+    RecallPluginIdentity,
+    verify_recall_plugin_bundle,
 )
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.ids import product_id
@@ -36,20 +40,6 @@ INVALID_HOOK_OUTPUT = {"systemMessage": "ZDecision ignored an invalid hook event
 UNAVAILABLE_HOOK_OUTPUT = {
     "systemMessage": "ZDecision could not record this lifecycle event."
 }
-CONTROL_BINDING_TOOL = "mcp__zdecision_local__show_zdecision_update"
-SHOW_RECALL_CONFIRMATION_TOOL = "mcp__zdecision_local__show_zdecision_recall_confirmation"
-TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
-APPLY_RECALL_DELIVERY_TOOL = (
-    "mcp__zdecision_local__apply_zdecision_recall_delivery"
-)
-RECALL_MUTATION_MATCHER = "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
-_ACTIVATING_APP_TOOLS = frozenset(
-    (
-        "mcp__zdecision_local__decide_zdecision_recall",
-        "mcp__zdecision_local__get_zdecision_recall_handoff",
-        "mcp__zdecision_local__ack_zdecision_recall_delivery",
-    )
-)
 _CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _HOOK_STORE_TIMEOUT_SECONDS = 0.05
@@ -77,6 +67,18 @@ _APPLICATION_INSTRUCTION = (
 _RESUME_INSTRUCTION = (
     "ZDecision recall revalidation is required before development continues."
 )
+# Compatibility exports derive from the sole production identity; branch
+# decisions below use the injected identity directly.
+CONTROL_BINDING_TOOL = PRODUCTION_RECALL_PLUGIN_IDENTITY.tool_name(
+    "show_zdecision_update"
+)
+SHOW_RECALL_CONFIRMATION_TOOL = PRODUCTION_RECALL_PLUGIN_IDENTITY.tool_name(
+    "show_zdecision_recall_confirmation"
+)
+TURN_GATE_TOOL = PRODUCTION_RECALL_PLUGIN_IDENTITY.tool_name("gate_zdecision_turn")
+APPLY_RECALL_DELIVERY_TOOL = PRODUCTION_RECALL_PLUGIN_IDENTITY.tool_name(
+    "apply_zdecision_recall_delivery"
+)
 
 
 def handle_hook(
@@ -94,6 +96,7 @@ def handle_hook(
     activation_binding_id_factory: Callable[[], str] | None = None,
     turn_gate_id_factory: Callable[..., str] | None = None,
     session_lease_seconds: float = 120.0,
+    recall_identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
 ) -> HookResponse:
     """Validate and record one Hook without retaining discarded host fields."""
 
@@ -113,6 +116,7 @@ def handle_hook(
                     activation_attempt_id_factory or activation_binding_id_factory
                 ),
                 turn_gate_id_factory=turn_gate_id_factory,
+                recall_identity=recall_identity,
             )
         observed_at = clock()
         occurred_at = _format_time(observed_at)
@@ -157,6 +161,7 @@ def handle_hook(
             recall_store=recall_store,
             now=lease_time,
             turn_gate_id_factory=turn_gate_id_factory,
+            recall_identity=recall_identity,
         )
         if worker_waker is None:
             from zdecision.agent.worker import wake_worker
@@ -183,11 +188,12 @@ def handle_pre_tool_hook(
     activation_attempt_id_factory: Callable[[], str] | None = None,
     activation_binding_id_factory: Callable[[], str] | None = None,
     turn_gate_id_factory: Callable[..., str] | None = None,
+    recall_identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
 ) -> HookResponse:
     """Dispatch trusted PreToolUse controls before the active-Turn guard."""
 
     tool_name = value.get("tool_name")
-    if tool_name == CONTROL_BINDING_TOOL:
+    if tool_name == recall_identity.tool_name("show_zdecision_update"):
         return handle_control_binding_hook(
             value,
             database=database,
@@ -195,11 +201,12 @@ def handle_pre_tool_hook(
             repository_resolver=repository_resolver,
             control_store=control_store,
             control_id_factory=control_id_factory,
+            recall_identity=recall_identity,
         )
     recall_binding = tool_name in (
-        SHOW_RECALL_CONFIRMATION_TOOL,
-        TURN_GATE_TOOL,
-        APPLY_RECALL_DELIVERY_TOOL,
+        recall_identity.tool_name("show_zdecision_recall_confirmation"),
+        recall_identity.tool_name("gate_zdecision_turn"),
+        recall_identity.tool_name("apply_zdecision_recall_delivery"),
     )
     owned_store: RecallHostStore | None = None
     try:
@@ -212,8 +219,11 @@ def handle_pre_tool_hook(
                     if recall_binding
                     else _HOOK_STORE_TIMEOUT_SECONDS
                 ),
+                identity=recall_identity,
             )
             store = owned_store
+        if store.identity != recall_identity:
+            raise ValueError("Recall Store identity does not match Hook identity")
         if recall_binding:
             return bind_recall_tool_call(
                 value,
@@ -226,8 +236,14 @@ def handle_pre_tool_hook(
                     activation_attempt_id_factory or activation_binding_id_factory
                 ),
                 turn_gate_id_factory=turn_gate_id_factory,
+                recall_identity=recall_identity,
             )
-        return guard_active_turn_tool(value, database=database, recall_store=store)
+        return guard_active_turn_tool(
+            value,
+            database=database,
+            recall_store=store,
+            recall_identity=recall_identity,
+        )
     except Exception:
         if recall_binding:
             return _pre_tool_response(
@@ -252,6 +268,7 @@ def bind_recall_tool_call(
     activation_attempt_id_factory: Callable[[], str] | None,
     turn_gate_id_factory: Callable[..., str] | None,
     recall_provider: RecallProvider | None = None,
+    recall_identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
 ) -> HookResponse:
     """Replace model-authored recall coordinates with one trusted binding."""
 
@@ -261,9 +278,9 @@ def bind_recall_tool_call(
             database=database,
             repository_resolver=repository_resolver,
         )
-        plugin_root = _trusted_plugin_root()
+        plugin_root = _trusted_plugin_root(recall_identity)
         tool_name = value.get("tool_name")
-        if tool_name == SHOW_RECALL_CONFIRMATION_TOOL:
+        if tool_name == recall_identity.tool_name("show_zdecision_recall_confirmation"):
             tool_input = value.get("tool_input")
             if (
                 not isinstance(tool_input, Mapping)
@@ -323,7 +340,7 @@ def bind_recall_tool_call(
                     "intent": intent.to_dict(),
                 },
             )
-        if tool_name == APPLY_RECALL_DELIVERY_TOOL:
+        if tool_name == recall_identity.tool_name("apply_zdecision_recall_delivery"):
             tool_input = value.get("tool_input")
             if (
                 not isinstance(tool_input, Mapping)
@@ -361,7 +378,7 @@ def bind_recall_tool_call(
                     "items": [item.to_dict() for item in submission.items],
                 },
             )
-        if tool_name != TURN_GATE_TOOL:
+        if tool_name != recall_identity.tool_name("gate_zdecision_turn"):
             raise ValueError("recall tool is invalid")
         tool_input = value.get("tool_input")
         if (
@@ -412,6 +429,7 @@ def guard_active_turn_tool(
     *,
     database: AgentDatabase,
     recall_store: RecallHostStore,
+    recall_identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
 ) -> HookResponse:
     """Deny only selected Sessions whose exact current Turn is not committed."""
 
@@ -422,7 +440,14 @@ def guard_active_turn_tool(
     session = recall_store.get_session(session_id)
     if session is None or session.state not in ("active", "activating", "blocked"):
         return HookResponse(event_id="", output={})
-    if value.get("tool_name") in _ACTIVATING_APP_TOOLS:
+    if value.get("tool_name") in frozenset(
+        recall_identity.tool_name(name)
+        for name in (
+            "decide_zdecision_recall",
+            "get_zdecision_recall_handoff",
+            "ack_zdecision_recall_delivery",
+        )
+    ):
         return HookResponse(event_id="", output={})
     if session.state != "active":
         return _pre_tool_response("deny", reason=_RECALL_GATE_DENIED_REASON)
@@ -447,6 +472,7 @@ def _handle_recall_lifecycle(
     recall_store: RecallHostStore | None,
     now: datetime,
     turn_gate_id_factory: Callable[..., str] | None,
+    recall_identity: RecallPluginIdentity,
 ) -> Mapping[str, object]:
     if invocation.event_name not in (
         "UserPromptSubmit",
@@ -459,9 +485,13 @@ def _handle_recall_lifecycle(
         store = recall_store
         if store is None:
             owned_store = RecallHostStore.open(
-                database.path, timeout_seconds=_HOOK_STORE_TIMEOUT_SECONDS
+                database.path,
+                timeout_seconds=_HOOK_STORE_TIMEOUT_SECONDS,
+                identity=recall_identity,
             )
             store = owned_store
+        if store.identity != recall_identity:
+            return {}
         session = store.get_session(invocation.session_id)
         if invocation.event_name == "SessionEnd":
             store.retire_activation_attempts(invocation.session_id, now=now)
@@ -476,7 +506,7 @@ def _handle_recall_lifecycle(
                     "UserPromptSubmit", _blocked_envelope("invalid_native_turn")
                 )
             try:
-                plugin_root = _trusted_plugin_root()
+                plugin_root = _trusted_plugin_root(recall_identity)
             except ValueError:
                 return _additional_context(
                     "UserPromptSubmit",
@@ -531,7 +561,7 @@ def _handle_recall_lifecycle(
                     invocation.cwd,
                     now,
                     plugin_root=(
-                        _trusted_plugin_root()
+                        _trusted_plugin_root(recall_identity)
                         if session.protocol_version == "recall-handoff-v1"
                         else None
                     ),
@@ -741,11 +771,11 @@ def _trusted_recall_coordinates(
     return session_id, turn_id, cwd
 
 
-def _trusted_plugin_root() -> str:
-    skill_path = installed_recall_skill_path(os.environ.get("PLUGIN_ROOT"))
-    if skill_path is None:
+def _trusted_plugin_root(identity: RecallPluginIdentity) -> str:
+    bundle = verify_recall_plugin_bundle(os.environ.get("PLUGIN_ROOT"), identity)
+    if bundle is None:
         raise ValueError("trusted plugin root is unavailable")
-    return str(skill_path.parents[2])
+    return str(bundle.root)
 
 
 def _turn_gate_id(
@@ -842,6 +872,7 @@ def handle_control_binding_hook(
     repository_resolver: RepositoryResolver | None = None,
     control_store: ControlBindingStore | None = None,
     control_id_factory: Callable[[], str] | None = None,
+    recall_identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
 ) -> HookResponse:
     """Replace render input with one trusted, device-local control binding."""
 
@@ -854,7 +885,8 @@ def handle_control_binding_hook(
         cwd_value = value.get("cwd")
         if (
             value.get("hook_event_name") != "PreToolUse"
-            or value.get("tool_name") != CONTROL_BINDING_TOOL
+            or value.get("tool_name")
+            != recall_identity.tool_name("show_zdecision_update")
             or "agent_id" in value
             or not isinstance(cwd_value, str)
             or not Path(cwd_value).is_absolute()

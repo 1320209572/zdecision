@@ -19,6 +19,7 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.mcp_server import LocalMcpTools
 from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
+from zdecision.agent.recall_plugin_identity import RecallPluginIdentity
 from zdecision.agent.recall_mcp import RecallMcpTools
 from zdecision.app_server.gateway import AppServerGateway
 from zdecision.recall.handoff import (
@@ -507,6 +508,23 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RecallProductionWiringTests(unittest.TestCase):
+    def test_create_mcp_server_uses_the_injected_identity_key(self) -> None:
+        """This catches a disposable composition retaining the production server key."""
+
+        identity = RecallPluginIdentity(
+            plugin_name="recall-gate",
+            mcp_server_key="recall-gate-local",
+            mcp_command="python",
+            mcp_args=("launcher.py", "mcp"),
+            hook_command="python launcher.py hook",
+            recall_skill_relative_path="skills/recall-gate/SKILL.md",
+        )
+        with patch("mcp.server.fastmcp.FastMCP") as fast_mcp:
+            mcp_server.create_mcp_server(
+                object(), recall_identity=identity
+            )
+        fast_mcp.assert_called_once_with("recall-gate-local")
+
     def test_run_mcp_uses_unavailable_provider_without_recall_app_server(self) -> None:
         """This catches production Recall reconnecting the obsolete App Server proof."""
 

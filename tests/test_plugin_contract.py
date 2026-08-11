@@ -6,6 +6,12 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from zdecision.agent.recall_plugin_identity import (
+    PRODUCTION_RECALL_PLUGIN_IDENTITY,
+    RecallPluginIdentity,
+    verify_recall_plugin_bundle,
+)
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision"
@@ -41,6 +47,52 @@ def is_valid_plugin_version(version: object) -> bool:
 
 
 class PluginContractTests(unittest.TestCase):
+    def test_production_recall_plugin_identity_is_the_installed_contract(self) -> None:
+        """This catches production composition drifting from installed Plugin bytes."""
+
+        self.assertEqual(
+            RecallPluginIdentity(
+                plugin_name="zdecision",
+                mcp_server_key="zdecision-local",
+                mcp_command="zdecision-agent",
+                mcp_args=("mcp",),
+                hook_command="zdecision-agent hook",
+                recall_skill_relative_path="skills/zdecision/SKILL.md",
+            ),
+            PRODUCTION_RECALL_PLUGIN_IDENTITY,
+        )
+        bundle = verify_recall_plugin_bundle(
+            PLUGIN_ROOT, PRODUCTION_RECALL_PLUGIN_IDENTITY
+        )
+        self.assertIsNotNone(bundle)
+        self.assertEqual(PLUGIN_ROOT.resolve(), bundle.root)
+        self.assertEqual(
+            (PLUGIN_ROOT / "skills/zdecision/SKILL.md").resolve(), bundle.skill_path
+        )
+
+    def test_identity_rejects_non_closed_names_and_skill_paths(self) -> None:
+        """This catches a disposable identity that can alias another namespace."""
+
+        fields = dict(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="python",
+            mcp_args=("launcher.py", "mcp"),
+            hook_command="python launcher.py hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        for name, value in (
+            ("plugin_name", "disposable_local"),
+            ("plugin_name", "Disposable"),
+            ("mcp_server_key", "disposable--local"),
+            ("mcp_command", "python\x00"),
+            ("recall_skill_relative_path", "skills/../disposable/SKILL.md"),
+        ):
+            with self.subTest(field=name, value=value):
+                invalid = dict(fields)
+                invalid[name] = value
+                with self.assertRaises(ValueError):
+                    RecallPluginIdentity(**invalid)
     def test_repository_marketplace_exposes_one_available_plugin(self) -> None:
         marketplace = load_json(MARKETPLACE_PATH)
 

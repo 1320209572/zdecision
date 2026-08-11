@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Literal
 
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.agent.recall_plugin_identity import (
+    PRODUCTION_RECALL_PLUGIN_IDENTITY,
+    RecallPluginIdentity,
+    verify_recall_plugin_bundle,
+)
 from zdecision.recall.handoff import (
     RECALL_HANDOFF_PROTOCOL,
     RecallApplicationSubmission,
@@ -161,13 +166,27 @@ class RecallGateConflict(ValueError):
 class RecallHostStore:
     """SQLite owner of trusted activation, native turn, and context state."""
 
-    def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        path: Path,
+        connection: sqlite3.Connection,
+        identity: RecallPluginIdentity,
+    ) -> None:
         self.path = path
         self._connection = connection
+        self._identity = identity
+
+    @property
+    def identity(self) -> RecallPluginIdentity:
+        return self._identity
 
     @classmethod
     def open(
-        cls, path: Path, *, timeout_seconds: float = 5.0
+        cls,
+        path: Path,
+        *,
+        timeout_seconds: float = 5.0,
+        identity: RecallPluginIdentity = PRODUCTION_RECALL_PLUGIN_IDENTITY,
     ) -> "RecallHostStore":
         if (
             not isinstance(timeout_seconds, (int, float))
@@ -416,10 +435,23 @@ class RecallHostStore:
                     "ALTER TABLE recall_activation_bindings "
                     "ADD COLUMN plugin_bundle_digest TEXT"
                 )
-        return cls(database_path, connection)
+        if not isinstance(identity, RecallPluginIdentity):
+            connection.close()
+            raise ValueError("identity is invalid")
+        return cls(database_path, connection, identity)
 
     def close(self) -> None:
         self._connection.close()
+
+    def _optional_plugin_binding(
+        self, value: object
+    ) -> tuple[str | None, str | None]:
+        if value is None:
+            return None, None
+        bundle = verify_recall_plugin_bundle(value, self.identity)
+        if bundle is None:
+            raise ValueError("plugin_root is not a verified Recall plugin")
+        return str(bundle.root), bundle.bundle_digest
 
     def get_session(self, session_id: str) -> RecallSession | None:
         session = _text(session_id, "session_id")
@@ -583,7 +615,7 @@ class RecallHostStore:
             repository_id=repository,
             repository_display_name=display_name,
         )
-        installed_root, bundle_digest = _optional_installed_plugin_binding(plugin_root)
+        installed_root, bundle_digest = self._optional_plugin_binding(plugin_root)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             if self._is_internal_thread(session):
@@ -1588,7 +1620,7 @@ class RecallHostStore:
         binding = _text(binding_id, "binding_id")
         working_directory = _absolute_path(cwd)
         created_at = _timestamp(_aware_utc(now, "now"))
-        installed_root, bundle_digest = _optional_installed_plugin_binding(
+        installed_root, bundle_digest = self._optional_plugin_binding(
             plugin_root
         )
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1679,7 +1711,7 @@ class RecallHostStore:
         context = _epoch(context_epoch, "context_epoch")
         intent = _epoch(intent_epoch, "intent_epoch")
         generation = _generation(active_generation)
-        installed_root, bundle_digest = _optional_installed_plugin_binding(
+        installed_root, bundle_digest = self._optional_plugin_binding(
             plugin_root
         )
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1780,10 +1812,10 @@ class RecallHostStore:
         ).fetchone()
         if row is None or row["plugin_root"] is None:
             return None
-        bundle = _installed_recall_bundle(row["plugin_root"])
-        if bundle is None or bundle[1] != row["plugin_bundle_digest"]:
+        bundle = verify_recall_plugin_bundle(row["plugin_root"], self.identity)
+        if bundle is None or bundle.bundle_digest != row["plugin_bundle_digest"]:
             return None
-        return bundle[0]
+        return bundle.skill_path
 
     def commit_turn_gate(
         self,
@@ -2134,7 +2166,7 @@ class RecallHostStore:
                     if current["last_gate_turn_id"] is None
                     else self._gate_for_turn(session, current["last_gate_turn_id"])
                 )
-                installed_root, bundle_digest = _optional_installed_plugin_binding(
+                installed_root, bundle_digest = self._optional_plugin_binding(
                     plugin_root
                 )
                 active_receipts = {
@@ -2678,84 +2710,10 @@ def _absolute_path(value: object) -> str:
 def installed_recall_skill_path(plugin_root: object) -> Path | None:
     """Validate one Hook-provided installed plugin root and exact Recall Skill."""
 
-    bundle = _installed_recall_bundle(plugin_root)
-    return None if bundle is None else bundle[0]
-
-
-def _installed_recall_bundle(
-    plugin_root: object,
-) -> tuple[Path, str] | None:
-    if (
-        not isinstance(plugin_root, str)
-        or not plugin_root
-        or len(plugin_root) > 4096
-        or "\x00" in plugin_root
-    ):
-        return None
-    try:
-        supplied_root = Path(plugin_root)
-        if not supplied_root.is_absolute():
-            return None
-        root = supplied_root.resolve(strict=True)
-        manifest_path = (root / ".codex-plugin/plugin.json").resolve(
-            strict=True
-        )
-        mcp_path = (root / ".mcp.json").resolve(strict=True)
-        skill_path = (root / "skills/zdecision/SKILL.md").resolve(
-            strict=True
-        )
-        if (
-            root not in manifest_path.parents
-            or root not in mcp_path.parents
-            or root not in skill_path.parents
-            or not manifest_path.is_file()
-            or not mcp_path.is_file()
-            or not skill_path.is_file()
-            or manifest_path.stat().st_size > 65_536
-            or mcp_path.stat().st_size > 65_536
-            or skill_path.stat().st_size > 262_144
-        ):
-            return None
-        manifest_bytes = manifest_path.read_bytes()
-        mcp_bytes = mcp_path.read_bytes()
-        skill_bytes = skill_path.read_bytes()
-        manifest = json.loads(manifest_bytes)
-        mcp_config = json.loads(mcp_bytes)
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("name") != "zdecision"
-            or manifest.get("skills") != "./skills/"
-            or manifest.get("mcpServers") != "./.mcp.json"
-            or not isinstance(mcp_config, dict)
-        ):
-            return None
-        servers = mcp_config.get("mcpServers")
-        if not isinstance(servers, dict):
-            return None
-        server = servers.get("zdecision-local")
-        if (
-            not isinstance(server, dict)
-            or server.get("command") != "zdecision-agent"
-            or server.get("args") != ["mcp"]
-        ):
-            return None
-        bundle_digest = hashlib.sha256(
-            manifest_bytes + b"\0" + mcp_bytes + b"\0" + skill_bytes
-        ).hexdigest()
-        return skill_path, bundle_digest
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError):
-        return None
-
-
-def _optional_installed_plugin_binding(
-    value: object,
-) -> tuple[str | None, str | None]:
-    if value is None:
-        return None, None
-    bundle = _installed_recall_bundle(value)
-    if bundle is None:
-        raise ValueError("plugin_root is not a verified ZDecision plugin")
-    return str(bundle[0].parents[2]), bundle[1]
+    bundle = verify_recall_plugin_bundle(
+        plugin_root, PRODUCTION_RECALL_PLUGIN_IDENTITY
+    )
+    return None if bundle is None else bundle.skill_path
 
 
 def _epoch(value: object, name: str) -> int:
