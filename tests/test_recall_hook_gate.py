@@ -19,6 +19,10 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import CONTROL_BINDING_TOOL, handle_hook
 from zdecision.agent.recall_host_state import RecallGateConflict, RecallHostStore
+from zdecision.agent.recall_plugin_identity import (
+    PRODUCTION_RECALL_PLUGIN_IDENTITY,
+    RecallPluginIdentity,
+)
 from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
@@ -109,6 +113,36 @@ def _result(*, context_epoch: int = 0, intent_epoch: int = 1) -> TurnGateResult:
 
 
 class RecallHookGateTests(unittest.TestCase):
+    def test_identity_mismatched_store_denies_generic_mutation_tools(self) -> None:
+        """This catches Store identity mismatch bypassing the active-Turn guard."""
+
+        other = RecallPluginIdentity(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="python",
+            mcp_args=("launcher.py", "mcp"),
+            hook_command="python launcher.py hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        mismatched = RecallHostStore.open(self.database_path, identity=other)
+        self.addCleanup(mismatched.close)
+        response = handle_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-a",
+                "turn_id": "turn-a",
+                "cwd": str(self.repository),
+                "tool_name": "Bash",
+                "tool_input": {},
+            },
+            database=self.database,
+            clock=lambda: NOW,
+            repository_resolver=self.resolver,
+            worker_waker=lambda _: None,
+            recall_store=mismatched,
+            recall_identity=PRODUCTION_RECALL_PLUGIN_IDENTITY,
+        )
+        self.assertEqual("deny", self._decision(response))
     def setUp(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)

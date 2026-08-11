@@ -453,6 +453,56 @@ class RecallHostStore:
             raise ValueError("plugin_root is not a verified Recall plugin")
         return str(bundle.root), bundle.bundle_digest
 
+    def _require_frozen_binding(
+        self,
+        row: sqlite3.Row,
+        *,
+        root_key: str = "plugin_root",
+        digest_key: str = "plugin_bundle_digest",
+    ) -> tuple[str, str] | None:
+        root = row[root_key]
+        digest = row[digest_key]
+        if root is None and digest is None:
+            return None
+        if not isinstance(root, str) or not isinstance(digest, str):
+            raise RecallGateConflict("plugin binding is invalid")
+        bundle = verify_recall_plugin_bundle(root, self.identity)
+        if bundle is None or bundle.bundle_digest != digest:
+            raise RecallGateConflict("plugin binding no longer authorizes recall")
+        return root, digest
+
+    def _require_delivery_binding(self, delivery: sqlite3.Row) -> None:
+        self._require_frozen_binding(
+            delivery,
+            root_key="attempt_plugin_root",
+            digest_key="attempt_plugin_bundle_digest",
+        )
+
+    def _session_frozen_binding(
+        self, session_id: str
+    ) -> tuple[str, str] | None:
+        attempt = self._connection.execute(
+            """
+            SELECT plugin_root, plugin_bundle_digest
+            FROM recall_activation_attempts
+            WHERE session_id = ? AND plugin_root IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if attempt is not None:
+            return self._require_frozen_binding(attempt)
+        gate = self._connection.execute(
+            """
+            SELECT plugin_root, plugin_bundle_digest
+            FROM recall_turn_gates
+            WHERE session_id = ? AND plugin_root IS NOT NULL
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        return None if gate is None else self._require_frozen_binding(gate)
+
     def get_session(self, session_id: str) -> RecallSession | None:
         session = _text(session_id, "session_id")
         if self._is_internal_thread(session):
@@ -488,6 +538,8 @@ class RecallHostStore:
         row = self._connection.execute(
             """
             SELECT d.*, a.preflight_json,
+                   a.plugin_root AS attempt_plugin_root,
+                   a.plugin_bundle_digest AS attempt_plugin_bundle_digest,
                    a.state AS attempt_state,
                    a.protocol_version AS attempt_protocol_version,
                    s.protocol_version AS session_protocol_version
@@ -511,6 +563,8 @@ class RecallHostStore:
         rows = self._connection.execute(
             """
             SELECT d.*, a.preflight_json,
+                   a.plugin_root AS attempt_plugin_root,
+                   a.plugin_bundle_digest AS attempt_plugin_bundle_digest,
                    a.state AS attempt_state,
                    a.protocol_version AS attempt_protocol_version,
                    s.protocol_version AS session_protocol_version
@@ -705,6 +759,7 @@ class RecallHostStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             row = self._required_activation_attempt(attempt)
+            self._require_frozen_binding(row)
             if row["ui_digest"] is None:
                 if row["state"] != "pending_confirmation":
                     raise RecallGateConflict("activation attempt is terminal")
@@ -748,6 +803,7 @@ class RecallHostStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             attempt_row = self._required_activation_attempt(attempt)
+            self._require_frozen_binding(attempt_row)
             if self._is_internal_thread(attempt_row["session_id"]):
                 raise RecallGateConflict("internal threads are recall-disabled")
             existing = self._delivery_for_attempt_row(attempt)
@@ -884,6 +940,7 @@ class RecallHostStore:
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
             _require_v1_delivery(row, self._connection)
+            self._require_delivery_binding(row)
             current = _delivery(row)
             expected_context = build_handoff_context(
                 delivery, current.preflight, shortlist
@@ -987,6 +1044,8 @@ class RecallHostStore:
                 or self._is_internal_thread(session)
             ):
                 raise RecallGateConflict("changed intent gate is not current")
+            self._require_frozen_binding(gate)
+            self._session_frozen_binding(session)
             existing = self._delivery_for_attempt_row(attempt)
             if existing is not None:
                 if (
@@ -1112,6 +1171,7 @@ class RecallHostStore:
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
             _require_v1_delivery(row, self._connection)
+            self._require_delivery_binding(row)
             current = _delivery(row)
             if (
                 row["state"] != "preparing"
@@ -1165,6 +1225,7 @@ class RecallHostStore:
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
             _require_v1_delivery(row, self._connection)
+            self._require_delivery_binding(row)
             if row["context_digest"] != digest:
                 raise RecallGateConflict("delivery context digest does not match")
             if row["state"] == "host_delivered":
@@ -1205,6 +1266,7 @@ class RecallHostStore:
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
             _require_v1_delivery(row, self._connection)
+            self._require_delivery_binding(row)
             if row["state"] == "delivery_unknown":
                 result = _delivery(row)
                 self._connection.commit()
@@ -1253,6 +1315,7 @@ class RecallHostStore:
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
             _require_v1_delivery(row, self._connection)
+            self._require_delivery_binding(row)
             if row["state"] == "delivery_claimed":
                 existing_expiry = row["claim_expires_at"]
                 if (
@@ -1321,11 +1384,13 @@ class RecallHostStore:
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
             _require_v1_delivery(row, self._connection)
+            self._require_delivery_binding(row)
             if row["session_id"] != session:
                 raise RecallGateConflict("delivery does not match trusted session")
             gate = self._gate_for_turn(session, turn)
             if gate is None or gate["gate_id"] != gate_identifier:
                 raise RecallGateConflict("turn gate does not match trusted binding")
+            self._require_frozen_binding(gate)
             current_session = self._session_row(session)
             if current_session is None:
                 raise RecallGateConflict("recall session was not found")
@@ -1531,6 +1596,7 @@ class RecallHostStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             row = self._required_activation_attempt(attempt)
+            self._require_frozen_binding(row)
             if (
                 action == "enable"
                 and row["protocol_version"] == RECALL_HANDOFF_PROTOCOL
@@ -1587,6 +1653,13 @@ class RecallHostStore:
         _aware_utc(now, "now")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            for row in self._connection.execute(
+                "SELECT plugin_root, plugin_bundle_digest "
+                "FROM recall_activation_attempts WHERE session_id = ? "
+                "AND state = 'pending_confirmation'",
+                (session,),
+            ).fetchall():
+                self._require_frozen_binding(row)
             self._connection.execute(
                 """
                 UPDATE recall_activation_attempts
@@ -1720,6 +1793,7 @@ class RecallHostStore:
                 raise RecallGateConflict("internal threads are recall-disabled")
             existing = self._gate_for_turn(session, turn)
             if existing is not None:
+                self._require_frozen_binding(existing)
                 if (
                     existing["plugin_root"] != installed_root
                     or existing["plugin_bundle_digest"] != bundle_digest
@@ -1760,6 +1834,12 @@ class RecallHostStore:
                 current["state"] != "active" and not activating_handoff
             ):
                 raise RecallGateConflict("session is not active for recall")
+            authoritative = self._session_frozen_binding(session)
+            if authoritative is not None and authoritative != (
+                installed_root,
+                bundle_digest,
+            ):
+                raise RecallGateConflict("turn gate identity does not match session")
             if current["context_epoch"] != context or current["intent_epoch"] != intent:
                 raise RecallGateConflict("turn gate epoch is stale")
             self._connection.execute(
@@ -1834,6 +1914,7 @@ class RecallHostStore:
             gate = self._gate_for_turn(session, turn)
             if gate is None or gate["gate_id"] != gate_id:
                 raise RecallGateConflict("turn gate does not match trusted binding")
+            self._require_frozen_binding(gate)
             if self._is_internal_thread(session):
                 raise RecallGateConflict("internal threads are recall-disabled")
             current_session = self._session_row(session)
@@ -1925,6 +2006,7 @@ class RecallHostStore:
         row = self._gate_for_turn(session, turn)
         if row is None or row["state"] != "committed":
             raise RecallGateConflict("turn gate is not committed")
+        self._require_frozen_binding(row)
         return _gate(row)
 
     def replayable_reuse_gate(
@@ -1945,6 +2027,11 @@ class RecallHostStore:
         row = self._gate_for_turn(session, turn)
         current = self._session_row(session)
         if row is None or current is None:
+            return False
+        try:
+            self._require_frozen_binding(row)
+            self._session_frozen_binding(session)
+        except RecallGateConflict:
             return False
         result = TurnGateResult(
             disposition="reuse",
@@ -2007,6 +2094,7 @@ class RecallHostStore:
             current = self._session_row(session)
             if current is None or current["state"] != "active":
                 raise RecallGateConflict("session is not active for restoration")
+            self._session_frozen_binding(session)
             replay_row = self._connection.execute(
                 """
                 SELECT * FROM recall_context_restorations
@@ -2118,6 +2206,7 @@ class RecallHostStore:
             if current is None:
                 self._connection.commit()
                 return None
+            self._session_frozen_binding(session)
             if current["state"] == "active":
                 self._connection.execute(
                     """
@@ -2194,6 +2283,7 @@ class RecallHostStore:
                     )
                 ):
                     raise RecallGateConflict("active receipt revalidation failed")
+                self._require_frozen_binding(gate)
                 next_state = "active"
             self._connection.execute(
                 """
@@ -2314,6 +2404,8 @@ class RecallHostStore:
         return self._connection.execute(
             """
             SELECT d.*, a.preflight_json,
+                   a.plugin_root AS attempt_plugin_root,
+                   a.plugin_bundle_digest AS attempt_plugin_bundle_digest,
                    a.state AS attempt_state,
                    a.protocol_version AS attempt_protocol_version,
                    s.protocol_version AS session_protocol_version
@@ -2329,6 +2421,8 @@ class RecallHostStore:
         return self._connection.execute(
             """
             SELECT d.*, a.preflight_json,
+                   a.plugin_root AS attempt_plugin_root,
+                   a.plugin_bundle_digest AS attempt_plugin_bundle_digest,
                    a.state AS attempt_state,
                    a.protocol_version AS attempt_protocol_version,
                    s.protocol_version AS session_protocol_version

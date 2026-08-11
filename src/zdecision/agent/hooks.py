@@ -223,7 +223,9 @@ def handle_pre_tool_hook(
             )
             store = owned_store
         if store.identity != recall_identity:
-            raise ValueError("Recall Store identity does not match Hook identity")
+            return _pre_tool_response(
+                "deny", reason=_RECALL_GATE_DENIED_REASON
+            )
         if recall_binding:
             return bind_recall_tool_call(
                 value,

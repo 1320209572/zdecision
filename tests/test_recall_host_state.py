@@ -17,6 +17,7 @@ from zdecision.agent.recall_host_state import (
     RecallGateConflict,
     RecallHostStore,
 )
+from zdecision.agent.recall_plugin_identity import RecallPluginIdentity
 from tests.test_recall_handoff_contracts import (
     formal_decision,
     ready_preflight,
@@ -58,6 +59,46 @@ def _result(
 
 
 class RecallHostStoreTests(unittest.TestCase):
+    def test_reopened_other_identity_cannot_begin_a_frozen_delivery(self) -> None:
+        """This catches durable consent being authorized by a different identity."""
+
+        root = Path(__file__).resolve().parents[1] / "plugins/zdecision"
+        intent = valid_intent()
+        preflight = ready_preflight(intent=intent)
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id=ATTEMPT_ID,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(root),
+            intent=intent,
+            preflight=preflight,
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+        self.store.close()
+        other = RecallPluginIdentity(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="python",
+            mcp_args=("launcher.py", "mcp"),
+            hook_command="python launcher.py hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        self.store = RecallHostStore.open(self.path, identity=other)
+        self.addCleanup(self.store.close)
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_delivery(
+                attempt_id=attempt.attempt_id,
+                delivery_id=DELIVERY_ID,
+                claim_token="claim_" + "c" * 32,
+                current_ui_digest="a" * 64,
+                now=NOW,
+                claim_expires_at=NOW + timedelta(seconds=30),
+            )
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)

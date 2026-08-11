@@ -215,6 +215,7 @@ def _valid_mcp(value: object, identity: RecallPluginIdentity) -> bool:
     server = servers[identity.mcp_server_key]
     return bool(
         isinstance(server, dict)
+        and set(server) == {"command", "args"}
         and server.get("command") == identity.mcp_command
         and server.get("args") == list(identity.mcp_args)
     )
@@ -232,9 +233,14 @@ def _valid_hooks(value: object, identity: RecallPluginIdentity) -> bool:
         if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
             return False
         entry = entries[0]
-        if set(entry) - {"matcher", "hooks"} or entry.get("matcher") != expected_matcher:
-            if not (expected_matcher is None and set(entry) == {"hooks"}):
-                return False
+        expected_entry_keys = {"hooks"}
+        if expected_matcher is not None:
+            expected_entry_keys.add("matcher")
+        if set(entry) != expected_entry_keys or (
+            expected_matcher is not None
+            and entry.get("matcher") != expected_matcher
+        ):
+            return False
         handlers = entry.get("hooks")
         if not isinstance(handlers, list) or len(handlers) != 1 or not isinstance(handlers[0], dict):
             return False

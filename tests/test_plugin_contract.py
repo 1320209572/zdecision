@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -93,6 +95,31 @@ class PluginContractTests(unittest.TestCase):
                 invalid[name] = value
                 with self.assertRaises(ValueError):
                     RecallPluginIdentity(**invalid)
+
+    def test_bundle_rejects_extra_mcp_fields_and_null_absent_matchers(self) -> None:
+        """This catches permissive security parsing that accepts a changed bundle."""
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name) / "zdecision"
+        shutil.copytree(PLUGIN_ROOT, root)
+        mcp_path = root / ".mcp.json"
+        document = load_json(mcp_path)
+        document["mcpServers"]["zdecision-local"]["env"] = {"X": "1"}
+        mcp_path.write_text(json.dumps(document), "utf-8")
+        self.assertIsNone(
+            verify_recall_plugin_bundle(root, PRODUCTION_RECALL_PLUGIN_IDENTITY)
+        )
+
+        shutil.rmtree(root)
+        shutil.copytree(PLUGIN_ROOT, root)
+        hooks_path = root / "hooks/hooks.json"
+        hooks = load_json(hooks_path)
+        hooks["hooks"]["UserPromptSubmit"][0]["matcher"] = None
+        hooks_path.write_text(json.dumps(hooks), "utf-8")
+        self.assertIsNone(
+            verify_recall_plugin_bundle(root, PRODUCTION_RECALL_PLUGIN_IDENTITY)
+        )
     def test_repository_marketplace_exposes_one_available_plugin(self) -> None:
         marketplace = load_json(MARKETPLACE_PATH)
 
