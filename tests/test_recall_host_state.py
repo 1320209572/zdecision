@@ -7,12 +7,27 @@ import tempfile
 import unittest
 import json
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import hashlib
+import inspect
 from pathlib import Path
 
 from zdecision.agent.recall_host_state import (
     RecallGateConflict,
     RecallHostStore,
+)
+from tests.test_recall_handoff_contracts import (
+    formal_decision,
+    ready_preflight,
+    valid_intent,
+)
+from zdecision.jsonio import canonical_json_bytes
+from zdecision.recall.handoff import (
+    RecallApplicationSubmission,
+    RecallShortlist,
+    RecalledDecision,
+    build_handoff_context,
 )
 from zdecision.recall.session import TurnGateResult
 
@@ -23,6 +38,8 @@ TURN_ID = "turn-1"
 ACTIVATION_ID = "activation-1"
 GATE_ID = "gate-1"
 ACTIVE_SET_DIGEST = "set-a"
+ATTEMPT_ID = "activation_" + "f" * 32
+DELIVERY_ID = "delivery_" + "d" * 32
 
 
 def _result(
@@ -101,9 +118,633 @@ class RecallHostStoreTests(unittest.TestCase):
             active_set_digest=active_set_digest,
         )
 
+    def handoff_values(self, *, two_items: bool = False):
+        intent = valid_intent()
+        preflight = ready_preflight(intent=intent)
+        first = RecalledDecision.create(
+            decision_space_id="space-product",
+            revision=formal_decision(),
+            match_reason="Exact product match",
+        )
+        items = (first,)
+        if two_items:
+            second_revision = replace(
+                formal_decision(claim="The second handoff item remains complete."),
+                decision_id="dec_" + "9" * 32,
+            )
+            second = RecalledDecision.create(
+                decision_space_id="space-product",
+                revision=second_revision,
+                match_reason="Exact capability match",
+            )
+            items += (second,)
+        shortlist = RecallShortlist.create(preflight=preflight, items=items)
+        return intent, preflight, shortlist
+
+    def create_handoff_attempt(self, *, two_items: bool = False):
+        intent, preflight, shortlist = self.handoff_values(two_items=two_items)
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id=ATTEMPT_ID,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+            intent=intent,
+            preflight=preflight,
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+        return attempt, preflight, shortlist
+
+    def prepare_handoff(self, *, two_items: bool = False):
+        attempt, preflight, shortlist = self.create_handoff_attempt(
+            two_items=two_items
+        )
+        claim = self.store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "c" * 32,
+            current_ui_digest="a" * 64,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        context_text = build_handoff_context(DELIVERY_ID, preflight, shortlist)
+        delivery = self.store.commit_prepared_delivery(
+            delivery_id=DELIVERY_ID,
+            claim_token=claim.claim_token,
+            shortlist=shortlist,
+            context_text=context_text,
+            now=NOW,
+        )
+        return attempt, preflight, shortlist, context_text, delivery
+
+    def acknowledge_handoff(self, *, two_items: bool = False):
+        attempt, preflight, shortlist, context_text, delivery = self.prepare_handoff(
+            two_items=two_items
+        )
+        acknowledged = self.store.ack_delivery(
+            delivery_id=DELIVERY_ID,
+            context_digest=delivery.context_digest,
+            now=NOW,
+        )
+        return attempt, preflight, shortlist, context_text, acknowledged
+
+    @staticmethod
+    def application(shortlist, dispositions, *, reason: str = "Bounded reason"):
+        return RecallApplicationSubmission.from_dict(
+            {
+                "delivery_id": DELIVERY_ID,
+                "items": [
+                    {
+                        "decision_id": item.revision.decision_id,
+                        "revision": item.revision.revision,
+                        "digest": item.digest,
+                        "disposition": disposition,
+                        "reason": reason,
+                    }
+                    for item, disposition in zip(shortlist.items, dispositions)
+                ],
+            }
+        )
+
     def test_unselected_session_has_no_state_row(self) -> None:
         """This catches creating recall state before a trusted activation."""
 
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+
+    def test_begin_delivery_atomically_accepts_consent_and_creates_activating_session(
+        self,
+    ) -> None:
+        """This catches consent committing without its preparing delivery."""
+
+        self.assertTrue(
+            hasattr(self.store, "begin_delivery"),
+            "RecallHostStore.begin_delivery is required",
+        )
+        intent = valid_intent()
+        preflight = ready_preflight(intent=intent)
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id=ATTEMPT_ID,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+            intent=intent,
+            preflight=preflight,
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+
+        claim = self.store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "c" * 32,
+            current_ui_digest="a" * 64,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+
+        self.assertTrue(claim.owned)
+        self.assertEqual("preparing", claim.delivery.state)
+        self.assertEqual("committed", self.store.get_activation_attempt(ATTEMPT_ID).state)
+        session = self.store.get_session(SESSION_ID)
+        self.assertEqual("activating", session.state)
+        self.assertEqual("recall-handoff-v1", session.protocol_version)
+        self.assertEqual(preflight.repository_id, session.repository_id)
+
+    def test_delivery_claim_has_one_owner_and_expired_preparing_claim_is_replaced(
+        self,
+    ) -> None:
+        """This catches concurrent retrieval owners or a permanently stranded claim."""
+
+        attempt, _, _ = self.create_handoff_attempt()
+        first = self.store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "1" * 32,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        competitor_store = RecallHostStore.open(self.path)
+        self.addCleanup(competitor_store.close)
+
+        competitor = competitor_store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "2" * 32,
+            now=NOW + timedelta(seconds=10),
+            claim_expires_at=NOW + timedelta(seconds=40),
+        )
+        takeover = competitor_store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "3" * 32,
+            now=NOW + timedelta(seconds=30),
+            claim_expires_at=NOW + timedelta(seconds=60),
+        )
+
+        self.assertTrue(first.owned)
+        self.assertFalse(competitor.owned)
+        self.assertIsNone(competitor.claim_token)
+        self.assertTrue(takeover.owned)
+        self.assertEqual("claim_" + "3" * 32, takeover.claim_token)
+        self.assertEqual(DELIVERY_ID, takeover.delivery.delivery_id)
+
+    def test_begin_delivery_rolls_back_consent_and_session_when_insert_fails(
+        self,
+    ) -> None:
+        """This catches consent surviving a failed delivery insert."""
+
+        attempt, _, _ = self.create_handoff_attempt()
+        self.store._connection.execute(  # noqa: SLF001 - transaction fault injection
+            """
+            CREATE TRIGGER fail_recall_delivery_insert
+            BEFORE INSERT ON recall_deliveries
+            BEGIN
+                SELECT RAISE(ABORT, 'forced delivery rollback');
+            END
+            """
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.begin_delivery(
+                attempt_id=attempt.attempt_id,
+                delivery_id=DELIVERY_ID,
+                claim_token="claim_" + "4" * 32,
+                now=NOW,
+                claim_expires_at=NOW + timedelta(seconds=30),
+            )
+
+        self.assertEqual(
+            "pending_confirmation",
+            self.store.get_activation_attempt(attempt.attempt_id).state,
+        )
+        self.assertIsNone(self.store.get_session(SESSION_ID))
+        self.assertIsNone(self.store.delivery_for_attempt(attempt.attempt_id))
+
+    def test_prepared_delivery_is_canonical_immutable_and_reopens(self) -> None:
+        """This catches prepared handoff bytes changing across retry or restart."""
+
+        self.assertTrue(
+            hasattr(self.store, "commit_prepared_delivery"),
+            "RecallHostStore.commit_prepared_delivery is required",
+        )
+        attempt, preflight, shortlist = self.create_handoff_attempt()
+        claim = self.store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "5" * 32,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        context_text = build_handoff_context(DELIVERY_ID, preflight, shortlist)
+
+        prepared = self.store.commit_prepared_delivery(
+            delivery_id=DELIVERY_ID,
+            claim_token=claim.claim_token,
+            shortlist=shortlist,
+            context_text=context_text,
+            now=NOW,
+        )
+
+        self.assertEqual("delivery_claimed", prepared.state)
+        self.assertEqual(shortlist, prepared.shortlist)
+        self.assertEqual(
+            hashlib.sha256(canonical_json_bytes(shortlist.to_dict())).hexdigest(),
+            prepared.snapshot_digest,
+        )
+        self.assertEqual(
+            hashlib.sha256(context_text.encode("utf-8")).hexdigest(),
+            prepared.context_digest,
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            preflight_json = connection.execute(
+                "SELECT preflight_json FROM recall_activation_attempts WHERE attempt_id = ?",
+                (ATTEMPT_ID,),
+            ).fetchone()[0]
+            shortlist_json = connection.execute(
+                "SELECT shortlist_json FROM recall_deliveries WHERE delivery_id = ?",
+                (DELIVERY_ID,),
+            ).fetchone()[0]
+        self.assertEqual(
+            canonical_json_bytes(preflight.to_dict()).decode("utf-8"), preflight_json
+        )
+        self.assertEqual(
+            canonical_json_bytes(shortlist.to_dict()).decode("utf-8"), shortlist_json
+        )
+        self.assertEqual(
+            prepared,
+            self.store.commit_prepared_delivery(
+                delivery_id=DELIVERY_ID,
+                claim_token=claim.claim_token,
+                shortlist=shortlist,
+                context_text=context_text,
+                now=NOW,
+            ),
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_prepared_delivery(
+                delivery_id=DELIVERY_ID,
+                claim_token=claim.claim_token,
+                shortlist=shortlist,
+                context_text=context_text + " ",
+                now=NOW,
+            )
+
+        self.store.close()
+        reopened = RecallHostStore.open(self.path)
+        self.store = reopened
+        self.addCleanup(reopened.close)
+        self.assertEqual(prepared, reopened.get_delivery(DELIVERY_ID))
+        self.assertEqual(prepared, reopened.delivery_for_attempt(ATTEMPT_ID))
+
+    def test_store_delivery_api_contains_no_provider_work(self) -> None:
+        """This catches retrieval dependencies leaking into SQLite transactions."""
+
+        for method_name in ("begin_delivery", "commit_prepared_delivery"):
+            self.assertTrue(hasattr(RecallHostStore, method_name))
+            parameters = inspect.signature(getattr(RecallHostStore, method_name)).parameters
+            self.assertNotIn("provider", parameters)
+
+    def test_delivery_ack_requires_the_exact_context_digest(self) -> None:
+        """This catches acknowledging bytes other than the frozen handoff."""
+
+        self.assertTrue(
+            hasattr(self.store, "ack_delivery"),
+            "RecallHostStore.ack_delivery is required",
+        )
+        _, _, _, _, prepared = self.prepare_handoff()
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.ack_delivery(
+                delivery_id=DELIVERY_ID,
+                context_digest="0" * 64,
+                now=NOW,
+            )
+
+        self.assertEqual(
+            "delivery_claimed", self.store.get_delivery(DELIVERY_ID).state
+        )
+        acknowledged = self.store.ack_delivery(
+            delivery_id=DELIVERY_ID,
+            context_digest=prepared.context_digest,
+            now=NOW,
+        )
+        self.assertEqual("host_delivered", acknowledged.state)
+        self.assertEqual(
+            acknowledged,
+            self.store.ack_delivery(
+                delivery_id=DELIVERY_ID,
+                context_digest=prepared.context_digest,
+                now=NOW,
+            ),
+        )
+
+    def test_unknown_delivery_is_explicitly_reclaimed_without_changing_bytes(
+        self,
+    ) -> None:
+        """This catches an automatic resend or retry with substituted context."""
+
+        self.assertTrue(hasattr(self.store, "mark_delivery_unknown"))
+        self.assertTrue(hasattr(self.store, "claim_delivery_retry"))
+        _, _, _, _, prepared = self.prepare_handoff()
+        frozen = (
+            prepared.preflight,
+            prepared.shortlist,
+            prepared.snapshot_digest,
+            prepared.context_text,
+            prepared.context_digest,
+        )
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.mark_delivery_unknown(
+                delivery_id=DELIVERY_ID,
+                now=NOW + timedelta(seconds=29),
+            )
+        unknown = self.store.mark_delivery_unknown(
+            delivery_id=DELIVERY_ID,
+            now=NOW + timedelta(seconds=30),
+        )
+        retry = self.store.claim_delivery_retry(
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "6" * 32,
+            now=NOW + timedelta(seconds=30),
+            claim_expires_at=NOW + timedelta(seconds=60),
+        )
+
+        self.assertEqual("delivery_unknown", unknown.state)
+        self.assertTrue(retry.owned)
+        self.assertEqual("delivery_claimed", retry.delivery.state)
+        self.assertEqual(frozen, (
+            retry.delivery.preflight,
+            retry.delivery.shortlist,
+            retry.delivery.snapshot_digest,
+            retry.delivery.context_text,
+            retry.delivery.context_digest,
+        ))
+        competitor_store = RecallHostStore.open(self.path)
+        self.addCleanup(competitor_store.close)
+        competitor = competitor_store.claim_delivery_retry(
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "7" * 32,
+            now=NOW + timedelta(seconds=40),
+            claim_expires_at=NOW + timedelta(seconds=70),
+        )
+        self.assertFalse(competitor.owned)
+        self.assertIsNone(competitor.claim_token)
+
+    def test_application_requires_every_frozen_item_and_commits_only_applicable(
+        self,
+    ) -> None:
+        """This catches partial classification or false positives becoming active."""
+
+        self.assertTrue(hasattr(self.store, "commit_delivery_application"))
+        self.assertTrue(hasattr(self.store, "list_active_items"))
+        _, preflight, shortlist, _, acknowledged = self.acknowledge_handoff(
+            two_items=True
+        )
+        gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-next",
+        )
+        incomplete = self.application(shortlist, ("applicable",))
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_delivery_application(
+                session_id=SESSION_ID,
+                turn_id="turn-next",
+                gate_id=gate.gate_id,
+                delivery_id=DELIVERY_ID,
+                submission=incomplete,
+                now=NOW,
+            )
+        self.assertEqual(
+            "host_delivered", self.store.get_delivery(DELIVERY_ID).state
+        )
+        self.assertEqual(
+            "pending", self.store.get_turn_gate(SESSION_ID, "turn-next").state
+        )
+
+        submission = self.application(
+            shortlist, ("applicable", "not_applicable")
+        )
+        committed = self.store.commit_delivery_application(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=submission,
+            now=NOW,
+        )
+        active = self.store.list_active_items(SESSION_ID)
+        session = self.store.get_session(SESSION_ID)
+
+        self.assertEqual("application_committed", committed.state)
+        self.assertEqual(submission, committed.application)
+        self.assertIsNotNone(committed.application_receipt_id)
+        self.assertEqual("committed", self.store.get_turn_gate(SESSION_ID, "turn-next").state)
+        self.assertEqual("active", session.state)
+        self.assertEqual(1, session.intent_epoch)
+        self.assertEqual(preflight.intent.digest, session.active_intent_digest)
+        self.assertIsNotNone(session.active_set_digest)
+        self.assertEqual("turn-next", session.last_gate_turn_id)
+        self.assertEqual(1, len(active))
+        self.assertEqual(shortlist.items[0].digest, active[0].digest)
+        self.assertEqual(shortlist.items[0], active[0].envelope)
+        self.assertEqual(committed.application_receipt_id, active[0].application_receipt_id)
+        with closing(sqlite3.connect(self.path)) as connection:
+            stored = connection.execute(
+                "SELECT application_json FROM recall_deliveries WHERE delivery_id = ?",
+                (DELIVERY_ID,),
+            ).fetchone()[0]
+        self.assertEqual(
+            canonical_json_bytes(submission.to_dict()).decode("utf-8"), stored
+        )
+
+    def test_all_not_applicable_commits_an_active_empty_set(self) -> None:
+        """This catches a valid empty active epoch remaining activating forever."""
+
+        self.assertTrue(hasattr(self.store, "commit_delivery_application"))
+        _, preflight, shortlist, _, _ = self.acknowledge_handoff()
+        gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-next",
+        )
+        submission = self.application(shortlist, ("not_applicable",))
+
+        committed = self.store.commit_delivery_application(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=submission,
+            now=NOW,
+        )
+
+        self.assertEqual("application_committed", committed.state)
+        self.assertEqual((), self.store.list_active_items(SESSION_ID))
+        self.assertEqual("active", self.store.get_session(SESSION_ID).state)
+        self.assertEqual(
+            hashlib.sha256(canonical_json_bytes([])).hexdigest(),
+            self.store.get_session(SESSION_ID).active_set_digest,
+        )
+
+    def test_application_rolls_back_delivery_gate_session_items_and_receipt(self) -> None:
+        """This catches a partial application receipt authorizing mutation."""
+
+        self.assertTrue(hasattr(self.store, "commit_delivery_application"))
+        _, preflight, shortlist, _, _ = self.acknowledge_handoff()
+        gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-next",
+        )
+        self.store._connection.execute(  # noqa: SLF001 - transaction fault injection
+            """
+            CREATE TRIGGER fail_active_item_insert
+            BEFORE INSERT ON recall_active_injected_items
+            BEGIN
+                SELECT RAISE(ABORT, 'forced application rollback');
+            END
+            """
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.commit_delivery_application(
+                session_id=SESSION_ID,
+                turn_id="turn-next",
+                gate_id=gate.gate_id,
+                delivery_id=DELIVERY_ID,
+                submission=self.application(shortlist, ("applicable",)),
+                now=NOW,
+            )
+
+        delivery = self.store.get_delivery(DELIVERY_ID)
+        self.assertEqual("host_delivered", delivery.state)
+        self.assertIsNone(delivery.application_receipt_id)
+        self.assertEqual("pending", self.store.get_turn_gate(SESSION_ID, "turn-next").state)
+        self.assertEqual("activating", self.store.get_session(SESSION_ID).state)
+        self.assertEqual((), self.store.list_active_items(SESSION_ID))
+
+    def test_committed_application_reopens_and_replays_without_duplicate_transition(
+        self,
+    ) -> None:
+        """This catches restart rerunning application or duplicating active rows."""
+
+        self.assertTrue(hasattr(self.store, "commit_delivery_application"))
+        _, preflight, shortlist, _, _ = self.acknowledge_handoff()
+        gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-next",
+        )
+        submission = self.application(shortlist, ("applicable",))
+        committed = self.store.commit_delivery_application(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=submission,
+            now=NOW,
+        )
+        self.store.close()
+        reopened = RecallHostStore.open(self.path)
+        self.store = reopened
+        self.addCleanup(reopened.close)
+
+        replay = reopened.commit_delivery_application(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=submission,
+            now=NOW + timedelta(minutes=1),
+        )
+
+        self.assertEqual(committed, replay)
+        self.assertEqual(1, len(reopened.list_active_items(SESSION_ID)))
+        self.assertEqual(1, reopened.get_session(SESSION_ID).intent_epoch)
+
+    def test_legacy_attempts_remain_readable_but_cannot_authorize_v1_delivery(
+        self,
+    ) -> None:
+        """This catches silently upgrading an old committed consent row."""
+
+        intent, preflight, _ = self.handoff_values()
+        with self.assertRaises(ValueError):
+            self.store.create_activation_attempt(
+                session_id="session-missing-preflight",
+                turn_id="turn-missing-preflight",
+                cwd="/tmp/recall",
+                repository_id=preflight.repository_id,
+                repository_display_name=preflight.repository_display_name,
+                attempt_id="activation_" + "1" * 32,
+                now=NOW,
+                expires_at=NOW + timedelta(minutes=15),
+                plugin_root=None,
+                intent=intent,
+            )
+        legacy = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id="activation_" + "2" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+        self.store.attach_activation_card(legacy.attempt_id, ui_digest="a" * 64)
+        self.store.decide_activation_attempt(legacy.attempt_id, action="enable", now=NOW)
+
+        self.assertIsNone(self.store.get_activation_attempt(legacy.attempt_id).protocol_version)
+        self.assertIsNone(self.store.get_activation_attempt(legacy.attempt_id).preflight)
+        self.assertIsNone(self.store.get_session(SESSION_ID).protocol_version)
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_delivery(
+                attempt_id=legacy.attempt_id,
+                delivery_id=DELIVERY_ID,
+                claim_token="claim_" + "8" * 32,
+                now=NOW,
+                claim_expires_at=NOW + timedelta(seconds=30),
+            )
+
+    def test_v1_attempt_cannot_use_legacy_enable_without_a_delivery(self) -> None:
+        """This catches the old decision API bypassing the v1 delivery transaction."""
+
+        attempt, _, _ = self.create_handoff_attempt()
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.decide_activation_attempt(
+                attempt.attempt_id,
+                action="enable",
+                now=NOW,
+            )
+
+        self.assertEqual(
+            "pending_confirmation",
+            self.store.get_activation_attempt(attempt.attempt_id).state,
+        )
         self.assertIsNone(self.store.get_session(SESSION_ID))
 
     def test_confirmation_attempt_commits_active_consent_only_after_enable(self) -> None:
@@ -800,3 +1441,82 @@ class RecallHostStoreTests(unittest.TestCase):
             connection.close()
         self.assertEqual([("lease-existing",)], rows)
         self.assertEqual(["lease_id"], [column[1] for column in columns])
+
+    def test_open_additively_migrates_legacy_recall_schema_and_rows(self) -> None:
+        """This catches rebuilding or silently authorizing pre-v1 Recall rows."""
+
+        legacy_path = Path(self.temporary_directory.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE recall_sessions (
+                    session_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                    authorization_turn_id TEXT NOT NULL, cwd TEXT NOT NULL,
+                    context_epoch INTEGER NOT NULL, intent_epoch INTEGER NOT NULL,
+                    active_intent_digest TEXT, active_set_digest TEXT,
+                    last_gate_turn_id TEXT, ended_at TEXT, resumed_at TEXT
+                );
+                CREATE TABLE recall_activation_attempts (
+                    attempt_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL, cwd TEXT NOT NULL,
+                    repository_id TEXT NOT NULL,
+                    repository_display_name TEXT NOT NULL, state TEXT NOT NULL,
+                    created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                    plugin_root TEXT, plugin_bundle_digest TEXT, ui_digest TEXT,
+                    result_digest TEXT, UNIQUE(session_id, turn_id)
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recall_activation_attempts VALUES (
+                    ?, ?, ?, ?, ?, ?, 'committed', ?, ?, NULL, NULL, ?, ?
+                )
+                """,
+                (
+                    "activation_" + "3" * 32,
+                    "legacy-session",
+                    "legacy-turn",
+                    "/tmp/legacy",
+                    "repo_" + "3" * 32,
+                    "legacy",
+                    "2026-08-06T03:00:00.000000Z",
+                    "2026-08-06T03:15:00.000000Z",
+                    "a" * 64,
+                    "b" * 64,
+                ),
+            )
+            connection.commit()
+
+        migrated = RecallHostStore.open(legacy_path)
+        self.addCleanup(migrated.close)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            attempt_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(recall_activation_attempts)"
+                )
+            }
+            session_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(recall_sessions)")
+            }
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+
+        self.assertTrue(
+            {"protocol_version", "preflight_json", "preflight_digest"}
+            <= attempt_columns
+        )
+        self.assertTrue({"protocol_version", "repository_id"} <= session_columns)
+        self.assertTrue(
+            {"recall_deliveries", "recall_active_injected_items"} <= tables
+        )
+        legacy = migrated.get_activation_attempt("activation_" + "3" * 32)
+        self.assertEqual("committed", legacy.state)
+        self.assertIsNone(legacy.protocol_version)
+        self.assertIsNone(legacy.preflight)
