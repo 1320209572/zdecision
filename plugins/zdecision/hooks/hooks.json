@@ -52,7 +52,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__zdecision_local__show_zdecision_update|mcp__zdecision_local__show_zdecision_recall_confirmation|mcp__zdecision_local__gate_zdecision_turn|Bash|apply_patch|Edit|Write|Agent|mcp__.*",
+        "matcher": "mcp__zdecision_local__show_zdecision_update|mcp__zdecision_local__show_zdecision_recall_confirmation|mcp__zdecision_local__apply_zdecision_recall_delivery|mcp__zdecision_local__gate_zdecision_turn|Bash|apply_patch|Edit|Write|Agent|mcp__.*",
         "hooks": [
           {
             "type": "command",

@@ -450,6 +450,36 @@ class RecallHostStore:
         ).fetchone()
         return None if row is None else _delivery(row)
 
+    def eligible_delivery_for_session(
+        self, session_id: str
+    ) -> RecallDelivery | None:
+        """Return the one authoritative handoff eligible for application."""
+
+        session = _text(session_id, "session_id")
+        if self._is_internal_thread(session):
+            return None
+        rows = self._connection.execute(
+            """
+            SELECT d.*, a.preflight_json,
+                   a.state AS attempt_state,
+                   a.protocol_version AS attempt_protocol_version,
+                   s.protocol_version AS session_protocol_version
+            FROM recall_deliveries AS d
+            JOIN recall_activation_attempts AS a ON a.attempt_id = d.attempt_id
+            JOIN recall_sessions AS s ON s.session_id = d.session_id
+            WHERE d.session_id = ?
+              AND d.state IN ('host_delivered', 'delivery_unknown')
+            """,
+            (session,),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            _require_v1_delivery(rows[0], self._connection)
+            return _delivery(rows[0])
+        except (RecallGateConflict, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     def list_active_items(self, session_id: str) -> tuple[ActiveInjectedItem, ...]:
         session = _text(session_id, "session_id")
         if self._is_internal_thread(session):

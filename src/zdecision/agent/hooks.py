@@ -23,6 +23,7 @@ from zdecision.agent.repository import RepositoryResolver
 from zdecision.ids import product_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.recall.handoff import (
+    RecallApplicationSubmission,
     RecallPreflightClarification,
     RecallPreflightReady,
     RecallPreflightUnavailable,
@@ -38,7 +39,17 @@ UNAVAILABLE_HOOK_OUTPUT = {
 CONTROL_BINDING_TOOL = "mcp__zdecision_local__show_zdecision_update"
 SHOW_RECALL_CONFIRMATION_TOOL = "mcp__zdecision_local__show_zdecision_recall_confirmation"
 TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
+APPLY_RECALL_DELIVERY_TOOL = (
+    "mcp__zdecision_local__apply_zdecision_recall_delivery"
+)
 RECALL_MUTATION_MATCHER = "Bash|apply_patch|Edit|Write|Agent|mcp__.*"
+_ACTIVATING_APP_TOOLS = frozenset(
+    (
+        "mcp__zdecision_local__decide_zdecision_recall",
+        "mcp__zdecision_local__get_zdecision_recall_handoff",
+        "mcp__zdecision_local__ack_zdecision_recall_delivery",
+    )
+)
 _CONTROL_ID = re.compile(r"^ctl_[0-9a-f]{32}$")
 _SAFE_HOST_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _HOOK_STORE_TIMEOUT_SECONDS = 0.05
@@ -58,6 +69,10 @@ _RECALL_GATE_DENIED_REASON = (
 _ACTIVE_GATE_INSTRUCTION = (
     "ZDecision recall is active. Call gate_zdecision_turn before substantive "
     "output or development tools in this Turn."
+)
+_APPLICATION_INSTRUCTION = (
+    "ZDecision decisions were delivered for this task. Classify every delivered "
+    "item and call apply_zdecision_recall_delivery before development tools."
 )
 _RESUME_INSTRUCTION = (
     "ZDecision recall revalidation is required before development continues."
@@ -181,7 +196,11 @@ def handle_pre_tool_hook(
             control_store=control_store,
             control_id_factory=control_id_factory,
         )
-    recall_binding = tool_name in (SHOW_RECALL_CONFIRMATION_TOOL, TURN_GATE_TOOL)
+    recall_binding = tool_name in (
+        SHOW_RECALL_CONFIRMATION_TOOL,
+        TURN_GATE_TOOL,
+        APPLY_RECALL_DELIVERY_TOOL,
+    )
     owned_store: RecallHostStore | None = None
     try:
         store = recall_store
@@ -304,6 +323,42 @@ def bind_recall_tool_call(
                     "intent": intent.to_dict(),
                 },
             )
+        if tool_name == APPLY_RECALL_DELIVERY_TOOL:
+            tool_input = value.get("tool_input")
+            if (
+                not isinstance(tool_input, Mapping)
+                or frozenset(tool_input)
+                != frozenset(("turn_gate_id", "delivery_id", "items"))
+            ):
+                raise ValueError("recall application input is invalid")
+            session = recall_store.get_session(session_id)
+            if (
+                session is None
+                or session.state != "activating"
+                or session.cwd != cwd
+            ):
+                raise RecallGateConflict("session is not awaiting application")
+            delivery = recall_store.eligible_delivery_for_session(session_id)
+            if delivery is None:
+                raise RecallGateConflict("eligible delivery was not found")
+            gate = recall_store.get_turn_gate(session_id, turn_id)
+            if (
+                gate is None
+                or gate.state != "pending"
+                or gate.active_generation != delivery.preflight.generation
+            ):
+                raise RecallGateConflict("application gate is not pending")
+            submission = RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery.delivery_id, "items": tool_input["items"]}
+            )
+            return _pre_tool_response(
+                "allow",
+                updated_input={
+                    "turn_gate_id": gate.gate_id,
+                    "delivery_id": delivery.delivery_id,
+                    "items": [item.to_dict() for item in submission.items],
+                },
+            )
         if tool_name != TURN_GATE_TOOL:
             raise ValueError("recall tool is invalid")
         tool_input = value.get("tool_input")
@@ -351,7 +406,9 @@ def guard_active_turn_tool(
     except ValueError:
         return HookResponse(event_id="", output={})
     session = recall_store.get_session(session_id)
-    if session is None or session.state not in ("active", "activating"):
+    if session is None or session.state not in ("active", "activating", "blocked"):
+        return HookResponse(event_id="", output={})
+    if value.get("tool_name") in _ACTIVATING_APP_TOOLS:
         return HookResponse(event_id="", output={})
     if session.state != "active":
         return _pre_tool_response("deny", reason=_RECALL_GATE_DENIED_REASON)
@@ -398,7 +455,7 @@ def _handle_recall_lifecycle(
                 store.mark_dormant(invocation.session_id, ended_at=now)
             return {}
         if invocation.event_name == "UserPromptSubmit":
-            if session is None or session.state != "active":
+            if session is None or session.state not in ("active", "activating"):
                 return {}
             if invocation.turn_id is None:
                 return _additional_context(
@@ -411,12 +468,24 @@ def _handle_recall_lifecycle(
                     "UserPromptSubmit",
                     _blocked_envelope("plugin_runtime_unavailable"),
                 )
+            delivery = (
+                store.eligible_delivery_for_session(invocation.session_id)
+                if session.state == "activating"
+                else None
+            )
+            if session.state == "activating" and delivery is None:
+                return _additional_context(
+                    "UserPromptSubmit", _blocked_envelope("delivery_unavailable")
+                )
+            active_generation = (
+                delivery.preflight.generation if delivery is not None else None
+            )
             gate_id = _turn_gate_id(
                 invocation.session_id,
                 invocation.turn_id,
                 session.context_epoch,
                 session.intent_epoch,
-                None,
+                active_generation,
                 turn_gate_id_factory,
             )
             try:
@@ -425,7 +494,7 @@ def _handle_recall_lifecycle(
                     turn_id=invocation.turn_id,
                     context_epoch=session.context_epoch,
                     intent_epoch=session.intent_epoch,
-                    active_generation=None,
+                    active_generation=active_generation,
                     gate_id=gate_id,
                     plugin_root=plugin_root,
                 )
@@ -433,7 +502,12 @@ def _handle_recall_lifecycle(
                 return _additional_context(
                     "UserPromptSubmit", _blocked_envelope("invalid_turn_gate")
                 )
-            return _additional_context("UserPromptSubmit", _ACTIVE_GATE_INSTRUCTION)
+            instruction = (
+                _APPLICATION_INSTRUCTION
+                if session.state == "activating"
+                else _ACTIVE_GATE_INSTRUCTION
+            )
+            return _additional_context("UserPromptSubmit", instruction)
         if session is None:
             return {}
         if invocation.source == "resume":

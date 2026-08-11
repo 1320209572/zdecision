@@ -12,6 +12,7 @@ from zdecision.agent.recall_host_state import (
 )
 from zdecision.recall.handoff import (
     RECALL_HANDOFF_PROTOCOL,
+    RecallApplicationSubmission,
     RecallPreflightReady,
     build_handoff_context,
 )
@@ -205,6 +206,25 @@ class RecallHandoffService:
             return {"state": "blocked", "code": "invalid_delivery"}
         return _delivery_output(acknowledged, include_context=False)
 
+    def apply(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        gate_id: str,
+        delivery_id: str,
+        submission: RecallApplicationSubmission,
+    ) -> dict[str, object]:
+        delivery = self.store.commit_delivery_application(
+            session_id=session_id,
+            turn_id=turn_id,
+            gate_id=gate_id,
+            delivery_id=delivery_id,
+            submission=submission,
+            now=self.clock(),
+        )
+        return bounded_application_output(delivery)
+
 
 def _delivery_output(
     delivery: RecallDelivery,
@@ -248,6 +268,34 @@ def _attempt_output(attempt: RecallActivationAttempt) -> dict[str, object]:
         )
         meta["zdecision/freshness"] = attempt.preflight.freshness
     return {"state": attempt.state, "_meta": meta}
+
+
+def bounded_application_output(delivery: RecallDelivery) -> dict[str, object]:
+    """Return only the safe model-visible result of an atomic application."""
+
+    if (
+        delivery.application is None
+        or delivery.shortlist is None
+        or delivery.application_receipt_id is None
+    ):
+        raise ValueError("delivery application is incomplete")
+    counts = {
+        "applicable": 0,
+        "not_applicable": 0,
+        "conflicting": 0,
+        "uncertain": 0,
+    }
+    for item in delivery.application.items:
+        counts[item.disposition] += 1
+    return {
+        "state": delivery.state,
+        "disposition_counts": counts,
+        "application_receipt_id": delivery.application_receipt_id,
+        "intent_epoch": 1,
+        "scope_titles": [
+            item.revision.scope_summary for item in delivery.shortlist.items
+        ],
+    }
 
 
 def _claim_expired(delivery: RecallDelivery, now: datetime) -> bool:

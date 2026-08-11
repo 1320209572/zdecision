@@ -22,7 +22,11 @@ from zdecision.agent.recall_host_state import (
 )
 from zdecision.app_server.models import ActiveTurnEvidence
 from zdecision.jsonio import atomic_write_json, canonical_json_bytes
-from zdecision.recall.handoff import RECALL_HANDOFF_PROTOCOL, RecallPreflightReady
+from zdecision.recall.handoff import (
+    RECALL_HANDOFF_PROTOCOL,
+    RecallApplicationSubmission,
+    RecallPreflightReady,
+)
 from zdecision.recall.provider import UnavailableRecallProvider
 from zdecision.recall.session import HostProbeEnvelope, RecallIntent, TurnGateResult
 
@@ -273,6 +277,33 @@ class RecallMcpTools:
             context_digest=context_digest,
         )
         return _merge_confirmation_meta(result, attempt)
+
+    def apply_recall_delivery(
+        self,
+        *,
+        turn_gate_id: str,
+        delivery_id: str,
+        items: object,
+    ) -> dict[str, object]:
+        """Commit classifications only through one trusted pending gate."""
+
+        binding = self._application_binding(turn_gate_id, delivery_id)
+        if binding is None:
+            return _blocked("invalid_application")
+        session, turn_id = binding
+        try:
+            submission = RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery_id, "items": items}
+            )
+            return self.handoff_service.apply(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                gate_id=turn_gate_id,
+                delivery_id=delivery_id,
+                submission=submission,
+            )
+        except Exception:
+            return _blocked("invalid_application")
 
     def activate_zdecision_recall(
         self, *, activation_binding_id: str, intent: object
@@ -605,6 +636,53 @@ class RecallMcpTools:
                 return None
             return session, row["turn_id"]
         except (OSError, sqlite3.Error, ValueError):
+            return None
+
+    def _application_binding(
+        self, gate_id: object, delivery_id: object
+    ) -> tuple[RecallSession, str] | None:
+        if not _valid_binding_id(gate_id) or not _valid_binding_id(delivery_id):
+            return None
+        try:
+            delivery = self.host_store.get_delivery(delivery_id)
+            if delivery is None:
+                return None
+            eligible = self.host_store.eligible_delivery_for_session(
+                delivery.session_id
+            )
+            if eligible is None or eligible.delivery_id != delivery.delivery_id:
+                return None
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT rowid, session_id, turn_id, active_generation, state
+                    FROM recall_turn_gates WHERE gate_id = ?
+                    """,
+                    (gate_id,),
+                ).fetchone()
+                newer = None
+                if row is not None:
+                    newer = connection.execute(
+                        """
+                        SELECT 1 FROM recall_turn_gates
+                        WHERE session_id = ? AND rowid > ? LIMIT 1
+                        """,
+                        (row["session_id"], row["rowid"]),
+                    ).fetchone()
+            session = self.host_store.get_session(delivery.session_id)
+            if (
+                row is None
+                or newer is not None
+                or row["session_id"] != delivery.session_id
+                or row["state"] != "pending"
+                or row["active_generation"] != delivery.preflight.generation
+                or session is None
+                or session.state != "activating"
+                or session.cwd != self.cwd
+            ):
+                return None
+            return session, row["turn_id"]
+        except (OSError, sqlite3.Error, RecallGateConflict, ValueError):
             return None
 
     def _has_later_gate(self, session_id: str, gate_id: str) -> bool:

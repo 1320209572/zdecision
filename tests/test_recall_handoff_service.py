@@ -13,7 +13,11 @@ from pathlib import Path
 
 from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
-from zdecision.recall.handoff import RecallShortlist, RecalledDecision
+from zdecision.recall.handoff import (
+    RecallApplicationSubmission,
+    RecallShortlist,
+    RecalledDecision,
+)
 
 from tests.test_recall_handoff_contracts import (
     formal_decision,
@@ -539,3 +543,83 @@ class RecallHandoffServiceTests(unittest.TestCase):
         self.assertEqual(0, self.provider.retrieve_calls)
         self.assertIsNone(self.store.delivery_for_attempt(ATTEMPT_ID))
         self.assertIsNone(self.store.get_session("private-session"))
+
+    def test_apply_delegates_to_atomic_commit_and_returns_only_safe_summary(
+        self,
+    ) -> None:
+        """This catches application output exposing frozen host coordinates."""
+
+        claimed = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        self.service.ack(
+            attempt_id=ATTEMPT_ID,
+            delivery_id=DELIVERY_ID,
+            context_digest=claimed["_meta"]["zdecision/context_digest"],
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="next-turn",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=self.preflight.generation,
+            gate_id="gate-next",
+        )
+        decision = self.shortlist.items[0]
+        submission = RecallApplicationSubmission.from_dict(
+            {
+                "delivery_id": DELIVERY_ID,
+                "items": [
+                    {
+                        "decision_id": decision.revision.decision_id,
+                        "revision": decision.revision.revision,
+                        "digest": decision.digest,
+                        "disposition": "applicable",
+                        "reason": "It governs this feature.",
+                    }
+                ],
+            }
+        )
+
+        result = self.service.apply(
+            session_id="private-session",
+            turn_id="next-turn",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=submission,
+        )
+
+        self.assertEqual(
+            {
+                "state",
+                "disposition_counts",
+                "application_receipt_id",
+                "intent_epoch",
+                "scope_titles",
+            },
+            set(result),
+        )
+        self.assertEqual("application_committed", result["state"])
+        self.assertEqual(
+            {
+                "applicable": 1,
+                "not_applicable": 0,
+                "conflicting": 0,
+                "uncertain": 0,
+            },
+            result["disposition_counts"],
+        )
+        self.assertEqual(["Recall handoff tests"], result["scope_titles"])
+        self.assertEqual(1, result["intent_epoch"])
+        self.assertTrue(result["application_receipt_id"].startswith("application_"))
+        encoded = json.dumps(result, sort_keys=True)
+        for private in (
+            "private-session",
+            "next-turn",
+            "gate-next",
+            DELIVERY_ID,
+            "/tmp/recall-handoff-service",
+            decision.digest,
+        ):
+            self.assertNotIn(private, encoded)

@@ -446,6 +446,112 @@ class RecallHostStoreTests(unittest.TestCase):
             ),
         )
 
+    def test_eligible_delivery_for_session_returns_only_one_v1_delivered_handoff(
+        self,
+    ) -> None:
+        """This catches Hook lookup accepting absent or non-delivered handoffs."""
+
+        self.assertIsNone(self.store.eligible_delivery_for_session(SESSION_ID))
+        _, _, _, _, acknowledged = self.acknowledge_handoff()
+
+        self.assertEqual(
+            acknowledged,
+            self.store.eligible_delivery_for_session(SESSION_ID),
+        )
+        with self.store._connection:  # noqa: SLF001 - fail-closed state fixture
+            self.store._connection.execute(
+                "UPDATE recall_deliveries SET state = 'blocked' WHERE delivery_id = ?",
+                (DELIVERY_ID,),
+            )
+
+        self.assertIsNone(self.store.eligible_delivery_for_session(SESSION_ID))
+
+    def test_eligible_delivery_lookup_accepts_unknown_but_rejects_legacy_and_internal(
+        self,
+    ) -> None:
+        """This catches uncertain, legacy, or internal delivery authority confusion."""
+
+        _, _, _, _, prepared = self.prepare_handoff()
+        unknown = self.store.mark_delivery_unknown(
+            delivery_id=DELIVERY_ID,
+            now=NOW + timedelta(seconds=30),
+        )
+        self.assertEqual(
+            unknown,
+            self.store.eligible_delivery_for_session(SESSION_ID),
+        )
+
+        with self.store._connection:  # noqa: SLF001 - legacy boundary fixture
+            self.store._connection.execute(
+                """
+                UPDATE recall_activation_attempts SET protocol_version = NULL
+                WHERE attempt_id = ?
+                """,
+                (prepared.attempt_id,),
+            )
+        self.assertIsNone(self.store.eligible_delivery_for_session(SESSION_ID))
+
+        with self.store._connection:  # noqa: SLF001 - restore exact v1 fixture
+            self.store._connection.execute(
+                """
+                UPDATE recall_activation_attempts SET protocol_version = ?
+                WHERE attempt_id = ?
+                """,
+                ("recall-handoff-v1", prepared.attempt_id),
+            )
+        self.store.bind_internal_thread(
+            thread_id=SESSION_ID,
+            parent_thread_id="parent-session",
+            purpose="capture",
+            operation_id="lookup-internal",
+            now=NOW,
+        )
+        self.assertIsNone(self.store.eligible_delivery_for_session(SESSION_ID))
+
+    def test_eligible_delivery_lookup_rejects_multiple_candidates(self) -> None:
+        """This catches an ambiguous delivered handoff being selected by row order."""
+
+        _, _, _, _, acknowledged = self.acknowledge_handoff()
+        second_attempt = "activation_" + "7" * 32
+        second_delivery = "delivery_" + "7" * 32
+        with self.store._connection:  # noqa: SLF001 - ambiguous-row fixture
+            self.store._connection.execute(
+                """
+                INSERT INTO recall_activation_attempts(
+                    attempt_id, session_id, turn_id, cwd, repository_id,
+                    repository_display_name, state, created_at, expires_at,
+                    plugin_root, plugin_bundle_digest, ui_digest, result_digest,
+                    protocol_version, preflight_json, preflight_digest
+                )
+                SELECT ?, session_id, 'turn-duplicate', cwd, repository_id,
+                       repository_display_name, state, created_at, expires_at,
+                       plugin_root, plugin_bundle_digest, ui_digest, result_digest,
+                       protocol_version, preflight_json, preflight_digest
+                FROM recall_activation_attempts WHERE attempt_id = ?
+                """,
+                (second_attempt, acknowledged.attempt_id),
+            )
+            self.store._connection.execute(
+                """
+                INSERT INTO recall_deliveries(
+                    delivery_id, attempt_id, session_id, state,
+                    preflight_digest, claim_token, claim_expires_at,
+                    shortlist_json, snapshot_digest, context_text,
+                    context_digest, application_json, application_digest,
+                    application_receipt_id, created_at, updated_at
+                )
+                SELECT ?, ?, session_id, state, preflight_digest, claim_token,
+                       claim_expires_at, shortlist_json, snapshot_digest,
+                       context_text, context_digest, application_json,
+                       application_digest, application_receipt_id, created_at,
+                       updated_at
+                FROM recall_deliveries WHERE delivery_id = ?
+                """,
+                (second_delivery, second_attempt, DELIVERY_ID),
+            )
+
+        self.assertIsNone(self.store.eligible_delivery_for_session(SESSION_ID))
+
     def test_unknown_delivery_is_explicitly_reclaimed_without_changing_bytes(
         self,
     ) -> None:

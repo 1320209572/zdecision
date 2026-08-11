@@ -79,6 +79,20 @@ class RecallIntentInput(BaseModel):
     exclusions: list[str]
 
 
+class RecallApplicationItemInput(BaseModel):
+    """Closed model-visible classification for one frozen Decision."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    decision_id: str
+    revision: int
+    digest: str
+    disposition: Literal[
+        "applicable", "not_applicable", "conflicting", "uncertain"
+    ]
+    reason: str
+
+
 class LocalMcpTools:
     """Testable domain methods behind the stdio MCP adapter."""
 
@@ -603,6 +617,28 @@ def create_mcp_server(
             )
 
         @server.tool(
+            title="Apply ZDecision Recall delivery",
+            description=(
+                "Commit complete four-category classifications for the delivered "
+                "Recall shortlist. Host coordinates are supplied by the Hook."
+            ),
+            annotations=recall_action,
+            meta={"ui": {"visibility": ["model", "app"]}},
+        )
+        def apply_zdecision_recall_delivery(
+            items: list[RecallApplicationItemInput],
+            turn_gate_id: str = "",
+            delivery_id: str = "",
+        ) -> CallToolResult:
+            return _application_call_result(
+                recall_tools.apply_recall_delivery(
+                    turn_gate_id=turn_gate_id,
+                    delivery_id=delivery_id,
+                    items=[item.model_dump(mode="python") for item in items],
+                )
+            )
+
+        @server.tool(
             title="Gate ZDecision Recall Turn",
             description="Gate one native Turn through its trusted host binding.",
             annotations=recall_action,
@@ -622,6 +658,7 @@ def create_mcp_server(
         _forbid_extra_tool_input(server, "decide_zdecision_recall")
         _forbid_extra_tool_input(server, "get_zdecision_recall_handoff")
         _forbid_extra_tool_input(server, "ack_zdecision_recall_delivery")
+        _forbid_extra_tool_input(server, "apply_zdecision_recall_delivery")
         _forbid_extra_tool_input(server, "gate_zdecision_turn")
 
     return server
@@ -742,6 +779,41 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         structuredContent=structured,
         _meta=safe_meta,
         isError=state == "blocked",
+    )
+
+
+def _application_call_result(value: object) -> CallToolResult:
+    if not isinstance(value, dict):
+        value = {"state": "blocked", "code": "invalid_application"}
+    allowed = frozenset(
+        (
+            "state",
+            "disposition_counts",
+            "application_receipt_id",
+            "intent_epoch",
+            "scope_titles",
+        )
+    )
+    if (
+        frozenset(value) == allowed
+        and value.get("state") in ("application_committed", "blocked")
+    ):
+        structured = {key: value[key] for key in allowed}
+        text = (
+            "ZDecision Recall application is committed."
+            if value["state"] == "application_committed"
+            else "ZDecision Recall application is committed but blocked."
+        )
+        is_error = False
+    else:
+        structured = {"state": "blocked", "code": "invalid_application"}
+        text = "ZDecision Recall application was rejected."
+        is_error = True
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent=structured,
+        _meta={},
+        isError=is_error,
     )
 
 

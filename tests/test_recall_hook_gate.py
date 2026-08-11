@@ -9,7 +9,8 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,16 +23,25 @@ from zdecision.agent.repository import RepositoryResolver
 from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
 from zdecision.recall.handoff import (
+    RecallApplicationSubmission,
     RecallPreflightClarification,
     RecallPreflightReady,
     RecallPreflightUnavailable,
+    RecallShortlist,
+    RecalledDecision,
+    build_handoff_context,
 )
 from zdecision.recall.session import RecallIntent, TurnGateResult
+from tests.test_recall_handoff_contracts import formal_decision
 
 
 NOW = datetime(2026, 8, 6, 4, 0, tzinfo=UTC)
 ACTIVATE_RECALL_TOOL = "mcp__zdecision_local__show_zdecision_recall_confirmation"
 TURN_GATE_TOOL = "mcp__zdecision_local__gate_zdecision_turn"
+APPLY_RECALL_DELIVERY_TOOL = (
+    "mcp__zdecision_local__apply_zdecision_recall_delivery"
+)
+DELIVERY_ID = "delivery_" + "d" * 32
 ACTIVATION_ID = "activation-hook-bound"
 GATE_ID = "gate-hook-bound"
 GATE_ID_C = "gate-hook-bound-c"
@@ -276,6 +286,86 @@ class RecallHookGateTests(unittest.TestCase):
             now=NOW,
             plugin_root=str(self.plugin_root),
         )
+
+    def _deliver_handoff(self, *, unknown: bool = False):
+        self._prompt()
+        intent = RecallIntent.from_dict(VALID_INTENT)
+        preflight = _ready_preflight(
+            repository_id=self.snapshot.repository_id,
+            repository_display_name=self.repository.name,
+        )
+        first = RecalledDecision.create(
+            decision_space_id=preflight.target_decision_space_ids[0],
+            revision=formal_decision(),
+            match_reason="Exact product match",
+        )
+        second = RecalledDecision.create(
+            decision_space_id=preflight.target_decision_space_ids[0],
+            revision=replace(
+                formal_decision(claim="A second decision remains complete."),
+                decision_id="dec_" + "9" * 32,
+            ),
+            match_reason="Exact capability match",
+        )
+        shortlist = RecallShortlist.create(
+            preflight=preflight,
+            items=(first, second),
+        )
+        attempt = self.recall_store.create_activation_attempt(
+            session_id="session-a",
+            turn_id="turn-a",
+            cwd=str(self.repository),
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id="activation_" + "a" * 32,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(self.plugin_root),
+            intent=intent,
+            preflight=preflight,
+        )
+        self.recall_store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+        claim = self.recall_store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "c" * 32,
+            current_ui_digest="a" * 64,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        prepared = self.recall_store.commit_prepared_delivery(
+            delivery_id=DELIVERY_ID,
+            claim_token=claim.claim_token,
+            shortlist=shortlist,
+            context_text=build_handoff_context(DELIVERY_ID, preflight, shortlist),
+            now=NOW,
+        )
+        if unknown:
+            delivery = self.recall_store.mark_delivery_unknown(
+                delivery_id=DELIVERY_ID,
+                now=NOW + timedelta(seconds=30),
+            )
+        else:
+            delivery = self.recall_store.ack_delivery(
+                delivery_id=DELIVERY_ID,
+                context_digest=prepared.context_digest,
+                now=NOW,
+            )
+        items = [
+            {
+                "decision_id": item.revision.decision_id,
+                "revision": item.revision.revision,
+                "digest": item.digest,
+                "disposition": disposition,
+                "reason": "Bounded local reason",
+            }
+            for item, disposition in zip(
+                shortlist.items,
+                ("applicable", "not_applicable"),
+                strict=True,
+            )
+        ]
+        return preflight, delivery, items
 
     @staticmethod
     def _decision(response) -> object:
@@ -695,6 +785,185 @@ class RecallHookGateTests(unittest.TestCase):
         unselected = self._prompt(session_id="session-other", turn_id="turn-other")
         self.assertEqual({}, unselected.output)
         self.assertIsNone(self.recall_store.get_session("session-other"))
+
+    def test_activating_prompt_creates_application_gate_and_trusted_binding(self) -> None:
+        """This catches delivered context failing to bind its next-message apply."""
+
+        preflight, delivery, items = self._deliver_handoff()
+
+        prompt = self._prompt(turn_id="turn-b")
+
+        output = prompt.output["hookSpecificOutput"]
+        self.assertIn("apply_zdecision_recall_delivery", output["additionalContext"])
+        self.assertLess(len(output["additionalContext"].encode("utf-8")), 1000)
+        gate = self.recall_store.get_turn_gate("session-a", "turn-b")
+        self.assertEqual("pending", gate.state)
+        self.assertEqual(preflight.generation, gate.active_generation)
+
+        bound = self._pre_tool(
+            APPLY_RECALL_DELIVERY_TOOL,
+            turn_id="turn-b",
+            tool_input={
+                "turn_gate_id": "model-gate",
+                "delivery_id": "delivery_" + "e" * 32,
+                "items": items,
+            },
+        )
+
+        self.assertEqual("allow", self._decision(bound))
+        self.assertEqual(
+            {
+                "turn_gate_id": GATE_ID,
+                "delivery_id": delivery.delivery_id,
+                "items": items,
+            },
+            bound.output["hookSpecificOutput"]["updatedInput"],
+        )
+        self.assert_private_values_absent(bound)
+
+    def test_activating_guard_denies_until_exact_application_then_allows(self) -> None:
+        """This catches consent or delivery acknowledgement releasing mutation early."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+        guarded = ("Bash", "apply_patch", "Edit", "Write", "Agent", "mcp__other__mutate")
+        for tool_name in guarded:
+            with self.subTest(tool=tool_name, phase="before"):
+                response = self._pre_tool(tool_name, turn_id="turn-b")
+                self.assertEqual("deny", self._decision(response))
+                self.assertTrue(
+                    response.output["hookSpecificOutput"]["permissionDecisionReason"]
+                )
+        for tool_name in (
+            "mcp__zdecision_local__decide_zdecision_recall",
+            "mcp__zdecision_local__get_zdecision_recall_handoff",
+            "mcp__zdecision_local__ack_zdecision_recall_delivery",
+        ):
+            with self.subTest(tool=tool_name, phase="app-only"):
+                self.assertEqual({}, self._pre_tool(tool_name, turn_id="turn-b").output)
+
+        self.recall_store.commit_delivery_application(
+            session_id="session-a",
+            turn_id="turn-b",
+            gate_id=GATE_ID,
+            delivery_id=delivery.delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery.delivery_id, "items": items}
+            ),
+            now=NOW,
+        )
+
+        for tool_name in guarded:
+            with self.subTest(tool=tool_name, phase="after"):
+                self.assertEqual({}, self._pre_tool(tool_name, turn_id="turn-b").output)
+
+    def test_all_not_applicable_releases_turn_with_empty_active_set(self) -> None:
+        """This catches an empty applicable set being treated as an uncommitted gate."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+        all_not_applicable = [
+            {**item, "disposition": "not_applicable"} for item in items
+        ]
+        self.recall_store.commit_delivery_application(
+            session_id="session-a",
+            turn_id="turn-b",
+            gate_id=GATE_ID,
+            delivery_id=delivery.delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery.delivery_id, "items": all_not_applicable}
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual((), self.recall_store.list_active_items("session-a"))
+        self.assertEqual({}, self._pre_tool("Bash", turn_id="turn-b").output)
+
+    def test_conflicting_or_uncertain_application_keeps_mutation_denied(self) -> None:
+        """This catches a committed blocked classification releasing affected work."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+        blocked_items = [
+            {**items[0], "disposition": "conflicting"},
+            {**items[1], "disposition": "uncertain"},
+        ]
+        committed = self.recall_store.commit_delivery_application(
+            session_id="session-a",
+            turn_id="turn-b",
+            gate_id=GATE_ID,
+            delivery_id=delivery.delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery.delivery_id, "items": blocked_items}
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual("blocked", committed.state)
+        self.assertEqual("blocked", self.recall_store.get_session("session-a").state)
+        for tool_name in ("Bash", "apply_patch", "mcp__other__mutate"):
+            self.assertEqual(
+                "deny", self._decision(self._pre_tool(tool_name, turn_id="turn-b"))
+            )
+
+    def test_unknown_delivery_binds_but_unacknowledged_and_stale_do_not(self) -> None:
+        """This catches recovery expanding beyond the one approved unknown state."""
+
+        _, _, items = self._deliver_handoff(unknown=True)
+        self._prompt(turn_id="turn-b")
+        bound = self._pre_tool(
+            APPLY_RECALL_DELIVERY_TOOL,
+            turn_id="turn-b",
+            tool_input={
+                "turn_gate_id": "model-gate",
+                "delivery_id": "delivery_" + "e" * 32,
+                "items": items,
+            },
+        )
+        self.assertEqual("allow", self._decision(bound))
+
+        with self.recall_store._connection:  # noqa: SLF001 - stale gate fixture
+            self.recall_store._connection.execute(
+                "UPDATE recall_turn_gates SET active_generation = 99 WHERE gate_id = ?",
+                (GATE_ID,),
+            )
+        stale = self._pre_tool(
+            APPLY_RECALL_DELIVERY_TOOL,
+            turn_id="turn-b",
+            tool_input={
+                "turn_gate_id": "model-gate",
+                "delivery_id": "delivery_" + "e" * 32,
+                "items": items,
+            },
+        )
+        self.assertEqual("deny", self._decision(stale))
+
+    def test_unacknowledged_delivery_creates_no_application_gate(self) -> None:
+        """This catches a delivery claim being treated as accepted model context."""
+
+        self._deliver_handoff()
+        with self.recall_store._connection:  # noqa: SLF001 - unacked state fixture
+            self.recall_store._connection.execute(
+                """
+                UPDATE recall_deliveries
+                SET state = 'delivery_claimed', claim_token = ?, claim_expires_at = ?
+                WHERE delivery_id = ?
+                """,
+                (
+                    "claim_" + "e" * 32,
+                    (NOW + timedelta(seconds=30)).isoformat(),
+                    DELIVERY_ID,
+                ),
+            )
+
+        prompt = self._prompt(turn_id="turn-b")
+
+        envelope = json.loads(prompt.output["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual("ZDECISION_RECALL_BLOCKED", envelope["marker"])
+        self.assertIsNone(self.recall_store.get_turn_gate("session-a", "turn-b"))
+        self.assertEqual(
+            "deny", self._decision(self._pre_tool("Bash", turn_id="turn-b"))
+        )
 
     def test_turn_gate_preserves_intent_and_replaces_model_coordinates(self) -> None:
         self._activate()
