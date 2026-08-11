@@ -678,11 +678,7 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         ):
             safe_meta[key] = digest
     context_text = meta.get("zdecision/context_text")
-    if (
-        isinstance(context_text, str)
-        and context_text
-        and len(context_text.encode("utf-8")) <= 65_536
-    ):
+    if isinstance(context_text, str) and context_text:
         safe_meta["zdecision/context_text"] = context_text
     invalid_confirmation = (
         state == "blocked" and structured.get("code") == "invalid_confirmation"

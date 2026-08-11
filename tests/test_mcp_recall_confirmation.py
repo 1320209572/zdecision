@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -414,6 +415,93 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("zdecision/context_text", result.meta)
         self.assertEqual("preparing", self.store.delivery_for_attempt(ATTEMPT_ID).state)
         self.assertEqual("activating", self.store.get_session("private-session").state)
+
+    async def test_large_valid_frozen_context_reaches_app_meta_unchanged(self) -> None:
+        """This catches successful delivery state silently losing context bytes."""
+
+        large_intent = RecallIntent.from_dict(
+            {
+                "target_decision_space_ids": ["dsp_" + "3" * 32],
+                "explicit_multi_space": False,
+                "feature_goal": "目" * 2_000,
+                "domain_objects": ["域" * 512],
+                "repository_relative_paths": ["src/" + "p" * 500],
+                "constraints": ["约" * 512],
+                "exclusions": [],
+            }
+        )
+        preflight = _ready_preflight(large_intent)
+        items = tuple(
+            RecalledDecision.create(
+                decision_space_id=preflight.target_decision_space_ids[0],
+                revision=replace(
+                    formal_decision(),
+                    decision_id="dec_" + f"{index:032x}",
+                ),
+                match_reason="理" * 2_000,
+            )
+            for index in range(8)
+        )
+        shortlist = RecallShortlist.create(preflight=preflight, items=items)
+        provider = _McpRecallProvider(shortlist)
+        large_attempt_id = "activation_" + "6" * 32
+        self.store.create_activation_attempt(
+            session_id="large-session",
+            turn_id="large-turn",
+            cwd=self.cwd,
+            repository_id=REPOSITORY_ID,
+            repository_display_name=REPOSITORY_NAME,
+            attempt_id=large_attempt_id,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+            intent=large_intent,
+            preflight=preflight,
+        )
+        service = RecallHandoffService(
+            store=self.store,
+            provider=provider,
+            clock=lambda: NOW,
+            delivery_id_factory=lambda _: DELIVERY_ID,
+            claim_token_factory=lambda: "claim_" + "7" * 32,
+        )
+        local = LocalMcpTools(database=self.database, cwd=self.cwd)
+        recall = RecallMcpTools(
+            host_store=self.store,
+            provider=ReadinessRecallGateProvider(),
+            handoff_service=service,
+            cwd=self.cwd,
+            clock=lambda: NOW,
+        )
+        server = mcp_server.create_mcp_server(local, recall)
+        await server.call_tool(
+            "show_zdecision_recall_confirmation",
+            {
+                "activation_attempt_id": large_attempt_id,
+                "intent": large_intent.to_dict(),
+            },
+        )
+
+        result = await server.call_tool(
+            "decide_zdecision_recall",
+            {"activation_attempt_id": large_attempt_id, "action": "enable"},
+        )
+
+        frozen = self.store.get_delivery(DELIVERY_ID)
+        self.assertGreater(len(frozen.context_text.encode("utf-8")), 65_536)
+        self.assertFalse(result.isError)
+        self.assertEqual({"state": "delivery_claimed"}, result.structuredContent)
+        self.assertIn("zdecision/context_text", result.meta)
+        self.assertEqual(frozen.context_text, result.meta["zdecision/context_text"])
+        model_visible = json.dumps(
+            {
+                "content": [content.model_dump() for content in result.content],
+                "structuredContent": result.structuredContent,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(frozen.context_text, model_visible)
 
     async def test_legacy_attempt_enable_keeps_the_old_decision_path(self) -> None:
         """This catches the v1 handoff breaking the prior host-gate protocol."""
