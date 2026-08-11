@@ -151,6 +151,15 @@ def _database_path(root: Path) -> Path:
     return root / "state/gate-a0.sqlite3"
 
 
+def _plugin_root(root: Path) -> Path:
+    selector = _configuration(root).get("selector")
+    if not isinstance(selector, str) or re.fullmatch(
+        r"zdecision-gate-a0-[0-9a-f]{8}", selector
+    ) is None:
+        raise ValueError("Gate A0 selector is invalid")
+    return root / "marketplace/plugins" / selector
+
+
 def _process_identity_path(root: Path) -> Path:
     return root / "state/mcp-process.json"
 
@@ -914,7 +923,7 @@ def create_server(store: GateA0Store) -> FastMCP:
         },
     )
     def gate_resource() -> str:
-        return (store.root / "plugin/static/recall-gate-a0-v1.html").read_text(
+        return (_plugin_root(store.root) / "static/recall-gate-a0-v1.html").read_text(
             "utf-8"
         )
 
@@ -1240,8 +1249,9 @@ def create(root: Path, repository: Path) -> dict[str, object]:
     )
     python = os.path.abspath(sys.executable)
     harness = str(Path(__file__).resolve())
+    plugin_root = root / "marketplace/plugins" / selector
     _write_json(
-        root / "plugin/.codex-plugin/plugin.json",
+        plugin_root / ".codex-plugin/plugin.json",
         {
             "name": selector,
             "version": "0.1.0+codex.gate-a0-disposable",
@@ -1263,7 +1273,7 @@ def create(root: Path, repository: Path) -> dict[str, object]:
         },
     )
     _write_json(
-        root / "plugin/.mcp.json",
+        plugin_root / ".mcp.json",
         {
             "mcpServers": {
                 "zdecision-gate-a0": {
@@ -1278,7 +1288,7 @@ def create(root: Path, repository: Path) -> dict[str, object]:
         for part in (python, harness, "hook", "--root", str(root))
     )
     _write_json(
-        root / "plugin/hooks/hooks.json",
+        plugin_root / "hooks/hooks.json",
         {
             "description": "Bind and guard only the disposable Gate A0 tools.",
             "hooks": {
@@ -1297,7 +1307,7 @@ def create(root: Path, repository: Path) -> dict[str, object]:
             },
         },
     )
-    _write_text(root / "plugin/static/recall-gate-a0-v1.html", CARD_HTML)
+    _write_text(plugin_root / "static/recall-gate-a0-v1.html", CARD_HTML)
     _write_json(
         root / "marketplace/.agents/plugins/marketplace.json",
         {
@@ -1306,7 +1316,10 @@ def create(root: Path, repository: Path) -> dict[str, object]:
             "plugins": [
                 {
                     "name": selector,
-                    "source": {"source": "local", "path": str(root / "plugin")},
+                    "source": {
+                        "source": "local",
+                        "path": f"./plugins/{selector}",
+                    },
                     "policy": {
                         "installation": "AVAILABLE",
                         "authentication": "ON_INSTALL",
@@ -1321,7 +1334,7 @@ def create(root: Path, repository: Path) -> dict[str, object]:
     return {
         "protocol_version": PROTOCOL_VERSION,
         "selector": selector,
-        "plugin_root": str(root / "plugin"),
+        "plugin_root": str(plugin_root),
         "marketplace_root": str(root / "marketplace"),
     }
 

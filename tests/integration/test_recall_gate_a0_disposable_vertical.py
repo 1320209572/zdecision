@@ -97,9 +97,20 @@ def _tree_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _generated_plugin_root(root: Path) -> Path:
+    marketplace_root = root / "marketplace"
+    marketplace = json.loads(
+        (marketplace_root / ".agents/plugins/marketplace.json").read_text("utf-8")
+    )
+    source = marketplace["plugins"][0]["source"]["path"]
+    return (marketplace_root / source).resolve()
+
+
 class McpProcess:
     def __init__(self, root: Path, env: dict[str, str]) -> None:
-        mcp = json.loads((root / "plugin/.mcp.json").read_text("utf-8"))
+        mcp = json.loads(
+            (_generated_plugin_root(root) / ".mcp.json").read_text("utf-8")
+        )
         server = next(iter(mcp["mcpServers"].values()))
         self.process = subprocess.Popen(
             [server["command"], *server["args"]],
@@ -267,7 +278,9 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
         cwd: Path | None = None,
     ) -> dict[str, object]:
         hooks = json.loads(
-            (self.root / "plugin/hooks/hooks.json").read_text("utf-8")
+            (_generated_plugin_root(self.root) / "hooks/hooks.json").read_text(
+                "utf-8"
+            )
         )
         command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         completed = subprocess.run(
@@ -451,7 +464,7 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
                 },
             ],
         }
-        card = self.root / "plugin/static/recall-gate-a0-v1.html"
+        card = _generated_plugin_root(self.root) / "static/recall-gate-a0-v1.html"
         html = card.read_text("utf-8")
         script = html.split("<script>", 1)[1].split("</script>", 1)[0]
         scenario = r'''
@@ -754,11 +767,12 @@ function result(state, extra = {}) {
             self.assertEqual(before, path.read_bytes())
 
     def test_generated_plugin_is_disposable_interactive_and_decoupled(self) -> None:
+        plugin_root = _generated_plugin_root(self.root)
         manifest = json.loads(
-            (self.root / "plugin/.codex-plugin/plugin.json").read_text("utf-8")
+            (plugin_root / ".codex-plugin/plugin.json").read_text("utf-8")
         )
-        mcp = json.loads((self.root / "plugin/.mcp.json").read_text("utf-8"))
-        hooks = json.loads((self.root / "plugin/hooks/hooks.json").read_text("utf-8"))
+        mcp = json.loads((plugin_root / ".mcp.json").read_text("utf-8"))
+        hooks = json.loads((plugin_root / "hooks/hooks.json").read_text("utf-8"))
         marketplace = json.loads(
             (self.root / "marketplace/.agents/plugins/marketplace.json").read_text(
                 "utf-8"
@@ -778,8 +792,29 @@ function result(state, extra = {}) {
         self.assertEqual({"name", "interface", "plugins"}, set(marketplace))
         self.assertEqual(1, len(marketplace["plugins"]))
         self.assertEqual(manifest["name"], marketplace["plugins"][0]["name"])
-        self.assertNotEqual(REPOSITORY_ROOT / "plugins/zdecision", self.root / "plugin")
+        self.assertNotEqual(REPOSITORY_ROOT / "plugins/zdecision", plugin_root)
         self.assertIsNotNone(disposable)
+
+    def test_marketplace_resolves_a_self_contained_relative_plugin(self) -> None:
+        marketplace_root = (self.root / "marketplace").resolve()
+        marketplace = json.loads(
+            (marketplace_root / ".agents/plugins/marketplace.json").read_text(
+                "utf-8"
+            )
+        )
+        entry = marketplace["plugins"][0]
+        source = entry["source"]
+
+        self.assertEqual("local", source["source"])
+        self.assertEqual(f"./plugins/{entry['name']}", source["path"])
+        self.assertFalse(Path(source["path"]).is_absolute())
+        plugin_root = (marketplace_root / source["path"]).resolve()
+        plugin_root.relative_to(marketplace_root)
+        manifest = json.loads(
+            (plugin_root / ".codex-plugin/plugin.json").read_text("utf-8")
+        )
+        self.assertEqual(entry["name"], manifest["name"])
+        self.assertFalse((self.root / "plugin").exists())
 
     def test_cleanup_refuses_a_marker_copied_to_another_root(self) -> None:
         wrong_root = self.parent / "wrong-root"
@@ -860,7 +895,7 @@ function result(state, extra = {}) {
         self.addCleanup(
             lambda: secondary.exists() and self._run_at(secondary, "cleanup")
         )
-        hooks_path = self.root / "plugin/hooks/hooks.json"
+        hooks_path = _generated_plugin_root(self.root) / "hooks/hooks.json"
         hooks = json.loads(hooks_path.read_text("utf-8"))
         hook = hooks["hooks"]["PreToolUse"][0]["hooks"][0]
         command = shlex.split(hook["command"])
@@ -903,7 +938,7 @@ function result(state, extra = {}) {
             },
         )
         attempt_id = self._updated_input(bound)["attempt_id"]
-        mcp_path = self.root / "plugin/.mcp.json"
+        mcp_path = _generated_plugin_root(self.root) / ".mcp.json"
         mcp = json.loads(mcp_path.read_text("utf-8"))
         generated = next(iter(mcp["mcpServers"].values()))
         generated["args"][-1] = str(secondary)
