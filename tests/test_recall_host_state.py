@@ -29,7 +29,7 @@ from zdecision.recall.handoff import (
     RecalledDecision,
     build_handoff_context,
 )
-from zdecision.recall.session import TurnGateResult
+from zdecision.recall.session import RecallIntent, TurnGateResult
 
 
 NOW = datetime(2026, 8, 6, 3, 0, tzinfo=UTC)
@@ -661,6 +661,11 @@ class RecallHostStoreTests(unittest.TestCase):
         self.assertEqual("active", session.state)
         self.assertEqual(1, session.intent_epoch)
         self.assertEqual(preflight.intent.digest, session.active_intent_digest)
+        self.assertEqual(preflight.intent, session.active_intent)
+        self.assertEqual(DELIVERY_ID, session.active_delivery_id)
+        self.assertEqual(
+            committed.application_receipt_id, session.application_receipt_id
+        )
         self.assertIsNotNone(session.active_set_digest)
         self.assertEqual("turn-next", session.last_gate_turn_id)
         self.assertEqual(1, len(active))
@@ -707,6 +712,91 @@ class RecallHostStoreTests(unittest.TestCase):
             hashlib.sha256(canonical_json_bytes([])).hexdigest(),
             self.store.get_session(SESSION_ID).active_set_digest,
         )
+
+    def test_changed_intent_delivery_is_frozen_for_an_already_consented_session(
+        self,
+    ) -> None:
+        """This catches changed-intent retrieval escaping durable gate ownership."""
+
+        _, preflight, shortlist, _, _ = self.acknowledge_handoff()
+        initial_gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-apply",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-apply",
+        )
+        self.store.commit_delivery_application(
+            session_id=SESSION_ID,
+            turn_id="turn-apply",
+            gate_id=initial_gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=self.application(shortlist, ("applicable",)),
+            now=NOW,
+        )
+        changed_intent = RecallIntent.from_dict(
+            {**preflight.intent.to_dict(), "feature_goal": "Changed feature"}
+        )
+        changed_preflight = replace(preflight, intent=changed_intent, generation=8)
+        changed_item = RecalledDecision.create(
+            decision_space_id=changed_preflight.target_decision_space_ids[0],
+            revision=replace(
+                formal_decision(claim="The changed feature uses this decision."),
+                decision_id="dec_" + "8" * 32,
+            ),
+            match_reason="Changed feature match",
+        )
+        changed_shortlist = RecallShortlist.create(
+            preflight=changed_preflight,
+            items=(changed_item,),
+        )
+        changed_gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-changed",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-changed",
+        )
+        changed_delivery_id = "delivery_" + "8" * 32
+
+        claim = self.store.begin_intent_delivery(
+            session_id=SESSION_ID,
+            turn_id="turn-changed",
+            gate_id=changed_gate.gate_id,
+            attempt_id="intent_attempt_" + "8" * 32,
+            delivery_id=changed_delivery_id,
+            claim_token="claim_" + "8" * 32,
+            preflight=changed_preflight,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+            retire_active_set=False,
+        )
+
+        self.assertTrue(claim.owned)
+        self.assertEqual("preparing", claim.delivery.state)
+        self.assertEqual("activating", self.store.get_session(SESSION_ID).state)
+        self.assertEqual(1, len(self.store.list_active_items(SESSION_ID)))
+        context = build_handoff_context(
+            changed_delivery_id, changed_preflight, changed_shortlist
+        )
+        delivered = self.store.commit_intent_delivery(
+            delivery_id=changed_delivery_id,
+            claim_token=claim.claim_token,
+            shortlist=changed_shortlist,
+            context_text=context,
+            now=NOW,
+        )
+
+        self.assertEqual("host_delivered", delivered.state)
+        self.assertEqual(
+            "pending",
+            self.store.get_turn_gate(SESSION_ID, "turn-changed").state,
+        )
+        reopened = RecallHostStore.open(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(delivered, reopened.get_delivery(changed_delivery_id))
 
     def test_application_rolls_back_delivery_gate_session_items_and_receipt(self) -> None:
         """This catches a partial application receipt authorizing mutation."""

@@ -8,12 +8,15 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.agent import mcp_server
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.mcp_server import LocalMcpTools
+from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.recall_mcp import ReadinessRecallGateProvider, RecallMcpTools
+from zdecision.app_server.gateway import AppServerGateway
 from zdecision.recall.handoff import (
     RecallShortlist,
     RecalledDecision,
@@ -46,13 +49,13 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
         self.store = RecallHostStore.open(database_path)
         self.addCleanup(self.store.close)
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
-        recall = RecallMcpTools(
+        self.recall = RecallMcpTools(
             host_store=self.store,
             provider=ReadinessRecallGateProvider(),
             cwd=self.cwd,
             clock=lambda: NOW,
         )
-        self.server = mcp_server.create_mcp_server(local, recall)
+        self.server = mcp_server.create_mcp_server(local, self.recall)
 
     def _prepare_application(self, *, unknown: bool = False):
         intent = valid_intent()
@@ -173,6 +176,144 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
             {"state": "blocked", "code": "invalid_application"},
             result.structuredContent,
         )
+
+    async def test_turn_gate_schema_uses_strict_intent_and_optional_host_coordinate(
+        self,
+    ) -> None:
+        """This catches the model being required to invent a trusted gate ID."""
+
+        tools = {item.name: item for item in await self.server.list_tools()}
+        schema = tools["gate_zdecision_turn"].inputSchema
+
+        self.assertEqual(["intent"], schema["required"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            {"intent", "turn_gate_id", "explicit_refresh"},
+            set(schema["properties"]),
+        )
+
+    async def test_same_intent_gate_reuses_without_app_server(self) -> None:
+        """This catches the new gate falling back to active-Turn evidence."""
+
+        shortlist = self._prepare_application()
+        applied = self.recall.apply_recall_delivery(
+            turn_gate_id=GATE_ID,
+            delivery_id=DELIVERY_ID,
+            items=self._items(shortlist, "applicable", "not_applicable"),
+        )
+        self.assertEqual("application_committed", applied["state"])
+        self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="same-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-same",
+        )
+
+        with patch.object(
+            AppServerGateway,
+            "connect",
+            side_effect=AssertionError("Recall must not connect an App Server"),
+        ):
+            result = await self.server.call_tool(
+                "gate_zdecision_turn",
+                {
+                    "turn_gate_id": "gate-same",
+                    "intent": valid_intent().to_dict(),
+                },
+            )
+
+        self.assertFalse(result.isError)
+        self.assertEqual("reuse", result.structuredContent["state"])
+
+    async def test_changed_intent_gate_returns_typed_handoff_without_app_server(
+        self,
+    ) -> None:
+        """This catches changed intent returning opaque bytes or host proof calls."""
+
+        shortlist = self._prepare_application()
+        self.recall.apply_recall_delivery(
+            turn_gate_id=GATE_ID,
+            delivery_id=DELIVERY_ID,
+            items=self._items(shortlist, "applicable", "not_applicable"),
+        )
+        changed = valid_intent().from_dict(
+            {**valid_intent().to_dict(), "feature_goal": "Changed MCP feature"}
+        )
+        preflight = replace(
+            self.store.get_delivery(DELIVERY_ID).preflight,
+            intent=changed,
+        )
+        decision = RecalledDecision.create(
+            decision_space_id=preflight.target_decision_space_ids[0],
+            revision=replace(
+                formal_decision(claim="The changed MCP feature uses this decision."),
+                decision_id="dec_" + "8" * 32,
+            ),
+            match_reason="Changed MCP match",
+        )
+        changed_shortlist = RecallShortlist.create(
+            preflight=preflight, items=(decision,)
+        )
+
+        class Provider:
+            retrieve_calls = 0
+
+            def preflight(self, **_kwargs):
+                return preflight
+
+            def retrieve(self, _preflight):
+                self.retrieve_calls += 1
+                return changed_shortlist
+
+        provider = Provider()
+        self.recall.handoff_service = RecallHandoffService(
+            store=self.store,
+            provider=provider,
+            clock=lambda: NOW,
+            delivery_id_factory=lambda _: "delivery_" + "f" * 32,
+            claim_token_factory=lambda: "claim_" + "f" * 32,
+        )
+        self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="changed-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-changed",
+        )
+
+        with patch.object(
+            AppServerGateway,
+            "connect",
+            side_effect=AssertionError("Recall must not connect an App Server"),
+        ):
+            result = await self.server.call_tool(
+                "gate_zdecision_turn",
+                {
+                    "turn_gate_id": "gate-changed",
+                    "intent": changed.to_dict(),
+                },
+            )
+
+        self.assertFalse(result.isError)
+        self.assertEqual("retrieve", result.structuredContent["state"])
+        self.assertEqual([decision.to_dict()], result.structuredContent["decisions"])
+        self.assertEqual("ZDECISION_RECALL_HANDOFF", json.loads(result.content[0].text)["marker"])
+        self.assertEqual(1, provider.retrieve_calls)
+
+        replay = await self.server.call_tool(
+            "gate_zdecision_turn",
+            {
+                "turn_gate_id": "gate-changed",
+                "intent": changed.to_dict(),
+            },
+        )
+        self.assertFalse(replay.isError)
+        self.assertEqual(result.structuredContent, replay.structuredContent)
+        self.assertEqual(result.content[0].text, replay.content[0].text)
+        self.assertEqual(1, provider.retrieve_calls)
 
     async def test_exact_application_commits_safe_model_visible_summary(self) -> None:
         """This catches MCP bypassing the Task 2 atomic application transaction."""

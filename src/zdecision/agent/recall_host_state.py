@@ -50,7 +50,10 @@ class RecallSession:
     context_epoch: int
     intent_epoch: int
     active_intent_digest: str | None
+    active_intent: RecallIntent | None
     active_set_digest: str | None
+    active_delivery_id: str | None
+    application_receipt_id: str | None
     last_gate_turn_id: str | None
     protocol_version: str | None = None
     repository_id: str | None = None
@@ -192,7 +195,10 @@ class RecallHostStore:
                     context_epoch INTEGER NOT NULL CHECK(context_epoch >= 0),
                     intent_epoch INTEGER NOT NULL CHECK(intent_epoch >= 0),
                     active_intent_digest TEXT,
+                    active_intent_json TEXT,
                     active_set_digest TEXT,
+                    active_delivery_id TEXT,
+                    application_receipt_id TEXT,
                     last_gate_turn_id TEXT,
                     ended_at TEXT,
                     resumed_at TEXT,
@@ -362,6 +368,18 @@ class RecallHostStore:
                 connection.execute(
                     "ALTER TABLE recall_sessions ADD COLUMN repository_id TEXT"
                 )
+            if "active_intent_json" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE recall_sessions ADD COLUMN active_intent_json TEXT"
+                )
+            if "active_delivery_id" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE recall_sessions ADD COLUMN active_delivery_id TEXT"
+                )
+            if "application_receipt_id" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE recall_sessions ADD COLUMN application_receipt_id TEXT"
+                )
             attempt_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -477,6 +495,44 @@ class RecallHostStore:
         try:
             _require_v1_delivery(rows[0], self._connection)
             return _delivery(rows[0])
+        except (RecallGateConflict, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def intent_delivery_for_gate(
+        self, session_id: str, turn_id: str, gate_id: str
+    ) -> RecallDelivery | None:
+        """Return the exact model-visible delivery frozen for one pending gate."""
+
+        session = _text(session_id, "session_id")
+        turn = _text(turn_id, "turn_id")
+        gate_identifier = _text(gate_id, "gate_id")
+        if self._is_internal_thread(session):
+            return None
+        rows = self._connection.execute(
+            """
+            SELECT d.*, a.preflight_json,
+                   a.state AS attempt_state,
+                   a.protocol_version AS attempt_protocol_version,
+                   s.protocol_version AS session_protocol_version,
+                   g.active_generation AS gate_active_generation
+            FROM recall_deliveries AS d
+            JOIN recall_activation_attempts AS a ON a.attempt_id = d.attempt_id
+            JOIN recall_sessions AS s ON s.session_id = d.session_id
+            JOIN recall_turn_gates AS g
+              ON g.session_id = d.session_id AND g.turn_id = a.turn_id
+            WHERE d.session_id = ? AND a.turn_id = ? AND g.gate_id = ?
+              AND g.state = 'pending' AND d.state = 'host_delivered'
+            """,
+            (session, turn, gate_identifier),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            _require_v1_delivery(rows[0], self._connection)
+            delivery = _delivery(rows[0])
+            if rows[0]["gate_active_generation"] != delivery.preflight.generation:
+                return None
+            return delivery
         except (RecallGateConflict, TypeError, ValueError, json.JSONDecodeError):
             return None
 
@@ -851,6 +907,214 @@ class RecallHostStore:
             self._connection.rollback()
             raise
 
+    def begin_intent_delivery(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        gate_id: str,
+        attempt_id: str,
+        delivery_id: str,
+        claim_token: str,
+        preflight: RecallPreflightReady,
+        now: datetime,
+        claim_expires_at: datetime,
+        retire_active_set: bool,
+    ) -> DeliveryClaim:
+        """Own changed-intent retrieval for an already-consented Session."""
+
+        session = _text(session_id, "session_id")
+        turn = _text(turn_id, "turn_id")
+        gate_identifier = _text(gate_id, "gate_id")
+        attempt = _text(attempt_id, "attempt_id")
+        delivery = _delivery_id(delivery_id)
+        token = _claim_token(claim_token)
+        started = _aware_utc(now, "now")
+        claim_expiry = _aware_utc(claim_expires_at, "claim_expires_at")
+        if claim_expiry <= started or not isinstance(retire_active_set, bool):
+            raise ValueError("intent delivery claim is invalid")
+        if not isinstance(preflight, RecallPreflightReady):
+            raise ValueError("preflight is invalid")
+        if started >= datetime.fromisoformat(preflight.expires_at):
+            raise RecallGateConflict("preflight expired")
+        preflight_text = canonical_json_bytes(preflight.to_dict()).decode("utf-8")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self._session_row(session)
+            gate = self._gate_for_turn(session, turn)
+            if (
+                current is None
+                or current["state"] != "active"
+                or current["protocol_version"] != RECALL_HANDOFF_PROTOCOL
+                or current["repository_id"] != preflight.repository_id
+                or gate is None
+                or gate["gate_id"] != gate_identifier
+                or gate["state"] != "pending"
+                or gate["context_epoch"] != current["context_epoch"]
+                or gate["intent_epoch"] != current["intent_epoch"]
+                or self._is_internal_thread(session)
+            ):
+                raise RecallGateConflict("changed intent gate is not current")
+            existing = self._delivery_for_attempt_row(attempt)
+            if existing is not None:
+                if (
+                    existing["delivery_id"] != delivery
+                    or existing["session_id"] != session
+                    or existing["preflight_digest"] != preflight.digest
+                ):
+                    raise RecallGateConflict("intent delivery is already frozen")
+                result = DeliveryClaim(
+                    existing["state"] == "preparing"
+                    and existing["claim_token"] == token,
+                    _delivery(existing),
+                    token if existing["claim_token"] == token else None,
+                )
+                self._connection.commit()
+                return result
+            if self._connection.execute(
+                "SELECT 1 FROM recall_activation_attempts WHERE attempt_id = ?",
+                (attempt,),
+            ).fetchone() is not None:
+                raise RecallGateConflict("intent attempt is already bound")
+            timestamp = _timestamp(started)
+            self._connection.execute(
+                """
+                INSERT INTO recall_activation_attempts(
+                    attempt_id, session_id, turn_id, cwd, repository_id,
+                    repository_display_name, state, created_at, expires_at,
+                    plugin_root, plugin_bundle_digest, ui_digest, result_digest,
+                    protocol_version, preflight_json, preflight_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, 'committed', ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    attempt,
+                    session,
+                    turn,
+                    current["cwd"],
+                    preflight.repository_id,
+                    preflight.repository_display_name,
+                    timestamp,
+                    preflight.expires_at,
+                    gate["plugin_root"],
+                    gate["plugin_bundle_digest"],
+                    hashlib.sha256(
+                        canonical_json_bytes({"action": "changed_intent"})
+                    ).hexdigest(),
+                    RECALL_HANDOFF_PROTOCOL,
+                    preflight_text,
+                    preflight.digest,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO recall_deliveries(
+                    delivery_id, attempt_id, session_id, state,
+                    preflight_digest, claim_token, claim_expires_at,
+                    shortlist_json, snapshot_digest, context_text,
+                    context_digest, application_json, application_digest,
+                    application_receipt_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'preparing', ?, ?, ?, NULL, NULL, NULL,
+                          NULL, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    delivery,
+                    attempt,
+                    session,
+                    preflight.digest,
+                    token,
+                    _timestamp(claim_expiry),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._connection.execute(
+                "UPDATE recall_turn_gates SET active_generation = ? WHERE gate_id = ?",
+                (preflight.generation, gate_identifier),
+            )
+            if retire_active_set:
+                self._connection.execute(
+                    "DELETE FROM recall_active_injected_items WHERE session_id = ?",
+                    (session,),
+                )
+                self._connection.execute(
+                    "UPDATE recall_sessions SET active_set_digest = NULL WHERE session_id = ?",
+                    (session,),
+                )
+            self._connection.execute(
+                "UPDATE recall_sessions SET state = 'activating' WHERE session_id = ?",
+                (session,),
+            )
+            result = DeliveryClaim(
+                True, _delivery(self._delivery_row(delivery)), token
+            )
+            self._connection.commit()
+            return result
+        except Exception:
+            self._connection.rollback()
+            raise
+
+    def commit_intent_delivery(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: str,
+        shortlist: RecallShortlist,
+        context_text: str,
+        now: datetime,
+    ) -> RecallDelivery:
+        """Atomically freeze and mark one model-visible Intent Epoch delivery."""
+
+        delivery = _delivery_id(delivery_id)
+        token = _claim_token(claim_token)
+        delivered_at = _aware_utc(now, "now")
+        if not isinstance(shortlist, RecallShortlist) or not isinstance(
+            context_text, str
+        ):
+            raise ValueError("intent delivery bytes are invalid")
+        shortlist_text = canonical_json_bytes(shortlist.to_dict()).decode("utf-8")
+        snapshot_digest = hashlib.sha256(shortlist_text.encode("utf-8")).hexdigest()
+        context_digest = hashlib.sha256(context_text.encode("utf-8")).hexdigest()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._delivery_row(delivery)
+            if row is None:
+                raise RecallGateConflict("delivery does not exist")
+            _require_v1_delivery(row, self._connection)
+            current = _delivery(row)
+            if (
+                row["state"] != "preparing"
+                or row["claim_token"] != token
+                or delivered_at >= _parse_timestamp(row["claim_expires_at"])
+                or delivered_at >= datetime.fromisoformat(current.preflight.expires_at)
+                or shortlist.preflight_digest != current.preflight_digest
+                or context_text
+                != build_handoff_context(delivery, current.preflight, shortlist)
+            ):
+                raise RecallGateConflict("intent delivery claim is invalid")
+            self._connection.execute(
+                """
+                UPDATE recall_deliveries
+                SET state = 'host_delivered', shortlist_json = ?,
+                    snapshot_digest = ?, context_text = ?, context_digest = ?,
+                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+                WHERE delivery_id = ? AND state = 'preparing'
+                """,
+                (
+                    shortlist_text,
+                    snapshot_digest,
+                    context_text,
+                    context_digest,
+                    _timestamp(delivered_at),
+                    delivery,
+                ),
+            )
+            result = _delivery(self._delivery_row(delivery))
+            self._connection.commit()
+            return result
+        except Exception:
+            self._connection.rollback()
+            raise
+
     def ack_delivery(
         self,
         *,
@@ -1195,14 +1459,21 @@ class RecallHostStore:
                 """
                 UPDATE recall_sessions
                 SET state = ?, intent_epoch = ?, active_intent_digest = ?,
-                    active_set_digest = ?, last_gate_turn_id = ?
+                    active_intent_json = ?, active_set_digest = ?,
+                    active_delivery_id = ?, application_receipt_id = ?,
+                    last_gate_turn_id = ?
                 WHERE session_id = ?
                 """,
                 (
                     "blocked" if blocked else "active",
                     next_intent_epoch,
                     current_delivery.preflight.intent.digest,
+                    canonical_json_bytes(
+                        current_delivery.preflight.intent.to_dict()
+                    ).decode("utf-8"),
                     active_set_digest,
+                    delivery,
+                    receipt_id,
                     turn,
                     session,
                 ),
@@ -1792,7 +2063,11 @@ class RecallHostStore:
             raise
 
     def begin_resume(
-        self, session_id: str, cwd: str, now: datetime
+        self,
+        session_id: str,
+        cwd: str,
+        now: datetime,
+        plugin_root: str | None = None,
     ) -> RecallSession | None:
         session = _text(session_id, "session_id")
         working_directory = _absolute_path(cwd)
@@ -1807,13 +2082,54 @@ class RecallHostStore:
                 return None
             if current["state"] != "dormant":
                 raise RecallGateConflict("session is not dormant")
+            next_state = "activating"
+            if current["protocol_version"] == RECALL_HANDOFF_PROTOCOL:
+                delivery = (
+                    None
+                    if current["active_delivery_id"] is None
+                    else self._delivery_row(current["active_delivery_id"])
+                )
+                gate = (
+                    None
+                    if current["last_gate_turn_id"] is None
+                    else self._gate_for_turn(session, current["last_gate_turn_id"])
+                )
+                installed_root, bundle_digest = _optional_installed_plugin_binding(
+                    plugin_root
+                )
+                active_receipts = {
+                    row["application_receipt_id"]
+                    for row in self._connection.execute(
+                        "SELECT application_receipt_id "
+                        "FROM recall_active_injected_items WHERE session_id = ?",
+                        (session,),
+                    ).fetchall()
+                }
+                if (
+                    delivery is None
+                    or delivery["state"] != "application_committed"
+                    or delivery["application_receipt_id"]
+                    != current["application_receipt_id"]
+                    or current["active_intent_json"] is None
+                    or current["active_intent_digest"] is None
+                    or gate is None
+                    or gate["state"] != "committed"
+                    or gate["plugin_root"] != installed_root
+                    or gate["plugin_bundle_digest"] != bundle_digest
+                    or any(
+                        receipt != current["application_receipt_id"]
+                        for receipt in active_receipts
+                    )
+                ):
+                    raise RecallGateConflict("active receipt revalidation failed")
+                next_state = "active"
             self._connection.execute(
                 """
                 UPDATE recall_sessions
-                SET state = 'activating', cwd = ?, resumed_at = ?
+                SET state = ?, cwd = ?, resumed_at = ?
                 WHERE session_id = ?
                 """,
-                (working_directory, resumed, session),
+                (next_state, working_directory, resumed, session),
             )
             result = self._required_session(session)
             self._connection.commit()
@@ -1974,6 +2290,16 @@ class RecallHostStore:
 
 
 def _session(row: sqlite3.Row) -> RecallSession:
+    active_intent = (
+        None
+        if row["active_intent_json"] is None
+        else RecallIntent.from_dict(json.loads(row["active_intent_json"]))
+    )
+    if (
+        active_intent is not None
+        and active_intent.digest != row["active_intent_digest"]
+    ):
+        raise RecallGateConflict("stored active intent does not match")
     return RecallSession(
         session_id=row["session_id"],
         state=row["state"],
@@ -1982,7 +2308,10 @@ def _session(row: sqlite3.Row) -> RecallSession:
         context_epoch=row["context_epoch"],
         intent_epoch=row["intent_epoch"],
         active_intent_digest=row["active_intent_digest"],
+        active_intent=active_intent,
         active_set_digest=row["active_set_digest"],
+        active_delivery_id=row["active_delivery_id"],
+        application_receipt_id=row["application_receipt_id"],
         last_gate_turn_id=row["last_gate_turn_id"],
         protocol_version=row["protocol_version"],
         repository_id=row["repository_id"],

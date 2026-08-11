@@ -15,9 +15,11 @@ from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.recall.handoff import (
     RecallApplicationSubmission,
+    RecallPreflightClarification,
     RecallShortlist,
     RecalledDecision,
 )
+from zdecision.recall.session import RecallIntent
 
 from tests.test_recall_handoff_contracts import (
     formal_decision,
@@ -35,10 +37,21 @@ UI_DIGEST = "a" * 64
 class _CountingProvider:
     def __init__(self, shortlist: RecallShortlist) -> None:
         self.shortlist = shortlist
+        self.preflight_result = None
+        self.preflight_calls = 0
         self.retrieve_calls = 0
+        self.on_retrieve = None
+
+    def preflight(self, **_kwargs):
+        self.preflight_calls += 1
+        if self.preflight_result is None:
+            raise AssertionError("unexpected preflight")
+        return self.preflight_result
 
     def retrieve(self, preflight):
         self.retrieve_calls += 1
+        if self.on_retrieve is not None:
+            self.on_retrieve()
         return self.shortlist
 
 
@@ -623,3 +636,275 @@ class RecallHandoffServiceTests(unittest.TestCase):
             decision.digest,
         ):
             self.assertNotIn(private, encoded)
+
+    def test_same_active_intent_commits_reuse_without_provider_work(self) -> None:
+        """This catches an ordinary continuation rerunning Recall retrieval."""
+
+        claimed = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        self.service.ack(
+            attempt_id=ATTEMPT_ID,
+            delivery_id=DELIVERY_ID,
+            context_digest=claimed["_meta"]["zdecision/context_digest"],
+        )
+        initial_gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="application-turn",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=self.preflight.generation,
+            gate_id="gate-application",
+        )
+        decision = self.shortlist.items[0]
+        self.service.apply(
+            session_id="private-session",
+            turn_id="application-turn",
+            gate_id=initial_gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=RecallApplicationSubmission.from_dict(
+                {
+                    "delivery_id": DELIVERY_ID,
+                    "items": [
+                        {
+                            "decision_id": decision.revision.decision_id,
+                            "revision": decision.revision.revision,
+                            "digest": decision.digest,
+                            "disposition": "applicable",
+                            "reason": "It governs this feature.",
+                        }
+                    ],
+                }
+            ),
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="continuation-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-continuation",
+        )
+        retrieve_calls = self.provider.retrieve_calls
+
+        result = self.service.gate_turn(
+            session_id="private-session",
+            turn_id="continuation-turn",
+            gate_id=gate.gate_id,
+            intent=self.intent,
+        )
+
+        self.assertEqual("reuse", result["state"])
+        self.assertEqual(retrieve_calls, self.provider.retrieve_calls)
+        self.assertEqual(
+            "committed",
+            self.store.get_turn_gate("private-session", "continuation-turn").state,
+        )
+
+    def test_changed_intent_returns_complete_frozen_shortlist_and_keeps_gate_pending(
+        self,
+    ) -> None:
+        """This catches changed intent reuse or an opaque/non-frozen tool result."""
+
+        self._commit_active_fixture()
+        changed = RecallIntent.from_dict(
+            {
+                **self.intent.to_dict(),
+                "feature_goal": "Implement a changed Recall feature",
+                "repository_relative_paths": ["src/zdecision/agent/hooks.py"],
+            }
+        )
+        changed_preflight = replace(self.preflight, intent=changed)
+        changed_item = RecalledDecision.create(
+            decision_space_id=changed_preflight.target_decision_space_ids[0],
+            revision=replace(
+                formal_decision(claim="The changed feature uses this decision."),
+                decision_id="dec_" + "8" * 32,
+            ),
+            match_reason="Changed feature match",
+        )
+        self.provider.preflight_result = changed_preflight
+        self.provider.shortlist = RecallShortlist.create(
+            preflight=changed_preflight,
+            items=(changed_item,),
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="changed-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-changed",
+        )
+        retrieve_calls = self.provider.retrieve_calls
+
+        result = self.service.gate_turn(
+            session_id="private-session",
+            turn_id="changed-turn",
+            gate_id=gate.gate_id,
+            intent=changed,
+        )
+
+        self.assertEqual("retrieve", result["state"])
+        self.assertEqual([changed_item.to_dict()], result["decisions"])
+        self.assertEqual(retrieve_calls + 1, self.provider.retrieve_calls)
+        self.assertEqual("pending", self.store.get_turn_gate("private-session", "changed-turn").state)
+        self.assertEqual("activating", self.store.get_session("private-session").state)
+
+        reopened = RecallHostStore.open(self.path)
+        self.addCleanup(reopened.close)
+        restarted = RecallHandoffService(
+            store=reopened,
+            provider=self.provider,
+            clock=lambda: self.current_time,
+            delivery_id_factory=lambda _: "delivery_" + "f" * 32,
+            claim_token_factory=lambda: "claim_" + "f" * 32,
+        )
+        replay = restarted.gate_turn(
+            session_id="private-session",
+            turn_id="changed-turn",
+            gate_id=gate.gate_id,
+            intent=changed,
+        )
+
+        self.assertEqual(result, replay)
+        self.assertEqual(retrieve_calls + 1, self.provider.retrieve_calls)
+
+    def test_validated_product_change_retires_old_items_before_retrieval(self) -> None:
+        """This catches old-product Decisions surviving into new-product routing."""
+
+        self._commit_active_fixture()
+        changed = RecallIntent.from_dict(
+            {
+                **self.intent.to_dict(),
+                "target_decision_space_ids": ["space-other"],
+                "feature_goal": "Work on the other product",
+            }
+        )
+        changed_preflight = replace(
+            self.preflight,
+            intent=changed,
+            target_decision_space_ids=("space-other",),
+            target_display_names=("Other Product",),
+        )
+        changed_item = RecalledDecision.create(
+            decision_space_id="space-other",
+            revision=replace(
+                formal_decision(claim="The other product uses this decision."),
+                decision_id="dec_" + "7" * 32,
+            ),
+            match_reason="Other product match",
+        )
+        self.provider.preflight_result = changed_preflight
+        self.provider.shortlist = RecallShortlist.create(
+            preflight=changed_preflight,
+            items=(changed_item,),
+        )
+        observed = []
+        self.provider.on_retrieve = lambda: observed.append(
+            (
+                self.store.get_session("private-session").state,
+                self.store.list_active_items("private-session"),
+            )
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="product-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-product",
+        )
+
+        result = self.service.gate_turn(
+            session_id="private-session",
+            turn_id="product-turn",
+            gate_id=gate.gate_id,
+            intent=changed,
+        )
+
+        self.assertEqual("retrieve", result["state"])
+        self.assertEqual([("activating", ())], observed)
+
+    def test_ambiguous_changed_intent_returns_names_without_retrieval_or_replacement(
+        self,
+    ) -> None:
+        """This catches ambiguity retrieving or replacing the current active set."""
+
+        self._commit_active_fixture()
+        changed = RecallIntent.from_dict(
+            {**self.intent.to_dict(), "feature_goal": "Work on an ambiguous product"}
+        )
+        self.provider.preflight_result = RecallPreflightClarification(
+            code="ambiguous_target",
+            candidate_display_names=("Cloud", "Shared UI"),
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="ambiguous-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-ambiguous",
+        )
+        before = self.store.list_active_items("private-session")
+        retrieve_calls = self.provider.retrieve_calls
+
+        result = self.service.gate_turn(
+            session_id="private-session",
+            turn_id="ambiguous-turn",
+            gate_id=gate.gate_id,
+            intent=changed,
+        )
+
+        self.assertEqual(
+            {
+                "state": "clarify_product",
+                "candidate_display_names": ["Cloud", "Shared UI"],
+            },
+            result,
+        )
+        self.assertEqual(retrieve_calls, self.provider.retrieve_calls)
+        self.assertEqual(before, self.store.list_active_items("private-session"))
+        self.assertEqual("pending", self.store.get_turn_gate("private-session", "ambiguous-turn").state)
+
+    def _commit_active_fixture(self) -> None:
+        claimed = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        self.service.ack(
+            attempt_id=ATTEMPT_ID,
+            delivery_id=DELIVERY_ID,
+            context_digest=claimed["_meta"]["zdecision/context_digest"],
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="application-turn",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=self.preflight.generation,
+            gate_id="gate-application",
+        )
+        decision = self.shortlist.items[0]
+        self.service.apply(
+            session_id="private-session",
+            turn_id="application-turn",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=RecallApplicationSubmission.from_dict(
+                {
+                    "delivery_id": DELIVERY_ID,
+                    "items": [
+                        {
+                            "decision_id": decision.revision.decision_id,
+                            "revision": decision.revision.revision,
+                            "digest": decision.digest,
+                            "disposition": "applicable",
+                            "reason": "It governs this feature.",
+                        }
+                    ],
+                }
+            ),
+        )

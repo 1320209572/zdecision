@@ -441,40 +441,29 @@ class RecallMcpTools:
         )
 
     def gate_zdecision_turn(
-        self, *, turn_gate_id: str, intent: object
+        self,
+        *,
+        turn_gate_id: str,
+        intent: object,
+        explicit_refresh: bool = False,
     ) -> dict[str, object]:
         parsed = _parse_intent(intent)
-        if parsed is None:
+        if parsed is None or not isinstance(explicit_refresh, bool):
             return _blocked("invalid_intent")
         binding = self._turn_binding(turn_gate_id)
         if binding is None:
             return _blocked("invalid_binding")
         session, turn_id = binding
-        receipt = self._receipt("turn", turn_gate_id)
-        if receipt is not None:
-            if receipt["intent_digest"] != parsed.digest:
-                return _blocked("binding_replayed")
-            return self._reconcile_receipt(receipt, session, turn_id)
-        if not self._active_turn_barrier_proven(
-            session,
-            turn_id,
-            tool_name="gate_zdecision_turn",
-            operation_id=turn_gate_id,
-            binding_kind="turn",
-            binding_id=turn_gate_id,
-            require_native_selection=False,
-        ):
+        try:
+            return self.handoff_service.gate_turn(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                gate_id=turn_gate_id,
+                intent=parsed,
+                explicit_refresh=explicit_refresh,
+            )
+        except Exception:
             return _blocked("host_gate_unavailable")
-        return self._claim_provider_result(
-            kind="turn",
-            binding_id=turn_gate_id,
-            gate_id=turn_gate_id,
-            parsed=parsed,
-            session=session,
-            turn_id=turn_id,
-            activation=False,
-            invoke=lambda: self.provider.gate(session, parsed),
-        )
 
     def _claim_provider_result(
         self,
@@ -630,7 +619,20 @@ class RecallMcpTools:
             if row is None or newer is not None:
                 return None
             session = self.host_store.get_session(row["session_id"])
-            if session is None or session.state != "active" or session.cwd != self.cwd:
+            recovering_intent_delivery = (
+                session is not None
+                and session.state == "activating"
+                and row["state"] == "pending"
+                and self.host_store.intent_delivery_for_gate(
+                    session.session_id, row["turn_id"], gate_id
+                )
+                is not None
+            )
+            if (
+                session is None
+                or session.cwd != self.cwd
+                or (session.state != "active" and not recovering_intent_delivery)
+            ):
                 return None
             if row["state"] != "pending" and self._receipt("turn", gate_id) is None:
                 return None

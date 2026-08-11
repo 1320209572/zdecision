@@ -121,12 +121,15 @@ class RecallIntent:
     @classmethod
     def from_dict(cls, value: object) -> "RecallIntent":
         item = _mapping(value)
+        feature_goal = item["feature_goal"]
+        if not isinstance(feature_goal, str):
+            raise ValueError("feature_goal is invalid")
         return cls(
             target_decision_space_ids=_members(
                 item["target_decision_space_ids"], "target_decision_space_ids"
             ),
             explicit_multi_space=item["explicit_multi_space"],
-            feature_goal=item["feature_goal"],
+            feature_goal=feature_goal.strip(),
             domain_objects=_members(item["domain_objects"], "domain_objects"),
             repository_relative_paths=_relative_paths(
                 item["repository_relative_paths"]

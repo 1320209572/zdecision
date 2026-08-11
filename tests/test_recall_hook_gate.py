@@ -1006,7 +1006,11 @@ class RecallHookGateTests(unittest.TestCase):
         self._activate()
         self._prompt(turn_id="turn-b")
 
-        response = self._pre_tool(TURN_GATE_TOOL, turn_id="turn-b")
+        response = self._pre_tool(
+            TURN_GATE_TOOL,
+            turn_id="turn-b",
+            tool_input={"intent": VALID_INTENT},
+        )
 
         self.assertEqual("allow", self._decision(response))
         self.assertEqual(
@@ -1044,6 +1048,35 @@ class RecallHookGateTests(unittest.TestCase):
             self.recall_store.get_turn_gate("session-a", "turn-b").state,
         )
         self.assert_private_values_absent(response)
+
+    def test_turn_gate_rejects_extra_input_and_normalizes_strict_intent(self) -> None:
+        """This catches untrusted gate fields surviving the Hook rewrite."""
+
+        self._activate()
+        self._prompt(turn_id="turn-b")
+
+        denied = self._pre_tool(
+            TURN_GATE_TOOL,
+            turn_id="turn-b",
+            tool_input={"intent": VALID_INTENT, "untrusted": "value"},
+        )
+        allowed = self._pre_tool(
+            TURN_GATE_TOOL,
+            turn_id="turn-b",
+            tool_input={
+                "turn_gate_id": "model-gate",
+                "intent": {**VALID_INTENT, "feature_goal": "  Continue the current product work  "},
+                "explicit_refresh": False,
+            },
+        )
+
+        self.assertEqual("deny", self._decision(denied))
+        self.assertEqual("allow", self._decision(allowed))
+        self.assertEqual(GATE_ID, allowed.output["hookSpecificOutput"]["updatedInput"]["turn_gate_id"])
+        self.assertEqual(
+            "Continue the current product work",
+            allowed.output["hookSpecificOutput"]["updatedInput"]["intent"]["feature_goal"],
+        )
 
     def test_mutations_wait_for_exact_committed_active_turn_gate(self) -> None:
         self._activate()
@@ -1200,6 +1233,111 @@ class RecallHookGateTests(unittest.TestCase):
         self.assertEqual(cleared.output, clear_replay.output)
         self.assertEqual(2, self.recall_store.get_session("session-a").context_epoch)
 
+    def test_compact_restores_complete_applicable_envelopes_and_receipt(self) -> None:
+        """This catches compact restoration returning only an opaque set digest."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+        committed = self.recall_store.commit_delivery_application(
+            session_id="session-a",
+            turn_id="turn-b",
+            gate_id=GATE_ID,
+            delivery_id=delivery.delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery.delivery_id, "items": items}
+            ),
+            now=NOW,
+        )
+        active = self.recall_store.list_active_items("session-a")
+        self.assertEqual(1, len(active))
+        self._compact_event("PreCompact", trigger="auto")
+        self._compact_event("PostCompact", trigger="auto")
+
+        first = self._session_start("compact")
+        replay = self._session_start("compact")
+
+        self.assertEqual(first.output, replay.output)
+        envelope = json.loads(first.output["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual("ZDECISION_RECALL_RESTORATION", envelope["marker"])
+        self.assertEqual(committed.application_receipt_id, envelope["application_receipt_id"])
+        self.assertEqual(1, envelope["context_epoch"])
+        self.assertEqual([active[0].envelope.to_dict()], envelope["decisions"])
+
+    def test_clear_restores_an_authoritative_empty_active_set(self) -> None:
+        """This catches an all-not-applicable epoch becoming restoration unavailable."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+        committed = self.recall_store.commit_delivery_application(
+            session_id="session-a",
+            turn_id="turn-b",
+            gate_id=GATE_ID,
+            delivery_id=delivery.delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {
+                    "delivery_id": delivery.delivery_id,
+                    "items": [
+                        {**item, "disposition": "not_applicable"}
+                        for item in items
+                    ],
+                }
+            ),
+            now=NOW,
+        )
+
+        response = self._session_start("clear")
+        envelope = json.loads(
+            response.output["hookSpecificOutput"]["additionalContext"]
+        )
+
+        self.assertEqual("ZDECISION_RECALL_RESTORATION", envelope["marker"])
+        self.assertEqual([], envelope["decisions"])
+        self.assertEqual(
+            committed.application_receipt_id,
+            envelope["application_receipt_id"],
+        )
+
+    def test_v1_resume_revalidates_active_receipt_without_confirmation(self) -> None:
+        """This catches native resume returning a consented task to confirmation."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+        self.recall_store.commit_delivery_application(
+            session_id="session-a",
+            turn_id="turn-b",
+            gate_id=GATE_ID,
+            delivery_id=delivery.delivery_id,
+            submission=RecallApplicationSubmission.from_dict(
+                {"delivery_id": delivery.delivery_id, "items": items}
+            ),
+            now=NOW,
+        )
+        before_attempts = self.recall_store._connection.execute(
+            "SELECT COUNT(*) FROM recall_activation_attempts"
+        ).fetchone()[0]
+        self._handle(
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": "session-a",
+                "cwd": str(self.repository),
+                "reason": "other",
+            }
+        )
+
+        resumed = self._session_start("resume", turn_id="turn-c")
+
+        self.assertEqual("active", self.recall_store.get_session("session-a").state)
+        self.assertEqual(
+            before_attempts,
+            self.recall_store._connection.execute(
+                "SELECT COUNT(*) FROM recall_activation_attempts"
+            ).fetchone()[0],
+        )
+        self.assertNotIn(
+            "confirmation",
+            resumed.output["hookSpecificOutput"]["additionalContext"].lower(),
+        )
+
     def test_unmatched_compaction_token_fails_closed_without_epoch_advance(self) -> None:
         self._commit_active_set()
         self._compact_event("PreCompact")
@@ -1221,7 +1359,11 @@ class RecallHookGateTests(unittest.TestCase):
         self._compact_event("PostCompact", turn_id="turn-c")
 
         restoration = self._session_start("compact", turn_id="turn-c")
-        gate_binding = self._pre_tool(TURN_GATE_TOOL, turn_id="turn-c")
+        gate_binding = self._pre_tool(
+            TURN_GATE_TOOL,
+            turn_id="turn-c",
+            tool_input={"intent": VALID_INTENT},
+        )
 
         envelope = json.loads(
             restoration.output["hookSpecificOutput"]["additionalContext"]

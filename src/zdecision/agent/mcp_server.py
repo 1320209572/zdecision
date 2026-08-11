@@ -36,6 +36,7 @@ from zdecision.agent.recall_mcp import (
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.service import load_agent_config
 from zdecision.app_server.gateway import AppServerGateway
+from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import (
     CaptureRequestCreate,
     CaptureRequestView,
@@ -644,12 +645,16 @@ def create_mcp_server(
             annotations=recall_action,
         )
         def gate_zdecision_turn(
-            turn_gate_id: str,
             intent: RecallIntentInput,
-        ) -> dict[str, object]:
-            return recall_tools.gate_zdecision_turn(
-                turn_gate_id=turn_gate_id,
-                intent=intent.model_dump(mode="python"),
+            turn_gate_id: str = "",
+            explicit_refresh: bool = False,
+        ) -> CallToolResult:
+            return _gate_call_result(
+                recall_tools.gate_zdecision_turn(
+                    turn_gate_id=turn_gate_id,
+                    intent=intent.model_dump(mode="python"),
+                    explicit_refresh=explicit_refresh,
+                )
             )
 
         _forbid_extra_tool_input(
@@ -814,6 +819,83 @@ def _application_call_result(value: object) -> CallToolResult:
         structuredContent=structured,
         _meta={},
         isError=is_error,
+    )
+
+
+def _gate_call_result(value: object) -> CallToolResult:
+    if not isinstance(value, dict):
+        value = {"state": "blocked", "code": "host_gate_unavailable"}
+    state = value.get("state")
+    if state == "retrieve":
+        handoff = value.get("handoff")
+        decisions = value.get("decisions")
+        if (
+            not isinstance(handoff, dict)
+            or handoff.get("marker") != "ZDECISION_RECALL_HANDOFF"
+            or not isinstance(decisions, list)
+            or handoff.get("decisions") != decisions
+        ):
+            return _gate_call_result(
+                {"state": "blocked", "code": "host_gate_unavailable"}
+            )
+        structured = {
+            "state": "retrieve",
+            "delivery_id": value.get("delivery_id"),
+            "intent_epoch": value.get("intent_epoch"),
+            "decisions": decisions,
+        }
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=canonical_json_bytes(handoff).decode("utf-8"),
+                )
+            ],
+            structuredContent=structured,
+            _meta={},
+            isError=False,
+        )
+    if state == "reuse":
+        structured = {
+            "state": "reuse",
+            "context_epoch": value.get("context_epoch"),
+            "intent_epoch": value.get("intent_epoch"),
+        }
+        return CallToolResult(
+            content=[TextContent(type="text", text="ZDecision Recall reused the active intent.")],
+            structuredContent=structured,
+            _meta={},
+            isError=False,
+        )
+    if state == "clarify_product":
+        names = value.get("candidate_display_names")
+        if isinstance(names, list) and 1 <= len(names) <= 8 and all(
+            isinstance(name, str) and name for name in names
+        ):
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text="Clarify the Recall target: " + ", ".join(names),
+                    )
+                ],
+                structuredContent={
+                    "state": "clarify_product",
+                    "candidate_display_names": names,
+                },
+                _meta={},
+                isError=False,
+            )
+    code = value.get("code")
+    structured = {
+        "state": "unavailable" if state == "unavailable" else "blocked",
+        "code": code if isinstance(code, str) else "host_gate_unavailable",
+    }
+    return CallToolResult(
+        content=[TextContent(type="text", text="ZDecision Recall is unavailable for this Turn.")],
+        structuredContent=structured,
+        _meta={},
+        isError=True,
     )
 
 

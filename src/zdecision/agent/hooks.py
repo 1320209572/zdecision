@@ -364,9 +364,18 @@ def bind_recall_tool_call(
         if tool_name != TURN_GATE_TOOL:
             raise ValueError("recall tool is invalid")
         tool_input = value.get("tool_input")
-        if not isinstance(tool_input, Mapping) or "intent" not in tool_input:
+        if (
+            not isinstance(tool_input, Mapping)
+            or "intent" not in tool_input
+            or not frozenset(tool_input).issubset(
+                frozenset(("turn_gate_id", "intent", "explicit_refresh"))
+            )
+        ):
             raise ValueError("recall intent is missing")
-        intent = tool_input["intent"]
+        intent = RecallIntent.from_dict(tool_input["intent"])
+        explicit_refresh = tool_input.get("explicit_refresh", False)
+        if not isinstance(explicit_refresh, bool):
+            raise ValueError("explicit_refresh is invalid")
         session = recall_store.get_session(session_id)
         if session is None or session.state != "active" or session.cwd != cwd:
             raise RecallGateConflict("session is not active for this CWD")
@@ -387,10 +396,13 @@ def bind_recall_tool_call(
             gate_id=gate_id,
             plugin_root=plugin_root,
         )
-        return _pre_tool_response(
-            "allow",
-            updated_input={"turn_gate_id": gate_id, "intent": intent},
-        )
+        updated_input: dict[str, object] = {
+            "turn_gate_id": gate_id,
+            "intent": intent.to_dict(),
+        }
+        if "explicit_refresh" in tool_input:
+            updated_input["explicit_refresh"] = explicit_refresh
+        return _pre_tool_response("allow", updated_input=updated_input)
     except Exception:
         return _pre_tool_response("deny", reason=_RECALL_BINDING_DENIED_REASON)
 
@@ -514,7 +526,16 @@ def _handle_recall_lifecycle(
             return {}
         if invocation.source == "resume":
             if session.state == "dormant":
-                store.begin_resume(invocation.session_id, invocation.cwd, now)
+                store.begin_resume(
+                    invocation.session_id,
+                    invocation.cwd,
+                    now,
+                    plugin_root=(
+                        _trusted_plugin_root()
+                        if session.protocol_version == "recall-handoff-v1"
+                        else None
+                    ),
+                )
                 return _additional_context("SessionStart", _RESUME_INSTRUCTION)
             return {}
         if invocation.source not in ("compact", "clear"):
@@ -604,16 +625,48 @@ def _handle_recall_lifecycle(
         receipt_id = _opaque_id(
             "restoration", restoration.compaction_key, restoration.context_epoch
         )
+        active_items = store.list_active_items(invocation.session_id)
+        if session.protocol_version == "recall-handoff-v1":
+            application_receipt_id = session.application_receipt_id
+            if (
+                not isinstance(application_receipt_id, str)
+                or not application_receipt_id
+                or any(
+                    item.application_receipt_id != application_receipt_id
+                    for item in active_items
+                )
+                or len(active_items) > 8
+                or sum(
+                    len(canonical_json_bytes(item.envelope.revision.to_dict()))
+                    for item in active_items
+                )
+                > 10_000
+            ):
+                return _additional_context(
+                    "SessionStart", _blocked_envelope("restoration_unavailable")
+                )
+        else:
+            application_receipt_id = None
+        payload: dict[str, object] = {
+            "marker": "ZDECISION_RECALL_RESTORATION",
+            "receipt_id": receipt_id,
+            "context_epoch": restoration.context_epoch,
+            "active_set_digest": restoration.active_set_digest,
+        }
+        if session.protocol_version == "recall-handoff-v1":
+            payload.update(
+                {
+                    "protocol": "recall-handoff-v1",
+                    "intent_epoch": session.intent_epoch,
+                    "application_receipt_id": application_receipt_id,
+                    "decisions": [
+                        item.envelope.to_dict() for item in active_items
+                    ],
+                }
+            )
         return _additional_context(
             "SessionStart",
-            _json_context(
-                {
-                    "marker": "ZDECISION_RECALL_RESTORATION",
-                    "receipt_id": receipt_id,
-                    "context_epoch": restoration.context_epoch,
-                    "active_set_digest": restoration.active_set_digest,
-                }
-            ),
+            _json_context(payload),
         )
     finally:
         if owned_store is not None:

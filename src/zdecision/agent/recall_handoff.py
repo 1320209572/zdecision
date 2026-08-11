@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from zdecision.agent.recall_host_state import (
     RecallActivationAttempt,
@@ -13,10 +16,13 @@ from zdecision.agent.recall_host_state import (
 from zdecision.recall.handoff import (
     RECALL_HANDOFF_PROTOCOL,
     RecallApplicationSubmission,
+    RecallPreflightClarification,
     RecallPreflightReady,
+    RecallPreflightUnavailable,
     build_handoff_context,
 )
 from zdecision.recall.provider import RecallProvider
+from zdecision.recall.session import RecallIntent, TurnGateResult
 
 
 _CLAIM_LEASE = timedelta(seconds=30)
@@ -225,6 +231,124 @@ class RecallHandoffService:
         )
         return bounded_application_output(delivery)
 
+    def gate_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        gate_id: str,
+        intent: RecallIntent,
+        explicit_refresh: bool = False,
+    ) -> dict[str, object]:
+        """Reuse one active intent or freeze one changed Intent Epoch."""
+
+        session = self.store.get_session(session_id)
+        if session is not None and session.state == "activating":
+            try:
+                delivery = self.store.intent_delivery_for_gate(
+                    session_id, turn_id, gate_id
+                )
+            except Exception:
+                delivery = None
+            if delivery is not None and delivery.preflight.intent == intent:
+                return _turn_delivery_output(
+                    delivery, intent_epoch=session.intent_epoch + 1
+                )
+        if (
+            session is None
+            or session.state != "active"
+            or not isinstance(intent, RecallIntent)
+        ):
+            return {"state": "blocked", "code": "intent_change_unavailable"}
+        if not isinstance(explicit_refresh, bool):
+            return {"state": "blocked", "code": "invalid_intent"}
+        if session.active_intent_digest == intent.digest and not explicit_refresh:
+            result = TurnGateResult(
+                disposition="reuse",
+                intent_digest=intent.digest,
+                context_epoch=session.context_epoch,
+                intent_epoch=session.intent_epoch,
+                probe=None,
+            )
+            self.store.commit_turn_gate(
+                session_id=session_id,
+                turn_id=turn_id,
+                gate_id=gate_id,
+                result=result,
+                active_set_digest=session.active_set_digest,
+            )
+            return {
+                "state": "reuse",
+                "context_epoch": session.context_epoch,
+                "intent_epoch": session.intent_epoch,
+            }
+        try:
+            preflight = self.provider.preflight(
+                repository_id=session.repository_id,
+                repository_display_name=Path(session.cwd).name,
+                intent=intent,
+                now=self.clock(),
+            )
+        except Exception:
+            return {"state": "unavailable", "code": "recall_not_ready"}
+        if isinstance(preflight, RecallPreflightClarification):
+            return {
+                "state": "clarify_product",
+                "candidate_display_names": list(
+                    preflight.candidate_display_names
+                ),
+            }
+        if isinstance(preflight, RecallPreflightUnavailable):
+            return {"state": "unavailable", "code": preflight.code}
+        if (
+            not isinstance(preflight, RecallPreflightReady)
+            or preflight.intent != intent
+            or preflight.repository_id != session.repository_id
+            or preflight.target_decision_space_ids
+            != intent.target_decision_space_ids
+        ):
+            return {"state": "unavailable", "code": "invalid_preflight"}
+        attempt_id = _intent_attempt_id(gate_id, preflight.digest)
+        delivery_id = _intent_delivery_id(attempt_id)
+        try:
+            claimed_at = self.clock()
+            claim = self.store.begin_intent_delivery(
+                session_id=session_id,
+                turn_id=turn_id,
+                gate_id=gate_id,
+                attempt_id=attempt_id,
+                delivery_id=delivery_id,
+                claim_token=self.claim_token_factory(),
+                preflight=preflight,
+                now=claimed_at,
+                claim_expires_at=claimed_at + _CLAIM_LEASE,
+                retire_active_set=(
+                    session.active_intent is not None
+                    and session.active_intent.target_decision_space_ids
+                    != preflight.target_decision_space_ids
+                ),
+            )
+            if not claim.owned:
+                return _turn_delivery_output(
+                    claim.delivery, intent_epoch=session.intent_epoch + 1
+                )
+            shortlist = self.provider.retrieve(preflight)
+            context_text = build_handoff_context(
+                delivery_id, preflight, shortlist
+            )
+            delivered = self.store.commit_intent_delivery(
+                delivery_id=delivery_id,
+                claim_token=claim.claim_token,
+                shortlist=shortlist,
+                context_text=context_text,
+                now=self.clock(),
+            )
+        except Exception:
+            return {"state": "blocked", "code": "delivery_prepare_failed"}
+        return _turn_delivery_output(
+            delivered, intent_epoch=session.intent_epoch + 1
+        )
+
 
 def _delivery_output(
     delivery: RecallDelivery,
@@ -302,3 +426,36 @@ def _claim_expired(delivery: RecallDelivery, now: datetime) -> bool:
     if delivery.claim_expires_at is None:
         return False
     return now >= datetime.fromisoformat(delivery.claim_expires_at)
+
+
+def _intent_attempt_id(gate_id: str, preflight_digest: str) -> str:
+    digest = hashlib.sha256(
+        f"zdecision-intent-attempt-v1\0{gate_id}\0{preflight_digest}".encode()
+    ).hexdigest()
+    return f"intent_attempt_{digest[:32]}"
+
+
+def _intent_delivery_id(attempt_id: str) -> str:
+    digest = hashlib.sha256(
+        f"zdecision-intent-delivery-v1\0{attempt_id}".encode()
+    ).hexdigest()
+    return f"delivery_{digest[:32]}"
+
+
+def _turn_delivery_output(
+    delivery: RecallDelivery, *, intent_epoch: int
+) -> dict[str, object]:
+    if (
+        delivery.state != "host_delivered"
+        or delivery.shortlist is None
+        or delivery.context_text is None
+    ):
+        return {"state": "blocked", "code": "delivery_in_progress"}
+    payload = json.loads(delivery.context_text)
+    return {
+        "state": "retrieve",
+        "delivery_id": delivery.delivery_id,
+        "intent_epoch": intent_epoch,
+        "decisions": [item.to_dict() for item in delivery.shortlist.items],
+        "handoff": payload,
+    }
