@@ -181,25 +181,43 @@ class RecallPreflightReady:
 @dataclass(frozen=True)
 class RecallPreflightClarification:
     code: str
-    message: str
+    candidate_display_names: tuple[str, ...]
 
     def __post_init__(self) -> None:
         _text(self.code, "code")
-        _text(self.message, "message", maximum=_MAX_REASON_CHARACTERS)
+        if (
+            not isinstance(self.candidate_display_names, tuple)
+            or not 1 <= len(self.candidate_display_names) <= _MAX_SHORTLIST_ITEMS
+            or any(
+                not isinstance(name, str)
+                or not name.strip()
+                or len(name) > _MAX_REASON_CHARACTERS
+                for name in self.candidate_display_names
+            )
+            or len(set(self.candidate_display_names))
+            != len(self.candidate_display_names)
+        ):
+            raise ValueError("candidate_display_names is invalid")
 
     def to_dict(self) -> dict[str, object]:
-        return {"code": self.code, "message": self.message}
+        return {
+            "code": self.code,
+            "candidate_display_names": list(self.candidate_display_names),
+        }
 
     @classmethod
     def from_dict(cls, value: object) -> "RecallPreflightClarification":
         item = _exact_mapping(
             value,
-            frozenset(("code", "message")),
+            frozenset(("code", "candidate_display_names")),
             "RecallPreflightClarification",
         )
+        candidate_display_names = item["candidate_display_names"]
+        if not isinstance(candidate_display_names, list):
+            raise ValueError("candidate_display_names is invalid")
         return cls(
             code=_text(item["code"], "code"),
-            message=_text(item["message"], "message", maximum=_MAX_REASON_CHARACTERS),
+            candidate_display_names=tuple(candidate_display_names),
         )
 
 

@@ -130,13 +130,23 @@ class RecallHandoffContractTests(unittest.TestCase):
         self.assertEqual(RecallPreflightReady.from_dict(preflight.to_dict()), preflight)
 
     def test_nonready_preflight_values_round_trip_exactly(self) -> None:
-        """This catches malformed non-ready outcomes crossing the provider seam."""
+        """This catches arbitrary ambiguity text crossing the provider seam."""
 
-        clarification = RecallPreflightClarification(
-            code="clarification_required", message="Choose a Decision space."
-        )
+        value = {
+            "code": "clarification_required",
+            "candidate_display_names": ["Storage", "Compute"],
+        }
+        try:
+            clarification = RecallPreflightClarification.from_dict(value)
+        except (TypeError, ValueError) as error:
+            self.fail(f"structured clarification candidates were rejected: {error}")
         unavailable = RecallPreflightUnavailable(code="recall_not_ready")
 
+        self.assertEqual(clarification.to_dict(), value)
+        self.assertEqual(
+            clarification.candidate_display_names,
+            ("Storage", "Compute"),
+        )
         self.assertEqual(
             RecallPreflightClarification.from_dict(clarification.to_dict()),
             clarification,
@@ -144,6 +154,34 @@ class RecallHandoffContractTests(unittest.TestCase):
         self.assertEqual(
             RecallPreflightUnavailable.from_dict(unavailable.to_dict()), unavailable
         )
+
+        for invalid_names in (
+            (),
+            tuple(f"Candidate {index}" for index in range(9)),
+            ("   ",),
+            ("Storage", "Storage"),
+            ("x" * 2_001,),
+        ):
+            with self.subTest(invalid_names=invalid_names):
+                with self.assertRaises(ValueError):
+                    RecallPreflightClarification(
+                        code="clarification_required",
+                        candidate_display_names=invalid_names,
+                    )
+
+        for malformed in (
+            {"code": "clarification_required"},
+            {"candidate_display_names": ["Storage"]},
+            {**value, "unexpected": True},
+            {"code": "clarification_required", "message": "Private details"},
+            {
+                "code": "clarification_required",
+                "candidate_display_names": ("Storage",),
+            },
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ValueError):
+                    RecallPreflightClarification.from_dict(malformed)
 
     def test_shortlist_rejects_more_than_eight_items(self) -> None:
         """This catches an unbounded Decision handoff list."""
