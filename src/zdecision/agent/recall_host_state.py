@@ -481,27 +481,24 @@ class RecallHostStore:
     def _session_frozen_binding(
         self, session_id: str
     ) -> tuple[str, str] | None:
-        attempt = self._connection.execute(
-            """
-            SELECT plugin_root, plugin_bundle_digest
-            FROM recall_activation_attempts
-            WHERE session_id = ? AND plugin_root IS NOT NULL
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (session_id,),
-        ).fetchone()
-        if attempt is not None:
-            return self._require_frozen_binding(attempt)
-        gate = self._connection.execute(
-            """
-            SELECT plugin_root, plugin_bundle_digest
-            FROM recall_turn_gates
-            WHERE session_id = ? AND plugin_root IS NOT NULL
-            ORDER BY rowid DESC LIMIT 1
-            """,
-            (session_id,),
-        ).fetchone()
-        return None if gate is None else self._require_frozen_binding(gate)
+        bindings: set[tuple[str, str]] = set()
+        for table in (
+            "recall_activation_bindings",
+            "recall_activation_attempts",
+            "recall_turn_gates",
+        ):
+            rows = self._connection.execute(
+                f"SELECT plugin_root, plugin_bundle_digest FROM {table} "
+                "WHERE session_id = ? AND plugin_root IS NOT NULL",
+                (session_id,),
+            ).fetchall()
+            for row in rows:
+                binding = self._require_frozen_binding(row)
+                if binding is not None:
+                    bindings.add(binding)
+        if len(bindings) > 1:
+            raise RecallGateConflict("session has conflicting plugin bindings")
+        return next(iter(bindings), None)
 
     def get_session(self, session_id: str) -> RecallSession | None:
         session = _text(session_id, "session_id")

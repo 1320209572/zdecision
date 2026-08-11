@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import shutil
 import tempfile
 import unittest
 import json
@@ -59,6 +60,189 @@ def _result(
 
 
 class RecallHostStoreTests(unittest.TestCase):
+    def test_other_identity_cannot_apply_a_frozen_delivery(self) -> None:
+        """This catches delivery application adopting a different Store identity."""
+
+        root = Path(__file__).resolve().parents[1] / "plugins/zdecision"
+        intent, preflight, shortlist = self.handoff_values()
+        attempt = self.store.create_activation_attempt(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            repository_id=preflight.repository_id,
+            repository_display_name=preflight.repository_display_name,
+            attempt_id=ATTEMPT_ID,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(root),
+            intent=intent,
+            preflight=preflight,
+        )
+        self.store.attach_activation_card(attempt.attempt_id, ui_digest="a" * 64)
+        claim = self.store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "c" * 32,
+            current_ui_digest="a" * 64,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        delivery = self.store.commit_prepared_delivery(
+            delivery_id=DELIVERY_ID,
+            claim_token=claim.claim_token,
+            shortlist=shortlist,
+            context_text=build_handoff_context(DELIVERY_ID, preflight, shortlist),
+            now=NOW,
+        )
+        self.store.ack_delivery(
+            delivery_id=DELIVERY_ID,
+            context_digest=delivery.context_digest,
+            now=NOW,
+        )
+        self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-apply",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-apply",
+            plugin_root=str(root),
+        )
+        self.store.close()
+        other = RecallPluginIdentity(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="disposable-agent",
+            mcp_args=("mcp",),
+            hook_command="disposable-agent hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        self.store = RecallHostStore.open(self.path, identity=other)
+        self.addCleanup(self.store.close)
+        submission = RecallApplicationSubmission.from_dict(
+            {
+                "delivery_id": DELIVERY_ID,
+                "items": [
+                    {
+                        "decision_id": item.revision.decision_id,
+                        "revision": item.revision.revision,
+                        "digest": item.digest,
+                        "disposition": "applicable",
+                        "reason": "Relevant",
+                    }
+                    for item in shortlist.items
+                ],
+            }
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_delivery_application(
+                session_id=SESSION_ID,
+                turn_id="turn-apply",
+                gate_id="gate-apply",
+                delivery_id=DELIVERY_ID,
+                submission=submission,
+                now=NOW,
+            )
+
+    def test_other_identity_cannot_commit_reuse_or_compact_a_frozen_gate(self) -> None:
+        """This catches later gate paths authorizing an activated other identity."""
+
+        production_root = Path(__file__).resolve().parents[1] / "plugins/zdecision"
+        self.store.bind_activation(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            binding_id=ACTIVATION_ID,
+            now=NOW,
+            plugin_root=str(production_root),
+        )
+        self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-bound",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=None,
+            gate_id="gate-bound",
+            plugin_root=str(production_root),
+        )
+        self.store.commit_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-bound",
+            gate_id="gate-bound",
+            result=_result(intent_epoch=1),
+            active_set_digest=ACTIVE_SET_DIGEST,
+        )
+        identity = RecallPluginIdentity(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="disposable-agent",
+            mcp_args=("mcp",),
+            hook_command="disposable-agent hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        self.store.close()
+        self.store = RecallHostStore.open(self.path, identity=identity)
+        self.addCleanup(self.store.close)
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_turn_gate(
+                session_id=SESSION_ID,
+                turn_id="turn-bound",
+                gate_id="gate-bound",
+                result=_result(intent_epoch=1),
+                active_set_digest=ACTIVE_SET_DIGEST,
+            )
+        self.assertFalse(
+            self.store.replayable_reuse_gate(
+                session_id=SESSION_ID,
+                turn_id="turn-bound",
+                gate_id="gate-bound",
+                intent=valid_intent(),
+            )
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_context_epoch(
+                session_id=SESSION_ID,
+                source="compact",
+                latest_observed_turn_id="turn-bound",
+                active_set_digest=ACTIVE_SET_DIGEST,
+                compaction_key="compact-other-identity",
+            )
+
+    def test_activation_binding_blocks_first_gate_under_another_identity(self) -> None:
+        """This catches the first gate adopting an identity after activation."""
+
+        production_root = Path(__file__).resolve().parents[1] / "plugins/zdecision"
+        disposable_root = self._disposable_bundle()
+        identity = RecallPluginIdentity(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="disposable-agent",
+            mcp_args=("mcp",),
+            hook_command="disposable-agent hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        self.store.bind_activation(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            binding_id=ACTIVATION_ID,
+            now=NOW,
+            plugin_root=str(production_root),
+        )
+        self.store.close()
+        self.store = RecallHostStore.open(self.path, identity=identity)
+        self.addCleanup(self.store.close)
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_turn_gate(
+                session_id=SESSION_ID,
+                turn_id="turn-disposable",
+                context_epoch=0,
+                intent_epoch=0,
+                active_generation=None,
+                gate_id="gate-disposable",
+                plugin_root=str(disposable_root),
+            )
+
     def test_reopened_other_identity_cannot_begin_a_frozen_delivery(self) -> None:
         """This catches durable consent being authorized by a different identity."""
 
@@ -105,6 +289,42 @@ class RecallHostStoreTests(unittest.TestCase):
         self.path = Path(self.temporary_directory.name) / "agent" / "state.sqlite3"
         self.store = RecallHostStore.open(self.path)
         self.addCleanup(self.store.close)
+
+    def _disposable_bundle(self) -> Path:
+        root = Path(self.temporary_directory.name) / "disposable"
+        production_root = Path(__file__).resolve().parents[1] / "plugins/zdecision"
+        shutil.copytree(production_root, root)
+        manifest_path = root / ".codex-plugin/plugin.json"
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        manifest["name"] = "disposable"
+        manifest_path.write_text(json.dumps(manifest), "utf-8")
+        mcp_path = root / ".mcp.json"
+        mcp_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "disposable-local": {
+                            "command": "disposable-agent",
+                            "args": ["mcp"],
+                        }
+                    }
+                }
+            ),
+            "utf-8",
+        )
+        shutil.move(root / "skills/zdecision", root / "skills/disposable")
+        hooks_path = root / "hooks/hooks.json"
+        hooks = json.loads(hooks_path.read_text("utf-8"))
+        for entries in hooks["hooks"].values():
+            for handler in entries[0]["hooks"]:
+                handler["command"] = "disposable-agent hook"
+        hooks["hooks"]["PreToolUse"][0]["matcher"] = (
+            hooks["hooks"]["PreToolUse"][0]["matcher"].replace(
+                "zdecision_local", "disposable_local"
+            )
+        )
+        hooks_path.write_text(json.dumps(hooks), "utf-8")
+        return root
 
     def activate(
         self,

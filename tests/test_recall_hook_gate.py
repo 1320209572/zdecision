@@ -126,23 +126,32 @@ class RecallHookGateTests(unittest.TestCase):
         )
         mismatched = RecallHostStore.open(self.database_path, identity=other)
         self.addCleanup(mismatched.close)
-        response = handle_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": "session-a",
-                "turn_id": "turn-a",
-                "cwd": str(self.repository),
-                "tool_name": "Bash",
-                "tool_input": {},
-            },
-            database=self.database,
-            clock=lambda: NOW,
-            repository_resolver=self.resolver,
-            worker_waker=lambda _: None,
-            recall_store=mismatched,
-            recall_identity=PRODUCTION_RECALL_PLUGIN_IDENTITY,
-        )
-        self.assertEqual("deny", self._decision(response))
+        for tool_name in (
+            "Bash",
+            "apply_patch",
+            "Edit",
+            "Write",
+            "Agent",
+            "mcp__other__mutate",
+        ):
+            with self.subTest(tool_name=tool_name):
+                response = handle_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": "session-a",
+                        "turn_id": "turn-a",
+                        "cwd": str(self.repository),
+                        "tool_name": tool_name,
+                        "tool_input": {},
+                    },
+                    database=self.database,
+                    clock=lambda: NOW,
+                    repository_resolver=self.resolver,
+                    worker_waker=lambda _: None,
+                    recall_store=mismatched,
+                    recall_identity=PRODUCTION_RECALL_PLUGIN_IDENTITY,
+                )
+                self.assertEqual("deny", self._decision(response))
     def setUp(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
