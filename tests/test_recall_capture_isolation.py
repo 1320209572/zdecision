@@ -387,6 +387,39 @@ class RecallCaptureIsolationTest(unittest.TestCase):
                 self.assertEqual(corpus, self.corpus_model.consumed_runs[-1])
                 self.assertIsNone(corpus[0].receipt_id)
 
+    def test_01b_formal_recall_state_never_becomes_capture_evidence(self) -> None:
+        """Formal envelopes, receipts, and handoff markers are context, not anchors."""
+
+        inherited = tuple(
+            CorpusItem(channel, "RECALL_PRIVATE_SENTINEL", "explicit_user_direction")
+            for channel in (
+                "formal_decision_envelope",
+                "recall_handoff_instruction",
+                "recall_application_receipt",
+                "recall_application_state",
+            )
+        )
+        output, manifest, _ = self._corpus_inventory(
+            seed="f",
+            inherited=inherited,
+            prompt_text="Summarize the repository.",
+            prompt_role="unrelated_question",
+        )
+        inventory, provenance = validate_inventory_v5(output, manifest)
+        self.assertEqual((), inventory.signals)
+        self.assertEqual((), provenance)
+        observations, candidate_provenance = validate_extraction_output_v5(
+            "cap_" + "f" * 32,
+            SourceCheckpoint("thread-f", "turn-f"),
+            "anheng",
+            {"candidates": []},
+            inventory,
+            provenance,
+            manifest,
+        )
+        self.assertEqual((), observations)
+        self.assertEqual((), candidate_provenance)
+
     def test_02_non_prompt_sources_alone_yield_zero_candidates(self) -> None:
         cases = (
             ("3", "assistant", "assistant proposal"),
