@@ -1458,12 +1458,16 @@ def create(root: Path, repository: Path) -> dict[str, object]:
 def cleanup(root: Path) -> dict[str, object]:
     validated_configuration = _configuration(root)
     validated_stat = root.stat()
+    validated_marker_stat = (root / _MARKER_NAME).stat()
 
-    def require_same_generation() -> None:
+    def require_same_generation(path: Path) -> None:
         try:
-            before = root.stat()
-            current_configuration = _configuration(root)
-            after = root.stat()
+            before = path.stat()
+            marker = path / _MARKER_NAME
+            marker_before = marker.stat()
+            current_configuration = json.loads(marker.read_text("utf-8"))
+            marker_after = marker.stat()
+            after = path.stat()
         except (OSError, ValueError) as error:
             raise RuntimeError("the disposable root generation changed") from error
         generations = {
@@ -1471,7 +1475,16 @@ def cleanup(root: Path) -> dict[str, object]:
             (before.st_dev, before.st_ino),
             (after.st_dev, after.st_ino),
         }
-        if len(generations) != 1 or current_configuration != validated_configuration:
+        marker_generations = {
+            (validated_marker_stat.st_dev, validated_marker_stat.st_ino),
+            (marker_before.st_dev, marker_before.st_ino),
+            (marker_after.st_dev, marker_after.st_ino),
+        }
+        if (
+            len(generations) != 1
+            or len(marker_generations) != 1
+            or current_configuration != validated_configuration
+        ):
             raise RuntimeError("the disposable root generation changed")
 
     lifecycle_lock = _process_lifecycle_lock_path(root)
@@ -1483,7 +1496,7 @@ def cleanup(root: Path) -> dict[str, object]:
                 "every exact disposable MCP instance must exit before cleanup"
             ) from error
         try:
-            require_same_generation()
+            require_same_generation(root)
             legacy_lock = _legacy_process_lock_path(root)
             with legacy_lock.open("a+", encoding="utf-8") as legacy_stream:
                 os.chmod(legacy_lock, 0o600)
@@ -1500,11 +1513,22 @@ def cleanup(root: Path) -> dict[str, object]:
                         raise RuntimeError(
                             "every exact disposable MCP instance must exit before cleanup"
                         )
-                    require_same_generation()
+                    require_same_generation(root)
                     quarantined_root = root.with_name(
                         f".{root.name}.cleanup-{secrets.token_hex(8)}"
                     )
                     root.rename(quarantined_root)
+                    try:
+                        require_same_generation(quarantined_root)
+                    except RuntimeError as error:
+                        if not os.path.lexists(root):
+                            try:
+                                quarantined_root.rename(root)
+                            except OSError:
+                                pass
+                        raise RuntimeError(
+                            "the quarantined disposable root generation changed"
+                        ) from error
                     shutil.rmtree(quarantined_root)
                 finally:
                     fcntl.flock(legacy_stream.fileno(), fcntl.LOCK_UN)

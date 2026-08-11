@@ -966,6 +966,80 @@ harness.cleanup(root)
         self.assertEqual(replacement_selector, replacement["selector"])
         self.assertTrue(old_generation.exists())
 
+    def test_cleanup_revalidates_the_generation_moved_at_rename_boundary(
+        self,
+    ) -> None:
+        old_generation = self.parent / "old-root-at-rename"
+        replacement_result = self.parent / "replacement-result.json"
+        original_marker = (
+            self.root / ".zdecision-gate-a0-disposable.json"
+        ).read_bytes()
+        script = """
+import json
+import os
+import sys
+from pathlib import Path
+from tests.integration import recall_gate_a0_disposable_harness as harness
+
+root = Path(sys.argv[1])
+repository = Path(sys.argv[2])
+old_generation = Path(sys.argv[3])
+replacement_result = Path(sys.argv[4])
+injected = False
+
+def audit(event, arguments):
+    global injected
+    if event != "os.rename" or injected:
+        return
+    source = Path(arguments[0])
+    target = Path(arguments[1])
+    if source != root or not target.name.startswith(f".{root.name}.cleanup-"):
+        return
+    injected = True
+    os.rename(root, old_generation)
+    created = harness.create(root, repository)
+    replacement_result.write_text(
+        json.dumps({"selector": created["selector"]}), "utf-8"
+    )
+
+sys.addaudithook(audit)
+harness.cleanup(root)
+"""
+        completed = subprocess.run(
+            [
+                str(PYTHON),
+                "-c",
+                script,
+                str(self.root),
+                str(self.repository),
+                str(old_generation),
+                str(replacement_result),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertNotEqual(0, completed.returncode, completed.stdout)
+        replacement_selector = json.loads(
+            replacement_result.read_text("utf-8")
+        )["selector"]
+        replacement = json.loads(
+            (self.root / ".zdecision-gate-a0-disposable.json").read_text("utf-8")
+        )
+        self.assertEqual(replacement_selector, replacement["selector"])
+        self.assertTrue(old_generation.exists())
+        self.assertEqual(
+            original_marker,
+            (old_generation / ".zdecision-gate-a0-disposable.json").read_bytes(),
+        )
+        self.assertEqual(
+            [], list(self.parent.glob(f".{self.root.name}.cleanup-*"))
+        )
+
     def test_digit_leading_host_ids_bind_render_application_and_mutation(self) -> None:
         attempt_id = self._render_attempt()
         client = self._mcp()
