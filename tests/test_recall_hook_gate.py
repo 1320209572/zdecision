@@ -821,6 +821,43 @@ class RecallHookGateTests(unittest.TestCase):
         )
         self.assert_private_values_absent(bound)
 
+        extra = self._pre_tool(
+            APPLY_RECALL_DELIVERY_TOOL,
+            turn_id="turn-b",
+            tool_input={"items": items, "untrusted": "model-value"},
+        )
+        self.assertEqual("deny", self._decision(extra))
+        self.assertEqual(
+            "pending",
+            self.recall_store.get_turn_gate("session-a", "turn-b").state,
+        )
+        self.assert_private_values_absent(extra)
+
+    def test_application_binding_accepts_items_only_and_injects_trusted_coordinates(
+        self,
+    ) -> None:
+        """This catches the public items-only schema being denied by the Hook."""
+
+        _, delivery, items = self._deliver_handoff()
+        self._prompt(turn_id="turn-b")
+
+        bound = self._pre_tool(
+            APPLY_RECALL_DELIVERY_TOOL,
+            turn_id="turn-b",
+            tool_input={"items": items},
+        )
+
+        self.assertEqual("allow", self._decision(bound))
+        self.assertEqual(
+            {
+                "turn_gate_id": GATE_ID,
+                "delivery_id": delivery.delivery_id,
+                "items": items,
+            },
+            bound.output["hookSpecificOutput"]["updatedInput"],
+        )
+        self.assert_private_values_absent(bound)
+
     def test_activating_guard_denies_until_exact_application_then_allows(self) -> None:
         """This catches consent or delivery acknowledgement releasing mutation early."""
 

@@ -327,8 +327,10 @@ def bind_recall_tool_call(
             tool_input = value.get("tool_input")
             if (
                 not isinstance(tool_input, Mapping)
-                or frozenset(tool_input)
-                != frozenset(("turn_gate_id", "delivery_id", "items"))
+                or "items" not in tool_input
+                or not frozenset(tool_input).issubset(
+                    frozenset(("turn_gate_id", "delivery_id", "items"))
+                )
             ):
                 raise ValueError("recall application input is invalid")
             session = recall_store.get_session(session_id)
