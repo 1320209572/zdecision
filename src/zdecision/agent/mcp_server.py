@@ -621,11 +621,22 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         "cancelled",
         "failed",
         "blocked",
+        "preparing",
+        "delivery_claimed",
+        "delivery_unknown",
     ):
         state = "blocked"
     structured: dict[str, object] = {"state": state}
-    if state == "blocked" and value.get("code") == "invalid_confirmation":
-        structured["code"] = "invalid_confirmation"
+    code = value.get("code")
+    if code in (
+        "invalid_confirmation",
+        "delivery_prepare_failed",
+        "delivery_in_progress",
+        "acknowledgement_expired",
+        "delivery_unavailable",
+        "delivery_not_found",
+    ):
+        structured["code"] = code
     meta = value.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
@@ -647,15 +658,46 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         and all(isinstance(item, str) and item for item in target_display_names)
     ):
         safe_meta["zdecision/target_display_names"] = list(target_display_names)
+    delivery_id = meta.get("zdecision/delivery_id")
+    if (
+        isinstance(delivery_id, str)
+        and len(delivery_id) == 41
+        and delivery_id.startswith("delivery_")
+        and all(character in "0123456789abcdef" for character in delivery_id[9:])
+    ):
+        safe_meta["zdecision/delivery_id"] = delivery_id
+    for key in (
+        "zdecision/snapshot_digest",
+        "zdecision/context_digest",
+    ):
+        digest = meta.get(key)
+        if (
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+        ):
+            safe_meta[key] = digest
+    context_text = meta.get("zdecision/context_text")
+    if (
+        isinstance(context_text, str)
+        and context_text
+        and len(context_text.encode("utf-8")) <= 65_536
+    ):
+        safe_meta["zdecision/context_text"] = context_text
     invalid_confirmation = (
         state == "blocked" and structured.get("code") == "invalid_confirmation"
     )
-    model_text = (
-        "ZDecision Recall confirmation is unavailable. "
-        "Do not retry or guess an activation attempt ID."
-        if invalid_confirmation
-        else "ZDecision Recall confirmation is ready."
-    )
+    if invalid_confirmation:
+        model_text = (
+            "ZDecision Recall confirmation is unavailable. "
+            "Do not retry or guess an activation attempt ID."
+        )
+    elif state == "blocked":
+        model_text = "ZDecision Recall delivery is unavailable."
+    elif state in ("preparing", "delivery_claimed", "delivery_unknown"):
+        model_text = "ZDecision Recall delivery state is available to the app."
+    else:
+        model_text = "ZDecision Recall confirmation is ready."
     return CallToolResult(
         content=[
             TextContent(
@@ -665,7 +707,7 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         ],
         structuredContent=structured,
         _meta=safe_meta,
-        isError=invalid_confirmation,
+        isError=state == "blocked",
     )
 
 

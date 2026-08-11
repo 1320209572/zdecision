@@ -12,7 +12,9 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
+from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import (
     RecallGateConflict,
     RecallHostStore,
@@ -21,6 +23,7 @@ from zdecision.agent.recall_host_state import (
 from zdecision.app_server.models import ActiveTurnEvidence
 from zdecision.jsonio import atomic_write_json, canonical_json_bytes
 from zdecision.recall.handoff import RECALL_HANDOFF_PROTOCOL, RecallPreflightReady
+from zdecision.recall.provider import UnavailableRecallProvider
 from zdecision.recall.session import HostProbeEnvelope, RecallIntent, TurnGateResult
 
 
@@ -133,6 +136,7 @@ class RecallMcpTools:
         *,
         host_store: RecallHostStore,
         provider: RecallGateProvider,
+        handoff_service: RecallHandoffService | None = None,
         cwd: str,
         live_acceptance: bool = False,
         evidence_gateway_factory: Callable[[], ActiveTurnEvidenceGateway]
@@ -151,6 +155,13 @@ class RecallMcpTools:
             else Path(recall_skill_path).resolve(strict=False)
         )
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.handoff_service = handoff_service or RecallHandoffService(
+            store=host_store,
+            provider=UnavailableRecallProvider(),
+            clock=self.clock,
+            delivery_id_factory=_delivery_id_for_attempt,
+            claim_token_factory=lambda: f"claim_{uuid4().hex}",
+        )
         self._ensure_receipt_schema()
 
     def show_recall_confirmation(
@@ -197,6 +208,18 @@ class RecallMcpTools:
             or attempt.ui_digest != current_ui_digest
         ):
             return _blocked("invalid_confirmation")
+        if attempt.protocol_version == RECALL_HANDOFF_PROTOCOL:
+            if action == "enable":
+                result = self.handoff_service.enable(
+                    attempt_id=attempt.attempt_id,
+                    current_ui_digest=current_ui_digest,
+                )
+            else:
+                result = self.handoff_service.decline(
+                    attempt_id=attempt.attempt_id,
+                    current_ui_digest=current_ui_digest,
+                )
+            return _merge_confirmation_meta(result, attempt)
         try:
             decided = self.host_store.decide_activation_attempt(
                 attempt.attempt_id, action=action, now=self.clock()
@@ -778,6 +801,17 @@ def _confirmation_output(attempt: object) -> dict[str, object]:
     }
 
 
+def _merge_confirmation_meta(
+    result: dict[str, object], attempt: object
+) -> dict[str, object]:
+    confirmation = _confirmation_output(attempt)
+    merged = dict(confirmation["_meta"])
+    result_meta = result.get("_meta")
+    if isinstance(result_meta, dict):
+        merged.update(result_meta)
+    return {**result, "_meta": merged}
+
+
 def _valid_result(
     result: object,
     intent: RecallIntent,
@@ -859,6 +893,18 @@ def _activation_gate_id(binding_id: str) -> str:
         )
     ).hexdigest()
     return f"activation_gate_{digest[:32]}"
+
+
+def _delivery_id_for_attempt(attempt_id: str) -> str:
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "domain": "zdecision-recall-delivery-v1",
+                "attempt_id": attempt_id,
+            }
+        )
+    ).hexdigest()
+    return f"delivery_{digest[:32]}"
 
 
 def _result_from_json(value: bytes) -> TurnGateResult:

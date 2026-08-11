@@ -13,10 +13,17 @@ from mcp.server.fastmcp.exceptions import ToolError
 from zdecision.agent import mcp_server
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.mcp_server import LocalMcpTools
+from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.recall_mcp import ReadinessRecallGateProvider, RecallMcpTools
-from zdecision.recall.handoff import RecallPreflightReady
+from zdecision.recall.handoff import (
+    RecallPreflightReady,
+    RecallShortlist,
+    RecalledDecision,
+)
 from zdecision.recall.session import RecallIntent
+
+from tests.test_recall_handoff_contracts import formal_decision
 
 
 NOW = datetime(2026, 8, 9, 4, 0, tzinfo=UTC)
@@ -39,6 +46,18 @@ VALID_INTENT: dict[str, object] = {
     "constraints": ["Use only trusted local state"],
     "exclusions": ["Decision retrieval"],
 }
+
+DELIVERY_ID = "delivery_" + "4" * 32
+
+
+class _McpRecallProvider:
+    def __init__(self, shortlist: RecallShortlist) -> None:
+        self.shortlist = shortlist
+        self.retrieve_calls = 0
+
+    def retrieve(self, preflight):
+        self.retrieve_calls += 1
+        return self.shortlist
 
 
 def _ready_preflight(intent: RecallIntent) -> RecallPreflightReady:
@@ -279,6 +298,154 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             result.meta["zdecision/repository_display_name"],
         )
         self.assertIsNone(self.store.get_session("private-session"))
+
+    async def test_v1_enable_delegates_to_one_private_frozen_delivery(self) -> None:
+        """This catches MCP committing consent without handoff preparation."""
+
+        await self.server.call_tool(
+            "show_zdecision_recall_confirmation",
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "intent": dict(VALID_INTENT),
+            },
+        )
+        item = RecalledDecision.create(
+            decision_space_id=self.preflight.target_decision_space_ids[0],
+            revision=formal_decision(),
+            match_reason="Exact product match",
+        )
+        provider = _McpRecallProvider(
+            RecallShortlist.create(preflight=self.preflight, items=(item,))
+        )
+        service = RecallHandoffService(
+            store=self.store,
+            provider=provider,
+            clock=lambda: NOW,
+            delivery_id_factory=lambda _: DELIVERY_ID,
+            claim_token_factory=lambda: "claim_" + "5" * 32,
+        )
+        local = LocalMcpTools(database=self.database, cwd=self.cwd)
+        recall = RecallMcpTools(
+            host_store=self.store,
+            provider=ReadinessRecallGateProvider(),
+            handoff_service=service,
+            cwd=self.cwd,
+            clock=lambda: NOW,
+        )
+        server = mcp_server.create_mcp_server(local, recall)
+
+        result = await server.call_tool(
+            "decide_zdecision_recall",
+            {"activation_attempt_id": ATTEMPT_ID, "action": "enable"},
+        )
+
+        self.assertFalse(result.isError)
+        self.assertEqual({"state": "delivery_claimed"}, result.structuredContent)
+        self.assertEqual(1, provider.retrieve_calls)
+        self.assertEqual(
+            {
+                "zdecision/activation_attempt_id",
+                "zdecision/repository_display_name",
+                "zdecision/target_display_names",
+                "zdecision/freshness",
+                "zdecision/delivery_id",
+                "zdecision/context_text",
+                "zdecision/snapshot_digest",
+                "zdecision/context_digest",
+            },
+            set(result.meta),
+        )
+        self.assertEqual(DELIVERY_ID, result.meta["zdecision/delivery_id"])
+        self.assertEqual("activating", self.store.get_session("private-session").state)
+        model_visible = json.dumps(
+            {
+                "content": [content.model_dump() for content in result.content],
+                "structuredContent": result.structuredContent,
+            },
+            sort_keys=True,
+        )
+        for private in (
+            ATTEMPT_ID,
+            DELIVERY_ID,
+            result.meta["zdecision/context_text"],
+            result.meta["zdecision/snapshot_digest"],
+            result.meta["zdecision/context_digest"],
+        ):
+            self.assertNotIn(private, model_visible)
+
+        replay = await server.call_tool(
+            "decide_zdecision_recall",
+            {"activation_attempt_id": ATTEMPT_ID, "action": "enable"},
+        )
+        self.assertFalse(replay.isError)
+        self.assertEqual(
+            {"state": "delivery_claimed", "code": "delivery_in_progress"},
+            replay.structuredContent,
+        )
+        self.assertEqual(1, provider.retrieve_calls)
+        self.assertEqual(DELIVERY_ID, replay.meta["zdecision/delivery_id"])
+        self.assertEqual(
+            result.meta["zdecision/context_digest"],
+            replay.meta["zdecision/context_digest"],
+        )
+        self.assertNotIn("zdecision/context_text", replay.meta)
+
+    async def test_default_provider_fails_closed_after_v1_consent(self) -> None:
+        """This catches production fabricating Recall data before Gates B and C."""
+
+        await self.server.call_tool(
+            "show_zdecision_recall_confirmation",
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "intent": dict(VALID_INTENT),
+            },
+        )
+
+        result = await self.server.call_tool(
+            "decide_zdecision_recall",
+            {"activation_attempt_id": ATTEMPT_ID, "action": "enable"},
+        )
+
+        self.assertTrue(result.isError)
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"},
+            result.structuredContent,
+        )
+        self.assertNotIn("zdecision/context_text", result.meta)
+        self.assertEqual("preparing", self.store.delivery_for_attempt(ATTEMPT_ID).state)
+        self.assertEqual("activating", self.store.get_session("private-session").state)
+
+    async def test_legacy_attempt_enable_keeps_the_old_decision_path(self) -> None:
+        """This catches the v1 handoff breaking the prior host-gate protocol."""
+
+        legacy_attempt_id = "activation_" + "8" * 32
+        self.store.create_activation_attempt(
+            session_id="legacy-session",
+            turn_id="legacy-turn",
+            cwd=self.cwd,
+            repository_id=REPOSITORY_ID,
+            repository_display_name=REPOSITORY_NAME,
+            attempt_id=legacy_attempt_id,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+        )
+        self.store.attach_activation_card(
+            legacy_attempt_id,
+            ui_digest=hashlib.sha256(WIDGET_PATH.read_bytes()).hexdigest(),
+        )
+
+        result = await self.server.call_tool(
+            "decide_zdecision_recall",
+            {"activation_attempt_id": legacy_attempt_id, "action": "enable"},
+        )
+
+        self.assertFalse(result.isError)
+        self.assertEqual({"state": "committed"}, result.structuredContent)
+        session = self.store.get_session("legacy-session")
+        self.assertEqual("active", session.state)
+        self.assertIsNone(session.protocol_version)
+        self.assertIsNone(self.store.delivery_for_attempt(legacy_attempt_id))
 
     async def test_render_rejects_mismatched_intent_and_legacy_attempt(self) -> None:
         mismatched = {**VALID_INTENT, "feature_goal": "A substituted intent"}

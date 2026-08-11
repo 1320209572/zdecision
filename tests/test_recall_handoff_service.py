@@ -1,0 +1,489 @@
+"""Behavior tests for idempotent Recall enable-and-prepare orchestration."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import tempfile
+import unittest
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from itertools import count
+from pathlib import Path
+
+from zdecision.agent.recall_handoff import RecallHandoffService
+from zdecision.agent.recall_host_state import RecallHostStore
+from zdecision.recall.handoff import RecallShortlist, RecalledDecision
+
+from tests.test_recall_handoff_contracts import (
+    formal_decision,
+    ready_preflight,
+    valid_intent,
+)
+
+
+NOW = datetime(2026, 8, 10, 10, 0, tzinfo=UTC)
+ATTEMPT_ID = "activation_" + "1" * 32
+DELIVERY_ID = "delivery_" + "2" * 32
+UI_DIGEST = "a" * 64
+
+
+class _CountingProvider:
+    def __init__(self, shortlist: RecallShortlist) -> None:
+        self.shortlist = shortlist
+        self.retrieve_calls = 0
+
+    def retrieve(self, preflight):
+        self.retrieve_calls += 1
+        return self.shortlist
+
+
+class _WritingProvider(_CountingProvider):
+    def __init__(self, shortlist: RecallShortlist, path: Path) -> None:
+        super().__init__(shortlist)
+        self.path = path
+
+    def retrieve(self, preflight):
+        with sqlite3.connect(self.path, timeout=0.05) as connection:
+            connection.execute(
+                "CREATE TABLE provider_transaction_probe(value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO provider_transaction_probe(value) VALUES ('outside')"
+            )
+        return super().retrieve(preflight)
+
+
+class _FailingProvider:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.retrieve_calls = 0
+
+    def retrieve(self, preflight):
+        self.retrieve_calls += 1
+        raise self.error
+
+
+class _ExpiringProvider(_CountingProvider):
+    def __init__(self, shortlist: RecallShortlist, expire) -> None:
+        super().__init__(shortlist)
+        self.expire = expire
+
+    def retrieve(self, preflight):
+        result = super().retrieve(preflight)
+        self.expire()
+        return result
+
+
+class RecallHandoffServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.path = Path(temporary_directory.name) / "zdecision.sqlite3"
+        self.store = RecallHostStore.open(self.path)
+        self.addCleanup(self.store.close)
+        self.intent = valid_intent()
+        self.preflight = ready_preflight(intent=self.intent)
+        item = RecalledDecision.create(
+            decision_space_id="space-product",
+            revision=formal_decision(),
+            match_reason="Exact product match",
+        )
+        self.shortlist = RecallShortlist.create(
+            preflight=self.preflight,
+            items=(item,),
+        )
+        self.store.create_activation_attempt(
+            session_id="private-session",
+            turn_id="private-turn",
+            cwd="/tmp/recall-handoff-service",
+            repository_id=self.preflight.repository_id,
+            repository_display_name=self.preflight.repository_display_name,
+            attempt_id=ATTEMPT_ID,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+            intent=self.intent,
+            preflight=self.preflight,
+        )
+        self.store.attach_activation_card(ATTEMPT_ID, ui_digest=UI_DIGEST)
+        self.provider = _CountingProvider(self.shortlist)
+        self.current_time = NOW
+        claim_numbers = count(1)
+        self.service = RecallHandoffService(
+            store=self.store,
+            provider=self.provider,
+            clock=lambda: self.current_time,
+            delivery_id_factory=lambda _: DELIVERY_ID,
+            claim_token_factory=lambda: f"claim_{next(claim_numbers):032x}",
+        )
+
+    def test_double_click_reuses_one_frozen_delivery_without_retrieval(self) -> None:
+        """This catches duplicate retrieval or substituted bytes on app replay."""
+
+        first = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        replay = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual("delivery_claimed", first["state"])
+        self.assertEqual(1, self.provider.retrieve_calls)
+        self.assertEqual(DELIVERY_ID, first["_meta"]["zdecision/delivery_id"])
+        self.assertEqual(
+            self.store.get_delivery(DELIVERY_ID).context_digest,
+            first["_meta"]["zdecision/context_digest"],
+        )
+        self.assertEqual("delivery_in_progress", replay["code"])
+        self.assertEqual(
+            first["_meta"]["zdecision/delivery_id"],
+            replay["_meta"]["zdecision/delivery_id"],
+        )
+        self.assertEqual(
+            first["_meta"]["zdecision/context_digest"],
+            replay["_meta"]["zdecision/context_digest"],
+        )
+        self.assertNotIn("zdecision/context_text", replay["_meta"])
+
+    def test_concurrent_preparing_click_is_in_progress_without_retrieval(self) -> None:
+        """This catches a second caller retrieving under another live claim."""
+
+        self.store.begin_delivery(
+            attempt_id=ATTEMPT_ID,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "a" * 32,
+            current_ui_digest=UI_DIGEST,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+
+        result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual(
+            {"state": "preparing", "code": "delivery_in_progress"}, result
+        )
+        self.assertEqual(0, self.provider.retrieve_calls)
+
+    def test_expired_preparing_claim_is_taken_over_with_the_same_delivery_id(self) -> None:
+        """This catches a crash after preparing permanently stranding consent."""
+
+        self.store.begin_delivery(
+            attempt_id=ATTEMPT_ID,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "a" * 32,
+            current_ui_digest=UI_DIGEST,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+        self.current_time = NOW + timedelta(seconds=30)
+
+        result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual("delivery_claimed", result["state"])
+        self.assertEqual(DELIVERY_ID, result["_meta"]["zdecision/delivery_id"])
+        self.assertEqual(1, self.provider.retrieve_calls)
+
+    def test_status_derives_unknown_and_only_enable_reclaims_frozen_bytes(self) -> None:
+        """This catches status mutation or blind resend after an ack-lost crash."""
+
+        first = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        frozen_context = first["_meta"]["zdecision/context_text"]
+        self.current_time = NOW + timedelta(seconds=30)
+
+        observed = self.service.status(attempt_id=ATTEMPT_ID)
+
+        self.assertEqual("delivery_unknown", observed["state"])
+        self.assertEqual("acknowledgement_expired", observed["code"])
+        self.assertEqual(
+            "delivery_claimed", self.store.get_delivery(DELIVERY_ID).state
+        )
+        self.assertNotIn("zdecision/context_text", observed["_meta"])
+
+        retried = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual("delivery_claimed", retried["state"])
+        self.assertEqual(frozen_context, retried["_meta"]["zdecision/context_text"])
+        self.assertEqual(
+            first["_meta"]["zdecision/snapshot_digest"],
+            retried["_meta"]["zdecision/snapshot_digest"],
+        )
+        self.assertEqual(1, self.provider.retrieve_calls)
+
+    def test_provider_runs_after_the_delivery_transaction_commits(self) -> None:
+        """This catches retrieval executing while SQLite holds the consent write."""
+
+        provider = _WritingProvider(self.shortlist, self.path)
+        self.service.provider = provider
+
+        result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual("delivery_claimed", result["state"])
+        self.assertEqual(1, provider.retrieve_calls)
+        row = self.store._connection.execute(  # noqa: SLF001 - transaction oracle
+            "SELECT value FROM provider_transaction_probe"
+        ).fetchone()
+        self.assertEqual("outside", row[0])
+
+    def test_provider_exception_is_bounded_and_leaves_session_activating(self) -> None:
+        """This catches provider details escaping or consent becoming active."""
+
+        provider = _FailingProvider(RuntimeError("private provider detail"))
+        self.service.provider = provider
+
+        result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"}, result
+        )
+        self.assertEqual(1, provider.retrieve_calls)
+        self.assertEqual("preparing", self.store.get_delivery(DELIVERY_ID).state)
+        self.assertEqual("activating", self.store.get_session("private-session").state)
+        self.assertNotIn("private provider detail", repr(result))
+
+    def test_all_decision_byte_limit_failure_is_bounded(self) -> None:
+        """This catches oversized complete Decisions escaping the shared budget."""
+
+        class OversizedProvider:
+            retrieve_calls = 0
+
+            def retrieve(inner_self, preflight):
+                inner_self.retrieve_calls += 1
+                oversized = RecalledDecision.create(
+                    decision_space_id="space-product",
+                    revision=formal_decision(claim="x" * 10_001),
+                    match_reason="Oversized complete Decision",
+                )
+                return RecallShortlist.create(
+                    preflight=preflight,
+                    items=(oversized,),
+                )
+
+        provider = OversizedProvider()
+        self.service.provider = provider
+
+        result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"}, result
+        )
+        self.assertEqual(1, provider.retrieve_calls)
+        self.assertEqual("preparing", self.store.get_delivery(DELIVERY_ID).state)
+
+    def test_invalid_or_expired_attempt_fails_before_provider_work(self) -> None:
+        """This catches a changed card or expired consent starting retrieval."""
+
+        wrong_digest = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest="f" * 64,
+        )
+        self.current_time = NOW + timedelta(minutes=15)
+        expired = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        expected = {"state": "blocked", "code": "invalid_confirmation"}
+        self.assertEqual(expected, wrong_digest)
+        self.assertEqual(expected, expired)
+        self.assertEqual(0, self.provider.retrieve_calls)
+        self.assertIsNone(self.store.delivery_for_attempt(ATTEMPT_ID))
+        self.assertIsNone(self.store.get_session("private-session"))
+
+    def test_mismatched_preflight_or_expired_commit_fails_closed(self) -> None:
+        """This catches a provider substituting generation bytes or winning late."""
+
+        mismatched_preflight = replace(
+            self.preflight,
+            generation=2,
+            generation_digest="d" * 64,
+        )
+        mismatched = RecallShortlist.create(
+            preflight=mismatched_preflight,
+            items=(),
+        )
+        self.service.provider = _CountingProvider(mismatched)
+        mismatch_result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"},
+            mismatch_result,
+        )
+
+        self.current_time = NOW + timedelta(seconds=30)
+        self.service.provider = _ExpiringProvider(
+            self.shortlist,
+            lambda: setattr(
+                self, "current_time", NOW + timedelta(seconds=61)
+            ),
+        )
+        race_result = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"},
+            race_result,
+        )
+        self.assertEqual("preparing", self.store.get_delivery(DELIVERY_ID).state)
+
+    def test_plugin_bundle_is_revalidated_after_provider_work(self) -> None:
+        """This catches changed installed bytes being accepted after retrieval."""
+
+        plugin_root = self.path.parent / "plugin"
+        (plugin_root / ".codex-plugin").mkdir(parents=True)
+        (plugin_root / "skills/zdecision").mkdir(parents=True)
+        (plugin_root / ".codex-plugin/plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "zdecision",
+                    "skills": "./skills/",
+                    "mcpServers": "./.mcp.json",
+                }
+            ),
+            "utf-8",
+        )
+        (plugin_root / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "zdecision-local": {
+                            "command": "zdecision-agent",
+                            "args": ["mcp"],
+                        }
+                    }
+                }
+            ),
+            "utf-8",
+        )
+        skill_path = plugin_root / "skills/zdecision/SKILL.md"
+        skill_path.write_text("trusted bundle", "utf-8")
+        attempt_id = "activation_" + "6" * 32
+        delivery_id = "delivery_" + "7" * 32
+        self.store.create_activation_attempt(
+            session_id="bundle-session",
+            turn_id="bundle-turn",
+            cwd="/tmp/recall-handoff-bundle",
+            repository_id=self.preflight.repository_id,
+            repository_display_name=self.preflight.repository_display_name,
+            attempt_id=attempt_id,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=str(plugin_root),
+            intent=self.intent,
+            preflight=self.preflight,
+        )
+        self.store.attach_activation_card(attempt_id, ui_digest=UI_DIGEST)
+        provider = _ExpiringProvider(
+            self.shortlist,
+            lambda: skill_path.write_text("changed bundle", "utf-8"),
+        )
+        service = RecallHandoffService(
+            store=self.store,
+            provider=provider,
+            clock=lambda: NOW,
+            delivery_id_factory=lambda _: delivery_id,
+            claim_token_factory=lambda: "claim_" + "8" * 32,
+        )
+
+        result = service.enable(
+            attempt_id=attempt_id,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"}, result
+        )
+        self.assertEqual(1, provider.retrieve_calls)
+        self.assertEqual("preparing", self.store.get_delivery(delivery_id).state)
+
+    def test_preflight_expiry_during_retrieval_fails_before_commit(self) -> None:
+        """This catches a late shortlist committing after frozen authority expires."""
+
+        expiring_preflight = replace(
+            self.preflight,
+            expires_at="2026-08-10T10:00:10Z",
+        )
+        shortlist = RecallShortlist.create(preflight=expiring_preflight, items=())
+        attempt_id = "activation_" + "9" * 32
+        delivery_id = "delivery_" + "a" * 32
+        self.store.create_activation_attempt(
+            session_id="expiring-session",
+            turn_id="expiring-turn",
+            cwd="/tmp/recall-handoff-expiring",
+            repository_id=expiring_preflight.repository_id,
+            repository_display_name=expiring_preflight.repository_display_name,
+            attempt_id=attempt_id,
+            now=NOW,
+            expires_at=NOW + timedelta(minutes=15),
+            plugin_root=None,
+            intent=self.intent,
+            preflight=expiring_preflight,
+        )
+        self.store.attach_activation_card(attempt_id, ui_digest=UI_DIGEST)
+        current_time = [NOW]
+        provider = _ExpiringProvider(
+            shortlist,
+            lambda: current_time.__setitem__(0, NOW + timedelta(seconds=10)),
+        )
+        service = RecallHandoffService(
+            store=self.store,
+            provider=provider,
+            clock=lambda: current_time[0],
+            delivery_id_factory=lambda _: delivery_id,
+            claim_token_factory=lambda: "claim_" + "b" * 32,
+        )
+
+        result = service.enable(
+            attempt_id=attempt_id,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual(
+            {"state": "blocked", "code": "delivery_prepare_failed"}, result
+        )
+        self.assertEqual("preparing", self.store.get_delivery(delivery_id).state)
+
+    def test_decline_is_terminal_without_delivery_or_provider_work(self) -> None:
+        """This catches decline accidentally authorizing the v1 handoff."""
+
+        first = self.service.decline(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+        replay = self.service.decline(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        self.assertEqual("declined", first["state"])
+        self.assertEqual(first, replay)
+        self.assertEqual(0, self.provider.retrieve_calls)
+        self.assertIsNone(self.store.delivery_for_attempt(ATTEMPT_ID))
+        self.assertIsNone(self.store.get_session("private-session"))
