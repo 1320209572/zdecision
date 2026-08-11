@@ -47,6 +47,7 @@ _OPAQUE = re.compile(
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CATEGORIES = frozenset(("applicable", "not_applicable", "conflicting", "uncertain"))
 _MARKER_NAME = ".zdecision-gate-a0-disposable.json"
+_CODEX_CONFIG_OVERRIDE = "ZDECISION_GATE_A0_CODEX_CONFIG"
 _PROCESS_INSTANCE_PREVIEW_LIMIT = 8
 
 
@@ -881,9 +882,17 @@ class GateA0Store:
             f"{selector}@{selector}-marketplace:hooks/hooks.json:pre_tool_use:0:0"
         )
         hook_trust_record_present = False
+        configured_path = os.environ.get(_CODEX_CONFIG_OVERRIDE)
         config = self.root / "codex-home/config.toml"
-        if config.is_file():
-            try:
+        if configured_path is not None:
+            selected = Path(configured_path)
+            config = (
+                Path(os.path.normpath(selected))
+                if selected.is_absolute() and selected != Path(selected.anchor)
+                else None
+            )
+        try:
+            if config is not None and config.is_file():
                 with config.open("rb") as stream:
                     hooks = tomllib.load(stream).get("hooks")
                 if isinstance(hooks, Mapping):
@@ -891,8 +900,8 @@ class GateA0Store:
                     hook_trust_record_present = (
                         isinstance(state, Mapping) and hook_trust_source in state
                     )
-            except (OSError, tomllib.TOMLDecodeError):
-                pass
+        except (OSError, ValueError, tomllib.TOMLDecodeError):
+            pass
         return {
             "protocol_version": PROTOCOL_VERSION,
             "attempt_count": scalar("SELECT COUNT(*) FROM attempts"),

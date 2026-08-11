@@ -651,14 +651,16 @@ class GateA0DisposableVerticalTests(unittest.TestCase):
             (self.root / ".zdecision-gate-a0-disposable.json").read_text("utf-8")
         )["selector"]
         source = f"{selector}@{selector}-marketplace:hooks/hooks.json:pre_tool_use:0:0"
-        config = self.root / "codex-home/config.toml"
+        fallback_config = self.root / "codex-home/config.toml"
+        host_config = self.parent / "fake-host-codex/config.toml"
 
         absent = self._run("inspect")
 
         self.assertEqual(source, absent["hook_trust_source"])
         self.assertFalse(absent["hook_trust_record_present"])
-        config.parent.mkdir()
-        config.write_text(f'[hooks.state]\n"{source}" = "trusted"\n', "utf-8")
+        host_config.parent.mkdir()
+        host_config.write_text(f'[hooks.state]\n"{source}" = "trusted"\n', "utf-8")
+        self.env["ZDECISION_GATE_A0_CODEX_CONFIG"] = str(host_config)
 
         present = self._run("inspect")
 
@@ -666,7 +668,44 @@ class GateA0DisposableVerticalTests(unittest.TestCase):
         self.assertTrue(present["hook_trust_record_present"])
         diagnostic = json.dumps(present, sort_keys=True)
         self.assertNotIn("trusted", diagnostic)
-        self.assertNotIn(str(config.parent), diagnostic)
+        self.assertNotIn(str(host_config), diagnostic)
+        self.assertNotIn("ZDECISION_GATE_A0_CODEX_CONFIG", diagnostic)
+
+        self.env.pop("ZDECISION_GATE_A0_CODEX_CONFIG")
+        fallback_config.parent.mkdir()
+        fallback_config.write_text(
+            f'[hooks.state]\n"{source}" = "fallback-trusted"\n', "utf-8"
+        )
+        fallback = self._run("inspect")
+        self.assertTrue(fallback["hook_trust_record_present"])
+        self.assertNotIn("fallback-trusted", json.dumps(fallback, sort_keys=True))
+
+    def test_inspect_fails_closed_for_invalid_host_config_override(self) -> None:
+        selector = json.loads(
+            (self.root / ".zdecision-gate-a0-disposable.json").read_text("utf-8")
+        )["selector"]
+        source = f"{selector}@{selector}-marketplace:hooks/hooks.json:pre_tool_use:0:0"
+        fallback_config = self.root / "codex-home/config.toml"
+        fallback_config.parent.mkdir()
+        fallback_config.write_text(
+            f'[hooks.state]\n"{source}" = "fallback-trusted"\n', "utf-8"
+        )
+        malformed_config = self.parent / "malformed-host-config.toml"
+        malformed_config.write_text("[hooks.state\n", "utf-8")
+
+        for override in (
+            "relative/config.toml",
+            str(self.parent / "missing-host-config.toml"),
+            str(malformed_config),
+        ):
+            with self.subTest(override=override):
+                self.env["ZDECISION_GATE_A0_CODEX_CONFIG"] = override
+                inspect = self._run("inspect")
+                self.assertEqual(source, inspect["hook_trust_source"])
+                self.assertFalse(inspect["hook_trust_record_present"])
+                diagnostic = json.dumps(inspect, sort_keys=True)
+                self.assertNotIn(override, diagnostic)
+                self.assertNotIn("fallback-trusted", diagnostic)
 
     def test_enable_commits_one_stable_delivery_with_literal_canonical_fixtures(self) -> None:
         for fixture_bytes, digest in (
