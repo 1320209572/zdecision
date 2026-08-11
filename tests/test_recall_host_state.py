@@ -747,6 +747,85 @@ class RecallHostStoreTests(unittest.TestCase):
         )
         self.assertIsNone(self.store.get_session(SESSION_ID))
 
+    def test_v1_activating_session_rejects_legacy_activation_and_gate_commit(
+        self,
+    ) -> None:
+        """This catches legacy state APIs bypassing the application receipt."""
+
+        attempt, preflight, shortlist = self.create_handoff_attempt()
+        claim = self.store.begin_delivery(
+            attempt_id=attempt.attempt_id,
+            delivery_id=DELIVERY_ID,
+            claim_token="claim_" + "a" * 32,
+            now=NOW,
+            claim_expires_at=NOW + timedelta(seconds=30),
+        )
+
+        with self.assertRaises(RecallGateConflict):
+            self.store.bind_activation(
+                session_id=SESSION_ID,
+                turn_id="turn-legacy",
+                cwd="/tmp/recall",
+                binding_id="activation-legacy-bypass",
+                now=NOW,
+            )
+        self.assertEqual("activating", self.store.get_session(SESSION_ID).state)
+        self.assertEqual("preparing", self.store.get_delivery(DELIVERY_ID).state)
+        with self.assertRaises(RecallGateConflict):
+            self.store.begin_turn_gate(
+                session_id=SESSION_ID,
+                turn_id="turn-next",
+                context_epoch=0,
+                intent_epoch=0,
+                active_generation=preflight.generation,
+                gate_id="gate-next",
+            )
+
+        context_text = build_handoff_context(DELIVERY_ID, preflight, shortlist)
+        prepared = self.store.commit_prepared_delivery(
+            delivery_id=DELIVERY_ID,
+            claim_token=claim.claim_token,
+            shortlist=shortlist,
+            context_text=context_text,
+            now=NOW,
+        )
+        self.store.ack_delivery(
+            delivery_id=DELIVERY_ID,
+            context_digest=prepared.context_digest,
+            now=NOW,
+        )
+        gate = self.store.begin_turn_gate(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="gate-next",
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_turn_gate(
+                session_id=SESSION_ID,
+                turn_id="turn-next",
+                gate_id=gate.gate_id,
+                result=_result(intent_digest="forged-intent"),
+                active_set_digest="forged-active-set",
+            )
+        self.assertEqual("pending", self.store.get_turn_gate(SESSION_ID, "turn-next").state)
+        self.assertEqual("activating", self.store.get_session(SESSION_ID).state)
+
+        applied = self.store.commit_delivery_application(
+            session_id=SESSION_ID,
+            turn_id="turn-next",
+            gate_id=gate.gate_id,
+            delivery_id=DELIVERY_ID,
+            submission=self.application(shortlist, ("applicable",)),
+            now=NOW,
+        )
+
+        self.assertEqual("application_committed", applied.state)
+        self.assertEqual("committed", self.store.get_turn_gate(SESSION_ID, "turn-next").state)
+        self.assertEqual("active", self.store.get_session(SESSION_ID).state)
+
     def test_confirmation_attempt_commits_active_consent_only_after_enable(self) -> None:
         """This catches a rendered confirmation activating Recall before consent."""
 
@@ -1238,6 +1317,135 @@ class RecallHostStoreTests(unittest.TestCase):
         with self.assertRaises(RecallGateConflict):
             self.commit_gate(session_id="thread-capture", gate_id="gate-thread")
         self.assertIsNone(self.store.get_session("thread-capture"))
+
+    def test_late_internal_binding_blocks_every_v1_delivery_transition(self) -> None:
+        """This catches a late Capture identity receiving or applying Recall bytes."""
+
+        intent, preflight, shortlist = self.handoff_values()
+
+        def freeze(digit: str):
+            session_id = f"internal-session-{digit}"
+            turn_id = f"internal-turn-{digit}"
+            attempt_id = "activation_" + digit * 32
+            delivery_id = "delivery_" + digit * 32
+            attempt = self.store.create_activation_attempt(
+                session_id=session_id,
+                turn_id=turn_id,
+                cwd="/tmp/recall",
+                repository_id=preflight.repository_id,
+                repository_display_name=preflight.repository_display_name,
+                attempt_id=attempt_id,
+                now=NOW,
+                expires_at=NOW + timedelta(minutes=15),
+                plugin_root=None,
+                intent=intent,
+                preflight=preflight,
+            )
+            self.store.attach_activation_card(attempt_id, ui_digest="a" * 64)
+            return session_id, turn_id, attempt_id, delivery_id
+
+        def begin(attempt_id: str, delivery_id: str, digit: str):
+            return self.store.begin_delivery(
+                attempt_id=attempt_id,
+                delivery_id=delivery_id,
+                claim_token="claim_" + digit * 32,
+                now=NOW,
+                claim_expires_at=NOW + timedelta(seconds=30),
+            )
+
+        def prepare(delivery_id: str, claim_token: str):
+            return self.store.commit_prepared_delivery(
+                delivery_id=delivery_id,
+                claim_token=claim_token,
+                shortlist=shortlist,
+                context_text=build_handoff_context(
+                    delivery_id, preflight, shortlist
+                ),
+                now=NOW,
+            )
+
+        def bind_internal(session_id: str, digit: str) -> None:
+            self.store.bind_internal_thread(
+                thread_id=session_id,
+                parent_thread_id="parent-session",
+                purpose="capture",
+                operation_id=f"late-internal-{digit}",
+                now=NOW,
+            )
+
+        session, _, attempt, delivery = freeze("1")
+        bind_internal(session, "1")
+        with self.assertRaises(RecallGateConflict):
+            begin(attempt, delivery, "1")
+        self.assertIsNone(self.store.delivery_for_attempt(attempt))
+
+        session, _, attempt, delivery = freeze("2")
+        claim = begin(attempt, delivery, "2")
+        bind_internal(session, "2")
+        with self.assertRaises(RecallGateConflict):
+            prepare(delivery, claim.claim_token)
+        self.assertEqual("preparing", self.store.get_delivery(delivery).state)
+
+        session, _, attempt, delivery = freeze("3")
+        claim = begin(attempt, delivery, "3")
+        prepared = prepare(delivery, claim.claim_token)
+        bind_internal(session, "3")
+        with self.assertRaises(RecallGateConflict):
+            self.store.ack_delivery(
+                delivery_id=delivery,
+                context_digest=prepared.context_digest,
+                now=NOW,
+            )
+        with self.assertRaises(RecallGateConflict):
+            self.store.mark_delivery_unknown(
+                delivery_id=delivery,
+                now=NOW + timedelta(seconds=30),
+            )
+        with self.assertRaises(RecallGateConflict):
+            self.store.claim_delivery_retry(
+                delivery_id=delivery,
+                claim_token="claim_" + "a" * 32,
+                now=NOW + timedelta(seconds=30),
+                claim_expires_at=NOW + timedelta(seconds=60),
+            )
+        self.assertEqual("delivery_claimed", self.store.get_delivery(delivery).state)
+
+        session, _, attempt, delivery = freeze("4")
+        claim = begin(attempt, delivery, "4")
+        prepared = prepare(delivery, claim.claim_token)
+        self.store.ack_delivery(
+            delivery_id=delivery,
+            context_digest=prepared.context_digest,
+            now=NOW,
+        )
+        gate = self.store.begin_turn_gate(
+            session_id=session,
+            turn_id="application-turn",
+            context_epoch=0,
+            intent_epoch=0,
+            active_generation=preflight.generation,
+            gate_id="application-gate",
+        )
+        bind_internal(session, "4")
+        submission = RecallApplicationSubmission.from_dict(
+            {
+                **self.application(shortlist, ("applicable",)).to_dict(),
+                "delivery_id": delivery,
+            }
+        )
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_delivery_application(
+                session_id=session,
+                turn_id="application-turn",
+                gate_id=gate.gate_id,
+                delivery_id=delivery,
+                submission=submission,
+                now=NOW,
+            )
+        terminal = self.store.get_delivery(delivery)
+        self.assertEqual("host_delivered", terminal.state)
+        self.assertIsNone(terminal.application_receipt_id)
+        self.assertEqual((), self.store.list_active_items(session))
 
     def test_late_internal_binding_denies_committed_receipts_and_restoration(self) -> None:
         """This catches late reconciliation binding retaining prior recall authority."""

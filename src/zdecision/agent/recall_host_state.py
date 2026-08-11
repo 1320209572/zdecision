@@ -630,9 +630,11 @@ class RecallHostStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             attempt_row = self._required_activation_attempt(attempt)
+            if self._is_internal_thread(attempt_row["session_id"]):
+                raise RecallGateConflict("internal threads are recall-disabled")
             existing = self._delivery_for_attempt_row(attempt)
             if existing is not None:
-                _require_v1_delivery(existing)
+                _require_v1_delivery(existing, self._connection)
                 if existing["delivery_id"] != delivery:
                     raise RecallGateConflict("activation attempt delivery is frozen")
                 if existing["state"] != "preparing":
@@ -763,7 +765,7 @@ class RecallHostStore:
             row = self._delivery_row(delivery)
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
-            _require_v1_delivery(row)
+            _require_v1_delivery(row, self._connection)
             current = _delivery(row)
             expected_context = build_handoff_context(
                 delivery, current.preflight, shortlist
@@ -836,7 +838,7 @@ class RecallHostStore:
             row = self._delivery_row(delivery)
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
-            _require_v1_delivery(row)
+            _require_v1_delivery(row, self._connection)
             if row["context_digest"] != digest:
                 raise RecallGateConflict("delivery context digest does not match")
             if row["state"] == "host_delivered":
@@ -876,7 +878,7 @@ class RecallHostStore:
             row = self._delivery_row(delivery)
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
-            _require_v1_delivery(row)
+            _require_v1_delivery(row, self._connection)
             if row["state"] == "delivery_unknown":
                 result = _delivery(row)
                 self._connection.commit()
@@ -924,7 +926,7 @@ class RecallHostStore:
             row = self._delivery_row(delivery)
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
-            _require_v1_delivery(row)
+            _require_v1_delivery(row, self._connection)
             if row["state"] == "delivery_claimed":
                 existing_expiry = row["claim_expires_at"]
                 if (
@@ -992,7 +994,7 @@ class RecallHostStore:
             row = self._delivery_row(delivery)
             if row is None:
                 raise RecallGateConflict("delivery does not exist")
-            _require_v1_delivery(row)
+            _require_v1_delivery(row, self._connection)
             if row["session_id"] != session:
                 raise RecallGateConflict("delivery does not match trusted session")
             gate = self._gate_for_turn(session, turn)
@@ -1322,6 +1324,10 @@ class RecallHostStore:
                     (session, turn, working_directory),
                 )
             elif current["state"] == "activating":
+                if current["protocol_version"] == RECALL_HANDOFF_PROTOCOL:
+                    raise RecallGateConflict(
+                        "v1 session activation requires an application receipt"
+                    )
                 self._connection.execute(
                     """
                     UPDATE recall_sessions
@@ -1498,6 +1504,16 @@ class RecallHostStore:
                 raise RecallGateConflict("turn gate does not match trusted binding")
             if self._is_internal_thread(session):
                 raise RecallGateConflict("internal threads are recall-disabled")
+            current_session = self._session_row(session)
+            if (
+                current_session is not None
+                and current_session["state"] == "activating"
+                and current_session["protocol_version"]
+                == RECALL_HANDOFF_PROTOCOL
+            ):
+                raise RecallGateConflict(
+                    "v1 activating gate requires delivery application"
+                )
             try:
                 active_set = _optional_text(active_set_digest, "active_set_digest")
                 _validate_result(result, gate)
@@ -2017,8 +2033,16 @@ def _delivery(row: sqlite3.Row | None) -> RecallDelivery:
     )
 
 
-def _require_v1_delivery(row: sqlite3.Row) -> None:
+def _require_v1_delivery(
+    row: sqlite3.Row, connection: sqlite3.Connection
+) -> None:
     if (
+        connection.execute(
+            "SELECT 1 FROM recall_internal_threads WHERE thread_id = ?",
+            (row["session_id"],),
+        ).fetchone()
+        is not None
+        or
         row["attempt_state"] != "committed"
         or row["attempt_protocol_version"] != RECALL_HANDOFF_PROTOCOL
         or row["session_protocol_version"] != RECALL_HANDOFF_PROTOCOL
