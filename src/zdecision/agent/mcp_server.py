@@ -569,6 +569,40 @@ def create_mcp_server(
             return _confirmation_call_result(result)
 
         @server.tool(
+            title="Get ZDecision Recall handoff",
+            description="Read the app's authoritative Recall handoff state.",
+            annotations=read_only,
+            meta={"ui": {"visibility": ["app"]}},
+        )
+        def get_zdecision_recall_handoff(
+            activation_attempt_id: str,
+        ) -> CallToolResult:
+            return _confirmation_call_result(
+                recall_tools.get_recall_handoff(
+                    activation_attempt_id=activation_attempt_id,
+                )
+            )
+
+        @server.tool(
+            title="Acknowledge ZDecision Recall delivery",
+            description="Acknowledge one successful host context update.",
+            annotations=recall_action,
+            meta={"ui": {"visibility": ["app"]}},
+        )
+        def ack_zdecision_recall_delivery(
+            activation_attempt_id: str,
+            delivery_id: str,
+            context_digest: str,
+        ) -> CallToolResult:
+            return _confirmation_call_result(
+                recall_tools.ack_recall_delivery(
+                    activation_attempt_id=activation_attempt_id,
+                    delivery_id=delivery_id,
+                    context_digest=context_digest,
+                )
+            )
+
+        @server.tool(
             title="Gate ZDecision Recall Turn",
             description="Gate one native Turn through its trusted host binding.",
             annotations=recall_action,
@@ -586,6 +620,8 @@ def create_mcp_server(
             server, "show_zdecision_recall_confirmation"
         )
         _forbid_extra_tool_input(server, "decide_zdecision_recall")
+        _forbid_extra_tool_input(server, "get_zdecision_recall_handoff")
+        _forbid_extra_tool_input(server, "ack_zdecision_recall_delivery")
         _forbid_extra_tool_input(server, "gate_zdecision_turn")
 
     return server
@@ -624,6 +660,7 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         "preparing",
         "delivery_claimed",
         "delivery_unknown",
+        "host_delivered",
     ):
         state = "blocked"
     structured: dict[str, object] = {"state": state}
@@ -635,6 +672,7 @@ def _confirmation_call_result(value: object) -> CallToolResult:
         "acknowledgement_expired",
         "delivery_unavailable",
         "delivery_not_found",
+        "invalid_delivery",
     ):
         structured["code"] = code
     meta = value.get("_meta")

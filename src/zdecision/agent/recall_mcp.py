@@ -228,6 +228,52 @@ class RecallMcpTools:
             return _blocked("invalid_confirmation")
         return _confirmation_output(decided)
 
+    def get_recall_handoff(
+        self, *, activation_attempt_id: str
+    ) -> dict[str, object]:
+        """Return app-only authoritative state without claiming delivery bytes."""
+
+        attempt = self._confirmation_attempt(activation_attempt_id)
+        if (
+            attempt is None
+            or attempt.protocol_version != RECALL_HANDOFF_PROTOCOL
+            or not isinstance(attempt.preflight, RecallPreflightReady)
+        ):
+            return _blocked("invalid_confirmation")
+        try:
+            delivery = self.host_store.delivery_for_attempt(attempt.attempt_id)
+        except Exception:
+            return _blocked("delivery_unavailable")
+        if delivery is None:
+            return _confirmation_output(attempt)
+        return _merge_confirmation_meta(
+            self.handoff_service.status(attempt_id=attempt.attempt_id),
+            attempt,
+        )
+
+    def ack_recall_delivery(
+        self,
+        *,
+        activation_attempt_id: str,
+        delivery_id: str,
+        context_digest: str,
+    ) -> dict[str, object]:
+        """Acknowledge the exact app-private delivery tuple."""
+
+        attempt = self._confirmation_attempt(activation_attempt_id)
+        if (
+            attempt is None
+            or attempt.protocol_version != RECALL_HANDOFF_PROTOCOL
+            or not isinstance(attempt.preflight, RecallPreflightReady)
+        ):
+            return _blocked("invalid_delivery")
+        result = self.handoff_service.ack(
+            attempt_id=attempt.attempt_id,
+            delivery_id=delivery_id,
+            context_digest=context_digest,
+        )
+        return _merge_confirmation_meta(result, attempt)
+
     def activate_zdecision_recall(
         self, *, activation_binding_id: str, intent: object
     ) -> dict[str, object]:

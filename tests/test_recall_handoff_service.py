@@ -224,6 +224,58 @@ class RecallHandoffServiceTests(unittest.TestCase):
         )
         self.assertEqual(1, self.provider.retrieve_calls)
 
+    def test_ack_requires_the_exact_attempt_delivery_and_context_digest(self) -> None:
+        """This catches cross-attempt or substituted acknowledgements committing."""
+
+        claimed = self.service.enable(
+            attempt_id=ATTEMPT_ID,
+            current_ui_digest=UI_DIGEST,
+        )
+
+        for arguments in (
+            {
+                "attempt_id": "activation_" + "9" * 32,
+                "delivery_id": DELIVERY_ID,
+                "context_digest": claimed["_meta"]["zdecision/context_digest"],
+            },
+            {
+                "attempt_id": ATTEMPT_ID,
+                "delivery_id": "delivery_" + "9" * 32,
+                "context_digest": claimed["_meta"]["zdecision/context_digest"],
+            },
+            {
+                "attempt_id": ATTEMPT_ID,
+                "delivery_id": DELIVERY_ID,
+                "context_digest": "9" * 64,
+            },
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    {"state": "blocked", "code": "invalid_delivery"},
+                    self.service.ack(**arguments),
+                )
+                self.assertEqual(
+                    "delivery_claimed", self.store.get_delivery(DELIVERY_ID).state
+                )
+
+        acknowledged = self.service.ack(
+            attempt_id=ATTEMPT_ID,
+            delivery_id=DELIVERY_ID,
+            context_digest=claimed["_meta"]["zdecision/context_digest"],
+        )
+
+        self.assertEqual("host_delivered", acknowledged["state"])
+        self.assertEqual(DELIVERY_ID, acknowledged["_meta"]["zdecision/delivery_id"])
+        self.assertEqual(
+            claimed["_meta"]["zdecision/context_digest"],
+            acknowledged["_meta"]["zdecision/context_digest"],
+        )
+        self.assertNotIn("zdecision/context_text", acknowledged["_meta"])
+        self.assertEqual("host_delivered", self.store.get_delivery(DELIVERY_ID).state)
+
+        recovered = self.service.status(attempt_id=ATTEMPT_ID)
+        self.assertEqual(acknowledged, recovered)
+
     def test_provider_runs_after_the_delivery_transaction_commits(self) -> None:
         """This catches retrieval executing while SQLite holds the consent write."""
 

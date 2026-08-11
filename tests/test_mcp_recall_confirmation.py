@@ -140,12 +140,22 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             ["app"],
             tools["decide_zdecision_recall"].meta["ui"]["visibility"],
         )
+        self.assertEqual(
+            ["app"],
+            tools["get_zdecision_recall_handoff"].meta["ui"]["visibility"],
+        )
+        self.assertEqual(
+            ["app"],
+            tools["ack_zdecision_recall_delivery"].meta["ui"]["visibility"],
+        )
         self.assertNotIn("activate_zdecision_recall", tools)
 
         render_schema = tools[
             "show_zdecision_recall_confirmation"
         ].inputSchema
         decision_schema = tools["decide_zdecision_recall"].inputSchema
+        status_schema = tools["get_zdecision_recall_handoff"].inputSchema
+        ack_schema = tools["ack_zdecision_recall_delivery"].inputSchema
         self.assertTrue(
             tools["show_zdecision_recall_confirmation"].annotations.readOnlyHint
         )
@@ -171,6 +181,28 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(render_schema.get("additionalProperties", True))
         self.assertFalse(decision_schema.get("additionalProperties", True))
+        self.assertTrue(
+            tools["get_zdecision_recall_handoff"].annotations.readOnlyHint
+        )
+        self.assertFalse(
+            tools["ack_zdecision_recall_delivery"].annotations.readOnlyHint
+        )
+        self.assertEqual(
+            {"activation_attempt_id"}, set(status_schema["properties"])
+        )
+        self.assertEqual(
+            ["activation_attempt_id"], status_schema.get("required", [])
+        )
+        self.assertEqual(
+            {"activation_attempt_id", "delivery_id", "context_digest"},
+            set(ack_schema["properties"]),
+        )
+        self.assertEqual(
+            {"activation_attempt_id", "delivery_id", "context_digest"},
+            set(ack_schema.get("required", [])),
+        )
+        self.assertFalse(status_schema.get("additionalProperties", True))
+        self.assertFalse(ack_schema.get("additionalProperties", True))
 
     async def test_render_without_hook_binding_fails_closed_after_schema_validation(
         self,
@@ -416,6 +448,125 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("preparing", self.store.delivery_for_attempt(ATTEMPT_ID).state)
         self.assertEqual("activating", self.store.get_session("private-session").state)
 
+    async def test_status_and_ack_tools_are_private_exact_and_recoverable(self) -> None:
+        """This catches app recovery mutating state or accepting a wrong tuple."""
+
+        item = RecalledDecision.create(
+            decision_space_id=self.preflight.target_decision_space_ids[0],
+            revision=formal_decision(),
+            match_reason="Exact product match",
+        )
+        provider = _McpRecallProvider(
+            RecallShortlist.create(preflight=self.preflight, items=(item,))
+        )
+        service = RecallHandoffService(
+            store=self.store,
+            provider=provider,
+            clock=lambda: NOW,
+            delivery_id_factory=lambda _: DELIVERY_ID,
+            claim_token_factory=lambda: "claim_" + "5" * 32,
+        )
+        local = LocalMcpTools(database=self.database, cwd=self.cwd)
+        recall = RecallMcpTools(
+            host_store=self.store,
+            provider=ReadinessRecallGateProvider(),
+            handoff_service=service,
+            cwd=self.cwd,
+            clock=lambda: NOW,
+        )
+        server = mcp_server.create_mcp_server(local, recall)
+        await server.call_tool(
+            "show_zdecision_recall_confirmation",
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "intent": dict(VALID_INTENT),
+            },
+        )
+
+        pending = await server.call_tool(
+            "get_zdecision_recall_handoff",
+            {"activation_attempt_id": ATTEMPT_ID},
+        )
+        self.assertEqual({"state": "pending_confirmation"}, pending.structuredContent)
+        self.assertIsNone(self.store.delivery_for_attempt(ATTEMPT_ID))
+
+        claimed = await server.call_tool(
+            "decide_zdecision_recall",
+            {"activation_attempt_id": ATTEMPT_ID, "action": "enable"},
+        )
+        recovered_claim = await server.call_tool(
+            "get_zdecision_recall_handoff",
+            {"activation_attempt_id": ATTEMPT_ID},
+        )
+        self.assertEqual(
+            {"state": "delivery_claimed", "code": "delivery_in_progress"},
+            recovered_claim.structuredContent,
+        )
+        self.assertNotIn("zdecision/context_text", recovered_claim.meta)
+
+        exact_digest = claimed.meta["zdecision/context_digest"]
+        invalid_arguments = (
+            {
+                "activation_attempt_id": "activation_" + "9" * 32,
+                "delivery_id": DELIVERY_ID,
+                "context_digest": exact_digest,
+            },
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "delivery_id": "delivery_" + "9" * 32,
+                "context_digest": exact_digest,
+            },
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "delivery_id": DELIVERY_ID,
+                "context_digest": "9" * 64,
+            },
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                rejected = await server.call_tool(
+                    "ack_zdecision_recall_delivery", arguments
+                )
+                self.assertTrue(rejected.isError)
+                self.assertEqual(
+                    {"state": "blocked", "code": "invalid_delivery"},
+                    rejected.structuredContent,
+                )
+                self.assertEqual(
+                    "delivery_claimed", self.store.get_delivery(DELIVERY_ID).state
+                )
+
+        acknowledged = await server.call_tool(
+            "ack_zdecision_recall_delivery",
+            {
+                "activation_attempt_id": ATTEMPT_ID,
+                "delivery_id": DELIVERY_ID,
+                "context_digest": exact_digest,
+            },
+        )
+        self.assertFalse(acknowledged.isError)
+        self.assertEqual({"state": "host_delivered"}, acknowledged.structuredContent)
+        self.assertEqual(ATTEMPT_ID, acknowledged.meta["zdecision/activation_attempt_id"])
+        self.assertEqual(DELIVERY_ID, acknowledged.meta["zdecision/delivery_id"])
+        self.assertEqual(exact_digest, acknowledged.meta["zdecision/context_digest"])
+        self.assertNotIn("zdecision/context_text", acknowledged.meta)
+
+        reopened = await server.call_tool(
+            "get_zdecision_recall_handoff",
+            {"activation_attempt_id": ATTEMPT_ID},
+        )
+        self.assertEqual({"state": "host_delivered"}, reopened.structuredContent)
+        self.assertEqual(acknowledged.meta, reopened.meta)
+        model_visible = json.dumps(
+            {
+                "content": [item.model_dump() for item in reopened.content],
+                "structuredContent": reopened.structuredContent,
+            },
+            sort_keys=True,
+        )
+        for private in (ATTEMPT_ID, DELIVERY_ID, exact_digest):
+            self.assertNotIn(private, model_visible)
+
     async def test_large_valid_frozen_context_reaches_app_meta_unchanged(self) -> None:
         """This catches successful delivery state silently losing context bytes."""
 
@@ -638,12 +789,12 @@ class RecallConfirmationCardTests(unittest.TestCase):
   first.deliverRender();
   first.deliverRender();
   await flush();
-  check(first.toolCalls().length === 0, "render notification called a tool");
+  check(first.toolCalls().length === 0, "pending mount called a tool");
 
   const second = await mount();
   second.deliverRender();
   await flush();
-  check(second.toolCalls().length === 0, "remount called a tool");
+  check(second.toolCalls().length === 0, "pending remount called a tool");
 
   const click = second.elements.enable.dispatch("click");
   const calls = second.toolCalls();
@@ -666,7 +817,7 @@ class RecallConfirmationCardTests(unittest.TestCase):
         )
         self.assertEqual("no-auto-enable-ok", output)
 
-    def test_committed_enable_sends_at_most_one_bounded_ui_message(self) -> None:
+    def test_enable_delivers_one_complete_snapshot_then_acks_without_message(self) -> None:
         output = self._run_card(
             """
   const widget = await mount();
@@ -674,36 +825,247 @@ class RecallConfirmationCardTests(unittest.TestCase):
   await flush();
   const click = widget.elements.enable.dispatch("click");
   const decision = widget.toolCalls()[0];
-  widget.respond(decision, result("committed"));
+  widget.respond(decision, deliveryClaimedResult());
+  await flush();
+  const updates = widget.contextUpdates();
+  check(updates.length === 1, "missing single context update");
+  check(
+    JSON.stringify(updates[0].params) === JSON.stringify({
+      content: [{ type: "text", text: contextText }],
+    }),
+    "context update did not contain the complete snapshot",
+  );
+  check(widget.messages().length === 0, "ui/message must not be used");
+  widget.respond(updates[0], {});
+  await flush();
+  const calls = widget.toolCalls();
+  check(calls.length === 2, "ack did not follow context update");
+  check(
+    calls[1].params?.name === "ack_zdecision_recall_delivery",
+    "ack did not follow context update",
+  );
+  check(
+    JSON.stringify(calls[1].params?.arguments) === JSON.stringify({
+      activation_attempt_id: attemptId,
+      delivery_id: deliveryId,
+      context_digest: contextDigest,
+    }),
+    "ack tuple changed",
+  );
+  widget.respond(calls[1], acknowledgedResult());
   await click;
   await flush();
-  widget.deliverCommittedNotification();
-  widget.deliverCommittedNotification();
-  await flush();
-  const messages = widget.messages();
-  check(messages.length === 1, "committed enable sent more than one ui/message");
-  check(messages[0].params?.role === "user", "ui/message used the wrong role");
-  const continuation = messages[0].params?.content;
-  check(Array.isArray(continuation), "ui/message content was not an array");
-  check(continuation.length === 1, "ui/message content was not bounded");
-  check(continuation[0]?.type === "text", "ui/message was not bounded text");
+  check(widget.contextUpdates().length === 1, "context update repeated");
+  check(widget.messages().length === 0, "ui/message must not be used");
   check(
-    continuation[0].text === "继续当前任务，并执行已启用的 ZDecision Recall。",
-    "ui/message text changed",
+    widget.elements.status.textContent ===
+      "决策已交付。请保留此附件并发送下一条原生消息；应用完成前不会修改代码。",
+    "card omitted the exact next-native-message instruction",
   );
-  check(!continuation[0].text.includes(attemptId), "ui/message exposed the attempt");
-  const messageTimeout = widget.takeTimer(3000);
-  if (messageTimeout) messageTimeout();
-  await flush();
-  check(widget.messages().length === 1, "ui/message timeout retried automatically");
-  check(
-    widget.elements.status.textContent.includes("下一条原生消息"),
-    "card omitted the native-message fallback",
-  );
-  process.stdout.write("bounded-continuation-ok");
+  process.stdout.write("one-update-no-message-ok");
 """,
         )
-        self.assertEqual("bounded-continuation-ok", output)
+        self.assertEqual("one-update-no-message-ok", output)
+
+    def test_missing_or_malformed_host_capabilities_are_unsupported(self) -> None:
+        output = self._run_card(
+            """
+  const cases = [
+    {},
+    { serverTools: true, updateModelContext: { text: {} } },
+    { serverTools: {}, updateModelContext: true },
+    { serverTools: {}, updateModelContext: { text: true } },
+    { serverTools: {}, updateModelContext: {} },
+  ];
+  for (const capabilities of cases) {
+    const widget = await mount(capabilities);
+    widget.deliverRender();
+    await flush();
+    check(widget.elements.enable.disabled, "unsupported host enabled delivery");
+    await widget.elements.enable.dispatch("click");
+    await flush();
+    check(widget.toolCalls().length === 0, "unsupported host called a tool");
+    check(widget.contextUpdates().length === 0, "unsupported host updated context");
+    check(widget.messages().length === 0, "unsupported host sent ui/message");
+  }
+  process.stdout.write("capability-closed-ok");
+""",
+        )
+        self.assertEqual("capability-closed-ok", output)
+
+    def test_remount_is_read_only_and_explicit_retry_reuses_exact_bytes(self) -> None:
+        output = self._run_card(
+            """
+  const remount = await mount();
+  remount.deliverRender("committed");
+  await flush();
+  const recover = remount.toolCalls()[0];
+  check(recover.params?.name === "get_zdecision_recall_handoff", "wrong recovery tool");
+  check(
+    JSON.stringify(recover.params?.arguments) === JSON.stringify({
+      activation_attempt_id: attemptId,
+    }),
+    "recovery arguments changed",
+  );
+  remount.respond(recover, deliveryStateResult("delivery_unknown"));
+  await flush();
+  check(remount.toolCalls().length === 1, "remount mutated state");
+  check(remount.contextUpdates().length === 0, "remount updated context");
+  check(remount.messages().length === 0, "remount sent ui/message");
+  check(remount.elements.enable.textContent === "重新交付", "retry label missing");
+  check(!remount.elements.enable.disabled, "explicit retry remained disabled");
+
+  const click = remount.elements.enable.dispatch("click");
+  const retry = remount.toolCalls()[1];
+  check(retry.params?.name === "decide_zdecision_recall", "retry used wrong tool");
+  remount.respond(retry, deliveryClaimedResult());
+  await flush();
+  const update = remount.contextUpdates()[0];
+  check(update.params?.content?.[0]?.text === contextText, "retry bytes changed");
+  remount.respond(update, {});
+  await flush();
+  const ack = remount.toolCalls()[2];
+  check(ack.params?.arguments?.delivery_id === deliveryId, "retry delivery changed");
+  check(
+    ack.params?.arguments?.context_digest === contextDigest,
+    "retry context digest changed",
+  );
+  remount.respond(ack, acknowledgedResult());
+  await click;
+  await flush();
+  check(remount.contextUpdates().length === 1, "explicit retry updated more than once");
+  check(remount.messages().length === 0, "explicit retry sent ui/message");
+
+  const delivered = await mount();
+  delivered.deliverRender("committed");
+  await flush();
+  const deliveredStatus = delivered.toolCalls()[0];
+  delivered.respond(deliveredStatus, deliveryStateResult("host_delivered"));
+  await flush();
+  check(delivered.toolCalls().length === 1, "delivered remount mutated state");
+  check(delivered.contextUpdates().length === 0, "delivered remount repeated context");
+  check(delivered.elements.enable.disabled, "delivered remount enabled retry");
+  check(delivered.elements["card-state"].textContent === "已交付", "delivery not restored");
+  process.stdout.write("remount-retry-ok");
+""",
+        )
+        self.assertEqual("remount-retry-ok", output)
+
+    def test_update_and_ack_failures_never_ack_or_resend_automatically(self) -> None:
+        output = self._run_card(
+            """
+  const updateFailed = await mount();
+  updateFailed.deliverRender();
+  await flush();
+  const failedClick = updateFailed.elements.enable.dispatch("click");
+  updateFailed.respond(updateFailed.toolCalls()[0], deliveryClaimedResult());
+  await flush();
+  const failedUpdate = updateFailed.contextUpdates()[0];
+  updateFailed.reject(failedUpdate, { code: -32603, message: "rejected" });
+  await failedClick;
+  await flush();
+  updateFailed.runAllTimers();
+  await flush();
+  check(updateFailed.toolCalls().length === 1, "failed update sent ack or retry");
+  check(updateFailed.contextUpdates().length === 1, "failed update retried");
+  check(updateFailed.messages().length === 0, "failed update sent ui/message");
+
+  const updateTimedOut = await mount();
+  updateTimedOut.deliverRender();
+  await flush();
+  const timedOutClick = updateTimedOut.elements.enable.dispatch("click");
+  updateTimedOut.respond(updateTimedOut.toolCalls()[0], deliveryClaimedResult());
+  await flush();
+  updateTimedOut.takeTimer(5000)();
+  await timedOutClick;
+  await flush();
+  check(updateTimedOut.toolCalls().length === 1, "update timeout sent ack or retry");
+  check(updateTimedOut.contextUpdates().length === 1, "update timeout resent context");
+  check(updateTimedOut.messages().length === 0, "update timeout sent ui/message");
+
+  const ackUnknown = await mount();
+  ackUnknown.deliverRender();
+  await flush();
+  const unknownClick = ackUnknown.elements.enable.dispatch("click");
+  ackUnknown.respond(ackUnknown.toolCalls()[0], deliveryClaimedResult());
+  await flush();
+  ackUnknown.respond(ackUnknown.contextUpdates()[0], {});
+  await flush();
+  check(
+    ackUnknown.toolCalls()[1].params?.name === "ack_zdecision_recall_delivery",
+    "ack was not attempted once",
+  );
+  ackUnknown.takeTimer(5000)();
+  await unknownClick;
+  await flush();
+  ackUnknown.runAllTimers();
+  await flush();
+  check(ackUnknown.toolCalls().length === 2, "ack timeout resent a tool call");
+  check(ackUnknown.contextUpdates().length === 1, "ack timeout resent context");
+  check(ackUnknown.messages().length === 0, "ack timeout sent ui/message");
+  check(
+    ackUnknown.elements["card-state"].textContent === "交付状态未知",
+    "ack timeout did not display unknown",
+  );
+
+  const ackRejected = await mount();
+  ackRejected.deliverRender();
+  await flush();
+  const rejectedClick = ackRejected.elements.enable.dispatch("click");
+  ackRejected.respond(ackRejected.toolCalls()[0], deliveryClaimedResult());
+  await flush();
+  ackRejected.respond(ackRejected.contextUpdates()[0], {});
+  await flush();
+  ackRejected.reject(
+    ackRejected.toolCalls()[1],
+    { code: -32603, message: "ack rejected" },
+  );
+  await rejectedClick;
+  await flush();
+  check(ackRejected.toolCalls().length === 2, "ack rejection resent a tool call");
+  check(ackRejected.contextUpdates().length === 1, "ack rejection resent context");
+  check(ackRejected.messages().length === 0, "ack rejection sent ui/message");
+  check(
+    ackRejected.elements["card-state"].textContent === "交付状态未知",
+    "ack rejection did not display unknown",
+  );
+  process.stdout.write("failure-no-resend-ok");
+""",
+        )
+        self.assertEqual("failure-no-resend-ok", output)
+
+    def test_explicit_retry_rejects_substituted_delivery_or_digests(self) -> None:
+        output = self._run_card(
+            """
+  const mutations = [
+    ["zdecision/delivery_id", "delivery_99999999999999999999999999999999"],
+    ["zdecision/snapshot_digest", "9".repeat(64)],
+    ["zdecision/context_digest", "9".repeat(64)],
+  ];
+  for (const [key, replacement] of mutations) {
+    const widget = await mount();
+    widget.deliverRender("committed");
+    await flush();
+    widget.respond(widget.toolCalls()[0], deliveryStateResult("delivery_unknown"));
+    await flush();
+    const click = widget.elements.enable.dispatch("click");
+    const substituted = deliveryClaimedResult();
+    substituted._meta[key] = replacement;
+    widget.respond(widget.toolCalls()[1], substituted);
+    await flush();
+    check(widget.contextUpdates().length === 0, `${key} substitution updated context`);
+    await click;
+    check(widget.toolCalls().length === 2, `${key} substitution sent ack`);
+    check(widget.messages().length === 0, `${key} substitution sent ui/message`);
+    check(
+      widget.elements["card-state"].textContent === "无法确认",
+      `${key} substitution did not fail closed`,
+    );
+  }
+  process.stdout.write("retry-substitution-closed-ok");
+""",
+        )
+        self.assertEqual("retry-substitution-closed-ok", output)
 
     def test_decline_never_enables_or_requests_recall_continuation(self) -> None:
         output = self._run_card(
@@ -728,6 +1090,13 @@ class RecallConfirmationCardTests(unittest.TestCase):
     "decline emitted enable",
   );
   check(widget.messages().length === 0, "decline requested Recall continuation");
+  check(widget.contextUpdates().length === 0, "decline updated model context");
+  check(
+    widget.toolCalls().every(
+      (call) => call.params?.name !== "ack_zdecision_recall_delivery",
+    ),
+    "decline sent a delivery acknowledgement",
+  );
   process.stdout.write("decline-is-terminal-ok");
 """,
         )
@@ -739,7 +1108,7 @@ class RecallConfirmationCardTests(unittest.TestCase):
         output = self._run_card(
             """
   const cases = [
-    { action: "enable", state: "committed", button: "enable" },
+    { action: "enable", state: "delivery_claimed", button: "enable" },
     { action: "decline", state: "declined", button: "decline" },
   ];
   const mutations = [
@@ -758,10 +1127,15 @@ class RecallConfirmationCardTests(unittest.TestCase):
       await flush();
       const click = widget.elements[item.button].dispatch("click");
       const decision = widget.toolCalls()[0];
-      widget.respond(
-        decision,
-        result(item.state, mutation.responseAttempt, mutation.includeAttempt),
-      );
+      const response = item.action === "enable"
+        ? deliveryClaimedResult()
+        : result(item.state);
+      if (mutation.includeAttempt) {
+        response._meta["zdecision/activation_attempt_id"] = mutation.responseAttempt;
+      } else {
+        delete response._meta["zdecision/activation_attempt_id"];
+      }
+      widget.respond(decision, response);
       await click;
       await flush();
       check(
@@ -788,6 +1162,10 @@ const vm = require("node:vm");
 const shippedScript = __SHIPPED_SCRIPT__;
 const attemptId = "activation_11111111111111111111111111111111";
 const repositoryName = "zdecision";
+const deliveryId = "delivery_44444444444444444444444444444444";
+const snapshotDigest = "5".repeat(64);
+const contextDigest = "6".repeat(64);
+const contextText = "ZDecision Recall handoff snapshot\ncomplete bytes";
 
 function check(condition, message) {
   if (!condition) throw new Error(message);
@@ -811,7 +1189,44 @@ function result(state, responseAttempt = attemptId, includeAttempt = true) {
   };
 }
 
-async function mount() {
+function deliveryClaimedResult() {
+  return {
+    content: [{ type: "text", text: "bounded" }],
+    structuredContent: { state: "delivery_claimed" },
+    _meta: {
+      "zdecision/activation_attempt_id": attemptId,
+      "zdecision/repository_display_name": repositoryName,
+      "zdecision/delivery_id": deliveryId,
+      "zdecision/snapshot_digest": snapshotDigest,
+      "zdecision/context_digest": contextDigest,
+      "zdecision/context_text": contextText,
+    },
+  };
+}
+
+function acknowledgedResult() {
+  return {
+    content: [{ type: "text", text: "bounded" }],
+    structuredContent: { state: "host_delivered" },
+    _meta: {
+      "zdecision/activation_attempt_id": attemptId,
+      "zdecision/repository_display_name": repositoryName,
+      "zdecision/delivery_id": deliveryId,
+      "zdecision/snapshot_digest": snapshotDigest,
+      "zdecision/context_digest": contextDigest,
+    },
+  };
+}
+
+function deliveryStateResult(state) {
+  const value = acknowledgedResult();
+  value.structuredContent.state = state;
+  return value;
+}
+
+async function mount(capabilities = {
+  serverTools: {}, updateModelContext: { text: {} },
+}) {
   const outbound = [];
   const timers = new Map();
   let nextTimerId = 1;
@@ -869,12 +1284,22 @@ async function mount() {
     deliver({ jsonrpc: "2.0", id: call.id, result: response });
   }
 
+  function reject(call, error) {
+    deliver({ jsonrpc: "2.0", id: call.id, error });
+  }
+
   function toolCalls() {
     return outbound.filter((message) => message.method === "tools/call");
   }
 
   function messages() {
     return outbound.filter((message) => message.method === "ui/message");
+  }
+
+  function contextUpdates() {
+    return outbound.filter(
+      (message) => message.method === "ui/update-model-context",
+    );
   }
 
   function takeTimer(delay) {
@@ -890,11 +1315,11 @@ async function mount() {
     for (const callback of callbacks) callback();
   }
 
-  function deliverRender() {
+  function deliverRender(state = "pending_confirmation") {
     deliver({
       jsonrpc: "2.0",
       method: "ui/notifications/tool-result",
-      params: result("pending_confirmation"),
+      params: result(state),
     });
   }
 
@@ -921,7 +1346,7 @@ async function mount() {
   deliver({
     jsonrpc: "2.0",
     id: initialize.id,
-    result: { hostCapabilities: { serverTools: {} } },
+    result: { hostCapabilities: capabilities },
   });
   await flush();
   return {
@@ -930,8 +1355,10 @@ async function mount() {
     deliverCommittedNotification,
     deliverDeclinedNotification,
     elements,
+    contextUpdates,
     messages,
     outbound,
+    reject,
     respond,
     runAllTimers,
     takeTimer,

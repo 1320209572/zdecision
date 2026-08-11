@@ -209,9 +209,17 @@
       let nextRequestId = 1;
       let initialized = false;
       let renderAccepted = false;
+      let renderState = null;
+      let recoveryStarted = false;
       let decisionStarted = false;
-      let continuationSent = false;
+      let supportsServerTools = false;
+      let supportsContextUpdate = false;
       let activationAttemptId = null;
+      let retryTuple = null;
+
+      function object(value) {
+        return value !== null && typeof value === "object" && !Array.isArray(value);
+      }
 
       function request(method, params, timeoutMs = null) {
         const id = nextRequestId++;
@@ -254,24 +262,79 @@
         const meta = toolResult?._meta;
         const attempt = meta?.["zdecision/activation_attempt_id"];
         const displayName = meta?.["zdecision/repository_display_name"];
+        const deliveryId = meta?.["zdecision/delivery_id"];
+        const snapshotDigest = meta?.["zdecision/snapshot_digest"];
+        const contextDigest = meta?.["zdecision/context_digest"];
+        const contextText = meta?.["zdecision/context_text"];
         const knownState = [
           "pending_confirmation", "committed", "declined", "cancelled",
-          "failed", "blocked",
+          "failed", "blocked", "preparing", "delivery_claimed",
+          "delivery_unknown", "host_delivered",
         ].includes(state);
         return {
           valid: toolResult?.isError !== true && knownState,
           state: knownState ? state : "blocked",
           attempt: typeof attempt === "string" ? attempt : null,
           displayName: typeof displayName === "string" ? displayName : null,
+          deliveryId: typeof deliveryId === "string" ? deliveryId : null,
+          snapshotDigest:
+            typeof snapshotDigest === "string" ? snapshotDigest : null,
+          contextDigest:
+            typeof contextDigest === "string" ? contextDigest : null,
+          contextText: typeof contextText === "string" ? contextText : null,
         };
+      }
+
+      function validDigest(value) {
+        return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+      }
+
+      function validClaim(value) {
+        const valid = value.valid
+          && value.state === "delivery_claimed"
+          && value.attempt === activationAttemptId
+          && /^delivery_[0-9a-f]{32}$/.test(value.deliveryId || "")
+          && validDigest(value.snapshotDigest)
+          && validDigest(value.contextDigest)
+          && typeof value.contextText === "string"
+          && value.contextText.length > 0;
+        return valid && (
+          retryTuple === null
+          || (
+            value.deliveryId === retryTuple.deliveryId
+            && value.snapshotDigest === retryTuple.snapshotDigest
+            && value.contextDigest === retryTuple.contextDigest
+          )
+        );
+      }
+
+      function validAcknowledgement(value, claim) {
+        return value.valid
+          && value.state === "host_delivered"
+          && value.attempt === activationAttemptId
+          && value.deliveryId === claim.deliveryId
+          && value.snapshotDigest === claim.snapshotDigest
+          && value.contextDigest === claim.contextDigest;
+      }
+
+      function validDeliveryStatus(value) {
+        return value.valid
+          && value.attempt === activationAttemptId
+          && /^delivery_[0-9a-f]{32}$/.test(value.deliveryId || "")
+          && validDigest(value.snapshotDigest)
+          && validDigest(value.contextDigest)
+          && value.contextText === null;
       }
 
       function setTerminal(state) {
         lockActions();
-        if (state === "committed") {
-          cardState.textContent = "已启用";
+        if (state === "host_delivered") {
+          cardState.textContent = "已交付";
           status.textContent =
-            "Recall 已为当前任务启用。若任务未自动继续，请发送下一条原生消息触发 Recall。";
+            "决策已交付。请保留此附件并发送下一条原生消息；应用完成前不会修改代码。";
+        } else if (state === "committed") {
+          cardState.textContent = "已启用";
+          status.textContent = "Recall 已为当前任务启用。";
         } else if (state === "declined") {
           cardState.textContent = "未启用";
           status.textContent = "当前任务不会启用决策召回。";
@@ -291,10 +354,6 @@
         if (value.displayName !== null) {
           repository.textContent = value.displayName;
         }
-        if (value.state !== "pending_confirmation") {
-          setTerminal(value.state);
-          return;
-        }
         if (value.attempt === null) {
           setTerminal("blocked");
           return;
@@ -304,34 +363,148 @@
           return;
         }
         renderAccepted = true;
+        renderState = value.state;
         activationAttemptId = value.attempt;
-        cardState.textContent = "等待确认";
-        status.textContent = "请明确选择后继续。";
-        const enabled = initialized && !decisionStarted;
-        enableButton.disabled = !enabled;
-        declineButton.disabled = !enabled;
+        lockActions();
+        if (value.state === "pending_confirmation") {
+          showPendingConfirmation();
+        } else {
+          recover();
+        }
       }
 
-      async function sendContinuationOnce() {
-        if (continuationSent) return;
-        continuationSent = true;
+      function showPendingConfirmation() {
+        if (
+          !initialized
+          || !renderAccepted
+          || !supportsServerTools
+          || !supportsContextUpdate
+          || decisionStarted
+        ) return;
+        enableButton.textContent = "启用本任务决策召回";
+        cardState.textContent = "等待确认";
+        status.textContent = "请明确选择后继续。";
+        enableButton.disabled = false;
+        declineButton.disabled = false;
+      }
+
+      async function recover() {
+        if (
+          recoveryStarted
+          || !initialized
+          || !renderAccepted
+          || !supportsServerTools
+          || !supportsContextUpdate
+        ) return;
+        recoveryStarted = true;
+        let recovered;
         try {
-          await request("ui/message", {
-            role: "user",
-            content: [{
-              type: "text",
-              text: "继续当前任务，并执行已启用的 ZDecision Recall。",
-            }],
-          }, 3000);
+          recovered = await request("tools/call", {
+            name: "get_zdecision_recall_handoff",
+            arguments: { activation_attempt_id: activationAttemptId },
+          }, 5000);
         } catch {
-          // The visible native-message instruction is the bounded fallback.
+          cardState.textContent = "状态未知";
+          status.textContent = "无法只读恢复交付状态；不会自动重试。";
+          lockActions();
+          return;
         }
+        const value = boundedResult(recovered);
+        if (!value.valid || value.attempt !== activationAttemptId) {
+          setTerminal("blocked");
+          return;
+        }
+        if (value.state === "pending_confirmation") {
+          enableButton.textContent = "启用本任务决策召回";
+          cardState.textContent = "等待确认";
+          status.textContent = "请明确选择后继续。";
+          enableButton.disabled = false;
+          declineButton.disabled = false;
+          return;
+        }
+        if (value.state === "delivery_unknown" && validDeliveryStatus(value)) {
+          retryTuple = {
+            deliveryId: value.deliveryId,
+            snapshotDigest: value.snapshotDigest,
+            contextDigest: value.contextDigest,
+          };
+          enableButton.textContent = "重新交付";
+          cardState.textContent = "交付状态未知";
+          status.textContent = "请明确点击重新交付；不会自动重发。";
+          enableButton.disabled = false;
+          declineButton.disabled = true;
+          return;
+        }
+        if (
+          value.state === "delivery_claimed"
+          && validDeliveryStatus(value)
+        ) {
+          cardState.textContent = "等待交付确认";
+          status.textContent = "当前交付仍在确认中；不会自动重发。";
+          lockActions();
+          return;
+        }
+        if (value.state === "host_delivered" && validDeliveryStatus(value)) {
+          setTerminal("host_delivered");
+          return;
+        }
+        if (value.state === "declined") {
+          setTerminal("declined");
+          return;
+        }
+        if (value.state === "preparing") {
+          cardState.textContent = "正在准备";
+          status.textContent = "Recall 正在准备交付；不会自动重试。";
+          lockActions();
+          return;
+        }
+        setTerminal("blocked");
+      }
+
+      async function deliverClaim(claim) {
+        try {
+          const updated = await request("ui/update-model-context", {
+            content: [{ type: "text", text: claim.contextText }],
+          }, 5000);
+          if (!object(updated) || Object.keys(updated).length !== 0) {
+            throw new Error("invalid_context_update_result");
+          }
+        } catch {
+          cardState.textContent = "交付失败";
+          status.textContent = "上下文交付失败；不会自动重试。";
+          lockActions();
+          return;
+        }
+        let acknowledged;
+        try {
+          acknowledged = await request("tools/call", {
+            name: "ack_zdecision_recall_delivery",
+            arguments: {
+              activation_attempt_id: activationAttemptId,
+              delivery_id: claim.deliveryId,
+              context_digest: claim.contextDigest,
+            },
+          }, 5000);
+        } catch {
+          cardState.textContent = "交付状态未知";
+          status.textContent = "交付确认结果未知；不会自动重发。重新打开可只读恢复。";
+          lockActions();
+          return;
+        }
+        const value = boundedResult(acknowledged);
+        if (!validAcknowledgement(value, claim)) {
+          setTerminal("blocked");
+          return;
+        }
+        setTerminal("host_delivered");
       }
 
       async function decide(action) {
         if (
           decisionStarted
           || !initialized
+          || !supportsServerTools
+          || (action === "enable" && !supportsContextUpdate)
           || !renderAccepted
           || typeof activationAttemptId !== "string"
         ) return;
@@ -350,17 +523,23 @@
             },
           }, 5000);
           const value = boundedResult(result);
-          const expected = action === "enable" ? "committed" : "declined";
-          if (
-            !value.valid
-            || value.state !== expected
-            || value.attempt !== activationAttemptId
-          ) {
+          if (action === "decline") {
+            if (
+              !value.valid
+              || value.state !== "declined"
+              || value.attempt !== activationAttemptId
+            ) {
+              setTerminal("blocked");
+              return;
+            }
+            setTerminal("declined");
+            return;
+          }
+          if (!validClaim(value)) {
             setTerminal("blocked");
             return;
           }
-          setTerminal(value.state);
-          if (value.state === "committed") sendContinuationOnce();
+          await deliverClaim(value);
         } catch {
           cardState.textContent = "结果未知";
           status.textContent =
@@ -398,12 +577,25 @@
         appCapabilities: {},
         protocolVersion: "2026-01-26",
       })
-        .then(() => {
+        .then((value) => {
+          const capabilities = object(value?.hostCapabilities)
+            ? value.hostCapabilities
+            : {};
+          supportsServerTools = object(capabilities.serverTools);
+          supportsContextUpdate = object(capabilities.updateModelContext)
+            && object(capabilities.updateModelContext.text);
           initialized = true;
           notify("ui/notifications/initialized", {});
-          if (renderAccepted && !decisionStarted) {
-            enableButton.disabled = false;
-            declineButton.disabled = false;
+          if (!supportsServerTools || !supportsContextUpdate) {
+            cardState.textContent = "宿主不支持";
+            status.textContent = "当前宿主缺少已验证的决策交付能力。";
+            lockActions();
+            return;
+          }
+          if (renderState === "pending_confirmation") {
+            showPendingConfirmation();
+          } else {
+            recover();
           }
         })
         .catch(() => setTerminal("blocked"));

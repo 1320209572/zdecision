@@ -183,6 +183,28 @@ class RecallHandoffService:
             )
         return _delivery_output(delivery, include_context=False)
 
+    def ack(
+        self,
+        *,
+        attempt_id: str,
+        delivery_id: str,
+        context_digest: str,
+    ) -> dict[str, object]:
+        """Acknowledge only the exact frozen delivery owned by an attempt."""
+
+        try:
+            delivery = self.store.delivery_for_attempt(attempt_id)
+            if delivery is None or delivery.delivery_id != delivery_id:
+                return {"state": "blocked", "code": "invalid_delivery"}
+            acknowledged = self.store.ack_delivery(
+                delivery_id=delivery_id,
+                context_digest=context_digest,
+                now=self.clock(),
+            )
+        except Exception:
+            return {"state": "blocked", "code": "invalid_delivery"}
+        return _delivery_output(acknowledged, include_context=False)
+
 
 def _delivery_output(
     delivery: RecallDelivery,
