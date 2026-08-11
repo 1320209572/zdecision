@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import queue
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -27,9 +28,9 @@ APPLICATION_INSTRUCTION = (
     "Classify every delivered Decision exactly once, then call "
     "apply_zdecision_gate_a0_delivery before development mutation."
 )
-LIVE_SESSION = "live-session-private-sentinel"
-LIVE_RENDER_TURN = "live-render-turn-private-sentinel"
-LIVE_APPLICATION_TURN = "live-application-turn-private-sentinel"
+LIVE_SESSION = "7live-session-private-sentinel"
+LIVE_RENDER_TURN = "8live-render-turn-private-sentinel"
+LIVE_APPLICATION_TURN = "9live-application-turn-private-sentinel"
 MODEL_SESSION = "model-session-must-be-discarded"
 MODEL_TURN = "model-turn-must-be-discarded"
 MODEL_CWD = "/model-authored/cwd/must-be-discarded"
@@ -98,8 +99,10 @@ def _tree_digest(path: Path) -> str:
 
 class McpProcess:
     def __init__(self, root: Path, env: dict[str, str]) -> None:
+        mcp = json.loads((root / "plugin/.mcp.json").read_text("utf-8"))
+        server = next(iter(mcp["mcpServers"].values()))
         self.process = subprocess.Popen(
-            [str(PYTHON), str(HARNESS_PATH), "mcp", "--root", str(root)],
+            [server["command"], *server["args"]],
             cwd=REPOSITORY_ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -208,14 +211,31 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
                 "PYTHONPATH": str(REPOSITORY_ROOT),
             }
         )
+        self.mcp_processes: list[McpProcess] = []
         self._run("create", "--repository", str(self.repository))
 
     def tearDown(self) -> None:
+        for process in reversed(self.mcp_processes):
+            process.close()
         if self.root.exists():
             self._run("cleanup")
 
+    def _mcp(self, root: Path | None = None) -> McpProcess:
+        process = McpProcess(root or self.root, self.env)
+        self.mcp_processes.append(process)
+        return process
+
     def _run(
         self, command: str, *extra: str, stdin: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        return self._run_at(self.root, command, *extra, stdin=stdin)
+
+    def _run_at(
+        self,
+        root: Path,
+        command: str,
+        *extra: str,
+        stdin: dict[str, object] | None = None,
     ) -> dict[str, object]:
         completed = subprocess.run(
             [
@@ -223,7 +243,7 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
                 str(HARNESS_PATH),
                 command,
                 "--root",
-                str(self.root),
+                str(root),
                 *extra,
             ],
             cwd=REPOSITORY_ROOT,
@@ -246,17 +266,32 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
         session_id: str = LIVE_SESSION,
         cwd: Path | None = None,
     ) -> dict[str, object]:
-        return self._run(
-            "hook",
-            stdin={
-                "hook_event_name": "PreToolUse",
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "cwd": str(cwd or self.repository),
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-            },
+        hooks = json.loads(
+            (self.root / "plugin/hooks/hooks.json").read_text("utf-8")
         )
+        command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        completed = subprocess.run(
+            shlex.split(command),
+            cwd=REPOSITORY_ROOT,
+            env=self.env,
+            input=json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "cwd": str(cwd or self.repository),
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                }
+            )
+            + "\n",
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr or completed.stdout)
+        return json.loads(completed.stdout)
 
     @staticmethod
     def _updated_input(output: dict[str, object]) -> dict[str, object]:
@@ -320,8 +355,7 @@ class DisposableRecallGateA0VerticalTests(unittest.TestCase):
                 DecisionRevision.from_dict(json.loads(fixture_bytes)).to_dict(),
             )
         attempt_id = self._render_attempt()
-        client = McpProcess(self.root, self.env)
-        self.addCleanup(client.close)
+        client = self._mcp()
 
         tools = client.request("tools/list", {})["tools"]
         by_name = {tool["name"]: tool for tool in tools}
@@ -540,8 +574,7 @@ function result(state, extra = {}) {
         self,
     ) -> None:
         attempt_id = self._render_attempt()
-        client = McpProcess(self.root, self.env)
-        self.addCleanup(client.close)
+        client = self._mcp()
         enabled = self._enable_and_ack(client, attempt_id)
         delivery_id = enabled["snapshot"]["delivery_id"]
         classifications = [
@@ -646,12 +679,12 @@ function result(state, extra = {}) {
             )
         }
         attempt_id = self._render_attempt()
-        first = McpProcess(self.root, self.env)
+        first = self._mcp()
         enabled = self._enable_and_ack(first, attempt_id)
         receipt = enabled["receipt"]
         first.close()
 
-        restarted = McpProcess(self.root, self.env)
+        restarted = self._mcp()
         status = restarted.call(
             "get_zdecision_gate_a0_status", {"attempt_id": attempt_id}
         )["structuredContent"]
@@ -669,8 +702,20 @@ function result(state, extra = {}) {
         inspect = self._run("inspect")
         self.assertEqual(1, inspect["delivery_count"])
         self.assertEqual(1, inspect["context_update_count"])
-        self.assertEqual(0, inspect["ui_message_count"])
-        self.assertEqual(0, inspect["app_server_start_count"])
+        self.assertEqual(
+            [FIXTURE_ONE_DIGEST[:12], FIXTURE_TWO_DIGEST[:12]],
+            inspect.get("fixture_digest_prefixes"),
+        )
+        self.assertRegex(
+            inspect.get("snapshot_digest_prefix", ""), r"^[0-9a-f]{12}$"
+        )
+        self.assertEqual("exited", inspect["mcp_process"]["state"])
+        self.assertRegex(
+            inspect["mcp_process"]["process_id_prefix"], r"^mcp_[0-9a-f]{8}$"
+        )
+        self.assertNotIn("pid", inspect["mcp_process"])
+        self.assertNotIn("ui_message_count", inspect)
+        self.assertNotIn("app_server_start_count", inspect)
         database = sqlite3.connect(self.root / "state/gate-a0.sqlite3")
         self.addCleanup(database.close)
         tables = {
@@ -762,6 +807,152 @@ function result(state, extra = {}) {
 
         self.assertNotEqual(0, completed.returncode)
         self.assertEqual("bounded", sentinel.read_text("utf-8"))
+
+    def test_digit_leading_host_ids_bind_render_application_and_mutation(self) -> None:
+        attempt_id = self._render_attempt()
+        client = self._mcp()
+        self._enable_and_ack(client, attempt_id)
+        classifications = [
+            {
+                "decision_id": FIXTURE_ONE["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_ONE_DIGEST,
+                "classification": "applicable",
+                "reason": "Digit-leading host binding remains trusted.",
+            },
+            {
+                "decision_id": FIXTURE_TWO["decision_id"],
+                "revision": 1,
+                "digest": FIXTURE_TWO_DIGEST,
+                "classification": "not_applicable",
+                "reason": "The second fixture remains outside this mutation.",
+            },
+        ]
+
+        application = self._hook(
+            "mcp__zdecision_gate_a0__apply_zdecision_gate_a0_delivery",
+            {"classifications": classifications},
+            turn_id=LIVE_APPLICATION_TURN,
+        )
+        applied = client.call(
+            "apply_zdecision_gate_a0_delivery", self._updated_input(application)
+        )
+        mutation = self._hook(
+            "mcp__zdecision_gate_a0__increment_zdecision_gate_a0_counter",
+            {},
+            turn_id=LIVE_APPLICATION_TURN,
+        )
+        incremented = client.call(
+            "increment_zdecision_gate_a0_counter", self._updated_input(mutation)
+        )
+
+        self.assertEqual("application_committed", applied["structuredContent"]["state"])
+        self.assertEqual(1, incremented["structuredContent"]["counter"])
+
+    def test_hook_request_runs_the_generated_command(self) -> None:
+        secondary = self.parent / "secondary-hook-root"
+        self._run_at(
+            secondary,
+            "create",
+            "--repository",
+            str(self.repository),
+        )
+        self.addCleanup(
+            lambda: secondary.exists() and self._run_at(secondary, "cleanup")
+        )
+        hooks_path = self.root / "plugin/hooks/hooks.json"
+        hooks = json.loads(hooks_path.read_text("utf-8"))
+        hook = hooks["hooks"]["PreToolUse"][0]["hooks"][0]
+        command = shlex.split(hook["command"])
+        command[-1] = str(secondary)
+        hook["command"] = shlex.join(command)
+        hooks_path.write_text(json.dumps(hooks), "utf-8")
+
+        output = self._hook(
+            "mcp__zdecision_gate_a0__show_zdecision_gate_a0",
+            {"session_id": MODEL_SESSION, "turn_id": MODEL_TURN, "cwd": MODEL_CWD},
+            session_id="launch-session",
+            turn_id="launch-turn",
+        )
+
+        self.assertEqual("allow", output["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual(0, self._run("inspect")["attempt_count"])
+        self.assertEqual(1, self._run_at(secondary, "inspect")["attempt_count"])
+
+    def test_mcp_process_runs_the_generated_command_and_arguments(self) -> None:
+        secondary = self.parent / "secondary-mcp-root"
+        self._run_at(
+            secondary,
+            "create",
+            "--repository",
+            str(self.repository),
+        )
+        self.addCleanup(
+            lambda: secondary.exists() and self._run_at(secondary, "cleanup")
+        )
+        bound = self._run_at(
+            secondary,
+            "hook",
+            stdin={
+                "hook_event_name": "PreToolUse",
+                "session_id": "launch-session",
+                "turn_id": "launch-turn",
+                "cwd": str(self.repository),
+                "tool_name": "mcp__zdecision_gate_a0__show_zdecision_gate_a0",
+                "tool_input": {},
+            },
+        )
+        attempt_id = self._updated_input(bound)["attempt_id"]
+        mcp_path = self.root / "plugin/.mcp.json"
+        mcp = json.loads(mcp_path.read_text("utf-8"))
+        generated = next(iter(mcp["mcpServers"].values()))
+        generated["args"][-1] = str(secondary)
+        mcp_path.write_text(json.dumps(mcp), "utf-8")
+
+        client = self._mcp()
+        rendered = client.call("show_zdecision_gate_a0", {"attempt_id": attempt_id})
+
+        self.assertEqual(
+            "pending_confirmation", rendered["structuredContent"]["state"]
+        )
+
+    def test_cleanup_requires_the_exact_generated_mcp_process_to_exit(self) -> None:
+        client = self._mcp()
+        running = self._run("inspect")["mcp_process"]
+        self.assertEqual("running", running["state"])
+        self.assertRegex(running["process_id_prefix"], r"^mcp_[0-9a-f]{8}$")
+
+        completed = subprocess.run(
+            [
+                str(PYTHON),
+                str(HARNESS_PATH),
+                "cleanup",
+                "--root",
+                str(self.root),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertNotEqual(0, completed.returncode)
+        self.assertTrue(self.root.exists())
+        identity = json.loads(
+            (self.root / "state/mcp-process.json").read_text("utf-8")
+        )
+        self.assertEqual(client.process.pid, identity["pid"])
+        self.assertRegex(identity["process_id"], r"^mcp_[0-9a-f]{32}$")
+        self.assertEqual("running", identity["state"])
+        client.close()
+        exited = json.loads(
+            (self.root / "state/mcp-process.json").read_text("utf-8")
+        )
+        self.assertEqual("exited", exited["state"])
+        self._run("cleanup")
+        self.assertFalse(self.root.exists())
 
 
 if __name__ == "__main__":

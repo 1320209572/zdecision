@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ RESOURCE_MIME = "text/html;profile=mcp-app"
 RENDER_TOOL = "mcp__zdecision_gate_a0__show_zdecision_gate_a0"
 APPLICATION_TOOL = "mcp__zdecision_gate_a0__apply_zdecision_gate_a0_delivery"
 MUTATION_TOOL = "mcp__zdecision_gate_a0__increment_zdecision_gate_a0_counter"
-_ID = re.compile(r"^[A-Za-z][A-Za-z0-9._:-]{0,255}$")
+_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _OPAQUE = re.compile(
     r"^(?:attempt|delivery|application|mutation|delivery_receipt|"
     r"application_receipt)_[0-9a-f]{32}$"
@@ -148,6 +149,85 @@ def _configuration(root: Path) -> dict[str, object]:
 
 def _database_path(root: Path) -> Path:
     return root / "state/gate-a0.sqlite3"
+
+
+def _process_identity_path(root: Path) -> Path:
+    return root / "state/mcp-process.json"
+
+
+def _process_lock_path(root: Path) -> Path:
+    return root / "state/mcp-process.lock"
+
+
+class DisposableMcpProcessLease:
+    """Root-specific OS lease proving the exact disposable server lifetime."""
+
+    def __init__(self, root: Path) -> None:
+        lock_path = _process_lock_path(root)
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root = root
+        self.stream = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            self.stream.close()
+            raise
+        self.process_id = f"mcp_{secrets.token_hex(16)}"
+        _write_json(
+            _process_identity_path(root),
+            {
+                "protocol_version": PROTOCOL_VERSION,
+                "process_id": self.process_id,
+                "pid": os.getpid(),
+                "state": "running",
+            },
+        )
+
+    def close(self) -> None:
+        if self.stream.closed:
+            return
+        _write_json(
+            _process_identity_path(self.root),
+            {
+                "protocol_version": PROTOCOL_VERSION,
+                "process_id": self.process_id,
+                "pid": os.getpid(),
+                "state": "exited",
+            },
+        )
+        fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+        self.stream.close()
+
+
+def _process_status(root: Path) -> dict[str, object]:
+    identity_path = _process_identity_path(root)
+    identity: dict[str, object] | None = None
+    if identity_path.is_file():
+        value = json.loads(identity_path.read_text("utf-8"))
+        if (
+            isinstance(value, dict)
+            and value.get("protocol_version") == PROTOCOL_VERSION
+            and isinstance(value.get("process_id"), str)
+            and re.fullmatch(r"mcp_[0-9a-f]{32}", value["process_id"]) is not None
+            and isinstance(value.get("pid"), int)
+        ):
+            identity = value
+    lock_path = _process_lock_path(root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock_path.open("a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            running = True
+        else:
+            running = False
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    return {
+        "state": "running" if running else "exited",
+        "process_id_prefix": (
+            identity["process_id"][:12] if identity is not None else None
+        ),
+    }
 
 
 class GateA0Store:
@@ -612,7 +692,10 @@ class GateA0Store:
     def inspect(self) -> dict[str, object]:
         scalar = lambda sql: self.connection.execute(sql).fetchone()[0]
         delivery = self.connection.execute(
-            "SELECT delivery_id, receipt FROM deliveries ORDER BY rowid DESC LIMIT 1"
+            """
+            SELECT delivery_id, receipt, snapshot_json
+            FROM deliveries ORDER BY rowid DESC LIMIT 1
+            """
         ).fetchone()
         application = self.connection.execute(
             "SELECT receipt FROM applications ORDER BY rowid DESC LIMIT 1"
@@ -631,8 +714,14 @@ class GateA0Store:
             "mutation_count": scalar(
                 "SELECT value FROM mutation_counter WHERE singleton = 1"
             ),
-            "ui_message_count": 0,
-            "app_server_start_count": 0,
+            "fixture_digest_prefixes": [digest[:12] for _, digest in FIXTURES],
+            "snapshot_digest_prefix": (
+                hashlib.sha256(delivery["snapshot_json"].encode("utf-8"))
+                .hexdigest()[:12]
+                if delivery is not None
+                else None
+            ),
+            "mcp_process": _process_status(self.root),
             "delivery_id_prefix": (
                 delivery["delivery_id"][:17] if delivery is not None else None
             ),
@@ -1239,6 +1328,10 @@ def create(root: Path, repository: Path) -> dict[str, object]:
 
 def cleanup(root: Path) -> dict[str, object]:
     _configuration(root)
+    if _process_status(root)["state"] == "running":
+        raise RuntimeError(
+            "the exact disposable MCP process must exit before cleanup"
+        )
     shutil.rmtree(root)
     return {"protocol_version": PROTOCOL_VERSION, "removed": True}
 
@@ -1268,11 +1361,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(run_hook(root), ensure_ascii=False, sort_keys=True))
         return 0
     if arguments.command == "mcp":
-        store = GateA0Store(root)
+        lease = DisposableMcpProcessLease(root)
         try:
-            create_server(store).run(transport="stdio")
+            store = GateA0Store(root)
+            try:
+                create_server(store).run(transport="stdio")
+            finally:
+                store.close()
         finally:
-            store.close()
+            lease.close()
         return 0
     if arguments.command == "inspect":
         store = GateA0Store(root)
