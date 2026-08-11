@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import os
 import tempfile
 import unittest
 import json
@@ -10,18 +12,21 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from zdecision.agent import mcp_server
+from mcp.server.fastmcp.exceptions import ToolError
+
+from zdecision.agent import cli, mcp_server
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.mcp_server import LocalMcpTools
 from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
-from zdecision.agent.recall_mcp import ReadinessRecallGateProvider, RecallMcpTools
+from zdecision.agent.recall_mcp import RecallMcpTools
 from zdecision.app_server.gateway import AppServerGateway
 from zdecision.recall.handoff import (
     RecallShortlist,
     RecalledDecision,
     build_handoff_context,
 )
+from zdecision.recall.provider import UnavailableRecallProvider
 
 from tests.test_recall_handoff_contracts import (
     formal_decision,
@@ -51,7 +56,6 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
         self.recall = RecallMcpTools(
             host_store=self.store,
-            provider=ReadinessRecallGateProvider(),
             cwd=self.cwd,
             clock=lambda: NOW,
         )
@@ -191,6 +195,22 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
             {"intent", "turn_gate_id", "explicit_refresh"},
             set(schema["properties"]),
         )
+
+    async def test_turn_gate_rejects_nested_extra_fields_and_boolean_coercion(
+        self,
+    ) -> None:
+        """This catches adapter coercion weakening the strict intent contract."""
+
+        for intent in (
+            {**valid_intent().to_dict(), "unexpected": "model-coordinate"},
+            {**valid_intent().to_dict(), "explicit_multi_space": 0},
+        ):
+            with self.subTest(intent=intent):
+                with self.assertRaises(ToolError):
+                    await self.server.call_tool(
+                        "gate_zdecision_turn",
+                        {"intent": intent},
+                    )
 
     async def test_same_intent_gate_reuses_without_app_server(self) -> None:
         """This catches the new gate falling back to active-Turn evidence."""
@@ -484,6 +504,66 @@ class RecallHandoffMcpTests(unittest.IsolatedAsyncioTestCase):
             result.structuredContent,
         )
         self.assertEqual("host_delivered", self.store.get_delivery(DELIVERY_ID).state)
+
+
+class RecallProductionWiringTests(unittest.TestCase):
+    def test_run_mcp_uses_unavailable_provider_without_recall_app_server(self) -> None:
+        """This catches production Recall reconnecting the obsolete App Server proof."""
+
+        class Server:
+            transport: str | None = None
+
+            def run(self, *, transport: str) -> None:
+                self.transport = transport
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        database_path = root / "state.sqlite3"
+        repository = root / "repository"
+        repository.mkdir()
+        captured: list[object] = []
+        server = Server()
+
+        def create(local_tools, recall_tools):
+            captured.extend((local_tools, recall_tools))
+            return server
+
+        with (
+            patch.object(
+                AppServerGateway,
+                "connect",
+                side_effect=AssertionError("Recall must not connect an App Server"),
+            ) as connect,
+            patch.object(mcp_server, "create_mcp_server", side_effect=create),
+        ):
+            mcp_server.run_mcp(
+                database_path=database_path,
+                config_locator_path=root / "missing-config.json",
+                cwd=str(repository),
+            )
+
+        recall_tools = captured[1]
+        provider = getattr(
+            recall_tools,
+            "provider",
+            recall_tools.handoff_service.provider,
+        )
+        self.assertIsInstance(provider, UnavailableRecallProvider)
+        connect.assert_not_called()
+        self.assertEqual("stdio", server.transport)
+
+    def test_cli_rejects_removed_recall_host_gate_in_every_environment(self) -> None:
+        """This catches the live-acceptance variable reviving the obsolete CLI."""
+
+        for environment in ({}, {"ZDECISION_LIVE_ACCEPTANCE": "1"}):
+            with self.subTest(environment=environment):
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch("sys.stderr", io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    cli.build_parser().parse_args(["recall-host-gate", "clear"])
 
 
 if __name__ == "__main__":

@@ -105,7 +105,6 @@ def _result(*, context_epoch: int = 0, intent_epoch: int = 1) -> TurnGateResult:
         intent_digest="intent-a",
         context_epoch=context_epoch,
         intent_epoch=intent_epoch,
-        probe=None,
     )
 
 
@@ -1147,7 +1146,6 @@ class RecallHookGateTests(unittest.TestCase):
             intent_digest="intent-a",
             context_epoch=0,
             intent_epoch=0,
-            probe=None,
         )
         self.recall_store.commit_turn_gate(
             session_id="session-a",

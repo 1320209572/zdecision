@@ -54,7 +54,6 @@ def _result(
         intent_digest=intent_digest,
         context_epoch=context_epoch,
         intent_epoch=intent_epoch,
-        probe=None,
     )
 
 

@@ -20,7 +20,6 @@ from zdecision.recall.provider import (
 )
 from zdecision.recall.session import (
     GateDisposition,
-    HostProbeEnvelope,
     RecallIntent,
     RecallSessionState,
     TurnGateResult,
@@ -29,7 +28,6 @@ from zdecision.recall.session import (
 __all__ = (
     "ApplicationDisposition",
     "GateDisposition",
-    "HostProbeEnvelope",
     "RECALL_HANDOFF_PROTOCOL",
     "RecallApplicationItem",
     "RecallApplicationSubmission",

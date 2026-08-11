@@ -16,7 +16,7 @@ from zdecision.agent.db import AgentDatabase
 from zdecision.agent.mcp_server import LocalMcpTools
 from zdecision.agent.recall_handoff import RecallHandoffService
 from zdecision.agent.recall_host_state import RecallHostStore
-from zdecision.agent.recall_mcp import ReadinessRecallGateProvider, RecallMcpTools
+from zdecision.agent.recall_mcp import RecallMcpTools
 from zdecision.recall.handoff import (
     RecallPreflightReady,
     RecallShortlist,
@@ -108,7 +108,6 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
         recall = RecallMcpTools(
             host_store=self.store,
-            provider=ReadinessRecallGateProvider(),
             cwd=self.cwd,
             clock=lambda: NOW,
         )
@@ -360,7 +359,6 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
         recall = RecallMcpTools(
             host_store=self.store,
-            provider=ReadinessRecallGateProvider(),
             handoff_service=service,
             cwd=self.cwd,
             clock=lambda: NOW,
@@ -469,7 +467,6 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
         recall = RecallMcpTools(
             host_store=self.store,
-            provider=ReadinessRecallGateProvider(),
             handoff_service=service,
             cwd=self.cwd,
             clock=lambda: NOW,
@@ -619,7 +616,6 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         local = LocalMcpTools(database=self.database, cwd=self.cwd)
         recall = RecallMcpTools(
             host_store=self.store,
-            provider=ReadinessRecallGateProvider(),
             handoff_service=service,
             cwd=self.cwd,
             clock=lambda: NOW,
@@ -654,8 +650,8 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(frozen.context_text, model_visible)
 
-    async def test_legacy_attempt_enable_keeps_the_old_decision_path(self) -> None:
-        """This catches the v1 handoff breaking the prior host-gate protocol."""
+    async def test_legacy_attempt_cannot_authorize_recall(self) -> None:
+        """This catches an old confirmation row authorizing the v1 workflow."""
 
         legacy_attempt_id = "activation_" + "8" * 32
         self.store.create_activation_attempt(
@@ -679,11 +675,16 @@ class RecallConfirmationMcpTests(unittest.IsolatedAsyncioTestCase):
             {"activation_attempt_id": legacy_attempt_id, "action": "enable"},
         )
 
-        self.assertFalse(result.isError)
-        self.assertEqual({"state": "committed"}, result.structuredContent)
-        session = self.store.get_session("legacy-session")
-        self.assertEqual("active", session.state)
-        self.assertIsNone(session.protocol_version)
+        self.assertTrue(result.isError)
+        self.assertEqual(
+            {"state": "blocked", "code": "invalid_confirmation"},
+            result.structuredContent,
+        )
+        self.assertIsNone(self.store.get_session("legacy-session"))
+        self.assertEqual(
+            "pending_confirmation",
+            self.store.get_activation_attempt(legacy_attempt_id).state,
+        )
         self.assertIsNone(self.store.delivery_for_attempt(legacy_attempt_id))
 
     async def test_render_rejects_mismatched_intent_and_legacy_attempt(self) -> None:

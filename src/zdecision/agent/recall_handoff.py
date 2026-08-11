@@ -268,7 +268,6 @@ class RecallHandoffService:
                 intent_digest=intent.digest,
                 context_epoch=session.context_epoch,
                 intent_epoch=session.intent_epoch,
-                probe=None,
             )
             self.store.commit_turn_gate(
                 session_id=session_id,

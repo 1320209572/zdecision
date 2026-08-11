@@ -28,15 +28,12 @@ from zdecision.agent.control_bindings import (
 )
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.repository import RepositoryResolver
-from zdecision.agent.recall_mcp import (
-    LiveHostProbeProvider,
-    ReadinessRecallGateProvider,
-    RecallMcpTools,
-)
+from zdecision.agent.recall_handoff import RecallHandoffService
+from zdecision.agent.recall_mcp import RecallMcpTools, delivery_id_for_attempt
 from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.agent.service import load_agent_config
-from zdecision.app_server.gateway import AppServerGateway
 from zdecision.jsonio import canonical_json_bytes
+from zdecision.recall.provider import UnavailableRecallProvider
 from zdecision.sync.contracts import (
     CaptureRequestCreate,
     CaptureRequestView,
@@ -934,21 +931,18 @@ def run_mcp(
             central_base_url=central_base_url,
             browser_launcher=SystemDefaultBrowserLauncher(),
         )
-        live_acceptance = os.environ.get("ZDECISION_LIVE_ACCEPTANCE") == "1"
-        provider = (
-            LiveHostProbeProvider(database_path, cwd)
-            if live_acceptance
-            else ReadinessRecallGateProvider()
-        )
+        recall_clock = lambda: datetime.now(UTC)
         recall_tools = RecallMcpTools(
             host_store=recall_store,
-            provider=provider,
-            cwd=cwd,
-            live_acceptance=live_acceptance,
-            evidence_gateway_factory=lambda: AppServerGateway.connect(
-                database=database
+            handoff_service=RecallHandoffService(
+                store=recall_store,
+                provider=UnavailableRecallProvider(),
+                clock=recall_clock,
+                delivery_id_factory=delivery_id_for_attempt,
+                claim_token_factory=lambda: f"claim_{uuid4().hex}",
             ),
-            recall_skill_path=None,
+            cwd=cwd,
+            clock=recall_clock,
         )
         create_mcp_server(tools, recall_tools).run(transport="stdio")
     finally:

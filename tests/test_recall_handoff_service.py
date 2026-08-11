@@ -16,6 +16,7 @@ from zdecision.agent.recall_host_state import RecallHostStore
 from zdecision.recall.handoff import (
     RecallApplicationSubmission,
     RecallPreflightClarification,
+    RecallPreflightUnavailable,
     RecallShortlist,
     RecalledDecision,
 )
@@ -868,6 +869,45 @@ class RecallHandoffServiceTests(unittest.TestCase):
         self.assertEqual(retrieve_calls, self.provider.retrieve_calls)
         self.assertEqual(before, self.store.list_active_items("private-session"))
         self.assertEqual("pending", self.store.get_turn_gate("private-session", "ambiguous-turn").state)
+
+    def test_unavailable_changed_intent_preserves_the_current_active_set(self) -> None:
+        """This catches an unavailable provider retiring the last valid active set."""
+
+        self._commit_active_fixture()
+        changed = RecallIntent.from_dict(
+            {**self.intent.to_dict(), "feature_goal": "Work while Recall is unavailable"}
+        )
+        self.provider.preflight_result = RecallPreflightUnavailable(
+            code="recall_not_ready"
+        )
+        gate = self.store.begin_turn_gate(
+            session_id="private-session",
+            turn_id="unavailable-turn",
+            context_epoch=0,
+            intent_epoch=1,
+            active_generation=None,
+            gate_id="gate-unavailable",
+        )
+        before = self.store.list_active_items("private-session")
+        retrieve_calls = self.provider.retrieve_calls
+
+        result = self.service.gate_turn(
+            session_id="private-session",
+            turn_id="unavailable-turn",
+            gate_id=gate.gate_id,
+            intent=changed,
+        )
+
+        self.assertEqual(
+            {"state": "unavailable", "code": "recall_not_ready"},
+            result,
+        )
+        self.assertEqual(retrieve_calls, self.provider.retrieve_calls)
+        self.assertEqual(before, self.store.list_active_items("private-session"))
+        self.assertEqual(
+            "pending",
+            self.store.get_turn_gate("private-session", "unavailable-turn").state,
+        )
 
     def _commit_active_fixture(self) -> None:
         claimed = self.service.enable(

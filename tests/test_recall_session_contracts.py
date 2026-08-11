@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import unittest
+from dataclasses import asdict
 
 from zdecision.jsonio import canonical_json_bytes
-from zdecision.recall.session import HostProbeEnvelope, RecallIntent
+from zdecision.recall.session import RecallIntent, TurnGateResult
 
 
 def _intent_value(**overrides: object) -> dict[str, object]:
@@ -170,24 +170,26 @@ class RecallIntentContractTests(unittest.TestCase):
             RecallIntent.from_dict(_intent_value(constraints=["x" * 512] * 32))
 
 
-class HostProbeEnvelopeContractTests(unittest.TestCase):
-    def test_probe_marker_is_fixture_only_and_frozen(self) -> None:
-        """This catches a host probe being represented as a formal decision."""
+class TurnGateResultContractTests(unittest.TestCase):
+    def test_result_contains_only_local_gate_state(self) -> None:
+        """This catches the removed host-probe payload returning to gate state."""
 
-        probe = HostProbeEnvelope(
-            probe_id="probe-1",
-            marker="host_gate_fixture_not_formal",
-            instruction="Use this fixture only for the host gate.",
+        result = TurnGateResult(
+            disposition="reuse",
+            intent_digest="a" * 64,
+            context_epoch=2,
+            intent_epoch=3,
         )
 
-        with self.assertRaises(ValueError):
-            HostProbeEnvelope(
-                probe_id="probe-1",
-                marker="formal_decision",  # type: ignore[arg-type]
-                instruction="This must not be a formal decision.",
-            )
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            probe.marker = "formal_decision"  # type: ignore[misc]
+        self.assertEqual(
+            {
+                "disposition": "reuse",
+                "intent_digest": "a" * 64,
+                "context_epoch": 2,
+                "intent_epoch": 3,
+            },
+            asdict(result),
+        )
 
 
 if __name__ == "__main__":

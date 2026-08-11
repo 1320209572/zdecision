@@ -327,7 +327,7 @@ class RecallCaptureIsolationTest(unittest.TestCase):
                 session_id=session_id,
                 turn_id=turn_id,
                 gate_id="gate-" + seed,
-                result=TurnGateResult("retrieve", "intent-" + seed, 0, 1, None),
+                result=TurnGateResult("retrieve", "intent-" + seed, 0, 1),
                 active_set_digest=reference_digest,
             )
         stop = self._record_event(
@@ -357,10 +357,10 @@ class RecallCaptureIsolationTest(unittest.TestCase):
         )
         return self.corpus_model.inventory(corpus, manifest), manifest, corpus
 
-    def test_01_recalled_decision_or_host_probe_without_anchor_yields_zero_candidates(self) -> None:
+    def test_01_recalled_decision_or_application_instruction_without_anchor_yields_zero_candidates(self) -> None:
         cases = (
             ("1", "recalled_decision_envelope", "recalled Decision rule"),
-            ("2", "host_probe", "host_gate_fixture_not_formal"),
+            ("2", "application_instruction", "Apply only delivered Decisions."),
         )
         for seed, channel, text in cases:
             with self.subTest(channel=channel):

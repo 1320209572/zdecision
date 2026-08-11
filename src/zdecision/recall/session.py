@@ -155,20 +155,8 @@ class RecallIntent:
 
 
 @dataclass(frozen=True)
-class HostProbeEnvelope:
-    probe_id: str
-    marker: Literal["host_gate_fixture_not_formal"]
-    instruction: str
-
-    def __post_init__(self) -> None:
-        if self.marker != "host_gate_fixture_not_formal":
-            raise ValueError("marker is invalid")
-
-
-@dataclass(frozen=True)
 class TurnGateResult:
     disposition: GateDisposition
     intent_digest: str
     context_epoch: int
     intent_epoch: int
-    probe: HostProbeEnvelope | None

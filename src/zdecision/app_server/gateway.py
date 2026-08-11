@@ -20,30 +20,12 @@ from zdecision.app_server.jsonl import (
     ProcessJsonlTransport,
 )
 from zdecision.app_server.models import (
-    ActiveTurnEvidence,
     AppServerTurnReceipt,
     FeasibilityModelProfile,
-    SelectedSkill,
     SourceBoundary,
     ThreadIdentity,
-    TurnItemEvidence,
 )
 from zdecision.jsonio import canonical_json_bytes
-
-
-_EVIDENCE_ITEM_TYPES = frozenset(
-    (
-        "hookPrompt",
-        "mcpToolCall",
-        "agentMessage",
-        "commandExecution",
-        "fileChange",
-        "contextCompaction",
-    )
-)
-_ZDECISION_RECALL_TOOLS = frozenset(
-    ("activate_zdecision_recall", "gate_zdecision_turn")
-)
 
 
 class AppServerGatewayError(Exception):
@@ -199,69 +181,6 @@ class AppServerGateway:
         )
         thread = _mapping(result.get("thread"), "thread/read thread")
         return _thread_identity(thread, requested_id)
-
-    def read_active_turn_evidence(
-        self, thread_id: str, turn_id: str
-    ) -> ActiveTurnEvidence:
-        requested_thread_id = _nonempty(thread_id, "thread_id")
-        requested_turn_id = _nonempty(turn_id, "turn_id")
-        result = _mapping(
-            self.client.request(
-                "thread/read",
-                {"threadId": requested_thread_id, "includeTurns": True},
-            ),
-            "thread/read result",
-        )
-        thread = _mapping(result.get("thread"), "thread/read thread")
-        identity = _thread_identity(thread, requested_thread_id)
-        turns = thread.get("turns")
-        if not isinstance(turns, list) or len(turns) > 4096:
-            raise InvalidAppServerResponse("thread/read did not include bounded Turns")
-        matches = [
-            value
-            for value in turns
-            if isinstance(value, Mapping) and value.get("id") == requested_turn_id
-        ]
-        if not matches:
-            raise UnknownSourceTurn("The active Turn is not present")
-        if len(matches) != 1:
-            raise InvalidAppServerResponse("thread/read repeated the active Turn")
-        turn = matches[0]
-        if turn.get("status") != "inProgress":
-            raise IncompleteSourceTurn("The requested Turn is not active")
-        if turn.get("itemsView") != "full":
-            raise InvalidAppServerResponse(
-                "active Turn did not include the full item view"
-            )
-        items = turn.get("items")
-        if not isinstance(items, list) or len(items) > 4096:
-            raise InvalidAppServerResponse("active Turn items are invalid")
-        selected: list[SelectedSkill] = []
-        ordered: list[TurnItemEvidence] = []
-        for value in items:
-            if not isinstance(value, Mapping):
-                raise InvalidAppServerResponse("active Turn item is invalid")
-            item_type = value.get("type")
-            if item_type == "userMessage":
-                selected.extend(_selected_skills(value))
-            elif item_type in _EVIDENCE_ITEM_TYPES:
-                try:
-                    ordered.append(_turn_item_evidence(value, item_type))
-                except (TypeError, ValueError) as error:
-                    raise InvalidAppServerResponse(
-                        "Turn item evidence is invalid"
-                    ) from error
-        try:
-            return ActiveTurnEvidence(
-                thread=identity,
-                turn_id=requested_turn_id,
-                selected_skills=tuple(selected),
-                ordered_items=tuple(ordered),
-            )
-        except (TypeError, ValueError) as error:
-            raise InvalidAppServerResponse(
-                "active Turn evidence is invalid"
-            ) from error
 
     def read_completed_boundary(
         self, thread_id: str, turn_id: str
@@ -676,159 +595,6 @@ def _thread_identity(
         raise InvalidAppServerResponse(
             "thread/read returned invalid Thread identity"
         ) from error
-
-
-def _selected_skills(item: Mapping[str, object]) -> tuple[SelectedSkill, ...]:
-    content = item.get("content")
-    if not isinstance(content, list) or len(content) > 256:
-        raise InvalidAppServerResponse("userMessage content is invalid")
-    selected: list[SelectedSkill] = []
-    for value in content:
-        if not isinstance(value, Mapping):
-            raise InvalidAppServerResponse("userMessage content item is invalid")
-        selection_type = value.get("type")
-        if selection_type not in ("skill", "mention"):
-            continue
-        try:
-            name = _bounded_response_string(value.get("name"), "selection name")
-            raw_path = value.get("path")
-            if (
-                not isinstance(raw_path, str)
-                or len(raw_path) > 4096
-                or "\x00" in raw_path
-                or not Path(raw_path).is_absolute()
-            ):
-                raise ValueError("selection path is invalid")
-            selected.append(
-                SelectedSkill(
-                    selection_type=selection_type,
-                    name=name,
-                    path=str(Path(raw_path).resolve(strict=False)),
-                )
-            )
-        except ValueError as error:
-            raise InvalidAppServerResponse(
-                "native selection evidence is invalid"
-            ) from error
-    return tuple(selected)
-
-
-def _turn_item_evidence(
-    item: Mapping[str, object], item_type: object
-) -> TurnItemEvidence:
-    item_id = _bounded_response_string(item.get("id"), "Turn item id")
-    tool_name = None
-    operation_id = None
-    receipt_id = None
-    probe_id = None
-    if item_type == "hookPrompt":
-        receipt_id = _hook_receipt_id(item)
-    elif item_type == "mcpToolCall":
-        tool_name = _bounded_response_string(item.get("tool"), "MCP tool name")
-        operation_id = _mcp_zdecision_operation_id(item, tool_name)
-        receipt_id, probe_id = _mcp_zdecision_ids(item, tool_name)
-    try:
-        return TurnItemEvidence(
-            item_type=item_type,
-            item_id=item_id,
-            tool_name=tool_name,
-            operation_id=operation_id,
-            receipt_id=receipt_id,
-            probe_id=probe_id,
-        )
-    except (TypeError, ValueError) as error:
-        raise InvalidAppServerResponse("Turn item evidence is invalid") from error
-
-
-def _hook_receipt_id(item: Mapping[str, object]) -> str | None:
-    fragments = item.get("fragments")
-    if not isinstance(fragments, list) or len(fragments) > 64:
-        raise InvalidAppServerResponse("hookPrompt fragments are invalid")
-    receipts: set[str] = set()
-    for fragment in fragments:
-        if not isinstance(fragment, Mapping):
-            raise InvalidAppServerResponse("hookPrompt fragment is invalid")
-        text = fragment.get("text")
-        if not isinstance(text, str):
-            raise InvalidAppServerResponse("hookPrompt text is invalid")
-        if len(text) > 2048:
-            continue
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(value, Mapping) or value.get("marker") not in (
-            "ZDECISION_RECALL_RESTORATION",
-            "ZDECISION_RECEIPT",
-        ):
-            continue
-        receipts.add(
-            _bounded_response_string(
-                value.get("receipt_id"), "ZDecision receipt id"
-            )
-        )
-    if len(receipts) > 1:
-        raise InvalidAppServerResponse("hookPrompt repeated ZDecision receipts")
-    return next(iter(receipts), None)
-
-
-def _mcp_zdecision_operation_id(
-    item: Mapping[str, object], tool_name: str
-) -> str | None:
-    if (
-        item.get("server") != "zdecision-local"
-        or tool_name not in _ZDECISION_RECALL_TOOLS
-        or item.get("status") != "inProgress"
-    ):
-        return None
-    arguments = item.get("arguments")
-    if not isinstance(arguments, Mapping):
-        raise InvalidAppServerResponse(
-            "active ZDecision MCP arguments are invalid"
-        )
-    field_name = (
-        "activation_binding_id"
-        if tool_name == "activate_zdecision_recall"
-        else "turn_gate_id"
-    )
-    try:
-        return _bounded_response_string(
-            arguments.get(field_name), "ZDecision operation id"
-        )
-    except ValueError as error:
-        raise InvalidAppServerResponse(
-            "active ZDecision operation id is invalid"
-        ) from error
-
-
-def _mcp_zdecision_ids(
-    item: Mapping[str, object], tool_name: str
-) -> tuple[str | None, str | None]:
-    if (
-        item.get("server") != "zdecision-local"
-        or tool_name not in _ZDECISION_RECALL_TOOLS
-    ):
-        return None, None
-    result = item.get("result")
-    if not isinstance(result, Mapping):
-        return None, None
-    structured = result.get("structuredContent")
-    if not isinstance(structured, Mapping):
-        return None, None
-    receipt_id = structured.get("receipt_id")
-    if receipt_id is not None:
-        receipt_id = _bounded_response_string(
-            receipt_id, "ZDecision receipt id"
-        )
-    probe_id = None
-    probe = structured.get("probe")
-    if isinstance(probe, Mapping) and probe.get("marker") == (
-        "host_gate_fixture_not_formal"
-    ):
-        probe_id = _bounded_response_string(
-            probe.get("probe_id"), "ZDecision probe id"
-        )
-    return receipt_id, probe_id
 
 
 def _bounded_response_string(value: object, field_name: str) -> str:

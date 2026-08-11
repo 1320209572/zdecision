@@ -1394,7 +1394,6 @@ class RecallHostStore:
                 intent_digest=current_delivery.preflight.intent.digest,
                 context_epoch=gate["context_epoch"],
                 intent_epoch=next_intent_epoch,
-                probe=None,
             )
             self._connection.execute(
                 """
@@ -1920,7 +1919,6 @@ class RecallHostStore:
             intent_digest=intent.digest,
             context_epoch=current["context_epoch"],
             intent_epoch=current["intent_epoch"],
-            probe=None,
         )
         return bool(
             current["protocol_version"] == RECALL_HANDOFF_PROTOCOL
