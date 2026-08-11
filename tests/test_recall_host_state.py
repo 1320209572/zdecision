@@ -18,7 +18,10 @@ from zdecision.agent.recall_host_state import (
     RecallGateConflict,
     RecallHostStore,
 )
-from zdecision.agent.recall_plugin_identity import RecallPluginIdentity
+from zdecision.agent.recall_plugin_identity import (
+    RecallPluginIdentity,
+    verify_recall_plugin_bundle,
+)
 from tests.test_recall_handoff_contracts import (
     formal_decision,
     ready_preflight,
@@ -60,6 +63,64 @@ def _result(
 
 
 class RecallHostStoreTests(unittest.TestCase):
+    def test_conflicting_historical_binding_cannot_commit_a_gate(self) -> None:
+        """This catches commit authorizing one gate while ignoring another binding."""
+
+        production_root = Path(__file__).resolve().parents[1] / "plugins/zdecision"
+        disposable_root = self._disposable_bundle()
+        identity = RecallPluginIdentity(
+            plugin_name="disposable",
+            mcp_server_key="disposable-local",
+            mcp_command="disposable-agent",
+            mcp_args=("mcp",),
+            hook_command="disposable-agent hook",
+            recall_skill_relative_path="skills/disposable/SKILL.md",
+        )
+        self.store.bind_activation(
+            session_id=SESSION_ID,
+            turn_id=TURN_ID,
+            cwd="/tmp/recall",
+            binding_id=ACTIVATION_ID,
+            now=NOW,
+            plugin_root=str(production_root),
+        )
+        self.store.close()
+        self.store = RecallHostStore.open(self.path, identity=identity)
+        self.addCleanup(self.store.close)
+        bundle = verify_recall_plugin_bundle(disposable_root, identity)
+        self.assertIsNotNone(bundle)
+        with self.store._connection:
+            self.store._connection.execute(
+                """
+                INSERT INTO recall_turn_gates(
+                    gate_id, session_id, turn_id, context_epoch, intent_epoch,
+                    active_generation, state, result_digest, plugin_root,
+                    plugin_bundle_digest
+                ) VALUES (?, ?, ?, 0, 0, NULL, 'pending', NULL, ?, ?)
+                """,
+                (
+                    "gate-historical-disposable",
+                    SESSION_ID,
+                    "turn-historical-disposable",
+                    str(bundle.root),
+                    bundle.bundle_digest,
+                ),
+            )
+        with self.assertRaises(RecallGateConflict):
+            self.store.commit_turn_gate(
+                session_id=SESSION_ID,
+                turn_id="turn-historical-disposable",
+                gate_id="gate-historical-disposable",
+                result=_result(intent_epoch=1),
+                active_set_digest=ACTIVE_SET_DIGEST,
+            )
+        self.assertEqual(
+            "pending",
+            self.store.get_turn_gate(
+                SESSION_ID, "turn-historical-disposable"
+            ).state,
+        )
+
     def test_other_identity_cannot_apply_a_frozen_delivery(self) -> None:
         """This catches delivery application adopting a different Store identity."""
 

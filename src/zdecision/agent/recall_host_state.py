@@ -477,6 +477,7 @@ class RecallHostStore:
             root_key="attempt_plugin_root",
             digest_key="attempt_plugin_bundle_digest",
         )
+        self._session_frozen_binding(delivery["session_id"])
 
     def _session_frozen_binding(
         self, session_id: str
@@ -1912,6 +1913,7 @@ class RecallHostStore:
             if gate is None or gate["gate_id"] != gate_id:
                 raise RecallGateConflict("turn gate does not match trusted binding")
             self._require_frozen_binding(gate)
+            self._session_frozen_binding(session)
             if self._is_internal_thread(session):
                 raise RecallGateConflict("internal threads are recall-disabled")
             current_session = self._session_row(session)
@@ -2004,6 +2006,7 @@ class RecallHostStore:
         if row is None or row["state"] != "committed":
             raise RecallGateConflict("turn gate is not committed")
         self._require_frozen_binding(row)
+        self._session_frozen_binding(session)
         return _gate(row)
 
     def replayable_reuse_gate(
