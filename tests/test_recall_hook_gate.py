@@ -884,6 +884,53 @@ class RecallHookGateTests(unittest.TestCase):
         )
         self.assert_private_values_absent(extra)
 
+    def test_application_instruction_exposes_the_exact_item_contract(self) -> None:
+        """This catches delivered fields being submitted under the wrong names."""
+
+        self._deliver_handoff()
+
+        prompt = self._prompt(turn_id="turn-b")
+
+        envelope = json.loads(
+            prompt.output["hookSpecificOutput"]["additionalContext"]
+        )
+        self.assertEqual(
+            {
+                "marker",
+                "tool",
+                "tool_input",
+                "allowed_dispositions",
+                "forbidden_item_fields",
+                "host_supplied_fields",
+                "rules",
+            },
+            set(envelope),
+        )
+        self.assertEqual("ZDECISION_RECALL_APPLICATION_REQUIRED", envelope["marker"])
+        self.assertEqual("apply_zdecision_recall_delivery", envelope["tool"])
+        self.assertEqual(
+            {
+                "decision_id": "copy decisions[].formal_decision.decision_id",
+                "revision": "copy decisions[].formal_decision.revision",
+                "digest": "copy decisions[].digest",
+                "disposition": "choose one allowed_dispositions value",
+                "reason": "brief reason, 1-240 characters",
+            },
+            envelope["tool_input"]["items"][0],
+        )
+        self.assertEqual(
+            ["applicable", "not_applicable", "conflicting", "uncertain"],
+            envelope["allowed_dispositions"],
+        )
+        self.assertEqual(
+            ["classification", "decision_space_id"],
+            envelope["forbidden_item_fields"],
+        )
+        self.assertEqual(
+            ["turn_gate_id", "delivery_id"], envelope["host_supplied_fields"]
+        )
+        self.assert_private_values_absent(prompt)
+
     def test_application_binding_accepts_items_only_and_injects_trusted_coordinates(
         self,
     ) -> None:

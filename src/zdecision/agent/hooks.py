@@ -60,10 +60,39 @@ _ACTIVE_GATE_INSTRUCTION = (
     "ZDecision recall is active. Call gate_zdecision_turn before substantive "
     "output or development tools in this Turn."
 )
-_APPLICATION_INSTRUCTION = (
-    "ZDecision decisions were delivered for this task. Classify every delivered "
-    "item and call apply_zdecision_recall_delivery before development tools."
-)
+_APPLICATION_INSTRUCTION = canonical_json_bytes(
+    {
+        "marker": "ZDECISION_RECALL_APPLICATION_REQUIRED",
+        "tool": "apply_zdecision_recall_delivery",
+        "tool_input": {
+            "items": [
+                {
+                    "decision_id": (
+                        "copy decisions[].formal_decision.decision_id"
+                    ),
+                    "revision": "copy decisions[].formal_decision.revision",
+                    "digest": "copy decisions[].digest",
+                    "disposition": "choose one allowed_dispositions value",
+                    "reason": "brief reason, 1-240 characters",
+                }
+            ]
+        },
+        "allowed_dispositions": [
+            "applicable",
+            "not_applicable",
+            "conflicting",
+            "uncertain",
+        ],
+        "forbidden_item_fields": ["classification", "decision_space_id"],
+        "host_supplied_fields": ["turn_gate_id", "delivery_id"],
+        "rules": [
+            "Submit every delivered decision exactly once.",
+            "Use exactly the five item fields shown.",
+            "Do not supply or guess host-supplied fields.",
+            "Call the tool once before any development tool.",
+        ],
+    }
+).decode("utf-8")
 _RESUME_INSTRUCTION = (
     "ZDecision recall revalidation is required before development continues."
 )
