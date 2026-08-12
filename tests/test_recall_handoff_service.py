@@ -454,6 +454,14 @@ class RecallHandoffServiceTests(unittest.TestCase):
         )
         skill_path = plugin_root / "skills/zdecision/SKILL.md"
         skill_path.write_text("trusted bundle", "utf-8")
+        hooks_path = plugin_root / "hooks/hooks.json"
+        hooks_path.parent.mkdir()
+        hooks_path.write_bytes(
+            (
+                Path(__file__).resolve().parents[1]
+                / "plugins/zdecision/hooks/hooks.json"
+            ).read_bytes()
+        )
         attempt_id = "activation_" + "6" * 32
         delivery_id = "delivery_" + "7" * 32
         self.store.create_activation_attempt(
