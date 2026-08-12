@@ -103,6 +103,127 @@ class _McpClient:
 
 
 class RecallGateAVerticalTests(unittest.TestCase):
+    def test_source_launcher_accepts_relocated_verified_installed_plugin_root(
+        self,
+    ) -> None:
+        """Codex supplies the installed bundle root to the source launcher."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            root = temporary_root / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            source_plugin = (
+                root / "marketplace" / "plugins" / created["plugin_name"]
+            )
+            installed_plugin = (
+                temporary_root
+                / "installed-cache"
+                / "recall-gate-a-disposable"
+                / created["plugin_name"]
+                / "0.1.0"
+            )
+            shutil.copytree(source_plugin, installed_plugin)
+            self.assertEqual(
+                {
+                    path.relative_to(source_plugin): path.read_bytes()
+                    for path in source_plugin.rglob("*")
+                    if path.is_file()
+                },
+                {
+                    path.relative_to(installed_plugin): path.read_bytes()
+                    for path in installed_plugin.rglob("*")
+                    if path.is_file()
+                },
+            )
+
+            configuration = harness._read_configuration(root)
+            identity = harness._identity_from_fields(configuration["identity"])
+            source_launcher = source_plugin / "recall_gate_a_launcher.py"
+
+            def run_hook(value: dict[str, object]) -> dict[str, object]:
+                launched = subprocess.run(
+                    [identity.mcp_command, str(source_launcher), "hook"],
+                    input=json.dumps(value),
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PLUGIN_ROOT": str(installed_plugin)},
+                    check=False,
+                )
+                self.assertEqual(0, launched.returncode, launched.stderr)
+                return json.loads(launched.stdout)
+
+            session_id = "session-installed-copy"
+            turn_id = "turn-installed-copy"
+            run_hook(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": session_id,
+                    "cwd": str(Path.cwd()),
+                    "source": "startup",
+                }
+            )
+            run_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "cwd": str(Path.cwd()),
+                    "prompt": "native installed-copy turn",
+                }
+            )
+            intent = RecallIntent.from_dict(
+                {
+                    "target_decision_space_ids": ["space-gate-a"],
+                    "explicit_multi_space": False,
+                    "feature_goal": "Bind the installed Gate A Plugin",
+                    "domain_objects": ["Recall"],
+                    "repository_relative_paths": ["src/gate-a"],
+                    "constraints": ["local only"],
+                    "exclusions": ["network"],
+                }
+            )
+            bound = run_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "cwd": str(Path.cwd()),
+                    "tool_name": identity.tool_name(
+                        "show_zdecision_recall_confirmation"
+                    ),
+                    "tool_input": {"intent": intent.to_dict()},
+                }
+            )
+            attempt_id = bound["hookSpecificOutput"]["updatedInput"][
+                "activation_attempt_id"
+            ]
+
+            database = harness.AgentDatabase.open(root / "state" / "agent.sqlite3")
+            store = harness.RecallHostStore.open(
+                root / "state" / "agent.sqlite3", identity=identity
+            )
+            try:
+                self.assertEqual(
+                    ["SessionStart", "UserPromptSubmit"],
+                    [
+                        event.invocation.event_name
+                        for event in database.list_events(session_id)
+                    ],
+                )
+                self.assertTrue(
+                    database.has_open_observed_turn(
+                        session_id, turn_id, str(Path.cwd())
+                    )
+                )
+                self.assertEqual(
+                    installed_plugin.resolve()
+                    / identity.recall_skill_relative_path,
+                    store.bound_recall_skill_path("attempt", attempt_id),
+                )
+            finally:
+                store.close()
+                database.close()
+
     def test_launcher_uses_source_runtime_for_target_without_python(self) -> None:
         """The target repository must not also be the harness runtime repository."""
 

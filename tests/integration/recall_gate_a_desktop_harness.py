@@ -247,12 +247,12 @@ def _root() -> tuple[Path, Path]:
         or not isinstance(marker.get("generation"), str)
     ):
         _fail("disposable Recall launcher ownership mismatch")
-    plugin_root = launcher.parent
+    source_plugin_root = launcher.parent
+    plugin_root = source_plugin_root
     supplied = os.environ.get("PLUGIN_ROOT")
     if supplied is not None:
         try:
-            if Path(supplied).resolve(strict=True) != plugin_root:
-                _fail("PLUGIN_ROOT does not match the disposable Plugin")
+            plugin_root = Path(supplied).resolve(strict=True)
         except OSError:
             _fail("PLUGIN_ROOT is invalid")
     prefix = "zdecision-gatea-"
@@ -264,7 +264,7 @@ def _root() -> tuple[Path, Path]:
     except OSError:
         _fail("disposable Recall repository binding is invalid")
     if (
-        plugin_root.name != IDENTITY[0]
+        source_plugin_root.name != IDENTITY[0]
         or not IDENTITY[0].startswith(prefix)
         or len(components) != 2
         or IDENTITY[2] != str(Path(SOURCE_REPOSITORY) / ".venv" / "bin" / "python")
