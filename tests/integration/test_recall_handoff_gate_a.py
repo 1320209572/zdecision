@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import threading
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from tests.integration import recall_gate_a_desktop_harness as harness
@@ -223,6 +224,248 @@ class RecallGateAVerticalTests(unittest.TestCase):
             finally:
                 store.close()
                 database.close()
+
+    def test_real_launcher_uses_current_utc_for_recall_lifetimes(self) -> None:
+        """Catch a generated Desktop runtime retaining the test fixture clock."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            launcher = plugin / "recall_gate_a_launcher.py"
+            identity = harness._identity_from_fields(
+                harness._read_configuration(root)["identity"]
+            )
+
+            def run_hook(value: dict[str, object]) -> dict[str, object]:
+                launched = subprocess.run(
+                    [identity.mcp_command, str(launcher), "hook"],
+                    input=json.dumps(value),
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PLUGIN_ROOT": str(plugin)},
+                    check=False,
+                )
+                self.assertEqual(0, launched.returncode, launched.stderr)
+                return json.loads(launched.stdout)
+
+            session_id = "session-current-clock"
+            turn_id = "turn-current-clock"
+            intent = RecallIntent.from_dict(
+                {
+                    "target_decision_space_ids": ["space-gate-a"],
+                    "explicit_multi_space": False,
+                    "feature_goal": "Use current UTC in the Desktop runtime",
+                    "domain_objects": ["Recall"],
+                    "repository_relative_paths": ["src/gate-a"],
+                    "constraints": ["local only"],
+                    "exclusions": ["network"],
+                }
+            )
+            observed_before = datetime.now(UTC) - timedelta(seconds=1)
+            run_hook(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": session_id,
+                    "cwd": str(Path.cwd()),
+                    "source": "startup",
+                }
+            )
+            run_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "cwd": str(Path.cwd()),
+                    "prompt": "native current-clock turn",
+                }
+            )
+            bound = run_hook(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "cwd": str(Path.cwd()),
+                    "tool_name": identity.tool_name(
+                        "show_zdecision_recall_confirmation"
+                    ),
+                    "tool_input": {"intent": intent.to_dict()},
+                }
+            )
+            attempt_id = bound["hookSpecificOutput"]["updatedInput"][
+                "activation_attempt_id"
+            ]
+            client = _McpClient(launcher, plugin)
+            try:
+                shown = client.tool(
+                    "show_zdecision_recall_confirmation",
+                    {
+                        "activation_attempt_id": attempt_id,
+                        "intent": intent.to_dict(),
+                    },
+                )
+                self.assertEqual(
+                    "pending_confirmation", shown["structuredContent"]["state"]
+                )
+                enabled = client.tool(
+                    "decide_zdecision_recall",
+                    {"activation_attempt_id": attempt_id, "action": "enable"},
+                )
+                self.assertEqual(
+                    "delivery_claimed", enabled["structuredContent"]["state"]
+                )
+            finally:
+                client.close()
+            observed_after = datetime.now(UTC) + timedelta(seconds=1)
+
+            database = harness.AgentDatabase.open(root / "state/agent.sqlite3")
+            store = harness.RecallHostStore.open(
+                root / "state/agent.sqlite3", identity=identity
+            )
+            try:
+                event_times = tuple(
+                    datetime.fromisoformat(
+                        event.invocation.occurred_at.replace("Z", "+00:00")
+                    )
+                    for event in database.list_events(session_id)
+                )
+                self.assertTrue(event_times)
+                self.assertTrue(
+                    all(
+                        observed_before <= event_time <= observed_after
+                        for event_time in event_times
+                    ),
+                    event_times,
+                )
+                attempt = store.get_activation_attempt(attempt_id)
+                self.assertIsNotNone(attempt)
+                created_at = datetime.fromisoformat(
+                    attempt.created_at.replace("Z", "+00:00")
+                )
+                expires_at = datetime.fromisoformat(
+                    attempt.expires_at.replace("Z", "+00:00")
+                )
+                preflight_expires_at = datetime.fromisoformat(
+                    attempt.preflight.expires_at.replace("Z", "+00:00")
+                )
+                self.assertTrue(observed_before <= created_at <= observed_after)
+                self.assertEqual(timedelta(minutes=15), expires_at - created_at)
+                self.assertEqual(
+                    timedelta(hours=1), preflight_expires_at - created_at
+                )
+                delivery = store.delivery_for_attempt(attempt_id)
+                self.assertIsNotNone(delivery)
+                claim_expires_at = datetime.fromisoformat(
+                    delivery.claim_expires_at.replace("Z", "+00:00")
+                )
+                self.assertTrue(
+                    observed_before + timedelta(seconds=30)
+                    <= claim_expires_at
+                    <= observed_after + timedelta(seconds=30)
+                )
+            finally:
+                store.close()
+                database.close()
+
+    def test_in_process_runtime_accepts_an_explicit_deterministic_clock(self) -> None:
+        """Keep automated Gate A composition deterministic without freezing Desktop."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            identity = harness._identity_from_fields(
+                harness._read_configuration(root)["identity"]
+            )
+            fixed_now = datetime(2032, 4, 5, 6, 7, 8, tzinfo=UTC)
+            try:
+                runtime = harness.GateARuntime(
+                    root=root,
+                    repository=Path.cwd(),
+                    identity=identity,
+                    clock=lambda: fixed_now,
+                )
+            except TypeError as error:
+                self.fail(f"Gate A runtime has no explicit clock seam: {error}")
+            try:
+                intent = RecallIntent.from_dict(
+                    {
+                        "target_decision_space_ids": ["space-gate-a"],
+                        "explicit_multi_space": False,
+                        "feature_goal": "Inject deterministic Gate A time",
+                        "domain_objects": ["Recall"],
+                        "repository_relative_paths": ["src/gate-a"],
+                        "constraints": ["local only"],
+                        "exclusions": ["network"],
+                    }
+                )
+                with patch.dict(
+                    "os.environ", {"PLUGIN_ROOT": str(plugin)}, clear=False
+                ):
+                    runtime.hook(
+                        {
+                            "hook_event_name": "SessionStart",
+                            "session_id": "session-fixed-clock",
+                            "cwd": str(Path.cwd()),
+                            "source": "startup",
+                        }
+                    )
+                    runtime.hook(
+                        {
+                            "hook_event_name": "UserPromptSubmit",
+                            "session_id": "session-fixed-clock",
+                            "turn_id": "turn-fixed-clock",
+                            "cwd": str(Path.cwd()),
+                            "prompt": "native fixed-clock turn",
+                        }
+                    )
+                    bound = runtime.hook(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "session_id": "session-fixed-clock",
+                            "turn_id": "turn-fixed-clock",
+                            "cwd": str(Path.cwd()),
+                            "tool_name": identity.tool_name(
+                                "show_zdecision_recall_confirmation"
+                            ),
+                            "tool_input": {"intent": intent.to_dict()},
+                        }
+                    )
+                attempt_id = bound["hookSpecificOutput"]["updatedInput"][
+                    "activation_attempt_id"
+                ]
+                event_times = {
+                    event.invocation.occurred_at
+                    for event in runtime.database.list_events("session-fixed-clock")
+                }
+                self.assertEqual({"2032-04-05T06:07:08Z"}, event_times)
+                attempt = runtime.store.get_activation_attempt(attempt_id)
+                self.assertIsNotNone(attempt)
+                self.assertEqual("2032-04-05T06:07:08.000000Z", attempt.created_at)
+                self.assertEqual(
+                    "2032-04-05T07:07:08+00:00", attempt.preflight.expires_at
+                )
+                ui_digest = sha256(RECALL_CONFIRMATION_PATH.read_bytes()).hexdigest()
+                shown = runtime.recall_tools.show_recall_confirmation(
+                    activation_attempt_id=attempt_id,
+                    intent=intent.to_dict(),
+                    ui_digest=ui_digest,
+                )
+                self.assertEqual("pending_confirmation", shown["state"])
+                enabled = runtime.recall_tools.decide_recall_confirmation(
+                    activation_attempt_id=attempt_id,
+                    action="enable",
+                    current_ui_digest=ui_digest,
+                )
+                self.assertEqual("delivery_claimed", enabled["state"])
+                delivery = runtime.store.delivery_for_attempt(attempt_id)
+                self.assertIsNotNone(delivery)
+                self.assertEqual(
+                    "2032-04-05T06:07:38.000000Z",
+                    delivery.claim_expires_at,
+                )
+            finally:
+                runtime.close()
 
     def test_launcher_uses_source_runtime_for_target_without_python(self) -> None:
         """The target repository must not also be the harness runtime repository."""
@@ -583,6 +826,186 @@ class RecallGateAVerticalTests(unittest.TestCase):
             self.assertNotEqual("zdecision-local", created["mcp_server_key"])
             inspected = harness.inspect(root=root)
             self.assertEqual("ready", inspected["state"])
+
+    def test_generated_identity_sensitive_tools_fit_codex_public_name_limit(
+        self,
+    ) -> None:
+        """Catch Codex replacing overlong Hook tool names with opaque aliases."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            configuration = harness._read_configuration(root)
+            identity = harness._identity_from_fields(configuration["identity"])
+            hooks = json.loads((plugin / "hooks/hooks.json").read_text("utf-8"))
+
+            basenames = (
+                "show_zdecision_update",
+                "show_zdecision_recall_confirmation",
+                "apply_zdecision_recall_delivery",
+                "gate_zdecision_turn",
+            )
+            public_names = tuple(
+                f"mcp__{identity.mcp_server_key.replace('-', '_')}__{basename}"
+                for basename in basenames
+            )
+
+            self.assertLessEqual(max(map(len, public_names)), 64, public_names)
+            self.assertRegex(
+                identity.plugin_name,
+                r"^zdecision-gatea-[0-9a-f]{16}-[0-9a-f]{32}$",
+            )
+            self.assertRegex(identity.mcp_server_key, r"^zgatea-[0-9a-f]{16}$")
+            self.assertNotEqual(identity.plugin_name, identity.mcp_server_key)
+            expected_matcher = "|".join(
+                (
+                    *public_names,
+                    "Bash",
+                    "apply_patch",
+                    "Edit",
+                    "Write",
+                    "Agent",
+                    "mcp__.*",
+                )
+            )
+            self.assertEqual(
+                expected_matcher,
+                identity.pre_tool_matcher,
+            )
+            self.assertEqual(
+                identity.pre_tool_matcher,
+                hooks["hooks"]["PreToolUse"][0]["matcher"],
+            )
+            self.assertNotIn(
+                f"mcp__{identity.plugin_name.replace('-', '_')}__",
+                identity.pre_tool_matcher,
+            )
+
+    def test_generated_identity_rejects_another_plugins_short_server_key(
+        self,
+    ) -> None:
+        """Catch a mixed disposable name and MCP namespace verifying together."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            first_root = temporary_root / "first-gate-a"
+            second_root = temporary_root / "second-gate-a"
+            harness.create(root=first_root, target_repository=Path.cwd())
+            harness.create(root=second_root, target_repository=Path.cwd())
+            first_fields = list(harness._read_configuration(first_root)["identity"])
+            second_fields = harness._read_configuration(second_root)["identity"]
+            self.assertNotEqual(first_fields[1], second_fields[1])
+
+            first_fields[1] = second_fields[1]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "disposable Plugin identity is invalid"
+            ):
+                harness._identity_from_fields(first_fields)
+
+    def test_coordinated_bundle_mutation_cannot_mix_another_short_server_key(
+        self,
+    ) -> None:
+        """Catch coordinated launcher/config/MCP/Hook namespace substitution."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            root = temporary_root / "gate-a"
+            foreign_root = temporary_root / "foreign-gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            harness.create(root=foreign_root, target_repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            launcher = plugin / "recall_gate_a_launcher.py"
+            configuration_path = root / ".recall-gate-a-runtime.json"
+            marker_path = root / ".recall-gate-a-marker.json"
+            configuration = json.loads(configuration_path.read_text("utf-8"))
+            original = harness._identity_from_fields(configuration["identity"])
+            foreign_fields = harness._read_configuration(foreign_root)["identity"]
+            foreign_key = foreign_fields[1]
+            self.assertNotEqual(original.mcp_server_key, foreign_key)
+
+            changed_fields = list(configuration["identity"])
+            changed_fields[1] = foreign_key
+            original_literal = (
+                original.plugin_name,
+                original.mcp_server_key,
+                original.mcp_command,
+                original.mcp_args,
+                original.hook_command,
+                original.recall_skill_relative_path,
+            )
+            changed_literal = (
+                changed_fields[0],
+                changed_fields[1],
+                changed_fields[2],
+                tuple(changed_fields[3]),
+                changed_fields[4],
+                changed_fields[5],
+            )
+            launcher_source = launcher.read_text("utf-8")
+            original_assignment = f"IDENTITY = {original_literal!r}"
+            changed_assignment = f"IDENTITY = {changed_literal!r}"
+            self.assertEqual(1, launcher_source.count(original_assignment))
+            launcher.write_text(
+                launcher_source.replace(original_assignment, changed_assignment),
+                "utf-8",
+            )
+            configuration["identity"] = changed_fields
+            configuration_path.write_text(
+                json.dumps(configuration, separators=(",", ":"), sort_keys=True),
+                "utf-8",
+            )
+
+            mcp_path = plugin / ".mcp.json"
+            mcp = json.loads(mcp_path.read_text("utf-8"))
+            server = mcp["mcpServers"].pop(original.mcp_server_key)
+            mcp["mcpServers"][foreign_key] = server
+            mcp_path.write_text(
+                json.dumps(mcp, separators=(",", ":"), sort_keys=True), "utf-8"
+            )
+            hooks_path = plugin / "hooks/hooks.json"
+            hooks = json.loads(hooks_path.read_text("utf-8"))
+            matcher = hooks["hooks"]["PreToolUse"][0]["matcher"]
+            hooks["hooks"]["PreToolUse"][0]["matcher"] = matcher.replace(
+                original.tool_namespace,
+                foreign_key.replace("-", "_"),
+            )
+            hooks_path.write_text(
+                json.dumps(hooks, separators=(",", ":"), sort_keys=True), "utf-8"
+            )
+            marker = json.loads(marker_path.read_text("utf-8"))
+            marker["launcher_digest"] = sha256(launcher.read_bytes()).hexdigest()
+            marker_path.write_text(
+                json.dumps(marker, separators=(",", ":"), sort_keys=True),
+                "utf-8",
+            )
+
+            launched = subprocess.run(
+                [original.mcp_command, str(launcher), "hook"],
+                input=json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "session-mixed-key",
+                        "cwd": str(Path.cwd()),
+                        "source": "startup",
+                    }
+                ),
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PLUGIN_ROOT": str(plugin)},
+                check=False,
+            )
+            self.assertNotEqual(0, launched.returncode)
+            with self.assertRaisesRegex(
+                RuntimeError, "disposable Plugin identity is invalid"
+            ):
+                harness.inspect(root=root)
+            with self.assertRaisesRegex(
+                RuntimeError, "disposable Plugin identity is invalid"
+            ):
+                harness.cleanup(root=root)
+            self.assertTrue(root.exists())
 
     def test_production_hook_store_handoff_and_reuse_vertical(self) -> None:
         """One native-shaped delivery reaches only production Gate A boundaries."""

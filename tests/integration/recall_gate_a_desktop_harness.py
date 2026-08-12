@@ -17,8 +17,9 @@ import secrets
 import sqlite3
 import stat
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -52,7 +53,6 @@ _LOCK = ".recall-gate-a-lifecycle.lock"
 _LEASES = ".recall-gate-a-leases"
 _STATE = "state"
 _LAUNCHER_NAME = "recall_gate_a_launcher.py"
-_NOW = datetime(2026, 8, 12, 0, 0, tzinfo=UTC)
 
 
 def gate_id_for_turn(turn_id: object) -> str:
@@ -93,13 +93,10 @@ def _repository_commitment(repository: Path) -> str:
     return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:32]
 
 
-def _plugin_commits_to_target(
-    plugin_name: str,
-    target_repository: Path,
-) -> bool:
+def _plugin_identity_components(plugin_name: object) -> tuple[str, str] | None:
     prefix = "zdecision-gatea-"
-    if not plugin_name.startswith(prefix):
-        return False
+    if not isinstance(plugin_name, str) or not plugin_name.startswith(prefix):
+        return None
     components = plugin_name.removeprefix(prefix).split("-")
     if (
         len(components) != 2
@@ -111,6 +108,23 @@ def _plugin_commits_to_target(
             for character in component
         )
     ):
+        return None
+    return components[0], components[1]
+
+
+def _mcp_server_key(plugin_name: object) -> str:
+    components = _plugin_identity_components(plugin_name)
+    if components is None:
+        raise RuntimeError("disposable Plugin identity is invalid")
+    return f"zgatea-{components[0]}"
+
+
+def _plugin_commits_to_target(
+    plugin_name: str,
+    target_repository: Path,
+) -> bool:
+    components = _plugin_identity_components(plugin_name)
+    if components is None:
         return False
     try:
         expected_target = _repository_commitment(target_repository)
@@ -157,7 +171,7 @@ def _identity(
     )
     return RecallPluginIdentity(
         plugin_name=plugin_name,
-        mcp_server_key=plugin_name,
+        mcp_server_key=_mcp_server_key(plugin_name),
         mcp_command=command,
         mcp_args=(str(launcher), "mcp"),
         hook_command=hook_command,
@@ -412,7 +426,7 @@ def _identity_from_fields(fields: object) -> RecallPluginIdentity:
     if not isinstance(fields, (list, tuple)) or len(fields) != 6:
         raise RuntimeError("launcher identity is invalid")
     try:
-        return RecallPluginIdentity(
+        identity = RecallPluginIdentity(
             plugin_name=fields[0],
             mcp_server_key=fields[1],
             mcp_command=fields[2],
@@ -422,6 +436,9 @@ def _identity_from_fields(fields: object) -> RecallPluginIdentity:
         )
     except (TypeError, ValueError) as error:
         raise RuntimeError("launcher identity is invalid") from error
+    if identity.mcp_server_key != _mcp_server_key(identity.plugin_name):
+        raise RuntimeError("disposable Plugin identity is invalid")
+    return identity
 
 
 @contextmanager
@@ -500,7 +517,7 @@ class DeterministicGateAProvider:
             retrieval_profile_digest="c" * 64,
             index_generation=1,
             freshness="ready",
-            expires_at="2026-08-12T01:00:00+00:00",
+            expires_at=(now + timedelta(hours=1)).astimezone(UTC).isoformat(),
         )
 
     def retrieve(self, preflight: RecallPreflightReady) -> RecallShortlist:
@@ -547,10 +564,18 @@ class DeterministicGateAProvider:
 class GateARuntime:
     """One in-process production composition used by hooks and the launcher."""
 
-    def __init__(self, *, root: Path, repository: Path, identity: RecallPluginIdentity) -> None:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        repository: Path,
+        identity: RecallPluginIdentity,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.root = root
         self.repository = repository
         self.identity = identity
+        self.clock = clock if clock is not None else lambda: datetime.now(UTC)
         self.database = AgentDatabase.open(root / _STATE / "agent.sqlite3")
         self.store = RecallHostStore.open(root / _STATE / "agent.sqlite3", identity=identity)
         resolved = RepositoryResolver(timeout_seconds=1.0).resolve(repository)
@@ -563,7 +588,7 @@ class GateARuntime:
         self.service = RecallHandoffService(
             store=self.store,
             provider=self.provider,
-            clock=lambda: _NOW,
+            clock=self.clock,
             delivery_id_factory=delivery_id_for_attempt,
             claim_token_factory=lambda: "claim_" + secrets.token_hex(16),
         )
@@ -571,7 +596,7 @@ class GateARuntime:
             host_store=self.store,
             handoff_service=self.service,
             cwd=str(repository),
-            clock=lambda: _NOW,
+            clock=self.clock,
         )
         self.server = create_mcp_server(
             LocalMcpTools(database=self.database, cwd=str(repository)),
@@ -598,7 +623,7 @@ class GateARuntime:
         response = handle_hook(
             raw,
             database=self.database,
-            clock=lambda: _NOW,
+            clock=self.clock,
             repository_resolver=self.resolver,
             worker_waker=lambda _: None,
             recall_store=self.store,
@@ -618,17 +643,22 @@ def create(*, root: Path, target_repository: Path) -> dict[str, object]:
     root = _fresh_root(root, source_repository, target_repository)
     root.mkdir(mode=0o700)
     root.chmod(0o700)
+    instance_id = secrets.token_hex(8)
     plugin_name = "-".join(
         (
             "zdecision-gatea",
-            secrets.token_hex(8),
+            instance_id,
             _repository_commitment(target_repository),
         )
     )
     plugin = root / "marketplace" / "plugins" / plugin_name
     launcher = plugin / _LAUNCHER_NAME
     relative_launcher = launcher.relative_to(root).as_posix()
-    identity = _identity(plugin_name, launcher, source_repository)
+    identity = _identity(
+        plugin_name,
+        launcher,
+        source_repository,
+    )
     generation = secrets.token_hex(16)
     for directory in (plugin, plugin / "skills" / "recall", plugin / "hooks", root / _STATE, root / _LEASES):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
