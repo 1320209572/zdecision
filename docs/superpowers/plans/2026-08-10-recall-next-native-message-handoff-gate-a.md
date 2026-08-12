@@ -1812,11 +1812,20 @@ production `zdecision@zdecision-local` and all pre-existing marketplace entries
 remain installed and unchanged; only the exact disposable marketplace entry may
 be added temporarily. Before installation, record bounded read-only baselines
 for the production marketplace entry, installed Plugin bundle bytes, and
-production database. Review and trust the current disposable Plugin's exact
-Hook hash separately for each of its eight required event entries via the
-supported Codex Hook UI before starting the acceptance task; prior disposable
-Hook trust does not carry across identities or event sources. Restart Codex
-once after all eight trust records are present.
+production database. The database baseline uses one consistent read
+transaction: freeze every table schema and the complete canonical row content
+of every table except the closed lifecycle allowlist `events`,
+`session_leases`, `worker_state`, and `session_checkpoints`; record bounded
+count/state aggregates for those four tables. Use SHA-256 over canonical
+`(type, name, tbl_name, sql)` `sqlite_schema` records and, separately, typed,
+length-prefixed row encodings sorted bytewise with duplicates preserved.
+Retain only each table's schema digest, content digest, and row count in a
+private temporary manifest created with mode `0600`; never retain raw rows.
+Review and trust the current disposable Plugin's exact Hook hash separately
+for each of its eight required event entries via the supported Codex Hook UI
+before starting the acceptance task; prior disposable Hook trust does not
+carry across identities or event sources. Restart Codex once after all eight
+trust records are present.
 
 Do not place the temporary root under the repository, home root, or production
 Plugin cache path. Do not reuse a prior probe database.
@@ -1856,9 +1865,16 @@ exact launcher/MCP lease to exit, and invoke only the harness's validated
 cleanup for the recorded temporary root. Verify the production
 Plugin remains installed/enabled and the disposable selector/process/database
 is absent. Verify the production marketplace entry, installed bundle bytes, and
-production database exactly match their pre-install baselines. If exact cleanup
-or baseline equality cannot be proven, stop and report it rather than using a
-broad recursive deletion.
+every production database schema plus every non-lifecycle table's complete
+canonical row content exactly match their pre-install baselines. Only
+`events`, `session_leases`, `worker_state`, and `session_checkpoints` may have
+row deltas; report their bounded count/state deltas and fail if any other table
+changed. Do not disable the production Plugin or restore database bytes to
+manufacture equality. If exact cleanup or the scoped baseline equality cannot
+be proven, stop and report it rather than using a broad recursive deletion.
+Delete the private digest manifest after the comparison on both PASS and FAIL;
+do not include raw rows, full digests, or private identifiers in the
+acceptance report.
 
 - [ ] **Step 5: Write and commit the sanitized acceptance report**
 
@@ -1868,6 +1884,9 @@ The report records:
 - PASS/FAIL for preflight, app-only action, context update, next-message
   application, guard, reuse, restoration, isolation, and cleanup;
 - provider call counts and only redacted digest/receipt prefixes;
+- exact production Plugin/marketplace equality, full non-lifecycle database
+  equality, and bounded aggregate deltas for the four allowed lifecycle
+  tables;
 - the fact that the provider was test-only and production remains unavailable;
   and
 - any bounded procedural deviation.

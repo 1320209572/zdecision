@@ -692,8 +692,23 @@ Automated tests must prove at least:
 7. initial binding and restart, delivery, application, reuse, and compact
    revalidation all use the Store's same immutable identity; and
 8. the Task 9 automated vertical and Task 10 Desktop run leave the installed
-   production Plugin, its marketplace entry, bundle bytes, and production
-   database unchanged.
+   production Plugin, its marketplace entry, and bundle bytes byte-identical.
+   For the production database, every table schema and the complete canonical
+   row content of every table except `events`, `session_leases`,
+   `worker_state`, and `session_checkpoints` must be identical before and
+   after the run. Those four lifecycle tables are the closed allowlist for
+   expected observation/worker deltas from the still-enabled production
+   Hooks; their bounded count/state deltas are reported explicitly. Any row
+   delta in any other table, any schema delta, or any attempt to obtain
+   equality by disabling the production Plugin or restoring database bytes is
+   a hard FAIL. Pre/post snapshots use the same deterministic SHA-256
+   algorithm: canonical `(type, name, tbl_name, sql)` `sqlite_schema` records
+   and typed, length-prefixed row encodings sorted bytewise with duplicates
+   preserved are hashed separately. Only each table's schema digest, content
+   digest, and row count are retained in a private temporary manifest created
+   with mode `0600`; raw rows are never retained. The manifest is deleted after
+   comparison on both PASS and FAIL, and the acceptance report contains only
+   equality results and permitted bounded lifecycle aggregates.
 
 Task 9 stops rather than weakening this contract if Codex does not expose the
 exact disposable MCP client, if the host supplies a mismatched Plugin root or
