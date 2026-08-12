@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import hashlib
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -617,8 +618,30 @@ class RecallCaptureIsolationTest(unittest.TestCase):
         fixture = processor_fixtures.CaptureRequestProcessorTest()
         fixture.setUp()
         try:
-            client = processor_fixtures.FakeCentralClient(fixture.group, fixture.views())
-            fixture.processor().process(fixture.group, client)
+            fixture.routes = (fixture.routes[1],)
+            group = replace(
+                fixture.group,
+                route_snapshot=fixture.routes,
+                route_snapshot_digest=hashlib.sha256(
+                    canonical_json_bytes(
+                        {"routes": [route.to_dict() for route in fixture.routes]}
+                    )
+                ).hexdigest(),
+            )
+            supplied: list[object] = []
+
+            def use_actual_capture_result(*args, **kwargs):
+                supplied.append((args, kwargs))
+                return replace(
+                    result,
+                    source_key=args[0].source_key,
+                    model_profile=fixture.capture_runner.profile,
+                )
+
+            fixture.capture_runner.run = use_actual_capture_result
+            client = processor_fixtures.FakeCentralClient(group, fixture.views())
+            fixture.processor().process(group, client)
+            self.assertEqual(1, len(supplied))
             emitted = b"".join(canonical_json_bytes(batch.to_dict()) for batch in client.uploads)
             self.assertTrue(all(sentinel.encode("utf-8") not in emitted for sentinel in sentinels))
         finally:

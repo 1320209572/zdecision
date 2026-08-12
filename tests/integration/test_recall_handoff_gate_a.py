@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from hashlib import sha256
 from pathlib import Path
 import os
@@ -15,7 +16,9 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from tests.integration import recall_gate_a_desktop_harness as harness
+from zdecision.agent.capture_operation_store import CaptureOperationStore
 from zdecision.agent.mcp_server import RECALL_CONFIRMATION_PATH
+from zdecision.agent.request_state import RequestStateStore
 from zdecision.recall.session import RecallIntent
 
 
@@ -86,25 +89,30 @@ class RecallGateAVerticalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            fixtures = Path(temporary) / "production-boundary-fixtures"
-            fixtures.mkdir()
-            fixture_files = {
-                "candidate_tables": fixtures / "candidate-tables.fixture",
-                "capture_state_and_eligibility": fixtures / "capture-state.fixture",
-                "registry_files": fixtures / "registry" / "formal-decision.fixture",
-                "production_plugin_tree": fixtures / "plugin" / "SKILL.md",
-                "production_marketplace": fixtures / "marketplace.json",
-                "production_database": fixtures / "agent.sqlite3.fixture",
-            }
-            for name, path in fixture_files.items():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"disposable-{name}-baseline", "utf-8")
-            def fixture_digest(path: Path) -> str:
-                return sha256(path.read_bytes()).hexdigest()
-            before = {name: fixture_digest(path) for name, path in fixture_files.items()}
-            central_transport_calls: list[str] = []
             created = harness.create(root=root, repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            database_path = root / "state" / "agent.sqlite3"
+            candidate_state = RequestStateStore.open(database_path)
+            capture_state = CaptureOperationStore.open(root / "state" / "capture.sqlite3")
+            self.addCleanup(candidate_state.close)
+            self.addCleanup(capture_state.close)
+            def table_snapshot(path: Path, prefix: str) -> tuple[tuple[str, int, str], ...]:
+                with sqlite3.connect(path) as connection:
+                    rows = connection.execute(
+                        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name LIKE ? ORDER BY name",
+                        (prefix + "%",),
+                    ).fetchall()
+                    return tuple(
+                        (name, int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]), sha256(sql.encode("utf-8")).hexdigest())
+                        for name, sql in rows
+                    )
+            before_candidate = table_snapshot(database_path, "candidate_") + table_snapshot(database_path, "slice_candidate_")
+            before_capture = table_snapshot(capture_state.path, "capture_")
+            before_plugin = tuple(
+                (path.relative_to(plugin).as_posix(), sha256(path.read_bytes()).hexdigest())
+                for path in sorted(plugin.rglob("*")) if path.is_file()
+            )
+            before_marketplace = sha256((root / "marketplace" / ".agents" / "plugins" / "marketplace.json").read_bytes()).hexdigest()
             client = _McpClient(plugin / "recall_gate_a_launcher.py", plugin)
             self.addCleanup(client.close)
             runtime = harness.GateARuntime(
@@ -224,11 +232,10 @@ class RecallGateAVerticalTests(unittest.TestCase):
                 other = harness.RecallHostStore.open(root / "state" / "agent.sqlite3", identity=foreign)
                 self.assertIsNone(other.bound_recall_skill_path("attempt", attempt_id))
                 other.close()
-            self.assertEqual([], central_transport_calls)
-            self.assertEqual(
-                before,
-                {name: fixture_digest(path) for name, path in fixture_files.items()},
-            )
+            self.assertEqual(before_candidate, table_snapshot(database_path, "candidate_") + table_snapshot(database_path, "slice_candidate_"))
+            self.assertEqual(before_capture, table_snapshot(capture_state.path, "capture_"))
+            self.assertEqual(before_plugin, tuple((path.relative_to(plugin).as_posix(), sha256(path.read_bytes()).hexdigest()) for path in sorted(plugin.rglob("*")) if path.is_file()))
+            self.assertEqual(before_marketplace, sha256((root / "marketplace" / ".agents" / "plugins" / "marketplace.json").read_bytes()).hexdigest())
 
     def test_launcher_and_cleanup_fail_closed_on_mismatch_or_live_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -293,6 +300,54 @@ class RecallGateAVerticalTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): harness.inspect(root=root)
             with self.assertRaises(RuntimeError): harness.cleanup(root=root)
             self.assertTrue(root.exists())
+
+    def test_coordinated_generation_substitution_cannot_fool_tracked_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            launcher = plugin / "recall_gate_a_launcher.py"
+            for name in (".recall-gate-a-marker.json", ".recall-gate-a-runtime.json"):
+                path = root / name
+                value = json.loads(path.read_text("utf-8"))
+                value["generation"] = "0" * 32
+                path.write_text(json.dumps(value), "utf-8")
+            failed = subprocess.run(
+                [str(Path.cwd() / ".venv/bin/python"), str(launcher), "hook"],
+                input="{}", text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(0, failed.returncode)
+            with self.assertRaises(RuntimeError):
+                harness.inspect(root=root)
+            with self.assertRaises(RuntimeError):
+                harness.cleanup(root=root)
+            self.assertTrue(root.exists())
+
+    def test_cleanup_preserves_replacement_after_quarantine_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            harness.create(root=root, repository=Path.cwd())
+            original_marker = harness._marker
+            displaced = Path(temporary) / "validated-quarantine"
+            replacement = Path(temporary) / "replacement-sentinel"
+            calls = 0
+
+            def substitute_after_second_validation(value: Path):
+                nonlocal calls
+                result = original_marker(value)
+                calls += 1
+                if calls == 2:
+                    value.rename(displaced)
+                    value.mkdir()
+                    replacement = value / "preserve-me"
+                    replacement.write_text("replacement", "utf-8")
+                return result
+
+            with patch.object(harness, "_marker", side_effect=substitute_after_second_validation):
+                with self.assertRaises(RuntimeError):
+                    harness.cleanup(root=root)
+            self.assertTrue((root / "preserve-me").is_file())
+            self.assertTrue(displaced.is_dir())
 
     def test_launcher_substitution_and_stale_lease_never_expand_cleanup_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

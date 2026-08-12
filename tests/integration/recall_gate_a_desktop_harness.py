@@ -8,12 +8,12 @@ server with a deterministic provider.
 from __future__ import annotations
 
 import argparse
+import ast
 import fcntl
 import hashlib
 import json
 import os
 import secrets
-import shutil
 import sqlite3
 import stat
 import sys
@@ -238,9 +238,33 @@ def _marker(root: Path) -> dict[str, object]:
         raise RuntimeError("disposable launcher is unavailable") from error
     if digest != marker["launcher_digest"]:
         raise RuntimeError("disposable launcher changed")
+    if _frozen_launcher_generation(launcher) != marker["generation"]:
+        raise RuntimeError("disposable launcher generation changed")
     if _read_configuration(root)["generation"] != marker["generation"]:
         raise RuntimeError("disposable root generation changed")
     return marker
+
+
+def _frozen_launcher_generation(launcher: Path) -> str:
+    """Read the exact generated literal only after the marker verified its bytes."""
+
+    try:
+        document = ast.parse(launcher.read_text("utf-8"), filename=str(launcher))
+    except (OSError, SyntaxError, UnicodeDecodeError) as error:
+        raise RuntimeError("disposable launcher generation is invalid") from error
+    values = [
+        statement.value.value
+        for statement in document.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "GENERATION"
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    ]
+    if len(values) != 1 or len(values[0]) != 32 or any(character not in "0123456789abcdef" for character in values[0]):
+        raise RuntimeError("disposable launcher generation is invalid")
+    return values[0]
 
 
 def _read_configuration(root: Path) -> dict[str, object]:
@@ -533,12 +557,67 @@ def cleanup(*, root: Path) -> dict[str, object]:
         quarantined = root.with_name(f".{root.name}.cleanup-{secrets.token_hex(8)}")
         root.rename(quarantined)
         try:
-            _marker(quarantined)
+            marker = _marker(quarantined)
+            _delete_validated_quarantine(quarantined, marker)
         except Exception:
-            quarantined.rename(root)
+            if quarantined.exists() and not root.exists():
+                quarantined.rename(root)
             raise
-        shutil.rmtree(quarantined)
     return {"state": "removed"}
+
+
+def _delete_validated_quarantine(quarantined: Path, marker: dict[str, object]) -> None:
+    """Delete only the inode just validated by ``_marker``; never its replacement."""
+
+    expected = (marker["root_device"], marker["root_inode"])
+    parent_fd = os.open(quarantined.parent, os.O_RDONLY)
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(
+            quarantined.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            dir_fd=parent_fd,
+        )
+        actual = os.fstat(directory_fd)
+        if (actual.st_dev, actual.st_ino) != expected:
+            raise RuntimeError("quarantined disposable root was replaced")
+        _require_quarantine_name_binding(parent_fd, quarantined.name, expected)
+        _remove_tree_at_fd(directory_fd)
+        _require_quarantine_name_binding(parent_fd, quarantined.name, expected)
+        os.rmdir(quarantined.name, dir_fd=parent_fd)
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _require_quarantine_name_binding(
+    parent_fd: int, name: str, expected: tuple[object, object]
+) -> None:
+    try:
+        bound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError("quarantined disposable root is unavailable") from error
+    if (bound.st_dev, bound.st_ino) != expected:
+        raise RuntimeError("quarantined disposable root was replaced")
+
+
+def _remove_tree_at_fd(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(entry.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                _remove_tree_at_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
 
 
 def _runtime(root: Path, plugin_root: Path, identity: RecallPluginIdentity) -> GateARuntime:
