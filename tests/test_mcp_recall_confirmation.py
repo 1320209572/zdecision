@@ -868,6 +868,84 @@ class RecallConfirmationCardTests(unittest.TestCase):
         )
         self.assertEqual("one-update-no-message-ok", output)
 
+    def test_desktop_model_context_receipt_is_accepted_then_acked(self) -> None:
+        output = self._run_card(
+            """
+  const widget = await mount();
+  widget.deliverRender();
+  await flush();
+  const click = widget.elements.enable.dispatch("click");
+  widget.respond(widget.toolCalls()[0], deliveryClaimedResult());
+  const update = await waitFor(
+    () => widget.contextUpdates()[0],
+    "missing Desktop context update",
+  );
+  widget.respond(update, {
+    _meta: {
+      "openai/modelContext": { updateId: "context-update-current-desktop" },
+    },
+  });
+  const ack = await waitFor(
+    () => widget.toolCalls()[1],
+    "Desktop success receipt did not trigger ack",
+  );
+  check(
+    ack.params?.name === "ack_zdecision_recall_delivery",
+    "Desktop success receipt triggered the wrong tool",
+  );
+  widget.respond(ack, acknowledgedResult());
+  await click;
+  await flush();
+  check(widget.contextUpdates().length === 1, "Desktop receipt repeated context");
+  check(widget.toolCalls().length === 2, "Desktop receipt repeated a tool");
+  check(widget.messages().length === 0, "Desktop receipt sent ui/message");
+  check(
+    widget.elements["card-state"].textContent === "已交付",
+    "Desktop receipt did not reach delivered state",
+  );
+  process.stdout.write("desktop-context-receipt-ok");
+""",
+        )
+        self.assertEqual("desktop-context-receipt-ok", output)
+
+    def test_unrecognized_model_context_receipts_do_not_ack(self) -> None:
+        output = self._run_card(
+            """
+  const invalidReceipts = [
+    null,
+    new Map(),
+    { unexpected: true },
+    { _meta: {} },
+    { _meta: { "openai/modelContext": {} } },
+    { _meta: { "openai/modelContext": { updateId: "" } } },
+    {
+      _meta: {
+        "openai/modelContext": { updateId: "valid-looking", extra: true },
+      },
+    },
+  ];
+  for (const receipt of invalidReceipts) {
+    const widget = await mount();
+    widget.deliverRender();
+    await flush();
+    const click = widget.elements.enable.dispatch("click");
+    widget.respond(widget.toolCalls()[0], deliveryClaimedResult());
+    const update = await waitFor(
+      () => widget.contextUpdates()[0],
+      "missing invalid-receipt context update",
+    );
+    widget.respond(update, receipt);
+    await click;
+    await flush();
+    check(widget.toolCalls().length === 1, "invalid receipt sent ack");
+    check(widget.contextUpdates().length === 1, "invalid receipt retried context");
+    check(widget.messages().length === 0, "invalid receipt sent ui/message");
+  }
+  process.stdout.write("invalid-context-receipts-closed-ok");
+""",
+        )
+        self.assertEqual("invalid-context-receipts-closed-ok", output)
+
     def test_missing_or_malformed_host_capabilities_are_unsupported(self) -> None:
         output = self._run_card(
             """

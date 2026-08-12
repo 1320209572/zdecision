@@ -221,6 +221,35 @@
         return value !== null && typeof value === "object" && !Array.isArray(value);
       }
 
+      function record(value) {
+        if (!object(value) || Object.prototype.toString.call(value) !== "[object Object]") {
+          return false;
+        }
+        const prototype = Object.getPrototypeOf(value);
+        return prototype === null || Object.getPrototypeOf(prototype) === null;
+      }
+
+      function validContextUpdateResult(value) {
+        if (!record(value)) return false;
+        const keys = Object.keys(value);
+        if (keys.length === 0) return true;
+        if (keys.length !== 1 || keys[0] !== "_meta" || !record(value._meta)) {
+          return false;
+        }
+        const metaKeys = Object.keys(value._meta);
+        if (metaKeys.length !== 1 || metaKeys[0] !== "openai/modelContext") {
+          return false;
+        }
+        const receipt = value._meta["openai/modelContext"];
+        if (!record(receipt)) return false;
+        const receiptKeys = Object.keys(receipt);
+        return receiptKeys.length === 1
+          && receiptKeys[0] === "updateId"
+          && typeof receipt.updateId === "string"
+          && receipt.updateId.length > 0
+          && receipt.updateId.length <= 200;
+      }
+
       function request(method, params, timeoutMs = null) {
         const id = nextRequestId++;
         window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
@@ -489,7 +518,7 @@
           const updated = await request("ui/update-model-context", {
             content: [{ type: "text", text: claim.contextText }],
           }, 5000);
-          if (!object(updated) || Object.keys(updated).length !== 0) {
+          if (!validContextUpdateResult(updated)) {
             throw new Error("invalid_context_update_result");
           }
         } catch {
