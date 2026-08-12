@@ -508,6 +508,103 @@ class RecallGateAVerticalTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_declined_task_does_not_block_the_next_task_confirmation(self) -> None:
+        """Activation identifiers are stable per task and unique across tasks."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            identity = harness._identity_from_fields(
+                harness._read_configuration(root)["identity"]
+            )
+            runtime = harness.GateARuntime(
+                root=root,
+                repository=Path.cwd(),
+                identity=identity,
+            )
+            intent = RecallIntent.from_dict(
+                {
+                    "target_decision_space_ids": ["space-gate-a"],
+                    "explicit_multi_space": False,
+                    "feature_goal": "Keep task-scoped Recall attempts independent",
+                    "domain_objects": ["Recall"],
+                    "repository_relative_paths": ["src/gate-a"],
+                    "constraints": ["local only"],
+                    "exclusions": ["network"],
+                }
+            )
+            ui_digest = sha256(RECALL_CONFIRMATION_PATH.read_bytes()).hexdigest()
+
+            def bind(session_id: str, turn_id: str) -> str:
+                runtime.hook(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": session_id,
+                        "cwd": str(Path.cwd()),
+                        "source": "startup",
+                    }
+                )
+                runtime.hook(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "cwd": str(Path.cwd()),
+                        "prompt": "native task-scoped Recall turn",
+                    }
+                )
+                bound = runtime.hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "cwd": str(Path.cwd()),
+                        "tool_name": identity.tool_name(
+                            "show_zdecision_recall_confirmation"
+                        ),
+                        "tool_input": {"intent": intent.to_dict()},
+                    }
+                )
+                self.assertEqual(
+                    "allow", bound["hookSpecificOutput"]["permissionDecision"]
+                )
+                return bound["hookSpecificOutput"]["updatedInput"][
+                    "activation_attempt_id"
+                ]
+
+            try:
+                with patch.dict(
+                    "os.environ", {"PLUGIN_ROOT": str(plugin)}, clear=False
+                ):
+                    declined_id = bind("session-declined", "turn-declined")
+                    shown = runtime.recall_tools.show_recall_confirmation(
+                        activation_attempt_id=declined_id,
+                        intent=intent.to_dict(),
+                        ui_digest=ui_digest,
+                    )
+                    self.assertEqual("pending_confirmation", shown["state"])
+                    declined = runtime.recall_tools.decide_recall_confirmation(
+                        activation_attempt_id=declined_id,
+                        action="decline",
+                        current_ui_digest=ui_digest,
+                    )
+                    self.assertEqual("declined", declined["state"])
+
+                    next_id = bind("session-next", "turn-next")
+                    replay_id = bind("session-next", "turn-next")
+
+                self.assertNotEqual(declined_id, next_id)
+                self.assertEqual(next_id, replay_id)
+                self.assertEqual(
+                    2,
+                    runtime.store._connection.execute(
+                        "SELECT COUNT(*) FROM recall_activation_attempts"
+                    ).fetchone()[0],
+                )
+            finally:
+                runtime.close()
+
     def test_launcher_uses_source_runtime_for_target_without_python(self) -> None:
         """The target repository must not also be the harness runtime repository."""
 

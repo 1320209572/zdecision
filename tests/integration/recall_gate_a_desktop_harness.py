@@ -63,6 +63,20 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
+def activation_id_for_turn(session_id: object, turn_id: object) -> str:
+    """Derive one stable activation ID from trusted task coordinates."""
+
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(turn_id, str)
+        or not turn_id
+    ):
+        raise RuntimeError("trusted task coordinates are unavailable")
+    frozen = _canonical({"session_id": session_id, "turn_id": turn_id})
+    return "activation_" + hashlib.sha256(frozen).hexdigest()[:32]
+
+
 def _write(path: Path, value: str | bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(value.encode("utf-8") if isinstance(value, str) else value)
@@ -647,6 +661,11 @@ class GateARuntime:
         self._secure_state_files()
 
     def hook(self, raw: object) -> dict[str, object]:
+        def activation_attempt_id() -> str:
+            if not isinstance(raw, dict):
+                raise RuntimeError("trusted task coordinates are unavailable")
+            return activation_id_for_turn(raw.get("session_id"), raw.get("turn_id"))
+
         response = handle_hook(
             raw,
             database=self.database,
@@ -655,7 +674,7 @@ class GateARuntime:
             worker_waker=lambda _: None,
             recall_store=self.store,
             recall_provider=self.provider,
-            activation_attempt_id_factory=lambda: "activation_" + "a" * 32,
+            activation_attempt_id_factory=activation_attempt_id,
             turn_gate_id_factory=lambda _session, turn, *_: gate_id_for_turn(turn),
             recall_identity=self.identity,
         )
