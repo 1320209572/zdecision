@@ -23,6 +23,36 @@ from zdecision.agent.request_state import RequestStateStore
 from zdecision.recall.session import RecallIntent
 
 
+def _create_target_repository(path: Path) -> None:
+    path.mkdir()
+    for arguments in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "gate-a@example.com"),
+        ("config", "user.name", "Gate A Tests"),
+        ("config", "commit.gpgsign", "false"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    (path / "README.md").write_text("target\n", "utf-8")
+    for arguments in (
+        ("add", "README.md"),
+        ("commit", "-m", "target fixture"),
+        ("remote", "add", "origin", "https://example.invalid/gate-a-target.git"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
 class _McpClient:
     def __init__(self, launcher: Path, plugin: Path) -> None:
         self.process = subprocess.Popen(
@@ -73,12 +103,267 @@ class _McpClient:
 
 
 class RecallGateAVerticalTests(unittest.TestCase):
+    def test_launcher_uses_source_runtime_for_target_without_python(self) -> None:
+        """The target repository must not also be the harness runtime repository."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            target_repository = temporary_root / "target-repository"
+            _create_target_repository(target_repository)
+
+            self.assertFalse((target_repository / ".venv").exists())
+            root = temporary_root / "gate-a"
+            created = harness.create(
+                root=root,
+                target_repository=target_repository,
+            )
+            configuration = harness._read_configuration(root)
+            source_repository = Path.cwd().resolve()
+            identity = harness._identity_from_fields(configuration["identity"])
+            launcher = (
+                root
+                / "marketplace"
+                / "plugins"
+                / created["plugin_name"]
+                / "recall_gate_a_launcher.py"
+            )
+
+            self.assertEqual(str(source_repository), configuration["source_repository"])
+            self.assertEqual(str(target_repository.resolve()), configuration["target_repository"])
+            self.assertEqual(
+                str(source_repository / ".venv" / "bin" / "python"),
+                identity.mcp_command,
+            )
+            launched = subprocess.run(
+                [identity.mcp_command, str(launcher), "hook"],
+                input=json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "session-target",
+                        "turn_id": "turn-target",
+                        "cwd": str(target_repository),
+                        "source": "startup",
+                    }
+                ),
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "PLUGIN_ROOT": str(launcher.parent),
+                },
+                check=False,
+            )
+            self.assertEqual(0, launched.returncode, launched.stderr)
+
+    def test_repository_substitution_invalidates_launcher_and_lifecycle(self) -> None:
+        """Neither frozen source nor target repository may be replaced on disk."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            substituted = temporary_root / "substituted-repository"
+            substituted.mkdir()
+            for field in ("source_repository", "target_repository"):
+                with self.subTest(field=field):
+                    root = temporary_root / f"gate-a-{field}"
+                    created = harness.create(
+                        root=root,
+                        target_repository=Path.cwd(),
+                    )
+                    plugin = (
+                        root
+                        / "marketplace"
+                        / "plugins"
+                        / created["plugin_name"]
+                    )
+                    launcher = plugin / "recall_gate_a_launcher.py"
+                    configuration_path = root / ".recall-gate-a-runtime.json"
+                    configuration = json.loads(configuration_path.read_text("utf-8"))
+                    configuration[field] = str(substituted)
+                    configuration_path.write_text(
+                        json.dumps(configuration, separators=(",", ":"), sort_keys=True),
+                        "utf-8",
+                    )
+
+                    launched = subprocess.run(
+                        [
+                            str(Path.cwd() / ".venv" / "bin" / "python"),
+                            str(launcher),
+                            "hook",
+                        ],
+                        input=json.dumps(
+                            {
+                                "hook_event_name": "SessionStart",
+                                "session_id": "session-substitution",
+                                "turn_id": "turn-substitution",
+                                "cwd": str(Path.cwd()),
+                                "source": "startup",
+                            }
+                        ),
+                        capture_output=True,
+                        text=True,
+                        env={**os.environ, "PLUGIN_ROOT": str(plugin)},
+                        check=False,
+                    )
+                    self.assertNotEqual(0, launched.returncode)
+                    with self.assertRaises(RuntimeError):
+                        harness.inspect(root=root)
+                    with self.assertRaises(RuntimeError):
+                        harness.cleanup(root=root)
+                    self.assertTrue(root.exists())
+
+    def test_coordinated_target_substitution_cannot_replace_identity_commitment(
+        self,
+    ) -> None:
+        """Launcher, config, and marker edits cannot retarget the Plugin."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            original_target = temporary_root / "original-target"
+            substituted_target = temporary_root / "substituted-target"
+            _create_target_repository(original_target)
+            _create_target_repository(substituted_target)
+            root = temporary_root / "gate-a"
+            created = harness.create(
+                root=root,
+                target_repository=original_target,
+            )
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            launcher = plugin / "recall_gate_a_launcher.py"
+            configuration_path = root / ".recall-gate-a-runtime.json"
+            marker_path = root / ".recall-gate-a-marker.json"
+
+            launcher_source = launcher.read_text("utf-8")
+            frozen_original = f"TARGET_REPOSITORY = {str(original_target.resolve())!r}"
+            frozen_substitute = (
+                f"TARGET_REPOSITORY = {str(substituted_target.resolve())!r}"
+            )
+            self.assertEqual(1, launcher_source.count(frozen_original))
+            launcher.write_text(
+                launcher_source.replace(frozen_original, frozen_substitute),
+                "utf-8",
+            )
+            configuration = json.loads(configuration_path.read_text("utf-8"))
+            configuration["target_repository"] = str(substituted_target.resolve())
+            configuration_path.write_text(
+                json.dumps(configuration, separators=(",", ":"), sort_keys=True),
+                "utf-8",
+            )
+            marker = json.loads(marker_path.read_text("utf-8"))
+            marker["launcher_digest"] = sha256(launcher.read_bytes()).hexdigest()
+            marker_path.write_text(
+                json.dumps(marker, separators=(",", ":"), sort_keys=True),
+                "utf-8",
+            )
+
+            launched = subprocess.run(
+                [
+                    str(Path.cwd() / ".venv" / "bin" / "python"),
+                    str(launcher),
+                    "hook",
+                ],
+                input=json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "session-coordinated-substitution",
+                        "turn_id": "turn-coordinated-substitution",
+                        "cwd": str(substituted_target),
+                        "source": "startup",
+                    }
+                ),
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PLUGIN_ROOT": str(plugin)},
+                check=False,
+            )
+            self.assertNotEqual(0, launched.returncode)
+            with self.assertRaises(RuntimeError):
+                harness.inspect(root=root)
+            with self.assertRaises(RuntimeError):
+                harness.cleanup(root=root)
+            self.assertTrue(root.exists())
+
+    def test_coordinated_source_substitution_fails_before_harness_import(
+        self,
+    ) -> None:
+        """A copied harness cannot self-authorize as the frozen source runtime."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            substituted_source = temporary_root / "substituted-source"
+            copied_package = substituted_source / "tests" / "integration"
+            copied_package.mkdir(parents=True)
+            (substituted_source / "tests" / "__init__.py").write_text("", "utf-8")
+            (copied_package / "__init__.py").write_text("", "utf-8")
+            shutil.copy2(
+                Path(harness.__file__),
+                copied_package / "recall_gate_a_desktop_harness.py",
+            )
+            substituted_python = substituted_source / ".venv" / "bin" / "python"
+            substituted_python.parent.mkdir(parents=True)
+            substituted_python.symlink_to(Path.cwd() / ".venv" / "bin" / "python")
+
+            root = temporary_root / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            plugin = root / "marketplace" / "plugins" / created["plugin_name"]
+            launcher = plugin / "recall_gate_a_launcher.py"
+            configuration_path = root / ".recall-gate-a-runtime.json"
+            marker_path = root / ".recall-gate-a-marker.json"
+            launcher_source = launcher.read_text("utf-8")
+            frozen_original = f"SOURCE_REPOSITORY = {str(Path.cwd().resolve())!r}"
+            frozen_substitute = (
+                f"SOURCE_REPOSITORY = {str(substituted_source.resolve())!r}"
+            )
+            self.assertEqual(1, launcher_source.count(frozen_original))
+            launcher.write_text(
+                launcher_source.replace(frozen_original, frozen_substitute),
+                "utf-8",
+            )
+            configuration = json.loads(configuration_path.read_text("utf-8"))
+            configuration["source_repository"] = str(substituted_source.resolve())
+            configuration_path.write_text(
+                json.dumps(configuration, separators=(",", ":"), sort_keys=True),
+                "utf-8",
+            )
+            marker = json.loads(marker_path.read_text("utf-8"))
+            marker["launcher_digest"] = sha256(launcher.read_bytes()).hexdigest()
+            marker_path.write_text(
+                json.dumps(marker, separators=(",", ":"), sort_keys=True),
+                "utf-8",
+            )
+
+            launched = subprocess.run(
+                [
+                    str(Path.cwd() / ".venv" / "bin" / "python"),
+                    str(launcher),
+                    "hook",
+                ],
+                input=json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "session-source-substitution",
+                        "turn_id": "turn-source-substitution",
+                        "cwd": str(Path.cwd()),
+                        "source": "startup",
+                    }
+                ),
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PLUGIN_ROOT": str(plugin)},
+                check=False,
+            )
+            self.assertNotEqual(0, launched.returncode)
+            with self.assertRaises(RuntimeError):
+                harness.inspect(root=root)
+            with self.assertRaises(RuntimeError):
+                harness.cleanup(root=root)
+            self.assertTrue(root.exists())
+
     def test_generated_disposable_bundle_is_an_installable_local_plugin(self) -> None:
         """Task 10 must install a real Codex Plugin with stable UI labels."""
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin_name = created["plugin_name"]
             plugin = root / "marketplace" / "plugins" / plugin_name
             validator = (
@@ -171,7 +456,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
 
             self.assertNotEqual("zdecision", created["plugin_name"])
             self.assertNotEqual("zdecision-local", created["mcp_server_key"])
@@ -183,7 +468,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             database_path = root / "state" / "agent.sqlite3"
             candidate_state = RequestStateStore.open(database_path)
@@ -334,7 +619,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_launcher_and_cleanup_fail_closed_on_mismatch_or_live_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             launcher = plugin / "recall_gate_a_launcher.py"
             wrong_root = Path(temporary) / "wrong"
@@ -357,7 +642,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            harness.create(root=root, repository=Path.cwd())
+            harness.create(root=root, target_repository=Path.cwd())
             original_marker = harness._marker
             displaced = Path(temporary) / "displaced-original"
             replacement = root / "replacement-sentinel"
@@ -383,7 +668,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_marker_generation_mutation_preserves_the_uncertain_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             launcher = root / "marketplace" / "plugins" / created["plugin_name"] / "recall_gate_a_launcher.py"
             marker = root / ".recall-gate-a-marker.json"
             value = __import__("json").loads(marker.read_text("utf-8"))
@@ -398,7 +683,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_coordinated_generation_substitution_cannot_fool_tracked_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             launcher = plugin / "recall_gate_a_launcher.py"
             for name in (".recall-gate-a-marker.json", ".recall-gate-a-runtime.json"):
@@ -420,7 +705,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_cleanup_preserves_replacement_after_quarantine_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            harness.create(root=root, repository=Path.cwd())
+            harness.create(root=root, target_repository=Path.cwd())
             original_marker = harness._marker
             displaced = Path(temporary) / "validated-quarantine"
             replacement = Path(temporary) / "replacement-sentinel"
@@ -446,7 +731,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_cleanup_never_follows_a_child_swapped_to_external_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            harness.create(root=root, repository=Path.cwd())
+            harness.create(root=root, target_repository=Path.cwd())
             child = root / "race-dir"
             child.mkdir()
             (child / "owned").write_text("owned", "utf-8")
@@ -489,7 +774,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_launcher_substitution_and_stale_lease_never_expand_cleanup_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             launcher = plugin / "recall_gate_a_launcher.py"
             stale = root / ".recall-gate-a-leases" / "stale-client"
@@ -515,7 +800,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_missing_exact_mcp_client_creates_no_cleanup_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             launcher = plugin / "recall_gate_a_launcher.py"
             wrong_root = Path(temporary) / "not-the-plugin"
@@ -535,7 +820,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_two_generated_mcp_clients_hold_distinct_cleanup_leases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             launcher = plugin / "recall_gate_a_launcher.py"
             self.assertEqual(0, harness.inspect(root=root)["live_mcp_leases"])
@@ -554,7 +839,7 @@ class RecallGateAVerticalTests(unittest.TestCase):
     def test_mixed_production_namespace_is_denied_by_disposable_composition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
-            created = harness.create(root=root, repository=Path.cwd())
+            created = harness.create(root=root, target_repository=Path.cwd())
             plugin = root / "marketplace" / "plugins" / created["plugin_name"]
             runtime = harness.GateARuntime(
                 root=root, repository=Path.cwd(),

@@ -81,14 +81,61 @@ def _inside(path: Path, parent: Path) -> bool:
     return True
 
 
-def _fresh_root(root: Path, repository: Path) -> Path:
+def _source_repository() -> Path:
+    repository = Path(__file__).resolve(strict=True).parents[2]
+    if not (repository / ".venv" / "bin" / "python").is_file():
+        raise RuntimeError("source repository Python is unavailable")
+    return repository
+
+
+def _repository_commitment(repository: Path) -> str:
+    resolved = repository.resolve(strict=True)
+    return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:32]
+
+
+def _plugin_commits_to_target(
+    plugin_name: str,
+    target_repository: Path,
+) -> bool:
+    prefix = "zdecision-gatea-"
+    if not plugin_name.startswith(prefix):
+        return False
+    components = plugin_name.removeprefix(prefix).split("-")
+    if (
+        len(components) != 2
+        or len(components[0]) != 16
+        or len(components[1]) != 32
+        or any(
+            character not in "0123456789abcdef"
+            for component in components
+            for character in component
+        )
+    ):
+        return False
+    try:
+        expected_target = _repository_commitment(target_repository)
+    except OSError:
+        return False
+    return secrets.compare_digest(components[1], expected_target)
+
+
+def _fresh_root(
+    root: Path,
+    source_repository: Path,
+    target_repository: Path,
+) -> Path:
     if not root.is_absolute() or root.exists():
         raise RuntimeError("disposable root must be a fresh absolute path")
     resolved_parent = root.parent.resolve(strict=True)
     candidate = resolved_parent / root.name
-    repository = repository.resolve(strict=True)
     home = Path.home().resolve(strict=True)
-    if _inside(candidate, repository) or _inside(candidate, home):
+    repositories = (
+        source_repository.resolve(strict=True),
+        target_repository.resolve(strict=True),
+    )
+    if any(_inside(candidate, repository) for repository in repositories) or _inside(
+        candidate, home
+    ):
         raise RuntimeError("disposable root must not be below repository or home")
     production_cache = home / ".codex"
     if _inside(candidate, production_cache):
@@ -96,10 +143,14 @@ def _fresh_root(root: Path, repository: Path) -> Path:
     return candidate
 
 
-def _identity(plugin_name: str, launcher: Path, repository: Path) -> RecallPluginIdentity:
-    python = repository / ".venv" / "bin" / "python"
+def _identity(
+    plugin_name: str,
+    launcher: Path,
+    source_repository: Path,
+) -> RecallPluginIdentity:
+    python = source_repository / ".venv" / "bin" / "python"
     if not python.is_file():
-        raise RuntimeError("repository Python is unavailable")
+        raise RuntimeError("source repository Python is unavailable")
     command = str(python)
     hook_command = " ".join(
         __import__("shlex").quote(part) for part in (command, str(launcher), "hook")
@@ -144,7 +195,12 @@ def _hooks(identity: RecallPluginIdentity) -> dict[str, object]:
 
 
 def _launcher_source(
-    *, root_relative_launcher: str, repository: Path, identity: RecallPluginIdentity, generation: str
+    *,
+    root_relative_launcher: str,
+    source_repository: Path,
+    target_repository: Path,
+    identity: RecallPluginIdentity,
+    generation: str,
 ) -> str:
     fields = repr(
         (
@@ -164,7 +220,8 @@ import sys
 from pathlib import Path
 
 IDENTITY = {fields}
-REPOSITORY = {str(repository)!r}
+SOURCE_REPOSITORY = {str(source_repository)!r}
+TARGET_REPOSITORY = {str(target_repository)!r}
 LAUNCHER_RELATIVE_PATH = {root_relative_launcher!r}
 GENERATION = {generation!r}
 
@@ -198,16 +255,39 @@ def _root() -> tuple[Path, Path]:
                 _fail("PLUGIN_ROOT does not match the disposable Plugin")
         except OSError:
             _fail("PLUGIN_ROOT is invalid")
+    prefix = "zdecision-gatea-"
+    components = IDENTITY[0].removeprefix(prefix).split("-")
+    try:
+        target_commitment = hashlib.sha256(
+            str(Path(TARGET_REPOSITORY).resolve(strict=True)).encode("utf-8")
+        ).hexdigest()[:32]
+    except OSError:
+        _fail("disposable Recall repository binding is invalid")
+    if (
+        plugin_root.name != IDENTITY[0]
+        or not IDENTITY[0].startswith(prefix)
+        or len(components) != 2
+        or IDENTITY[2] != str(Path(SOURCE_REPOSITORY) / ".venv" / "bin" / "python")
+        or components[1] != target_commitment
+    ):
+        _fail("disposable Recall repository binding mismatch")
     return root, plugin_root
 
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in ("hook", "mcp"):
         _fail("expected exactly one of hook or mcp")
     root, plugin_root = _root()
-    if REPOSITORY not in sys.path:
-        sys.path.insert(0, REPOSITORY)
+    if SOURCE_REPOSITORY not in sys.path:
+        sys.path.insert(0, SOURCE_REPOSITORY)
     from tests.integration.recall_gate_a_desktop_harness import run_launcher
-    return run_launcher(root=root, plugin_root=plugin_root, identity_fields=IDENTITY, command=sys.argv[1])
+    return run_launcher(
+        root=root,
+        plugin_root=plugin_root,
+        identity_fields=IDENTITY,
+        source_repository=SOURCE_REPOSITORY,
+        target_repository=TARGET_REPOSITORY,
+        command=sys.argv[1],
+    )
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -238,33 +318,73 @@ def _marker(root: Path) -> dict[str, object]:
         raise RuntimeError("disposable launcher is unavailable") from error
     if digest != marker["launcher_digest"]:
         raise RuntimeError("disposable launcher changed")
-    if _frozen_launcher_generation(launcher) != marker["generation"]:
+    frozen = _frozen_launcher_configuration(launcher)
+    if frozen["generation"] != marker["generation"]:
         raise RuntimeError("disposable launcher generation changed")
-    if _read_configuration(root)["generation"] != marker["generation"]:
+    configuration = _read_configuration(root)
+    if configuration["generation"] != marker["generation"]:
         raise RuntimeError("disposable root generation changed")
+    if (
+        frozen["source_repository"] != str(_source_repository())
+        or configuration["source_repository"] != frozen["source_repository"]
+        or configuration["target_repository"] != frozen["target_repository"]
+    ):
+        raise RuntimeError("disposable repository binding changed")
+    identity = _identity_from_fields(configuration["identity"])
+    plugin = launcher.parent
+    if (
+        plugin.name != identity.plugin_name
+        or identity.mcp_command
+        != str(Path(frozen["source_repository"]) / ".venv" / "bin" / "python")
+        or not _plugin_commits_to_target(
+            identity.plugin_name,
+            Path(frozen["target_repository"]),
+        )
+        or verify_recall_plugin_bundle(plugin, identity) is None
+    ):
+        raise RuntimeError("disposable target commitment changed")
     return marker
 
 
-def _frozen_launcher_generation(launcher: Path) -> str:
-    """Read the exact generated literal only after the marker verified its bytes."""
+def _frozen_launcher_configuration(launcher: Path) -> dict[str, str]:
+    """Read closed generated literals only after the marker verified launcher bytes."""
 
     try:
         document = ast.parse(launcher.read_text("utf-8"), filename=str(launcher))
     except (OSError, SyntaxError, UnicodeDecodeError) as error:
-        raise RuntimeError("disposable launcher generation is invalid") from error
-    values = [
-        statement.value.value
-        for statement in document.body
-        if isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance(statement.targets[0], ast.Name)
-        and statement.targets[0].id == "GENERATION"
-        and isinstance(statement.value, ast.Constant)
-        and isinstance(statement.value.value, str)
-    ]
-    if len(values) != 1 or len(values[0]) != 32 or any(character not in "0123456789abcdef" for character in values[0]):
+        raise RuntimeError("disposable launcher configuration is invalid") from error
+    values: dict[str, str] = {}
+    for name, key in (
+        ("GENERATION", "generation"),
+        ("SOURCE_REPOSITORY", "source_repository"),
+        ("TARGET_REPOSITORY", "target_repository"),
+    ):
+        assignments = [
+            statement
+            for statement in document.body
+            if isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == name
+        ]
+        if (
+            len(assignments) != 1
+            or not isinstance(assignments[0].value, ast.Constant)
+            or not isinstance(assignments[0].value.value, str)
+        ):
+            raise RuntimeError("disposable launcher configuration is invalid")
+        values[key] = assignments[0].value.value
+    generation = values["generation"]
+    if len(generation) != 32 or any(
+        character not in "0123456789abcdef" for character in generation
+    ):
         raise RuntimeError("disposable launcher generation is invalid")
-    return values[0]
+    if any(
+        "\x00" in values[key] or not Path(values[key]).is_absolute()
+        for key in ("source_repository", "target_repository")
+    ):
+        raise RuntimeError("disposable launcher repository binding is invalid")
+    return values
 
 
 def _read_configuration(root: Path) -> dict[str, object]:
@@ -272,7 +392,18 @@ def _read_configuration(root: Path) -> dict[str, object]:
         value = json.loads((root / _CONFIGURATION).read_text("utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("disposable configuration is invalid") from error
-    if not isinstance(value, dict) or set(value) != {"repository", "identity", "generation"} or not isinstance(value["generation"], str):
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {"source_repository", "target_repository", "identity", "generation"}
+        or not isinstance(value["source_repository"], str)
+        or not isinstance(value["target_repository"], str)
+        or not isinstance(value["generation"], str)
+        or "\x00" in value["source_repository"]
+        or "\x00" in value["target_repository"]
+        or not Path(value["source_repository"]).is_absolute()
+        or not Path(value["target_repository"]).is_absolute()
+    ):
         raise RuntimeError("disposable configuration is invalid")
     return value
 
@@ -479,18 +610,25 @@ class GateARuntime:
         return response.output
 
 
-def create(*, root: Path, repository: Path) -> dict[str, object]:
+def create(*, root: Path, target_repository: Path) -> dict[str, object]:
     """Write a fresh self-contained marketplace and exactly one Plugin."""
 
-    repository = repository.resolve(strict=True)
-    root = _fresh_root(root, repository)
+    source_repository = _source_repository()
+    target_repository = target_repository.resolve(strict=True)
+    root = _fresh_root(root, source_repository, target_repository)
     root.mkdir(mode=0o700)
     root.chmod(0o700)
-    plugin_name = "zdecision-gatea-" + secrets.token_hex(8)
+    plugin_name = "-".join(
+        (
+            "zdecision-gatea",
+            secrets.token_hex(8),
+            _repository_commitment(target_repository),
+        )
+    )
     plugin = root / "marketplace" / "plugins" / plugin_name
     launcher = plugin / _LAUNCHER_NAME
     relative_launcher = launcher.relative_to(root).as_posix()
-    identity = _identity(plugin_name, launcher, repository)
+    identity = _identity(plugin_name, launcher, source_repository)
     generation = secrets.token_hex(16)
     for directory in (plugin, plugin / "skills" / "recall", plugin / "hooks", root / _STATE, root / _LEASES):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -547,7 +685,11 @@ Use this disposable Skill only for the bounded Recall Gate A acceptance.
         }],
     })
     launcher_source = _launcher_source(
-        root_relative_launcher=relative_launcher, repository=repository, identity=identity, generation=generation
+        root_relative_launcher=relative_launcher,
+        source_repository=source_repository,
+        target_repository=target_repository,
+        identity=identity,
+        generation=generation,
     )
     _write(launcher, launcher_source)
     marker = {
@@ -559,7 +701,8 @@ Use this disposable Skill only for the bounded Recall Gate A acceptance.
     }
     _write_json(root / _MARKER, marker)
     _write_json(root / _CONFIGURATION, {
-        "repository": str(repository),
+        "source_repository": str(source_repository),
+        "target_repository": str(target_repository),
         "generation": generation,
         "identity": list((identity.plugin_name, identity.mcp_server_key, identity.mcp_command, list(identity.mcp_args), identity.hook_command, identity.recall_skill_relative_path)),
     })
@@ -687,7 +830,13 @@ def _require_child_name_binding(
         raise RuntimeError("disposable child directory was replaced")
 
 
-def _runtime(root: Path, plugin_root: Path, identity: RecallPluginIdentity) -> GateARuntime:
+def _runtime(
+    root: Path,
+    plugin_root: Path,
+    identity: RecallPluginIdentity,
+    source_repository: str,
+    target_repository: str,
+) -> GateARuntime:
     _marker(root)
     if verify_recall_plugin_bundle(plugin_root, identity) is None:
         raise RuntimeError("launcher Plugin identity did not verify")
@@ -697,15 +846,39 @@ def _runtime(root: Path, plugin_root: Path, identity: RecallPluginIdentity) -> G
         list(identity.mcp_args), identity.hook_command, identity.recall_skill_relative_path,
     ):
         raise RuntimeError("launcher identity differs from generated configuration")
-    repository = Path(configuration["repository"])
-    return GateARuntime(root=root, repository=repository, identity=identity)
+    if configuration["target_repository"] != target_repository:
+        raise RuntimeError("launcher target differs from generated configuration")
+    if configuration["source_repository"] != source_repository:
+        raise RuntimeError("launcher source differs from generated configuration")
+    return GateARuntime(
+        root=root,
+        repository=Path(target_repository),
+        identity=identity,
+    )
 
 
-def run_launcher(*, root: Path, plugin_root: Path, identity_fields: object, command: str) -> int:
+def run_launcher(
+    *,
+    root: Path,
+    plugin_root: Path,
+    identity_fields: object,
+    source_repository: str,
+    target_repository: str,
+    command: str,
+) -> int:
     if command not in ("hook", "mcp"):
         raise RuntimeError("launcher command is invalid")
     identity = _identity_from_fields(identity_fields)
-    runtime = _runtime(root, plugin_root, identity)
+    imported_source = Path(__file__).resolve(strict=True).parents[2]
+    if imported_source != Path(source_repository).resolve(strict=True):
+        raise RuntimeError("launcher imported the harness from a different source")
+    runtime = _runtime(
+        root,
+        plugin_root,
+        identity,
+        source_repository,
+        target_repository,
+    )
     try:
         if command == "hook":
             raw = json.loads(sys.stdin.buffer.read(65_537).decode("utf-8"))
@@ -723,7 +896,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     create_parser = commands.add_parser("create")
     create_parser.add_argument("--root", required=True)
-    create_parser.add_argument("--repository", required=True)
+    create_parser.add_argument("--target-repository", required=True)
     for name in ("inspect", "cleanup"):
         command = commands.add_parser(name)
         command.add_argument("--root", required=True)
@@ -734,7 +907,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     root = Path(arguments.root)
     if arguments.command == "create":
-        result = create(root=root, repository=Path(arguments.repository))
+        result = create(
+            root=root,
+            target_repository=Path(arguments.target_repository),
+        )
     elif arguments.command == "inspect":
         result = inspect(root=root)
     else:
