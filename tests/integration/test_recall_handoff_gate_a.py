@@ -104,6 +104,47 @@ class _McpClient:
 
 
 class RecallGateAVerticalTests(unittest.TestCase):
+    def test_generated_skill_inherits_the_approved_recall_workflow(self) -> None:
+        """The disposable selection must teach the same Recall workflow."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, target_repository=Path.cwd())
+            generated = (
+                root
+                / "marketplace"
+                / "plugins"
+                / created["plugin_name"]
+                / "skills"
+                / "recall"
+                / "SKILL.md"
+            ).read_text("utf-8")
+            approved = (
+                Path(__file__).resolve().parents[2]
+                / "plugins"
+                / "zdecision"
+                / "skills"
+                / "zdecision"
+                / "SKILL.md"
+            ).read_text("utf-8")
+
+            generated_frontmatter, separator, generated_body = generated.partition(
+                "\n---\n"
+            )
+            self.assertTrue(separator)
+            _approved_frontmatter, separator, approved_body = approved.partition(
+                "\n---\n"
+            )
+            self.assertTrue(separator)
+            self.assertEqual(
+                "---\n"
+                "name: zdecision-gate-a\n"
+                "description: Use when the user explicitly selects ZDecision Gate A "
+                "in this native task.",
+                generated_frontmatter,
+            )
+            self.assertEqual(approved_body, generated_body)
+
     def test_source_launcher_accepts_relocated_verified_installed_plugin_root(
         self,
     ) -> None:

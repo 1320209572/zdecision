@@ -73,6 +73,33 @@ def _write_json(path: Path, value: object) -> None:
     _write(path, _canonical(value))
 
 
+def _disposable_skill_source(source_repository: Path) -> str:
+    approved = (
+        source_repository
+        / "plugins"
+        / "zdecision"
+        / "skills"
+        / "zdecision"
+        / "SKILL.md"
+    )
+    try:
+        _frontmatter, separator, body = approved.read_text("utf-8").partition(
+            "\n---\n"
+        )
+    except OSError as error:
+        raise RuntimeError("approved Recall Skill is unavailable") from error
+    if not separator or not body.strip():
+        raise RuntimeError("approved Recall Skill is invalid")
+    return (
+        "---\n"
+        "name: zdecision-gate-a\n"
+        "description: Use when the user explicitly selects ZDecision Gate A "
+        "in this native task.\n"
+        "---\n"
+        + body
+    )
+
+
 def _inside(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -687,15 +714,7 @@ def create(*, root: Path, target_repository: Path) -> dict[str, object]:
         "command": identity.mcp_command, "args": list(identity.mcp_args)}}})
     _write(
         plugin / identity.recall_skill_relative_path,
-        """---
-name: zdecision-gate-a
-description: Run the isolated ZDecision Recall Gate A acceptance for the current task.
----
-
-# ZDecision Gate A
-
-Use this disposable Skill only for the bounded Recall Gate A acceptance.
-""",
+        _disposable_skill_source(source_repository),
     )
     _write_json(plugin / "hooks" / "hooks.json", _hooks(identity))
     _write_json(root / "marketplace" / ".agents" / "plugins" / "marketplace.json", {
