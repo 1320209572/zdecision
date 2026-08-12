@@ -496,15 +496,55 @@ def create(*, root: Path, repository: Path) -> dict[str, object]:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
     _write_json(plugin / ".codex-plugin" / "plugin.json", {
-        "name": identity.plugin_name, "skills": "./skills/", "mcpServers": "./.mcp.json"
+        "name": identity.plugin_name,
+        "version": "0.1.0",
+        "description": "Disposable ZDecision Recall Gate A acceptance Plugin",
+        "author": {"name": "ZDecision"},
+        "skills": "./skills/",
+        "mcpServers": "./.mcp.json",
+        "interface": {
+            "displayName": "ZDecision Gate A",
+            "shortDescription": "Disposable Recall Gate A acceptance",
+            "longDescription": (
+                "Runs the isolated Recall Gate A Desktop acceptance without "
+                "replacing the production ZDecision Plugin."
+            ),
+            "developerName": "ZDecision",
+            "category": "Productivity",
+            "capabilities": ["Read"],
+            "defaultPrompt": ["Run ZDecision Gate A"],
+        },
     })
     _write_json(plugin / ".mcp.json", {"mcpServers": {identity.mcp_server_key: {
         "command": identity.mcp_command, "args": list(identity.mcp_args)}}})
-    _write(plugin / identity.recall_skill_relative_path, "# Disposable Recall Gate A\n")
+    _write(
+        plugin / identity.recall_skill_relative_path,
+        """---
+name: zdecision-gate-a
+description: Run the isolated ZDecision Recall Gate A acceptance for the current task.
+---
+
+# ZDecision Gate A
+
+Use this disposable Skill only for the bounded Recall Gate A acceptance.
+""",
+    )
     _write_json(plugin / "hooks" / "hooks.json", _hooks(identity))
     _write_json(root / "marketplace" / ".agents" / "plugins" / "marketplace.json", {
         "name": "recall-gate-a-disposable",
-        "plugins": [{"name": identity.plugin_name, "source": {"path": f"plugins/{identity.plugin_name}"}}],
+        "interface": {"displayName": "ZDecision Gate A Disposable"},
+        "plugins": [{
+            "name": identity.plugin_name,
+            "source": {
+                "source": "local",
+                "path": f"./plugins/{identity.plugin_name}",
+            },
+            "policy": {
+                "installation": "AVAILABLE",
+                "authentication": "ON_INSTALL",
+            },
+            "category": "Productivity",
+        }],
     })
     launcher_source = _launcher_source(
         root_relative_launcher=relative_launcher, repository=repository, identity=identity, generation=generation

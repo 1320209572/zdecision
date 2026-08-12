@@ -10,6 +10,7 @@ from pathlib import Path
 import os
 import json
 import queue
+import shutil
 import subprocess
 import threading
 from dataclasses import replace
@@ -72,6 +73,99 @@ class _McpClient:
 
 
 class RecallGateAVerticalTests(unittest.TestCase):
+    def test_generated_disposable_bundle_is_an_installable_local_plugin(self) -> None:
+        """Task 10 must install a real Codex Plugin with stable UI labels."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            created = harness.create(root=root, repository=Path.cwd())
+            plugin_name = created["plugin_name"]
+            plugin = root / "marketplace" / "plugins" / plugin_name
+            validator = (
+                Path.home()
+                / ".codex"
+                / "skills"
+                / ".system"
+                / "plugin-creator"
+                / "scripts"
+                / "validate_plugin.py"
+            )
+
+            self.assertTrue(validator.is_file(), "current Codex Plugin validator is required")
+            uv = shutil.which("uv")
+            self.assertIsNotNone(uv, "uv is required to run the current Plugin validator")
+            validated = subprocess.run(
+                [
+                    uv,
+                    "run",
+                    "--no-project",
+                    "--offline",
+                    "--with",
+                    "pyyaml",
+                    "python",
+                    str(validator),
+                    str(plugin),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                validated.returncode,
+                validated.stdout + validated.stderr,
+            )
+
+            manifest = json.loads(
+                (plugin / ".codex-plugin" / "plugin.json").read_text("utf-8")
+            )
+            self.assertEqual("ZDecision Gate A", manifest["interface"]["displayName"])
+            self.assertNotIn("hooks", manifest)
+            self.assertEqual("./skills/", manifest["skills"])
+            self.assertEqual("./.mcp.json", manifest["mcpServers"])
+
+            mcp = json.loads((plugin / ".mcp.json").read_text("utf-8"))
+            configuration = harness._read_configuration(root)
+            identity = harness._identity_from_fields(configuration["identity"])
+            self.assertEqual(
+                {
+                    identity.mcp_server_key: {
+                        "command": identity.mcp_command,
+                        "args": list(identity.mcp_args),
+                    }
+                },
+                mcp["mcpServers"],
+            )
+
+            marketplace = json.loads(
+                (
+                    root
+                    / "marketplace"
+                    / ".agents"
+                    / "plugins"
+                    / "marketplace.json"
+                ).read_text("utf-8")
+            )
+            self.assertEqual(
+                {"displayName": "ZDecision Gate A Disposable"},
+                marketplace["interface"],
+            )
+            self.assertEqual(
+                {
+                    "name": plugin_name,
+                    "source": {
+                        "source": "local",
+                        "path": f"./plugins/{plugin_name}",
+                    },
+                    "policy": {
+                        "installation": "AVAILABLE",
+                        "authentication": "ON_INSTALL",
+                    },
+                    "category": "Productivity",
+                },
+                marketplace["plugins"][0],
+            )
+
     def test_generated_disposable_bundle_has_a_verified_unique_identity(self) -> None:
         """The vertical must use a generated bundle, never production identity."""
 
