@@ -606,18 +606,45 @@ def _remove_tree_at_fd(directory_fd: int) -> None:
     for name in os.listdir(directory_fd):
         entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(entry.st_mode):
-            child_fd = os.open(
-                name,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                dir_fd=directory_fd,
-            )
+            expected = (entry.st_dev, entry.st_ino)
             try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise RuntimeError("disposable child directory is unavailable") from error
+            try:
+                opened = os.fstat(child_fd)
+                if (
+                    (opened.st_dev, opened.st_ino) != expected
+                    or not stat.S_ISDIR(opened.st_mode)
+                ):
+                    raise RuntimeError("disposable child directory was replaced")
                 _remove_tree_at_fd(child_fd)
             finally:
                 os.close(child_fd)
+            _require_child_name_binding(directory_fd, name, expected)
             os.rmdir(name, dir_fd=directory_fd)
         else:
             os.unlink(name, dir_fd=directory_fd)
+
+
+def _require_child_name_binding(
+    parent_fd: int, name: str, expected: tuple[int, int]
+) -> None:
+    try:
+        bound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError("disposable child directory is unavailable") from error
+    if (
+        (bound.st_dev, bound.st_ino) != expected
+        or not stat.S_ISDIR(bound.st_mode)
+    ):
+        raise RuntimeError("disposable child directory was replaced")
 
 
 def _runtime(root: Path, plugin_root: Path, identity: RecallPluginIdentity) -> GateARuntime:

@@ -349,6 +349,49 @@ class RecallGateAVerticalTests(unittest.TestCase):
             self.assertTrue((root / "preserve-me").is_file())
             self.assertTrue(displaced.is_dir())
 
+    def test_cleanup_never_follows_a_child_swapped_to_external_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "gate-a"
+            harness.create(root=root, repository=Path.cwd())
+            child = root / "race-dir"
+            child.mkdir()
+            (child / "owned").write_text("owned", "utf-8")
+            external = Path(temporary) / "external"
+            external.mkdir()
+            sentinel = external / "must-survive"
+            sentinel.write_text("external", "utf-8")
+            displaced = Path(temporary) / "displaced-child"
+            original_stat = harness.os.stat
+            swapped = False
+
+            def swap_after_child_stat(name, *args, **kwargs):
+                nonlocal swapped
+                result = original_stat(name, *args, **kwargs)
+                if (
+                    not swapped
+                    and name == "race-dir"
+                    and kwargs.get("follow_symlinks") is False
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    swapped = True
+                    quarantined = next(
+                        path
+                        for path in Path(temporary).iterdir()
+                        if path.name.startswith(".gate-a.cleanup-")
+                    )
+                    live_child = quarantined / name
+                    live_child.rename(displaced)
+                    os.symlink(external, live_child)
+                return result
+
+            with patch.object(harness.os, "stat", side_effect=swap_after_child_stat):
+                with self.assertRaises((RuntimeError, OSError)):
+                    harness.cleanup(root=root)
+            self.assertTrue(swapped)
+            self.assertTrue(sentinel.is_file())
+            self.assertTrue(root.exists())
+            self.assertTrue(displaced.is_dir())
+
     def test_launcher_substitution_and_stale_lease_never_expand_cleanup_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "gate-a"
