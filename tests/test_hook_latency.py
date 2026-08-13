@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import math
+import os
 import subprocess
 import tempfile
 import time
@@ -12,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from zdecision.agent.db import AgentDatabase
+from zdecision.agent import cli as agent_cli
 from zdecision.agent.events import TestRepositoryMapping
 from zdecision.agent.hooks import handle_hook
 from zdecision.agent.recall_host_state import RecallHostStore
@@ -20,6 +23,7 @@ from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
 from zdecision.recall.handoff import RecallPreflightReady
 from zdecision.recall.session import RecallIntent
+from tests.test_recall_demo_wiring import _CapturedOutput, _DemoVertical
 
 try:
     from zdecision.agent.worker import RetryableWorkerError, Worker, WorkerConfig
@@ -343,6 +347,89 @@ class HookLatencyTests(unittest.TestCase):
         self.assertLessEqual(p95, 150.0)
         self.assertEqual(200, provider.preflight_calls)
         self.assertEqual(0, provider.retrieve_calls)
+
+    def test_wired_demo_cli_preflight_p95_is_at_most_150_milliseconds(self) -> None:
+        """The production CLI path must preflight Demo metadata without model or network work."""
+        temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(temporary_directory.name)
+        vertical = _DemoVertical(root)
+        self.addCleanup(vertical.close)
+        self.addCleanup(temporary_directory.cleanup)
+        state_path = agent_cli.database_path(
+            {"ZDECISION_STATE_DIR": str(vertical.state_root)}
+        )
+        database = AgentDatabase.open(state_path)
+        self.addCleanup(database.close)
+        resolver = RepositoryResolver(timeout_seconds=0.5)
+        snapshot = resolver.resolve(vertical.repository)
+        self.assertIsNotNone(snapshot)
+        database.put_test_repository_mapping(
+            TestRepositoryMapping(
+                repository_id=snapshot.repository_id,
+                product_id=product_id("Wired Demo Latency"),
+                product_name="Wired Demo Latency",
+                enabled=True,
+            )
+        )
+        database.put_enabled_repository(EnabledRepository(snapshot.repository_id, True))
+
+        def invoke(value: dict[str, object]) -> dict[str, object]:
+            stdout = _CapturedOutput()
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(value).encode("utf-8")))
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+                self.assertEqual(0, agent_cli.main(["hook"]))
+            return json.loads(stdout.buffer.getvalue())
+
+        original_import = builtins.__import__
+
+        def guarded_import(name: str, *arguments: object, **kwargs: object):
+            if name.split(".")[0] in ("torch", "transformers"):
+                raise AssertionError("Hook must not import model libraries")
+            return original_import(name, *arguments, **kwargs)
+
+        elapsed_milliseconds: list[float] = []
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ZDECISION_STATE_DIR": str(vertical.state_root),
+                    "PLUGIN_ROOT": str(vertical.plugin_root()),
+                },
+                clear=False,
+            ),
+            patch("zdecision.agent.worker.wake_worker", return_value=None),
+            patch("socket.socket.connect", side_effect=AssertionError("network forbidden")),
+            patch("builtins.__import__", side_effect=guarded_import),
+            patch(
+                "zdecision.recall.demo.runtime.load_transformers_runtime",
+                side_effect=AssertionError("runtime loading forbidden"),
+            ),
+        ):
+            for index in range(50):
+                common = {
+                    "session_id": "wired-demo-latency",
+                    "turn_id": f"turn-{index}",
+                    "cwd": str(vertical.repository),
+                }
+                invoke({"hook_event_name": "UserPromptSubmit", "prompt": "not retained", **common})
+                started = time.perf_counter()
+                response = invoke(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": SHOW_RECALL_CONFIRMATION_TOOL,
+                        "tool_input": {"intent": vertical.intent},
+                        **common,
+                    }
+                )
+                elapsed_milliseconds.append((time.perf_counter() - started) * 1000)
+                self.assertEqual(
+                    "allow", response["hookSpecificOutput"]["permissionDecision"]
+                )
+
+        ordered = sorted(elapsed_milliseconds)
+        p95 = ordered[math.ceil(0.95 * len(ordered)) - 1]
+        print(f"Wired Demo CLI Hook preflight p95: {p95:.2f} ms")
+        self.assertLessEqual(p95, 150.0)
 
 
 if __name__ == "__main__":
