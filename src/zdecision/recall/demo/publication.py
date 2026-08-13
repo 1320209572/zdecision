@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import stat
-import tempfile
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -88,10 +87,12 @@ class DemoBundlePointer:
         if (
             not _exact_integer(pointer.schema_version, 1)
             or not _positive_integer(pointer.generation)
+            or not isinstance(pointer.publication_commit, str)
             or _COMMIT.fullmatch(pointer.publication_commit) is None
+            or not isinstance(pointer.bundle, str)
             or pointer.bundle != f"bundles/{pointer.publication_commit}/bundle"
             or any(
-                _DIGEST.fullmatch(digest) is None
+                not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None
                 for digest in (
                     pointer.manifest_digest,
                     pointer.profile_digest,
@@ -134,16 +135,15 @@ def load_demo_bundle_pointer(config: DemoProviderConfig) -> DemoBundlePointer:
         _verify_generation(
             root,
             pointer,
-            _profile(config),
-            _prepared_model_digest(config),
             config.trust_root_path,
+            config.model_state_root,
         )
         return pointer
     except FileNotFoundError:
         raise
     except RecallDemoPublicationError:
         raise
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, ModelStoreError):
         raise RecallDemoPublicationError("pointer_invalid") from None
 
 
@@ -163,8 +163,6 @@ class DemoBundlePublisher:
             bundles = root / "bundles"
             _ensure_owner_directory(root)
             _ensure_owner_directory(bundles)
-            profile = _profile(self._config.provider)
-            model_digest = _prepared_model_digest(self._config.provider)
             previous = self._current_or_none()
             if previous is not None and previous.publication_commit == publication_commit:
                 return previous
@@ -172,12 +170,13 @@ class DemoBundlePublisher:
             generation = bundles / publication_commit
             if generation.exists() or generation.is_symlink():
                 metadata = _verify_existing_generation(
-                    root, generation, publication_commit, profile, model_digest,
+                    root, generation, publication_commit,
                     self._config.provider.trust_root_path,
+                    self._config.provider.model_state_root,
                 )
             else:
                 metadata = self._create_generation(
-                    bundles, generation, publication_commit, profile, model_digest
+                    bundles, generation, publication_commit
                 )
             next_pointer = _pointer_from_generation(
                 previous=previous, metadata=metadata
@@ -204,8 +203,6 @@ class DemoBundlePublisher:
         bundles: Path,
         generation: Path,
         publication_commit: str,
-        profile: DemoRetrievalProfile,
-        model_digest: str,
     ) -> Mapping[str, object]:
         staging = bundles / f".{publication_commit}.{uuid.uuid4().hex}"
         try:
@@ -220,8 +217,14 @@ class DemoBundlePublisher:
             verified = load_verified_bundle(
                 bundle_root=bundle, trust_root_path=self._config.provider.trust_root_path
             )
+            model_digest = _prepared_model_digest(
+                self._config.provider.model_state_root, verified.profile
+            )
             metadata = _generation_metadata(
-                publication_commit, verified.manifest_digest, profile.digest, model_digest
+                publication_commit,
+                verified.manifest_digest,
+                verified.profile.digest,
+                model_digest,
             )
             _write_sealed_json(staging / "generation.json", metadata)
             _sync_directory(staging)
@@ -229,8 +232,9 @@ class DemoBundlePublisher:
                 _rename_no_replace(staging, generation)
             except FileExistsError:
                 return _verify_existing_generation(
-                    bundles.parent, generation, publication_commit, profile, model_digest,
+                    bundles.parent, generation, publication_commit,
                     self._config.provider.trust_root_path,
+                    self._config.provider.model_state_root,
                 )
             _sync_directory(bundles)
             return metadata
@@ -281,9 +285,8 @@ def _verify_existing_generation(
     root: Path,
     generation: Path,
     publication_commit: str,
-    profile: DemoRetrievalProfile,
-    model_digest: str,
     trust_root: Path,
+    model_state_root: Path,
 ) -> Mapping[str, object]:
     try:
         state = generation.lstat()
@@ -296,6 +299,7 @@ def _verify_existing_generation(
         or stat.S_IMODE(state.st_mode) != 0o700
     ):
         raise RecallDemoPublicationError("generation_conflict")
+    _require_contained_bundle(root, generation, publication_commit)
     metadata_path = generation / "generation.json"
     try:
         _require_owned_file(metadata_path, 0o600, "generation_conflict")
@@ -304,21 +308,23 @@ def _verify_existing_generation(
         raise RecallDemoPublicationError("generation_conflict") from None
     if frozenset(metadata) != _GENERATION_FIELDS:
         raise RecallDemoPublicationError("generation_conflict")
-    expected = _generation_metadata(
-        publication_commit,
-        str(metadata.get("manifest_digest", "")),
-        profile.digest,
-        model_digest,
-    )
-    if metadata != expected:
-        raise RecallDemoPublicationError("generation_conflict")
     try:
         verified = load_verified_bundle(
             bundle_root=generation / "bundle", trust_root_path=trust_root
         )
     except DemoBundleError:
         raise RecallDemoPublicationError("generation_conflict") from None
-    if verified.manifest_digest != metadata["manifest_digest"]:
+    try:
+        model_digest = _prepared_model_digest(model_state_root, verified.profile)
+    except ModelStoreError:
+        raise RecallDemoPublicationError("generation_conflict") from None
+    expected = _generation_metadata(
+        publication_commit,
+        verified.manifest_digest,
+        verified.profile.digest,
+        model_digest,
+    )
+    if metadata != expected:
         raise RecallDemoPublicationError("generation_conflict")
     return metadata
 
@@ -326,29 +332,60 @@ def _verify_existing_generation(
 def _verify_generation(
     root: Path,
     pointer: DemoBundlePointer,
-    profile: DemoRetrievalProfile,
-    model_digest: str,
     trust_root: Path,
+    model_state_root: Path,
 ) -> None:
     metadata = _verify_existing_generation(
         root,
         root / "bundles" / pointer.publication_commit,
         pointer.publication_commit,
-        profile,
-        model_digest,
         trust_root,
+        model_state_root,
     )
     if any(pointer.to_dict()[name] != metadata[name] for name in _GENERATION_FIELDS - {"schema_version"}):
         raise RecallDemoPublicationError("pointer_invalid")
 
 
-def _profile(config: DemoProviderConfig) -> DemoRetrievalProfile:
-    return DemoRetrievalProfile.from_dict(_read_canonical_mapping(config.profile_path))
+def _require_contained_bundle(
+    root: Path, generation: Path, publication_commit: str
+) -> None:
+    bundle = generation / "bundle"
+    try:
+        root_state = root.lstat()
+        bundles = root / "bundles"
+        bundles_state = bundles.lstat()
+        bundle_state = bundle.lstat()
+        resolved_root = root.resolve(strict=True)
+        resolved_bundles = bundles.resolve(strict=True)
+        resolved_generation = generation.resolve(strict=True)
+        resolved_bundle = bundle.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise RecallDemoPublicationError("generation_conflict") from None
+    if (
+        stat.S_ISLNK(root_state.st_mode)
+        or not stat.S_ISDIR(root_state.st_mode)
+        or root_state.st_uid != os.geteuid()
+        or stat.S_IMODE(root_state.st_mode) != 0o700
+        or stat.S_ISLNK(bundles_state.st_mode)
+        or not stat.S_ISDIR(bundles_state.st_mode)
+        or bundles_state.st_uid != os.geteuid()
+        or stat.S_IMODE(bundles_state.st_mode) != 0o700
+        or stat.S_ISLNK(bundle_state.st_mode)
+        or not stat.S_ISDIR(bundle_state.st_mode)
+        or bundle_state.st_uid != os.geteuid()
+        or stat.S_IMODE(bundle_state.st_mode) != 0o700
+        or resolved_bundles.parent != resolved_root
+        or resolved_generation.parent != resolved_bundles
+        or resolved_generation.name != publication_commit
+        or resolved_bundle.parent != resolved_generation
+    ):
+        raise RecallDemoPublicationError("generation_conflict")
 
 
-def _prepared_model_digest(config: DemoProviderConfig) -> str:
-    profile = _profile(config)
-    installed = load_installed_models(profile, config.model_state_root)
+def _prepared_model_digest(
+    model_state_root: Path, profile: DemoRetrievalProfile
+) -> str:
+    installed = load_installed_models(profile, model_state_root)
     return hashlib.sha256(installed.install_manifest_path.read_bytes()).hexdigest()
 
 
@@ -373,12 +410,14 @@ def _write_sealed_json(path: Path, value: Mapping[str, object]) -> None:
 
 def _replace_pointer(path: Path, pointer: DemoBundlePointer) -> None:
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    replaced = False
     try:
         _write_owner_file(temporary, canonical_json_bytes(pointer.to_dict()))
         os.replace(temporary, path)
-        _sync_directory(path.parent)
+        replaced = True
     finally:
-        temporary.unlink(missing_ok=True)
+        if not replaced:
+            temporary.unlink(missing_ok=True)
 
 
 def _write_owner_file(path: Path, content: bytes) -> None:

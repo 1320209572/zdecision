@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -64,6 +66,7 @@ class RecallDemoPublicationTests(unittest.TestCase):
             order.append("build")
             bundle = Path(arguments["output_root"])
             bundle.mkdir(parents=True)
+            os.chmod(bundle, 0o700)
             return bundle
 
         def verify(**_arguments: object) -> VerifiedDemoBundle:
@@ -202,3 +205,111 @@ class RecallDemoPublicationTests(unittest.TestCase):
         self.assertEqual(2, second.generation)
         self.assertNotEqual(first.manifest_digest, second.manifest_digest)
         self.assertNotEqual(first.generation_digest, second.generation_digest)
+
+    def test_pointer_selection_returns_success_after_atomic_replace(self) -> None:
+        """A post-replace durability failure must not produce a false failure result."""
+        order: list[str] = []
+        build, verify = self._dependencies(order)
+        with (
+            patch("zdecision.recall.demo.publication.build_signed_bundle", build),
+            patch("zdecision.recall.demo.publication.load_verified_bundle", verify),
+            patch("zdecision.recall.demo.publication._prepared_model_digest", return_value="d" * 64),
+        ):
+            publisher = self._publisher()
+            publisher.refresh("a" * 40)
+            publisher.refresh("b" * 40)
+            with patch(
+                "zdecision.recall.demo.publication._sync_directory",
+                side_effect=OSError(),
+            ):
+                selected = publisher.refresh("a" * 40)
+        self.assertEqual("a" * 40, selected.publication_commit)
+
+    def test_pointer_rejects_generation_bundle_symlink_escape(self) -> None:
+        """The signed bundle directory must be a sealed child of its generation."""
+        order: list[str] = []
+        build, verify = self._dependencies(order)
+        with (
+            patch("zdecision.recall.demo.publication.build_signed_bundle", build),
+            patch("zdecision.recall.demo.publication.load_verified_bundle", verify),
+            patch("zdecision.recall.demo.publication._prepared_model_digest", return_value="d" * 64),
+        ):
+            self._publisher().refresh("a" * 40)
+            generation = self.provider.bundle_state_root / "bundles" / ("a" * 40)
+            bundle = generation / "bundle"
+            bundle.rmdir()
+            outside = self.root / "outside-bundle"
+            outside.mkdir()
+            bundle.symlink_to(outside, target_is_directory=True)
+            from zdecision.recall.demo.publication import (
+                RecallDemoPublicationError,
+                load_demo_bundle_pointer,
+            )
+            with self.assertRaises(RecallDemoPublicationError) as captured:
+                load_demo_bundle_pointer(self.provider)
+        self.assertEqual("generation_conflict", captured.exception.code)
+
+    def test_pointer_normalizes_scalar_and_model_store_failures(self) -> None:
+        """Malformed pointer fields and model state never leak raw exception types."""
+        from zdecision.recall.demo.publication import (
+            DemoBundlePointer,
+            RecallDemoPublicationError,
+            _pointer_from_generation,
+            load_demo_bundle_pointer,
+        )
+        pointer = _pointer_from_generation(
+            previous=None,
+            metadata={
+                "publication_commit": "a" * 40,
+                "bundle": "bundles/" + "a" * 40 + "/bundle",
+                "manifest_digest": "b" * 64,
+                "profile_digest": "c" * 64,
+                "model_install_digest": "d" * 64,
+            },
+        )
+        for field in ("publication_commit", "manifest_digest"):
+            value = pointer.to_dict()
+            value[field] = 1
+            with self.assertRaises(RecallDemoPublicationError) as captured:
+                DemoBundlePointer.from_dict(value)
+            self.assertEqual("pointer_invalid", captured.exception.code)
+
+        order: list[str] = []
+        build, verify = self._dependencies(order)
+        with (
+            patch("zdecision.recall.demo.publication.build_signed_bundle", build),
+            patch("zdecision.recall.demo.publication.load_verified_bundle", verify),
+            patch("zdecision.recall.demo.publication._prepared_model_digest", return_value="d" * 64),
+        ):
+            self._publisher().refresh("a" * 40)
+        from zdecision.recall.demo.model_store import ModelStoreError
+        with (
+            patch("zdecision.recall.demo.publication.load_verified_bundle", return_value=self._bundle()),
+            patch("zdecision.recall.demo.publication.load_installed_models", side_effect=ModelStoreError("installed_pointer_invalid")),
+        ):
+            with self.assertRaises(RecallDemoPublicationError) as captured:
+                load_demo_bundle_pointer(self.provider)
+        self.assertEqual("generation_conflict", captured.exception.code)
+
+    def test_verified_bundle_profile_digest_controls_generation_metadata(self) -> None:
+        """Metadata must bind the profile that the signed bundle actually verifies."""
+        alternate = deepcopy(self.profile.to_dict())
+        alternate["reranker_threshold"] = 2.5
+        verified_profile = DemoRetrievalProfile.from_dict(alternate)
+        verified = VerifiedDemoBundle(
+            decision_space_id=self.provider.decision_space_id,
+            product_name=self.provider.product_name,
+            repository=self.provider.repository_name,
+            profile=verified_profile,
+            decisions=(),
+            manifest_digest="b" * 64,
+        )
+        order: list[str] = []
+        build, _verify = self._dependencies(order)
+        with (
+            patch("zdecision.recall.demo.publication.build_signed_bundle", build),
+            patch("zdecision.recall.demo.publication.load_verified_bundle", return_value=verified),
+            patch("zdecision.recall.demo.publication._prepared_model_digest", return_value="d" * 64),
+        ):
+            pointer = self._publisher().refresh("a" * 40)
+        self.assertEqual(verified_profile.digest, pointer.profile_digest)
