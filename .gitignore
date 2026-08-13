@@ -8,6 +8,7 @@ node_modules/
 .mypy_cache/
 dist/
 build/
+.worktrees/
 
 # Private ZDecision runtime data must never be committed.
 .zdecision/
