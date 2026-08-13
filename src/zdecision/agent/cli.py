@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -11,6 +14,10 @@ from pathlib import Path
 
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.private_store.filesystem import private_state_root
+
+
+_RECALL_DEMO_NONCE = b"zdecision-recall-demo-setup-v1"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def database_path(environ: Mapping[str, str]) -> Path:
@@ -65,12 +72,32 @@ def build_parser() -> argparse.ArgumentParser:
     enable.add_argument("--cwd", required=True)
     disable = actions.add_parser("disable", help="disable one feasibility repository")
     disable.add_argument("--cwd", required=True)
+    recall_demo = subparsers.add_parser(
+        "recall-demo", help="configure the bounded local Recall demonstration"
+    )
+    recall_demo_actions = recall_demo.add_subparsers(
+        dest="recall_demo_action", required=True
+    )
+    configure = recall_demo_actions.add_parser("configure")
+    for name in (
+        "registry-product-root",
+        "profile",
+        "model-state-root",
+        "trust-root",
+        "bundle-state-root",
+        "signing-private-key",
+    ):
+        configure.add_argument(f"--{name}", required=True, type=_absolute_path)
+    configure.add_argument("--signing-key-id", required=True)
+    recall_demo_actions.add_parser("status")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     state_path = database_path(os.environ)
+    if arguments.command == "recall-demo":
+        return _run_recall_demo_command(arguments, os.environ)
     if arguments.command == "mcp":
         run_mcp(
             database_path=state_path,
@@ -127,6 +154,189 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _configure_test_repository(arguments, database)
     finally:
         database.close()
+
+
+def _absolute_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("filesystem path must be absolute")
+    return path
+
+
+def _run_recall_demo_command(
+    arguments: argparse.Namespace, environ: Mapping[str, str]
+) -> int:
+    from zdecision.recall.demo.config import (
+        DemoRecallConfig,
+        load_demo_recall_config,
+        recall_demo_config_path,
+        write_demo_recall_config,
+    )
+
+    path = recall_demo_config_path(environ)
+    if arguments.recall_demo_action == "configure":
+        try:
+            config = DemoRecallConfig.from_dict(
+                {
+                    "schema_version": 1,
+                    "repository_name": "zstack-ui-next",
+                    "product_name": "third-party-services",
+                    "decision_space_id": "prod_3e6e73b8defbfee89ce7bf26e739b1dc",
+                    "registry_product_root": str(arguments.registry_product_root),
+                    "profile_path": str(arguments.profile),
+                    "model_state_root": str(arguments.model_state_root),
+                    "trust_root_path": str(arguments.trust_root),
+                    "bundle_state_root": str(arguments.bundle_state_root),
+                    "signing_private_key_path": str(arguments.signing_private_key),
+                    "signing_key_id": arguments.signing_key_id,
+                }
+            )
+            profile_digest, model_digest = _validate_recall_demo_setup(config)
+            _prepare_bundle_state_root(config.provider.bundle_state_root)
+            write_demo_recall_config(path, config)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            _write_recall_demo_error()
+            return 1
+        _write_recall_demo_status("configured", profile_digest, model_digest)
+        return 0
+
+    try:
+        config = load_demo_recall_config(path)
+    except FileNotFoundError:
+        _write_recall_demo_status("not-configured", None, None)
+        return 0
+    except (OSError, RuntimeError, TypeError, ValueError):
+        _write_recall_demo_error()
+        return 1
+    try:
+        profile_digest, model_digest = _validate_recall_demo_setup(config)
+        generation, digest = _current_recall_demo_generation(
+            config.provider.bundle_state_root
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        _write_recall_demo_status("invalid", None, None)
+        return 0
+    _write_recall_demo_status(
+        "configured", profile_digest, model_digest, generation, digest
+    )
+    return 0
+
+
+def _validate_recall_demo_setup(config: object) -> tuple[str, str]:
+    """Validate all owner-supplied setup material before config creation."""
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+
+    from zdecision.recall.demo.config import DemoRecallConfig
+    from zdecision.recall.demo.contracts import DemoRetrievalProfile
+    from zdecision.recall.demo.model_store import load_installed_models
+    from zdecision.registry.models import ProductMetadata, ProductRegistry
+
+    if not isinstance(config, DemoRecallConfig):
+        raise ValueError("recall_demo_config_invalid")
+    profile = DemoRetrievalProfile.from_dict(
+        json.loads(config.provider.profile_path.read_bytes())
+    )
+    if (
+        profile.repository != config.provider.repository_name
+        or profile.product_name != config.provider.product_name
+        or profile.decision_space_id != config.provider.decision_space_id
+    ):
+        raise ValueError("recall_demo_config_invalid")
+    installed = load_installed_models(profile, config.provider.model_state_root)
+    model_digest = hashlib.sha256(
+        installed.install_manifest_path.read_bytes()
+    ).hexdigest()
+    private_key = Ed25519PrivateKey.from_private_bytes(
+        config.publisher.signing_private_key_path.read_bytes()
+    )
+    public_key = Ed25519PublicKey.from_public_bytes(
+        config.provider.trust_root_path.read_bytes()
+    )
+    try:
+        public_key.verify(private_key.sign(_RECALL_DEMO_NONCE), _RECALL_DEMO_NONCE)
+    except InvalidSignature:
+        raise ValueError("recall_demo_config_invalid") from None
+    product = ProductMetadata.from_dict(
+        json.loads(
+            (config.publisher.registry_product_root / "product.json").read_bytes()
+        )
+    )
+    registry = ProductRegistry.from_dict(
+        json.loads(
+            (config.publisher.registry_product_root / "registry.json").read_bytes()
+        )
+    )
+    if (
+        product.product_id != config.provider.decision_space_id
+        or product.name != config.provider.product_name
+        or registry.product_id != product.product_id
+    ):
+        raise ValueError("recall_demo_config_invalid")
+    return profile.digest, model_digest
+
+
+def _prepare_bundle_state_root(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("recall_demo_config_invalid")
+    path.chmod(0o700)
+
+
+def _current_recall_demo_generation(
+    bundle_state_root: Path,
+) -> tuple[int | None, str | None]:
+    path = bundle_state_root / "current.json"
+    if not path.exists():
+        return None, None
+    if path.is_symlink():
+        raise ValueError("recall_demo_config_invalid")
+    value = json.loads(path.read_bytes())
+    if not isinstance(value, Mapping):
+        raise ValueError("recall_demo_config_invalid")
+    generation = value.get("generation")
+    digest = value.get("generation_digest")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+    ):
+        raise ValueError("recall_demo_config_invalid")
+    return generation, digest[:12]
+
+
+def _write_recall_demo_status(
+    status: str,
+    profile_digest: str | None,
+    model_digest: str | None,
+    generation: int | None = None,
+    current_digest: str | None = None,
+) -> None:
+    sys.stdout.buffer.write(
+        canonical_json_bytes(
+            {
+                "status": status,
+                "profile_digest_prefix": (
+                    profile_digest[:12] if profile_digest is not None else None
+                ),
+                "model_install_digest_prefix": (
+                    model_digest[:12] if model_digest is not None else None
+                ),
+                "current_generation": generation,
+                "current_digest_prefix": current_digest,
+            }
+        )
+    )
+
+
+def _write_recall_demo_error() -> None:
+    sys.stderr.buffer.write(b'{"error":"recall_demo_config_invalid"}')
 
 
 def _configure_test_repository(
