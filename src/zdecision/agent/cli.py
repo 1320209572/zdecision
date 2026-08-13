@@ -10,6 +10,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 from zdecision.jsonio import canonical_json_bytes
@@ -18,6 +19,23 @@ from zdecision.private_store.filesystem import private_state_root
 
 _RECALL_DEMO_NONCE = b"zdecision-recall-demo-setup-v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _RecallDemoArgumentError(Exception):
+    """A Recall Demo parse error whose details must remain private."""
+
+
+class _AgentArgumentParser(argparse.ArgumentParser):
+    def __init__(
+        self, *args: object, sanitize_errors: bool = False, **kwargs: object
+    ) -> None:
+        self._sanitize_errors = sanitize_errors
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> None:
+        if self._sanitize_errors:
+            raise _RecallDemoArgumentError()
+        super().error(message)
 
 
 def database_path(environ: Mapping[str, str]) -> Path:
@@ -36,9 +54,18 @@ def run_mcp(**arguments: object) -> None:
     run_mcp_server(**arguments)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="zdecision-agent")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def build_parser(
+    *, sanitize_recall_demo_errors: bool = False
+) -> argparse.ArgumentParser:
+    parser_factory = partial(
+        _AgentArgumentParser, sanitize_errors=sanitize_recall_demo_errors
+    )
+    parser = _AgentArgumentParser(
+        prog="zdecision-agent", sanitize_errors=sanitize_recall_demo_errors
+    )
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=parser_factory
+    )
     subparsers.add_parser("hook", help="record one Codex Hook JSON object from stdin")
     subparsers.add_parser("mcp", help="serve the local ZDecision MCP tools over stdio")
     subparsers.add_parser("worker", help="run the singleton local Agent worker")
@@ -47,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         "service", help="manage the persistent local delivery service"
     )
     service_actions = service.add_subparsers(
-        dest="service_action", required=True
+        dest="service_action", required=True, parser_class=parser_factory
     )
     service_run = service_actions.add_parser(
         "run", help="run the persistent local delivery loop"
@@ -67,7 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
         "test-repository",
         help="configure feasibility-only local repository enablement",
     )
-    actions = repository.add_subparsers(dest="repository_action", required=True)
+    actions = repository.add_subparsers(
+        dest="repository_action", required=True, parser_class=parser_factory
+    )
     enable = actions.add_parser("enable", help="enable one feasibility repository")
     enable.add_argument("--cwd", required=True)
     disable = actions.add_parser("disable", help="disable one feasibility repository")
@@ -76,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         "recall-demo", help="configure the bounded local Recall demonstration"
     )
     recall_demo_actions = recall_demo.add_subparsers(
-        dest="recall_demo_action", required=True
+        dest="recall_demo_action", required=True, parser_class=parser_factory
     )
     configure = recall_demo_actions.add_parser("configure")
     for name in (
@@ -94,7 +123,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+    argument_values = tuple(sys.argv[1:] if argv is None else argv)
+    try:
+        arguments = build_parser(
+            sanitize_recall_demo_errors=(
+                bool(argument_values) and argument_values[0] == "recall-demo"
+            )
+        ).parse_args(argument_values)
+    except _RecallDemoArgumentError:
+        _write_recall_demo_error()
+        return 2
     state_path = database_path(os.environ)
     if arguments.command == "recall-demo":
         return _run_recall_demo_command(arguments, os.environ)

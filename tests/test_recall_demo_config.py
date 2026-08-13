@@ -39,12 +39,21 @@ class _CapturedOutput:
     def __init__(self) -> None:
         self.buffer = io.BytesIO()
 
+    def write(self, value: str) -> int:
+        return self.buffer.write(value.encode("utf-8"))
+
+    def flush(self) -> None:
+        return None
+
 
 def _capture(argv: list[str]) -> tuple[int, str, str]:
     stdout = _CapturedOutput()
     stderr = _CapturedOutput()
     with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
-        code = agent_cli.main(argv)
+        try:
+            code = agent_cli.main(argv)
+        except SystemExit as error:
+            code = error.code
     return (
         code,
         stdout.buffer.getvalue().decode("utf-8"),
@@ -109,6 +118,23 @@ class RecallDemoConfigTests(unittest.TestCase):
                 write_demo_recall_config(path, config)
             self.assertEqual(original, path.read_bytes())
 
+    def test_writer_failure_leaves_no_final_file_and_allows_retry(self) -> None:
+        """A failed publish must not strand a partial create-only config file."""
+        config = DemoRecallConfig.from_dict(FIXTURE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recall-demo.json"
+            with patch(
+                "zdecision.recall.demo.config.os.write",
+                side_effect=OSError("injected write failure"),
+            ), self.assertRaises(ValueError):
+                write_demo_recall_config(path, config)
+            self.assertFalse(path.exists())
+            self.assertEqual([], list(root.iterdir()))
+
+            write_demo_recall_config(path, config)
+            self.assertEqual(config, load_demo_recall_config(path))
+
     def test_cli_emits_only_configured_status_not_paths(self) -> None:
         """Operator output exposes only bounded prefixes, never setup material."""
         profile_digest = "0123456789ab" + "c" * 52
@@ -158,3 +184,17 @@ class RecallDemoConfigTests(unittest.TestCase):
                     code, _stdout, stderr = _capture(["recall-demo", "status"])
                 self.assertEqual(1, code)
                 self.assertEqual('{"error":"recall_demo_config_invalid"}', stderr)
+
+    def test_recall_demo_parser_errors_are_bounded(self) -> None:
+        """Invalid Recall Demo arguments must not disclose their private values."""
+        private_path = "/private/demo-private-key"
+        secret = "demo-leadership-v1"
+        code, stdout, stderr = _capture(
+            ["recall-demo", "status", private_path, secret]
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertEqual('{"error":"recall_demo_config_invalid"}', stderr)
+        self.assertNotIn(private_path, stderr)
+        self.assertNotIn(secret, stderr)

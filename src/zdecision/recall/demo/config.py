@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -147,24 +148,50 @@ def write_demo_recall_config(path: Path, config: DemoRecallConfig) -> None:
         raise ValueError("recall_demo_config_invalid")
     DemoRecallConfig.from_dict(config.to_dict())
     path = Path(path)
+    temporary_path: Path | None = None
+    descriptor: int | None = None
+    created = False
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
         )
-        try:
-            payload = canonical_json_bytes(config.to_dict())
-            offset = 0
-            while offset < len(payload):
-                offset += os.write(descriptor, payload[offset:])
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        path.chmod(0o600)
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        payload = canonical_json_bytes(config.to_dict())
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("recall_demo_config_invalid")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.link(temporary_path, path)
+        created = True
+        _fsync_directory(path.parent)
     except OSError:
         raise ValueError("recall_demo_config_invalid") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        if created:
+            _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _absolute_path(value: object) -> Path:
