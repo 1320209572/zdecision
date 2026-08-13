@@ -222,7 +222,6 @@ def inventory_output_schema(
                                         "enum": list(evidence_receipt_ids),
                                     },
                                     "maxItems": len(evidence_receipt_ids),
-                                    "uniqueItems": True,
                                 },
                             }
                         ),

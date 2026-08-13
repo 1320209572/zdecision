@@ -449,6 +449,27 @@ class PromptContractTests(unittest.TestCase):
         self.assertEqual([2, 5], candidate["properties"]["source_signal_ordinal"]["enum"])
         self.assertIn("source_signal_ordinal", candidate["required"])
 
+    def test_v5_inventory_schema_uses_only_codex_supported_array_constraints(
+        self,
+    ) -> None:
+        """This catches sending unsupported JSON Schema keywords to Codex."""
+        from zdecision.app_server.models import inventory_output_schema
+
+        receipts = ("rcpt_" + "1" * 64, "rcpt_" + "2" * 64)
+        schema = inventory_output_schema(receipts)
+        receipt_selection = schema["properties"]["signals"]["items"]["properties"][
+            "evidence_receipt_ids"
+        ]
+
+        self.assertEqual(
+            {
+                "type": "array",
+                "items": {"type": "string", "enum": list(receipts)},
+                "maxItems": 2,
+            },
+            receipt_selection,
+        )
+
     def test_v5_extraction_schema_closes_an_empty_eligible_set(self) -> None:
         from zdecision.app_server.models import extraction_output_schema
 
