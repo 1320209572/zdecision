@@ -30,6 +30,10 @@ from zdecision.app_server.reconciliation_runner import (
     ReconciliationAttemptRetryable,
     ReconciliationRunnerError,
 )
+from zdecision.app_server.session_product_routing import (
+    SessionProductRoutingInvalid,
+    SessionProductRoutingRetryable,
+)
 from zdecision.app_server.requested_capture import (
     CaptureAttemptRetryable,
     FrozenModelUnavailable,
@@ -67,6 +71,7 @@ class OnDemandCaptureProcessor:
         session_index: SessionIndex,
         git_paths: GitPathEvidenceReader,
         routing_store: CaptureRoutingStore,
+        session_router,
         capture_runner,
         reconciliation_runner,
         request_state: RequestStateStore,
@@ -81,6 +86,8 @@ class OnDemandCaptureProcessor:
             raise TypeError("git_paths must freeze Git evidence")
         if not isinstance(routing_store, CaptureRoutingStore):
             raise TypeError("routing_store must be a CaptureRoutingStore")
+        if not hasattr(session_router, "route"):
+            raise TypeError("session_router must route Session sources")
         if not isinstance(request_state, RequestStateStore):
             raise TypeError("request_state must be a RequestStateStore")
         if not isinstance(control_store, ControlBindingStore):
@@ -91,6 +98,7 @@ class OnDemandCaptureProcessor:
         self.session_index = session_index
         self.git_paths = git_paths
         self.routing_store = routing_store
+        self.session_router = session_router
         self.capture_runner = capture_runner
         self.reconciliation_runner = reconciliation_runner
         self.request_state = request_state
@@ -116,6 +124,19 @@ class OnDemandCaptureProcessor:
             raise TerminalCaptureRequestError("local_delivery_conflict") from error
         except CaptureAttemptRetryable as error:
             raise RetryableCaptureRequestError("capture_attempt_retryable") from error
+        except SessionProductRoutingRetryable as error:
+            raise RetryableCaptureRequestError("session_route_retryable") from error
+        except SessionProductRoutingInvalid as error:
+            code = str(error)
+            if code not in {
+                "repository_identity_mismatch",
+                "session_route_binding_invalid",
+                "session_route_invalid",
+                "source_boundary_unavailable",
+                "source_not_interactive",
+            }:
+                code = "session_route_invalid"
+            raise TerminalCaptureRequestError(code) from error
         except FrozenModelUnavailable as error:
             raise TerminalCaptureRequestError("frozen_model_unavailable") from error
         except RequestModelProfileConflict as error:
@@ -183,9 +204,26 @@ class OnDemandCaptureProcessor:
                 self.database.get_repository_snapshot(group.repository_id),
                 sources,
             )
-            plan = self.routing_store.get_or_create_plan(
-                group, snapshot, sources, evidence
-            )
+            if evidence.paths or not sources:
+                plan = self.routing_store.get_or_create_plan(
+                    group, snapshot, sources, evidence
+                )
+            else:
+                profile = self._routing_profile(group)
+                decisions = tuple(
+                    self.session_router.route(
+                        source,
+                        snapshot,
+                        profile,
+                        heartbeat=lambda: client.heartbeat(
+                            group.request_id, group.lease_token
+                        ),
+                    )
+                    for source in sources
+                )
+                plan = self.routing_store.get_or_create_session_plan(
+                    group, snapshot, sources, evidence, decisions
+                )
         slices = client.plan_slices(group, plan.route_selections())
         self._verify_slice_plan(group, plan, slices)
 
@@ -207,6 +245,7 @@ class OnDemandCaptureProcessor:
                 group.request_id, slice_view.slice_id
             ):
                 continue
+            slice_source_keys = frozenset(slice_plan.source_keys)
             self._process_slice(
                 group,
                 slice_view,
@@ -214,7 +253,8 @@ class OnDemandCaptureProcessor:
                 tuple(
                     source
                     for source in sources
-                    if source.source_key not in excluded_source_keys
+                    if source.source_key in slice_source_keys
+                    and source.source_key not in excluded_source_keys
                 ),
                 excluded_source_keys,
                 client,
@@ -383,6 +423,17 @@ class OnDemandCaptureProcessor:
         profile = self.capture_runner.resolve_request_profile(
             frozen if frozen is not None else operation
         )
+        if not isinstance(profile, FeasibilityModelProfile):
+            raise TerminalCaptureRequestError("model_profile_mismatch")
+        return self.session_index.freeze_request_model_profile(
+            group.request_id, profile
+        )
+
+    def _routing_profile(
+        self, group: ClaimedCaptureGroup
+    ) -> FeasibilityModelProfile:
+        frozen = self.session_index.request_model_profile(group.request_id)
+        profile = self.capture_runner.resolve_request_profile(frozen)
         if not isinstance(profile, FeasibilityModelProfile):
             raise TerminalCaptureRequestError("model_profile_mismatch")
         return self.session_index.freeze_request_model_profile(

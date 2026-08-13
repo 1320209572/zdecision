@@ -545,9 +545,15 @@ never sends or steers a source Session.
 The central trusted configuration owns catalog groups, leaf Decision spaces,
 repository routes, route versions, package metadata, and V1 compatibility
 partitions. The Agent freezes normalized repository-relative tracked Git paths
-and a source-boundary digest locally, matches only the server-issued route
-snapshot, and creates one deterministic slice per matched leaf. Model text,
-Candidate paths, the browser, and upload payloads cannot choose ownership.
+and a source-boundary digest locally. Nonempty Git evidence matches only the
+server-issued route snapshot and creates one deterministic slice per matched
+leaf. When and only when the frozen Git path set is empty, the Agent forks each
+exact completed Session boundary and asks the model to select one registered,
+enabled leaf from a closed structured route list. The resulting source-to-route
+selection and output digest are frozen in the same durable group plan before
+Capture; replay never reruns that model decision. Candidate paths, the browser,
+and upload payloads cannot choose ownership, and nonempty but unmatched Git
+evidence never falls back to Session inference.
 
 The Demo catalog exposes independent `packages/products/*` product roots and
 selected concrete leaves beneath `packages/products/shared`,

@@ -157,11 +157,16 @@ Directory names are not a universal source of truth. During repository
 onboarding the system may inspect tracked workspace manifests and Nx
 `product:*` tags to propose routes, but an administrator-owned persisted route
 configuration is authoritative. Untracked build output, ignored directories,
-package names, and model-generated text never create a product automatically.
+and package names never create a product automatically. The narrow empty-Git
+amendment in `2026-08-13-empty-git-session-product-routing-design.md` permits
+only a closed model selection among already registered enabled leaves; it does
+not create a new product or route.
 
 Explicit registration may add a known company product even when the current
-checkout lacks a tracked product manifest. Such a route simply produces no
-Candidate until trusted tracked changes match it.
+checkout lacks a tracked product manifest. With nonempty Git evidence such a
+route produces no Candidate until trusted tracked changes match it; with an
+exactly empty path set, the frozen-Session amendment may select it from the
+closed registered route list.
 
 ### 2.4 Shared and multi-space code
 
@@ -170,15 +175,19 @@ library. They do not route to the Shared root and do not fan out into Cloud,
 Portal, sibling Shared packages, or every package that imports them. A broad
 `packages/products/shared/** -> Shared` fallback route is forbidden.
 
-Only a trusted Git path match against a registered Shared-leaf route may create
-a Shared-leaf Capture slice. The extraction model cannot promote product-routed
-work to Shared or move work between Shared leaves merely because its
-conclusion sounds broadly applicable.
+With nonempty Git evidence, only a trusted path match against a registered
+Shared-leaf route may create a Shared-leaf Capture slice. When the frozen path
+set is exactly empty, the later amendment may select that same registered leaf
+from the exact frozen Session; it cannot invent Shared ownership. The
+extraction model cannot promote product-routed work to Shared or move work
+between Shared leaves merely because its conclusion sounds broadly applicable.
 
 One development task may touch several products and Shared leaves at the same
-time. The system does not force that task into one repository-default product
-and does not ask the extraction model to guess. It creates one leaf-scoped
-Capture slice for every trusted route matched by the task:
+time. The system does not force that task into one repository-default product.
+With Git evidence it creates one leaf-scoped Capture slice for every trusted
+route matched by the task. With exactly empty Git evidence it independently
+classifies each frozen Session into one registered leaf and groups those frozen
+selections into slices:
 
 ```text
 one Update action
@@ -207,6 +216,14 @@ evidence:
 - committed paths when a matching commit exists; and
 - the registered route configuration version used for the Capture.
 
+Git path evidence remains authoritative whenever it is nonempty. If and only
+if the frozen path tuple is empty, the Agent may use the exact completed Session
+conversation to choose one route ID from the closed set of registered enabled
+leaves. It persists the source key, selected route ID, and structured-output
+digest before Capture, and retry reuses that plan without another model turn.
+Raw Session text is not stored in the routing plan. Nonempty but unmatched Git
+evidence remains a no-route result and cannot invoke this fallback.
+
 The model-generated `CandidateContent.paths` field is useful for display,
 search, and consistency checks after routing. It may be empty, edited during
 Review, or incorrect, so it never selects a product or Shared leaf.
@@ -226,8 +243,10 @@ Capture group.
   group and run without another user prompt.
 - Shared-only changes create one slice per matched Shared leaf; they never
   create a slice for the Shared root.
-- No matched route produces a successful `no_routable_decision_space_changes`
-  result and no Candidate.
+- Nonempty Git evidence with no matched route produces a successful
+  `no_routable_decision_space_changes` result and no Candidate.
+- Exactly empty Git evidence routes each frozen Session once through the closed
+  registered-leaf model selection and then follows the same slice flow.
 - A route configuration that is missing, disabled, malformed, or ambiguous
   fails closed before extraction.
 
@@ -425,7 +444,8 @@ The migration is additive and does not guess historical ownership:
 This slice does not add:
 
 - an administrator UI for repository-route discovery or editing;
-- model-based product classification;
+- open-ended or arbitrary model-based product classification outside the
+  approved empty-Git closed registered-route fallback;
 - automatic broadcast of Shared-leaf decisions to products or sibling Shared
   packages;
 - a generic Shared Inbox, Review draft, publication target, or Registry
@@ -459,8 +479,10 @@ The design is implemented only when all of the following are demonstrated:
    action; no generic Shared slice is created.
 5. A Shared package consumed by several products remains owned by its real
    Shared leaf and is not copied into those products.
-6. No route match creates no Candidate; client or model ownership claims cannot
-   override the server route or move work between Shared leaves.
+6. Nonempty Git evidence with no route match creates no Candidate. Exactly
+   empty Git evidence may use only the frozen Session model-selection amendment;
+   client claims and later Candidate text cannot override its frozen route or
+   move work between leaves.
 7. Route changes never move an existing Candidate or Review to another product
    or Shared leaf.
 8. Repository-only deep links never guess one product or Shared leaf in a

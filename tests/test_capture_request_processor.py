@@ -5,12 +5,16 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
-from zdecision.agent.capture_routing import CaptureRoutingStore
+from zdecision.agent.capture_routing import (
+    CaptureRoutingStore,
+    SessionRouteDecision,
+)
 from zdecision.agent.control_bindings import ControlBindingStore
 from zdecision.agent.db import AgentDatabase
 from zdecision.agent.events import AgentEvent, HookInvocation, RepositorySnapshot, event_id_for
 from zdecision.agent.git_path_evidence import FrozenGitPathEvidence
 from zdecision.agent.request_state import RequestStateStore
+from zdecision.agent.repository_routes import RepositoryRouteSnapshot
 from zdecision.agent.session_index import SessionIndex
 from zdecision.app_server.models import FeasibilityModelProfile
 from zdecision.app_server.requested_capture import SessionCaptureResult
@@ -66,6 +70,7 @@ class FakeCaptureRunner:
         self.protocol_by_session: dict[str, str] = {}
         self.unavailable_sessions: set[str] = set()
         self.zero_eligible = False
+        self.source_route_calls: list[tuple[str, str]] = []
 
     def sweep_archives(self) -> None:
         pass
@@ -94,6 +99,9 @@ class FakeCaptureRunner:
 
             raise SourceEvidenceUnavailable("missing prompt anchors")
         self.calls.append(route_context.decision_space_id)
+        self.source_route_calls.append(
+            (source.session_id, route_context.decision_space_id)
+        )
         seed = route_context.route_id[4]
         if self.zero_eligible:
             from zdecision.app_server.models import extraction_output_schema
@@ -149,6 +157,30 @@ class FakeCaptureRunner:
                     active_reference_set_digests=(),
                     reference_decision_ids=(),
                 ),
+            ),
+        )
+
+
+class FakeSessionRouter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.route_by_session: dict[str, str] = {}
+        self.error: Exception | None = None
+
+    def route(self, source, snapshot, profile, heartbeat=None):
+        self.calls.append((source.session_id, profile.profile_id))
+        if self.error is not None:
+            raise self.error
+        route_id = self.route_by_session.get(
+            source.session_id, snapshot.routes[0].route_id
+        )
+        return SessionRouteDecision(
+            source_key=source.source_key,
+            route_id=route_id,
+            output_digest=(
+                "e" * 64
+                if route_id == snapshot.routes[0].route_id
+                else "f" * 64
             ),
         )
 
@@ -328,6 +360,7 @@ class CaptureRequestProcessorTest(unittest.TestCase):
         )
         self.git_paths = FakeGitPaths(evidence)
         self.capture_runner = FakeCaptureRunner()
+        self.session_router = FakeSessionRouter()
         self.reconciliation_runner = FakeReconciliationRunner()
 
     def observe_stop(
@@ -422,12 +455,110 @@ class CaptureRequestProcessorTest(unittest.TestCase):
             session_index=self.session_index,
             git_paths=self.git_paths,
             routing_store=self.routing_store,
+            session_router=self.session_router,
             capture_runner=self.capture_runner,
             reconciliation_runner=self.reconciliation_runner,
             request_state=self.request_state,
             control_store=self.control_store,
             clock=lambda: NOW,
         )
+
+    def test_nonempty_git_evidence_never_invokes_session_router(self) -> None:
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        self.assertEqual([], self.session_router.calls)
+
+    def test_empty_git_evidence_routes_one_frozen_session_from_context(
+        self,
+    ) -> None:
+        self.git_paths.evidence = FrozenGitPathEvidence.create(
+            repository_id=REPOSITORY_ID,
+            head_commit="d" * 40,
+            commit_ranges=(),
+            paths=(),
+        )
+        client = FakeCentralClient(self.group, self.views()[:1])
+
+        self.processor().process(self.group, client)
+
+        self.assertEqual(1, len(self.session_router.calls))
+        self.assertEqual(
+            [(SESSION_ID, self.routes[0].decision_space_id)],
+            self.capture_runner.source_route_calls,
+        )
+        plan = self.routing_store.load_plan(
+            self.group,
+            RepositoryRouteSnapshot.create(REPOSITORY_ID, self.routes),
+        )
+        self.assertEqual("session_model", plan.routing_method)
+
+    def test_empty_git_all_valid_routes_each_source_only_to_its_leaf(
+        self,
+    ) -> None:
+        second_session = "019fb100-0000-7000-8000-000000000010"
+        self.observe_stop(
+            session_id=second_session,
+            turn_id="019fb100-0000-7000-8000-000000000011",
+            occurred_at="2026-08-05T05:00:01Z",
+        )
+        self.git_paths.evidence = FrozenGitPathEvidence.create(
+            repository_id=REPOSITORY_ID,
+            head_commit="d" * 40,
+            commit_ranges=(),
+            paths=(),
+        )
+        self.session_router.route_by_session = {
+            SESSION_ID: self.routes[0].route_id,
+            second_session: self.routes[1].route_id,
+        }
+        client = FakeCentralClient(self.group, self.views())
+
+        self.processor().process(self.group, client)
+
+        self.assertEqual(2, len(self.session_router.calls))
+        self.assertEqual(
+            {
+                (SESSION_ID, self.routes[0].decision_space_id),
+                (second_session, self.routes[1].decision_space_id),
+            },
+            set(self.capture_runner.source_route_calls),
+        )
+        self.assertEqual(2, len(self.capture_runner.source_route_calls))
+
+    def test_empty_git_route_failures_are_bounded(self) -> None:
+        from zdecision.agent.service import (
+            RetryableCaptureRequestError,
+            TerminalCaptureRequestError,
+        )
+        from zdecision.app_server.session_product_routing import (
+            SessionProductRoutingInvalid,
+            SessionProductRoutingRetryable,
+        )
+
+        self.git_paths.evidence = FrozenGitPathEvidence.create(
+            repository_id=REPOSITORY_ID,
+            head_commit="d" * 40,
+            commit_ranges=(),
+            paths=(),
+        )
+        client = FakeCentralClient(self.group, self.views()[:1])
+        self.session_router.error = SessionProductRoutingRetryable(
+            "private transport detail"
+        )
+        with self.assertRaisesRegex(
+            RetryableCaptureRequestError, "session_route_retryable"
+        ):
+            self.processor().process(self.group, client)
+
+        self.session_router.error = SessionProductRoutingInvalid(
+            "private invalid detail"
+        )
+        with self.assertRaisesRegex(
+            TerminalCaptureRequestError, "session_route_invalid"
+        ):
+            self.processor().process(self.group, client)
 
     def persist_empty_reconciliation_and_restart(
         self, *, item_protocol: str | None

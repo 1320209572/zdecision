@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zdecision.agent.capture_routing import CaptureRoutingStore, plan_capture_group
+from zdecision.agent.capture_routing import (
+    CaptureRoutingStore,
+    SessionRouteDecision,
+    plan_capture_group,
+    plan_session_routed_capture_group,
+)
 from zdecision.agent.git_path_evidence import FrozenGitPathEvidence
 from zdecision.agent.repository_routes import RepositoryRouteSnapshot
 from zdecision.agent.session_index import FrozenSessionSource
@@ -98,6 +103,39 @@ class CaptureRoutingTest(unittest.TestCase):
                 source_fingerprint="8" * 64,
                 previous_handled_head_commit=None,
                 upper_head_commit="d" * 40,
+            ),
+        )
+
+    def two_sources(self) -> tuple[FrozenSessionSource, ...]:
+        first = self.sources()[0]
+        return (
+            first,
+            FrozenSessionSource(
+                request_id=REQUEST_ID,
+                source_key="src_" + "9" * 32,
+                repository_id=REPOSITORY_ID,
+                session_id="019fb100-0000-7000-8000-000000000003",
+                cwd="/private/repository",
+                lineage="lin_" + "a" * 32,
+                previous_handled_turn_id=None,
+                upper_turn_id="019fb100-0000-7000-8000-000000000004",
+                source_fingerprint="b" * 64,
+                previous_handled_head_commit=None,
+                upper_head_commit="d" * 40,
+            ),
+        )
+
+    def session_decisions(self) -> tuple[SessionRouteDecision, ...]:
+        return (
+            SessionRouteDecision(
+                source_key="src_" + "6" * 32,
+                route_id="drr_" + "a" * 32,
+                output_digest="e" * 64,
+            ),
+            SessionRouteDecision(
+                source_key="src_" + "9" * 32,
+                route_id="drr_" + "c" * 32,
+                output_digest="f" * 64,
             ),
         )
 
@@ -242,6 +280,115 @@ class CaptureRoutingTest(unittest.TestCase):
         self.assertEqual((THEME_SPACE_ID,), tuple(
             item.decision_space_id for item in replay.slices
         ))
+
+    def test_empty_git_evidence_groups_session_routes_into_leaf_slices(
+        self,
+    ) -> None:
+        snapshot = self.route_snapshot()
+
+        plan = plan_session_routed_capture_group(
+            self.claimed_group(snapshot),
+            snapshot,
+            self.evidence(),
+            self.two_sources(),
+            self.session_decisions(),
+        )
+
+        self.assertEqual("session_model", plan.routing_method)
+        self.assertEqual(self.session_decisions(), plan.session_route_decisions)
+        self.assertEqual(
+            (CLOUD_SPACE_ID, THEME_SPACE_ID),
+            tuple(item.decision_space_id for item in plan.slices),
+        )
+        self.assertEqual(
+            (
+                ("src_" + "6" * 32,),
+                ("src_" + "9" * 32,),
+            ),
+            tuple(item.source_keys for item in plan.slices),
+        )
+        self.assertTrue(all(item.matched_paths == () for item in plan.slices))
+        self.assertTrue(
+            all(
+                item.matched_path_digest
+                == hashlib.sha256(
+                    canonical_json_bytes({"paths": []})
+                ).hexdigest()
+                for item in plan.slices
+            )
+        )
+
+    def test_session_route_plan_rejects_nonempty_git_or_invalid_coverage(
+        self,
+    ) -> None:
+        snapshot = self.route_snapshot()
+        group = self.claimed_group(snapshot)
+
+        with self.assertRaisesRegex(ValueError, "session_route_requires_empty_git"):
+            plan_session_routed_capture_group(
+                group,
+                snapshot,
+                self.evidence("packages/products/cloud/src/App.tsx"),
+                self.two_sources(),
+                self.session_decisions(),
+            )
+        with self.assertRaisesRegex(ValueError, "session_route_source_mismatch"):
+            plan_session_routed_capture_group(
+                group,
+                snapshot,
+                self.evidence(),
+                self.two_sources(),
+                self.session_decisions()[:1],
+            )
+        with self.assertRaisesRegex(ValueError, "session_route_invalid"):
+            plan_session_routed_capture_group(
+                group,
+                snapshot,
+                self.evidence(),
+                self.two_sources(),
+                (
+                    self.session_decisions()[0],
+                    SessionRouteDecision(
+                        source_key="src_" + "9" * 32,
+                        route_id="drr_" + "0" * 32,
+                        output_digest="f" * 64,
+                    ),
+                ),
+            )
+
+    def test_persisted_session_plan_replays_without_rebinding_or_raw_text(
+        self,
+    ) -> None:
+        snapshot = self.route_snapshot()
+        group = self.claimed_group(snapshot)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.sqlite3"
+            store = CaptureRoutingStore.open(path)
+            first = store.get_or_create_session_plan(
+                group,
+                snapshot,
+                self.two_sources(),
+                self.evidence(),
+                self.session_decisions(),
+            )
+            store.close()
+            store = CaptureRoutingStore.open(path)
+            replay = store.get_or_create_session_plan(
+                group,
+                snapshot,
+                self.two_sources(),
+                self.evidence(),
+                tuple(reversed(self.session_decisions())),
+            )
+            encoded = store._connection.execute(
+                "SELECT plan_json FROM capture_group_plans WHERE request_id = ?",
+                (REQUEST_ID,),
+            ).fetchone()["plan_json"]
+            store.close()
+
+        self.assertEqual(first, replay)
+        self.assertNotIn("third-party-services", encoded)
+        self.assertNotIn("019fb100", encoded)
 
 
 if __name__ == "__main__":

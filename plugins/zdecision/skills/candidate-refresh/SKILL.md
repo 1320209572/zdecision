@@ -32,8 +32,12 @@ Those observations never authorize Candidate generation.
   on **当前 Session** or **所有有效 Session** authorizes a scoped request.
 - The card exposes exactly these two Update scopes. ZDecision must not ask the user to choose
   a product or Shared package. After repository and Session
-  authorization, the local Agent routes trusted local Git path evidence to
-  the configured leaf Decision spaces.
+  authorization, the local Agent prefers trusted local Git path evidence and
+  routes it to the configured leaf Decision spaces. Only when the frozen Git
+  evidence is exactly empty, the Agent uses each frozen Session conversation
+  to select one registered enabled leaf with a structured model result. It
+  never asks the user to choose a product, and a nonempty but unmatched Git
+  result never falls back to Session inference.
 - Do not proactively render at Session start, during intermediate Turns, after
   incomplete or failed validation, or for non-code work.
 - Duplicate renders have no domain side effect. The render tool never starts

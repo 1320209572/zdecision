@@ -31,13 +31,18 @@ class ZDecisionSkillContractTests(unittest.TestCase):
 
     def test_installed_plugin_keeps_two_neutral_update_scopes(self) -> None:
         text = CANDIDATE_PLUGIN_SKILL.read_text("utf-8")
+        normalized = " ".join(text.split())
 
         self.assertEqual(1, text.count("**当前 Session**"))
         self.assertEqual(2, text.count("**所有有效 Session**"))
         self.assertIn("exactly these two Update scopes", text)
         self.assertIn("must not ask the user to choose", text)
         self.assertIn("product or Shared package", text)
-        self.assertIn("trusted local Git path evidence", text)
+        self.assertIn("prefers trusted local Git path evidence", normalized)
+        self.assertIn("frozen Git evidence is exactly empty", normalized)
+        self.assertIn("frozen Session conversation", normalized)
+        self.assertIn("select one registered enabled leaf", normalized)
+        self.assertIn("nonempty but unmatched Git", normalized)
 
     def test_root_skill_routes_templates_without_exposing_cli_as_user_ux(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text("utf-8")

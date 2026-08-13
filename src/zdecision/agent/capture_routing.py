@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,11 @@ from zdecision.central.decision_spaces import RepositoryDecisionRoute
 from zdecision.ids import capture_slice_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.sync.contracts import ClaimedCaptureGroup, RouteSelection
+
+
+_SOURCE_KEY = re.compile(r"^src_[0-9a-f]{32}$")
+_ROUTE_ID = re.compile(r"^drr_[0-9a-f]{32}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -49,13 +55,48 @@ class CaptureSlicePlan:
 
 
 @dataclass(frozen=True)
+class SessionRouteDecision:
+    source_key: str
+    route_id: str
+    output_digest: str
+
+    def __post_init__(self) -> None:
+        if _SOURCE_KEY.fullmatch(self.source_key) is None:
+            raise ValueError("source_key is invalid")
+        if _ROUTE_ID.fullmatch(self.route_id) is None:
+            raise ValueError("route_id is invalid")
+        if _DIGEST.fullmatch(self.output_digest) is None:
+            raise ValueError("output_digest is invalid")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "source_key": self.source_key,
+            "route_id": self.route_id,
+            "output_digest": self.output_digest,
+        }
+
+
+@dataclass(frozen=True)
 class CaptureGroupPlan:
     request_id: str
     repository_id: str
     route_snapshot_digest: str
     evidence_digest: str
     source_boundary_digest: str
+    routing_method: str
+    session_route_decisions: tuple[SessionRouteDecision, ...]
     slices: tuple[CaptureSlicePlan, ...]
+
+    def __post_init__(self) -> None:
+        if self.routing_method not in ("git_paths", "session_model"):
+            raise ValueError("routing_method is invalid")
+        if self.routing_method == "git_paths" and self.session_route_decisions:
+            raise ValueError("git path plan cannot contain Session decisions")
+        if (
+            self.routing_method == "session_model"
+            and not self.session_route_decisions
+        ):
+            raise ValueError("Session model plan requires decisions")
 
     def route_selections(self) -> tuple[RouteSelection, ...]:
         return tuple(
@@ -75,6 +116,10 @@ class CaptureGroupPlan:
             "route_snapshot_digest": self.route_snapshot_digest,
             "evidence_digest": self.evidence_digest,
             "source_boundary_digest": self.source_boundary_digest,
+            "routing_method": self.routing_method,
+            "session_route_decisions": [
+                item.to_dict() for item in self.session_route_decisions
+            ],
             "slices": [item.to_dict() for item in self.slices],
         }
 
@@ -206,6 +251,58 @@ class CaptureRoutingStore:
             self._connection.rollback()
             raise
 
+    def get_or_create_session_plan(
+        self,
+        group: ClaimedCaptureGroup,
+        snapshot: RepositoryRouteSnapshot,
+        sources: tuple[FrozenSessionSource, ...],
+        evidence: FrozenGitPathEvidence,
+        decisions: tuple[SessionRouteDecision, ...],
+    ) -> CaptureGroupPlan:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT * FROM capture_group_plans WHERE request_id = ?",
+                (group.request_id,),
+            ).fetchone()
+            if row is not None:
+                plan = self._stored_plan(row, group, snapshot)
+                self._connection.commit()
+                return plan
+
+            plan = plan_session_routed_capture_group(
+                group, snapshot, evidence, sources, decisions
+            )
+            snapshot_json = canonical_json_bytes(
+                {"routes": [route.to_dict() for route in snapshot.routes]}
+            ).decode("utf-8")
+            plan_json = canonical_json_bytes(plan.to_dict()).decode("utf-8")
+            plan_digest = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
+            self._connection.execute(
+                """
+                INSERT INTO capture_group_plans(
+                    request_id, repository_id, route_snapshot_json,
+                    route_snapshot_digest, evidence_digest,
+                    source_boundary_digest, plan_json, plan_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    group.request_id,
+                    group.repository_id,
+                    snapshot_json,
+                    snapshot.digest,
+                    evidence.evidence_digest,
+                    plan.source_boundary_digest,
+                    plan_json,
+                    plan_digest,
+                ),
+            )
+            self._connection.commit()
+            return plan
+        except Exception:
+            self._connection.rollback()
+            raise
+
     @staticmethod
     def _stored_plan(
         row: sqlite3.Row,
@@ -255,29 +352,15 @@ def plan_capture_group(
         raise ValueError("route_snapshot_mismatch")
     matched = RepositoryRouteMatcher().match(evidence.paths, snapshot)
     source_keys = tuple(source.source_key for source in sources)
-    source_boundary_digest = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "sources": [
-                    {
-                        "source_key": source.source_key,
-                        "source_fingerprint": source.source_fingerprint,
-                        "previous_handled_head_commit": (
-                            source.previous_handled_head_commit
-                        ),
-                        "upper_head_commit": source.upper_head_commit,
-                    }
-                    for source in sources
-                ]
-            }
-        )
-    ).hexdigest()
+    source_boundary_digest = _source_boundary_digest(sources)
     return CaptureGroupPlan(
         request_id=group.request_id,
         repository_id=group.repository_id,
         route_snapshot_digest=snapshot.digest,
         evidence_digest=evidence.evidence_digest,
         source_boundary_digest=source_boundary_digest,
+        routing_method="git_paths",
+        session_route_decisions=(),
         slices=tuple(
             CaptureSlicePlan(
                 slice_id=capture_slice_id(
@@ -296,6 +379,96 @@ def plan_capture_group(
             for item in matched
         ),
     )
+
+
+def plan_session_routed_capture_group(
+    group: ClaimedCaptureGroup,
+    snapshot: RepositoryRouteSnapshot,
+    evidence: FrozenGitPathEvidence,
+    sources: tuple[FrozenSessionSource, ...],
+    decisions: tuple[SessionRouteDecision, ...],
+) -> CaptureGroupPlan:
+    if group.repository_id != snapshot.repository_id:
+        raise ValueError("route_snapshot_repository_mismatch")
+    if group.repository_id != evidence.repository_id:
+        raise ValueError("git_evidence_repository_mismatch")
+    if group.route_snapshot_digest != snapshot.digest:
+        raise ValueError("route_snapshot_mismatch")
+    if evidence.paths:
+        raise ValueError("session_route_requires_empty_git")
+    source_keys = tuple(source.source_key for source in sources)
+    decision_keys = tuple(item.source_key for item in decisions)
+    if (
+        len(set(source_keys)) != len(source_keys)
+        or len(set(decision_keys)) != len(decision_keys)
+        or set(decision_keys) != set(source_keys)
+    ):
+        raise ValueError("session_route_source_mismatch")
+
+    routes = {
+        route.route_id: route for route in snapshot.routes if route.enabled
+    }
+    if any(item.route_id not in routes for item in decisions):
+        raise ValueError("session_route_invalid")
+    grouped: dict[str, list[str]] = {}
+    for decision in decisions:
+        grouped.setdefault(decision.route_id, []).append(decision.source_key)
+
+    source_boundary_digest = _source_boundary_digest(sources)
+    empty_path_digest = hashlib.sha256(
+        canonical_json_bytes({"paths": []})
+    ).hexdigest()
+    ordered_decisions = tuple(sorted(decisions, key=lambda item: item.source_key))
+    return CaptureGroupPlan(
+        request_id=group.request_id,
+        repository_id=group.repository_id,
+        route_snapshot_digest=snapshot.digest,
+        evidence_digest=evidence.evidence_digest,
+        source_boundary_digest=source_boundary_digest,
+        routing_method="session_model",
+        session_route_decisions=ordered_decisions,
+        slices=tuple(
+            CaptureSlicePlan(
+                slice_id=capture_slice_id(
+                    group.request_id,
+                    routes[route_id].route_id,
+                    routes[route_id].configuration_version,
+                ),
+                route_id=routes[route_id].route_id,
+                route_configuration_version=(
+                    routes[route_id].configuration_version
+                ),
+                decision_space_id=routes[route_id].decision_space_id,
+                matched_paths=(),
+                matched_path_digest=empty_path_digest,
+                source_boundary_digest=source_boundary_digest,
+                source_keys=tuple(sorted(keys)),
+            )
+            for route_id, keys in sorted(grouped.items())
+        ),
+    )
+
+
+def _source_boundary_digest(
+    sources: tuple[FrozenSessionSource, ...],
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "sources": [
+                    {
+                        "source_key": source.source_key,
+                        "source_fingerprint": source.source_fingerprint,
+                        "previous_handled_head_commit": (
+                            source.previous_handled_head_commit
+                        ),
+                        "upper_head_commit": source.upper_head_commit,
+                    }
+                    for source in sources
+                ]
+            }
+        )
+    ).hexdigest()
 
 
 def _read_json(
@@ -319,14 +492,22 @@ def _read_json(
 
 
 def _plan_from_dict(value: object) -> CaptureGroupPlan:
-    if not isinstance(value, dict) or set(value) != {
+    legacy_fields = {
         "request_id",
         "repository_id",
         "route_snapshot_digest",
         "evidence_digest",
         "source_boundary_digest",
         "slices",
-    }:
+    }
+    current_fields = legacy_fields | {
+        "routing_method",
+        "session_route_decisions",
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        legacy_fields,
+        current_fields,
+    ):
         raise ValueError("capture_group_plan_corrupt")
     raw_slices = value["slices"]
     if not isinstance(raw_slices, list):
@@ -362,11 +543,37 @@ def _plan_from_dict(value: object) -> CaptureGroupPlan:
                 source_keys=tuple(source_keys),
             )
         )
-    return CaptureGroupPlan(
-        request_id=value["request_id"],
-        repository_id=value["repository_id"],
-        route_snapshot_digest=value["route_snapshot_digest"],
-        evidence_digest=value["evidence_digest"],
-        source_boundary_digest=value["source_boundary_digest"],
-        slices=tuple(slices),
-    )
+    raw_decisions = value.get("session_route_decisions", [])
+    if not isinstance(raw_decisions, list):
+        raise ValueError("capture_group_plan_corrupt")
+    decisions: list[SessionRouteDecision] = []
+    for item in raw_decisions:
+        if not isinstance(item, dict) or set(item) != {
+            "source_key",
+            "route_id",
+            "output_digest",
+        }:
+            raise ValueError("capture_group_plan_corrupt")
+        try:
+            decisions.append(
+                SessionRouteDecision(
+                    source_key=item["source_key"],
+                    route_id=item["route_id"],
+                    output_digest=item["output_digest"],
+                )
+            )
+        except (TypeError, ValueError):
+            raise ValueError("capture_group_plan_corrupt") from None
+    try:
+        return CaptureGroupPlan(
+            request_id=value["request_id"],
+            repository_id=value["repository_id"],
+            route_snapshot_digest=value["route_snapshot_digest"],
+            evidence_digest=value["evidence_digest"],
+            source_boundary_digest=value["source_boundary_digest"],
+            routing_method=value.get("routing_method", "git_paths"),
+            session_route_decisions=tuple(decisions),
+            slices=tuple(slices),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("capture_group_plan_corrupt") from None

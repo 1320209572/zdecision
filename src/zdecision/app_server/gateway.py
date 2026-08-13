@@ -60,6 +60,10 @@ class StructuredTurnFailed(AppServerGatewayError):
     """A structured app-server Turn failed or returned invalid output."""
 
 
+class StructuredTurnOutputInvalid(StructuredTurnFailed):
+    """A completed structured Turn returned malformed output."""
+
+
 class AppServerUnavailable(AppServerGatewayError):
     """Neither the explicit host route nor controlled fallback is available."""
 
@@ -754,7 +758,9 @@ def _structured_output(turn: Mapping[str, object]) -> Mapping[str, object]:
         return dict(direct)
     items = turn.get("items")
     if not isinstance(items, list):
-        raise StructuredTurnFailed("The structured Turn returned no items")
+        raise StructuredTurnOutputInvalid(
+            "The structured Turn returned no items"
+        )
     messages = [
         value
         for value in items
@@ -763,17 +769,17 @@ def _structured_output(turn: Mapping[str, object]) -> Mapping[str, object]:
         and isinstance(value.get("text"), str)
     ]
     if not messages:
-        raise StructuredTurnFailed(
+        raise StructuredTurnOutputInvalid(
             "The structured Turn returned no final agent message"
         )
     try:
         parsed = json.loads(messages[-1]["text"])
     except json.JSONDecodeError:
-        raise StructuredTurnFailed(
+        raise StructuredTurnOutputInvalid(
             "The structured Turn output is not valid JSON"
         ) from None
     if not isinstance(parsed, Mapping):
-        raise StructuredTurnFailed(
+        raise StructuredTurnOutputInvalid(
             "The structured Turn output must be a JSON object"
         )
     return dict(parsed)

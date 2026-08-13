@@ -267,6 +267,9 @@ def configured_processor(
     from zdecision.app_server.requested_capture import (
         RequestedCaptureRunner,
     )
+    from zdecision.app_server.session_product_routing import (
+        SessionProductRouter,
+    )
     from zdecision.capture.templates import TemplateCatalog
 
     local_state_path = Path(state_path)
@@ -299,6 +302,11 @@ def configured_processor(
             session_index=session_index,
             git_paths=GitPathEvidenceReader(),
             routing_store=routing_store,
+            session_router=SessionProductRouter(
+                gateway=gateway,
+                recall_host_store=recall_host_store,
+                clock=lambda: datetime.now(UTC),
+            ),
             capture_runner=RequestedCaptureRunner(
                 gateway=gateway,
                 operation_store=operation_store,

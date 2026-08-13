@@ -568,11 +568,13 @@ class AgentServiceTest(unittest.TestCase):
             )
             connect.assert_called_once_with(database=database)
             self.assertEqual(state_path, processor.control_store.path)
+            self.assertIs(fake_gateway, processor.session_router.gateway)
             processor.session_index.close()
             processor.request_state.close()
             processor.routing_store.close()
             processor.control_store.close()
             processor.capture_runner.operation_store.close()
+            processor.session_router.recall_host_store.close()
 
     def test_configured_processor_closes_recall_store_when_retirement_fails(
         self,

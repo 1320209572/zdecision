@@ -43,6 +43,7 @@ from zdecision.app_server.models import (
 )
 from zdecision.app_server.reconciliation_runner import ReconciliationRunner
 from zdecision.app_server.requested_capture import RequestedCaptureRunner
+from zdecision.app_server.session_product_routing import SessionProductRouter
 from zdecision.capture.on_demand import ValidatedCaptureResult
 from zdecision.capture.templates import TemplateCatalog
 from zdecision.central.api import create_app
@@ -82,6 +83,9 @@ RAW_PROMPT = "PROMPT-RAW-SENTINEL-DO-NOT-SYNC"
 RAW_SOURCE = "def raw_source_sentinel_never_syncs(): pass"
 LOCAL_PATH_SENTINEL = "LOCAL-PATH-RAW-SENTINEL"
 TRANSCRIPT_PATH_SENTINEL = "TRANSCRIPT-PATH-MUST-NEVER-BE-OPENED"
+SESSION_ROUTING_CONTEXT = (
+    "SESSION-ROUTING-RAW-SENTINEL third-party-services security-services"
+)
 
 
 class MutableClock:
@@ -213,6 +217,8 @@ class FakeAppServerGateway:
             "extraction": 0,
             "reconciliation": 0,
         }
+        self.routing_turn_creates = 0
+        self.session_route_by_session: dict[str, str] = {}
         self.archived_threads: list[str] = []
         self.zero_candidates = False
         self.replace_mode = False
@@ -324,7 +330,16 @@ class FakeAppServerGateway:
     ) -> AppServerTurnReceipt:
         self._assert_context(cwd, profile)
         properties = output_schema.get("properties", {})
-        if "signals" in properties:
+        if "route_id" in properties:
+            stage = "routing"
+            source_id = self.capture_source_by_fork[thread_id][0]
+            route_ids = properties["route_id"]["enum"]
+            output = {
+                "route_id": self.session_route_by_session.get(
+                    source_id, route_ids[0]
+                )
+            }
+        elif "signals" in properties:
             stage = "inventory"
             output = copy.deepcopy(VALID_INVENTORY)
             signal_properties = properties["signals"]["items"]["properties"]
@@ -358,7 +373,10 @@ class FakeAppServerGateway:
             output = self._reconciliation_output(prompt)
         else:
             raise AssertionError("Unexpected structured Turn")
-        self.structured_turn_creates[stage] += 1
+        if stage == "routing":
+            self.routing_turn_creates += 1
+        else:
+            self.structured_turn_creates[stage] += 1
         self.turn_creates += 1
         if (
             stage == "inventory"
@@ -748,6 +766,78 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
         self.assertEqual(
             TURN_A1, self.session_index.handled_turn(source.source_key)
         )
+
+    def test_empty_git_routes_session_to_third_party_services(self) -> None:
+        specifications = (
+            ("Cloud", "packages/products/cloud"),
+            (
+                "third-party-services",
+                "packages/products/third-party-services",
+            ),
+        )
+        routes = []
+        route_by_name = {}
+        for display_name, source_root in specifications:
+            compatibility_id = product_id(display_name)
+            leaf_id = decision_space_id("product", compatibility_id)
+            route = RepositoryDecisionRoute(
+                route_id=repository_route_id(self.repository_id, leaf_id),
+                repository_id=self.repository_id,
+                decision_space_id=leaf_id,
+                path_prefixes=(source_root,),
+                excluded_prefixes=(),
+                enabled=True,
+                configuration_version=1,
+            )
+            self.central_store.put_decision_space(
+                "org_demo",
+                LeafDecisionSpace(
+                    decision_space_id=leaf_id,
+                    kind="product",
+                    display_name=display_name,
+                    compatibility_product_id=compatibility_id,
+                    compatibility_product_name=display_name,
+                    catalog_group_id=None,
+                    catalog_breadcrumb=(),
+                    source_root=source_root,
+                    package_name=None,
+                    asset_type=None,
+                    enabled=True,
+                ),
+            )
+            routes.append(route)
+            route_by_name[display_name] = route
+        self.central_store.replace_trusted_route_heads(
+            "org_demo", self.repository_id, tuple(routes)
+        )
+        (self.registered_repository / "source.py").write_text(
+            f"{RAW_SOURCE}\n", "utf-8"
+        )
+        self.gateway.source_context_by_boundary[(SESSION_A, TURN_A1)] = (
+            SESSION_ROUTING_CONTEXT
+        )
+        self.gateway.session_route_by_session[SESSION_A] = route_by_name[
+            "third-party-services"
+        ].route_id
+        self._observe(SESSION_A, TURN_A1, self.registered_repository)
+        self._drain_hooks()
+
+        request_id = self._click("web_action_empty_git_session_route")
+        self.assertTrue(self._run_agent_once())
+
+        self.assertEqual("succeeded", self._request(request_id)["state"])
+        self.assertEqual(1, self.gateway.routing_turn_creates)
+        self.assertEqual(
+            {"third-party-services"},
+            {item["content"]["product"] for item in self._candidates()},
+        )
+        plan = self.routing_store._connection.execute(
+            "SELECT plan_json FROM capture_group_plans WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        self.assertEqual("session_model", json.loads(plan[0])["routing_method"])
+        self.assertNotIn(SESSION_ROUTING_CONTEXT, plan[0])
+        self._assert_central_has_no_raw_source()
 
     def test_blocking_inventory_keeps_one_live_lease_past_thirty_seconds(
         self,
@@ -1454,6 +1544,11 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             session_index=self.session_index,
             git_paths=GitPathEvidenceReader(timeout_seconds=1.0),
             routing_store=self.routing_store,
+            session_router=SessionProductRouter(
+                gateway=self.gateway,
+                recall_host_store=self.recall_host_store,
+                clock=self.clock,
+            ),
             capture_runner=self.capture_runner,
             reconciliation_runner=self.reconciliation_runner,
             request_state=self.request_state,
@@ -1727,6 +1822,7 @@ class OnDemandCaptureCoreTest(unittest.TestCase):
             TURN_CHILD,
             TURN_PRIVATE,
             TRANSCRIPT_PATH_SENTINEL,
+            SESSION_ROUTING_CONTEXT,
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden.encode("utf-8"), combined)
