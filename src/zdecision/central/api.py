@@ -26,7 +26,10 @@ from zdecision.central.service import (
     RepositoryUnavailable,
     RequestNotFound,
 )
-from zdecision.central.web.application import CentralWebApplication
+from zdecision.central.web.application import (
+    CentralWebApplication,
+    RecallDemoRefreshFailed,
+)
 from zdecision.central.web.queries import (
     DecisionNotFound,
     DecisionRegistryUnavailable,
@@ -275,6 +278,15 @@ def create_app(
         request: Request, error: PublicationAmbiguous
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"error": error.code})
+
+    @app.exception_handler(RecallDemoRefreshFailed)
+    async def recall_demo_refresh_failed_handler(
+        request: Request, error: RecallDemoRefreshFailed
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "recall_demo_refresh_failed"},
+        )
 
     @app.exception_handler(ValueError)
     async def value_error_handler(

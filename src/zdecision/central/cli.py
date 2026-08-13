@@ -43,6 +43,11 @@ from zdecision.jsonio import atomic_create_json
 from zdecision.registry.git import GitRegistryAdapter, GitRegistryError
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.query import RegistryQuery
+from zdecision.recall.demo.config import (
+    load_demo_recall_config,
+    recall_demo_config_path,
+)
+from zdecision.recall.demo.publication import DemoBundlePublisher
 
 
 _DEFAULT_CENTRAL_URL = "http://127.0.0.1:8765"
@@ -212,6 +217,14 @@ def _run_server(arguments: argparse.Namespace) -> int:
         arguments.registry_repository_root
     )
     config = _load_central_config(config_path)
+    try:
+        demo_config = load_demo_recall_config(recall_demo_config_path(os.environ))
+    except FileNotFoundError:
+        recall_demo_publisher = None
+    except (OSError, ValueError):
+        raise CentralCliError("recall_demo_config_invalid") from None
+    else:
+        recall_demo_publisher = DemoBundlePublisher(demo_config.publisher)
 
     from zdecision.central.api import create_app
 
@@ -259,6 +272,7 @@ def _run_server(arguments: argparse.Namespace) -> int:
             catalog=RegistryCatalog(registry_root),
             git=git,
             registry_synchronizer=synchronizer,
+            recall_demo_publisher=recall_demo_publisher,
         )
         app = create_app(
             CaptureRequestService(store),

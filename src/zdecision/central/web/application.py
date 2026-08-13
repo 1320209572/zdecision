@@ -43,6 +43,14 @@ from zdecision.central.web.reviews import (
 from zdecision.central.web.store import CentralWebStore
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter
+from zdecision.recall.demo.publication import (
+    DemoBundlePublisher,
+    RecallDemoPublicationError,
+)
+
+
+class RecallDemoRefreshFailed(RuntimeError):
+    pass
 
 
 class CentralWebApplication:
@@ -54,6 +62,7 @@ class CentralWebApplication:
         catalog: RegistryCatalog | None = None,
         git: GitRegistryAdapter | None = None,
         registry_synchronizer: RegistryProjectionSynchronizer | None = None,
+        recall_demo_publisher: DemoBundlePublisher | None = None,
     ) -> None:
         if not isinstance(store, CentralWebStore):
             raise TypeError("store must be a CentralWebStore")
@@ -70,6 +79,7 @@ class CentralWebApplication:
         if any(configured) and not all(configured):
             raise ValueError("Preview Registry dependencies must be configured together")
         self.registry_synchronizer = registry_synchronizer
+        self.recall_demo_publisher = recall_demo_publisher
         self.previews = (
             CentralPreviewService(
                 store=store, queries=queries, catalog=catalog, git=git
@@ -293,3 +303,10 @@ class CentralWebApplication:
             )
         except RegistryProjectionError:
             return
+        if self.recall_demo_publisher is not None:
+            try:
+                self.recall_demo_publisher.refresh(publication.commit_sha)
+            except RecallDemoPublicationError:
+                raise RecallDemoRefreshFailed(
+                    "recall_demo_refresh_failed"
+                ) from None
