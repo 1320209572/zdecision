@@ -6,6 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from zdecision.central.registry_projection import (
+    ProjectionState,
+    RegistryProjectionState,
+)
 from zdecision.central.web.application import CentralWebApplication
 from zdecision.recall.demo.publication import RecallDemoPublicationError
 from tests import test_central_web_api
@@ -23,8 +27,20 @@ class _RecordingSynchronizer:
         organization_id: str,
         commit_sha: str,
         verified_at: str,
-    ) -> None:
+    ) -> RegistryProjectionState:
         self.calls.append(("registry", commit_sha))
+        return _projection_state("available", commit_sha)
+
+
+class _UnavailableSynchronizer(_RecordingSynchronizer):
+    def synchronize(
+        self,
+        organization_id: str,
+        commit_sha: str,
+        verified_at: str,
+    ) -> RegistryProjectionState:
+        self.calls.append(("registry", commit_sha))
+        return _projection_state("unavailable", None)
 
 
 class _RecordingPublisher:
@@ -41,6 +57,25 @@ class _FailingPublisher:
 
     def refresh(self, publication_commit: str) -> None:
         raise RecallDemoPublicationError("generation_conflict")
+
+
+def _projection_state(
+    state: ProjectionState, active_commit: str | None,
+) -> RegistryProjectionState:
+    return RegistryProjectionState(
+        organization_id="org_demo",
+        state=state,
+        active_commit=active_commit,
+        active_tree_oid="a" * 40 if active_commit is not None else None,
+        desired_commit=active_commit,
+        desired_tree_oid="a" * 40 if active_commit is not None else None,
+        verified_at="2026-08-06T10:00:00Z",
+        updated_at="2026-08-06T10:00:00Z",
+        product_count=1 if active_commit is not None else None,
+        decision_count=1 if active_commit is not None else None,
+        projection_digest="b" * 64 if active_commit is not None else None,
+        error_code=None if active_commit is not None else "registry_invalid",
+    )
 
 
 class RecallDemoPublicationBridgeTests(unittest.TestCase):
@@ -120,6 +155,18 @@ class RecallDemoPublicationBridgeTests(unittest.TestCase):
                 )
 
         self.assertEqual([], calls)
+
+    def test_unavailable_projection_result_never_refreshes(self) -> None:
+        """A returned unavailable projection must not select an unprojected Demo."""
+        calls: list[tuple[str, str]] = []
+        self._configure_bridge(
+            _RecordingPublisher(calls), _UnavailableSynchronizer(calls)
+        )
+
+        publication = self._publish("bridge-unavailable-projection")
+
+        self.assertEqual("completed", publication["state"])
+        self.assertEqual([("registry", publication["commit_sha"])], calls)
 
     def test_unconfigured_central_behavior_is_unchanged(self) -> None:
         """An absent Demo config must retain the established publication result."""

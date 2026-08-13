@@ -296,12 +296,17 @@ class CentralWebApplication:
         if self.registry_synchronizer is None:
             raise RuntimeError("Registry synchronizer is not configured")
         try:
-            self.registry_synchronizer.synchronize(
+            projection = self.registry_synchronizer.synchronize(
                 publication.organization_id,
                 publication.commit_sha,
                 publication.updated_at,
             )
         except RegistryProjectionError:
+            return
+        if (
+            projection.state != "available"
+            or projection.active_commit != publication.commit_sha
+        ):
             return
         if self.recall_demo_publisher is not None:
             try:
