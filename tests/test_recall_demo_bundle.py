@@ -315,6 +315,35 @@ class DemoBundleTests(unittest.TestCase):
             output_root=self.root / "bundle",
         )
 
+    def _product_copy(self, name: str = "product-copy") -> Path:
+        product_root = self.root / name
+        shutil.copytree(PRODUCT_ROOT, product_root)
+        return product_root
+
+    def _write_head(
+        self,
+        product_root: Path,
+        *,
+        decision_id: str,
+        revision: int,
+        lifecycle: str = "active",
+    ) -> None:
+        registry_path = product_root / "registry.json"
+        registry = json.loads(registry_path.read_text())
+        source_path = next((product_root / "decisions").glob("*/r0001.json"))
+        decision = json.loads(source_path.read_text())
+        decision["decision_id"] = decision_id
+        decision["revision"] = revision
+        destination = product_root / "decisions" / decision_id / f"r{revision:04d}.json"
+        destination.parent.mkdir()
+        destination.write_bytes(canonical_json_bytes(decision))
+        registry["decisions"][decision_id] = {
+            "head_path": str(destination.relative_to(product_root)),
+            "head_revision": revision,
+            "lifecycle": lifecycle,
+        }
+        registry_path.write_bytes(canonical_json_bytes(registry))
+
     def _assert_rejected(self, bundle: Path | None = None) -> None:
         with self.assertRaises(DemoBundleError) as captured:
             load_verified_bundle(
@@ -389,6 +418,80 @@ class DemoBundleTests(unittest.TestCase):
             all(item.repositories == ("zstack-ui-next",) for item in verified.decisions)
         )
 
+    def test_bundle_accepts_an_eleventh_active_head(self) -> None:
+        """An additional complete active formal head must be signed and returned."""
+        product_root = self._product_copy()
+        self._write_head(
+            product_root,
+            decision_id="dec_0123456789abcdef0123456789abcdef",
+            revision=1,
+        )
+
+        bundle = build_signed_bundle(
+            product_root=product_root,
+            profile_path=PROFILE_PATH,
+            private_key_path=self.private_key_path,
+            key_id="recall-demo-test-key",
+            output_root=self.root / "bundle",
+        )
+
+        verified = load_verified_bundle(
+            bundle_root=bundle, trust_root_path=self.trust_root_path
+        )
+        self.assertEqual(11, len(verified.decisions))
+
+    def test_bundle_accepts_one_and_thirty_two_active_heads(self) -> None:
+        """The valid formal active corpus may range from one through thirty-two."""
+        for count in (1, 32):
+            with self.subTest(count=count):
+                product_root = self._product_copy(f"product-copy-{count}")
+                registry_path = product_root / "registry.json"
+                registry = json.loads(registry_path.read_text())
+                registry["decisions"] = {}
+                registry_path.write_bytes(canonical_json_bytes(registry))
+                for number in range(count):
+                    self._write_head(
+                        product_root,
+                        decision_id=f"dec_{number:032x}",
+                        revision=1,
+                    )
+                bundle = build_signed_bundle(
+                    product_root=product_root,
+                    profile_path=PROFILE_PATH,
+                    private_key_path=self.private_key_path,
+                    key_id="recall-demo-test-key",
+                    output_root=self.root / f"bundle-{count}",
+                )
+                verified = load_verified_bundle(
+                    bundle_root=bundle, trust_root_path=self.trust_root_path
+                )
+                self.assertEqual(count, len(verified.decisions))
+
+    def test_bundle_rejects_zero_or_more_than_thirty_two_active_heads(self) -> None:
+        """The publisher must bound the active corpus before it signs any bundle."""
+        for count in (0, 33):
+            with self.subTest(count=count):
+                product_root = self._product_copy(f"invalid-product-copy-{count}")
+                registry_path = product_root / "registry.json"
+                registry = json.loads(registry_path.read_text())
+                registry["decisions"] = {}
+                registry_path.write_bytes(canonical_json_bytes(registry))
+                for number in range(count):
+                    self._write_head(
+                        product_root,
+                        decision_id=f"dec_{number:032x}",
+                        revision=1,
+                    )
+                with self.assertRaises(DemoBundleError) as captured:
+                    build_signed_bundle(
+                        product_root=product_root,
+                        profile_path=PROFILE_PATH,
+                        private_key_path=self.private_key_path,
+                        key_id="recall-demo-test-key",
+                        output_root=self.root / f"bundle-{count}",
+                    )
+                self.assertEqual("source_invalid", captured.exception.code)
+
     def test_rejects_equal_length_snapshot_tampering(self) -> None:
         """A changed snapshot byte must not survive its signed digest check."""
         bundle = self._build()
@@ -445,15 +548,18 @@ class DemoBundleTests(unittest.TestCase):
             load_verified_bundle(bundle_root=bundle, trust_root_path=wrong_trust_root)
         self.assertEqual(captured.exception.code, str(captured.exception))
 
-    def test_rejects_deleted_decision(self) -> None:
-        """A missing registry leaf must fail the exact bundled leaf contract."""
+    def test_accepts_resigned_bundle_within_active_bounds(self) -> None:
+        """A trusted snapshot may contain any signed active count within bounds."""
         self._build()
         snapshot_path = self.root / "bundle/snapshot.json"
         snapshot = json.loads(snapshot_path.read_text())
         snapshot["decisions"].pop()
         self._rewrite_snapshot_and_resign(snapshot)
 
-        self._assert_rejected_code("manifest_invalid")
+        verified = load_verified_bundle(
+            bundle_root=self.root / "bundle", trust_root_path=self.trust_root_path
+        )
+        self.assertEqual(9, len(verified.decisions))
 
     def test_rejects_duplicate_decision(self) -> None:
         """Duplicating a leaf must fail the exact unique-identity contract."""
@@ -508,8 +614,8 @@ class DemoBundleTests(unittest.TestCase):
             )
         self.assertEqual("private_key_location", captured.exception.code)
 
-    def test_build_rejects_registry_without_exactly_ten_heads(self) -> None:
-        """A frozen corpus build must reject a registry with only nine heads."""
+    def test_build_accepts_registry_with_nine_heads(self) -> None:
+        """A valid active source set below ten must still be publishable."""
         product_root = self.root / "product-copy"
         shutil.copytree(PRODUCT_ROOT, product_root)
         registry_path = product_root / "registry.json"
@@ -517,20 +623,23 @@ class DemoBundleTests(unittest.TestCase):
         registry["decisions"].pop(next(iter(registry["decisions"])))
         registry_path.write_bytes(canonical_json_bytes(registry))
 
-        with self.assertRaises(DemoBundleError):
-            build_signed_bundle(
-                product_root=product_root,
-                profile_path=PROFILE_PATH,
-                private_key_path=self.private_key_path,
-                key_id="recall-demo-test-key",
-                output_root=self.root / "bundle",
-            )
+        bundle = build_signed_bundle(
+            product_root=product_root,
+            profile_path=PROFILE_PATH,
+            private_key_path=self.private_key_path,
+            key_id="recall-demo-test-key",
+            output_root=self.root / "bundle",
+        )
+        self.assertEqual(
+            9,
+            len(load_verified_bundle(bundle_root=bundle, trust_root_path=self.trust_root_path).decisions),
+        )
 
-    def test_verification_rejects_resigned_bundle_without_exactly_ten_decisions(self) -> None:
-        """A trusted signature cannot change the frozen ten-leaf corpus size."""
+    def test_verification_rejects_resigned_bundle_without_active_decisions(self) -> None:
+        """A trusted signature still cannot select an empty active corpus."""
         self._build()
         snapshot = json.loads((self.root / "bundle/snapshot.json").read_text())
-        snapshot["decisions"].pop()
+        snapshot["decisions"] = []
         self._rewrite_snapshot_and_resign(snapshot)
 
         self._assert_rejected()

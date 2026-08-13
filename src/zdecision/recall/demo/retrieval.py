@@ -211,7 +211,9 @@ def _validate_bindings(
             revision.product_id != bundle.decision_space_id
             or revision.product_name != bundle.product_name
             or revision.lifecycle != "active"
-            or revision.revision != 1
+            or not isinstance(revision.revision, int)
+            or isinstance(revision.revision, bool)
+            or revision.revision <= 0
             or revision.repositories != (bundle.repository,)
         ):
             raise DemoRetrievalError("decision_leaf_invalid")

@@ -37,7 +37,8 @@ _MANIFEST_FIELDS = frozenset(
     ("schema_version", "files", "decision_count", "decision_leaves")
 )
 _SIGNED_MANIFEST_FIELDS = frozenset(("key_id", "manifest", "signature"))
-_FROZEN_DECISION_COUNT = 10
+_MIN_ACTIVE_DECISIONS = 1
+_MAX_ACTIVE_DECISIONS = 32
 
 
 class DemoBundleError(RuntimeError):
@@ -182,11 +183,11 @@ def _read_product_heads(
     registry: ProductRegistry,
     repository: str,
 ) -> tuple[DecisionRevision, ...]:
-    if len(registry.decisions) != _FROZEN_DECISION_COUNT:
-        raise DemoBundleError("source_invalid")
     decisions: list[DecisionRevision] = []
     for decision_id, head in registry.decisions.items():
-        if head.lifecycle != "active" or head.head_revision != 1:
+        if head.lifecycle != "active":
+            continue
+        if not _is_positive_integer(head.head_revision):
             raise DemoBundleError("source_invalid")
         value = _read_canonical_json(product_root / head.head_path)
         if not isinstance(value, Mapping):
@@ -198,7 +199,7 @@ def _read_product_heads(
         decisions.append(decision)
     if tuple(decision.decision_id for decision in decisions) != tuple(
         sorted(decision.decision_id for decision in decisions)
-    ) or len(decisions) != _FROZEN_DECISION_COUNT:
+    ) or not _valid_active_count(len(decisions)):
         raise DemoBundleError("source_invalid")
     return tuple(decisions)
 
@@ -208,7 +209,7 @@ def _manifest(
     profile_bytes: bytes,
     decisions: tuple[DecisionRevision, ...],
 ) -> dict[str, object]:
-    if len(decisions) != _FROZEN_DECISION_COUNT:
+    if not _valid_active_count(len(decisions)):
         raise DemoBundleError("source_invalid")
     return {
         "schema_version": 1,
@@ -331,7 +332,7 @@ def _validate_manifest_shape(manifest: Mapping[str, object]) -> None:
     count = manifest["decision_count"]
     leaves = manifest["decision_leaves"]
     if (
-        not _is_exact_integer(count, _FROZEN_DECISION_COUNT)
+        not _valid_active_count(count)
         or not isinstance(leaves, list)
         or len(leaves) != count
     ):
@@ -342,7 +343,7 @@ def _validate_manifest_shape(manifest: Mapping[str, object]) -> None:
             not isinstance(leaf, Mapping)
             or frozenset(leaf) != {"decision_id", "revision"}
             or not isinstance(leaf["decision_id"], str)
-            or not _is_exact_integer(leaf["revision"], 1)
+            or not _is_positive_integer(leaf["revision"])
         ):
             raise DemoBundleError("manifest_invalid")
         identities.append(leaf["decision_id"])
@@ -397,7 +398,7 @@ def _validate_snapshot(
         for leaf in manifest["decision_leaves"]
     ]
     if (
-        len(decisions) != _FROZEN_DECISION_COUNT
+        not _valid_active_count(len(decisions))
         or len(decisions) != manifest["decision_count"]
         or identities != expected
         or [item.decision_id for item in decisions] != sorted(item.decision_id for item in decisions)
@@ -411,6 +412,14 @@ def _is_exact_integer(value: object, expected: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value == expected
 
 
+def _is_positive_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _valid_active_count(value: int) -> bool:
+    return _MIN_ACTIVE_DECISIONS <= value <= _MAX_ACTIVE_DECISIONS
+
+
 def _validate_leaf(
     decision: DecisionRevision,
     decision_space_id: str,
@@ -421,7 +430,7 @@ def _validate_leaf(
         decision.product_id != decision_space_id
         or decision.product_name != product_name
         or decision.lifecycle != "active"
-        or decision.revision != 1
+        or not _is_positive_integer(decision.revision)
         or decision.repositories != (repository,)
     ):
         raise DemoBundleError("snapshot_invalid")
