@@ -137,7 +137,10 @@ class GitPathEvidenceReader:
     ) -> None:
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds is invalid")
-        self.resolver = resolver or RepositoryResolver()
+        self.resolver = resolver or RepositoryResolver(
+            git_executable=git_executable,
+            timeout_seconds=timeout_seconds,
+        )
         self.git_executable = git_executable
         self.timeout_seconds = float(timeout_seconds)
 
@@ -154,9 +157,10 @@ class GitPathEvidenceReader:
         ):
             raise TypeError("sources must contain FrozenSessionSource values")
         resolved = self.resolver.resolve(repository.worktree_root)
+        if resolved is None:
+            raise OSError("repository_identity_unavailable")
         if (
-            resolved is None
-            or resolved.repository_id != repository.repository_id
+            resolved.repository_id != repository.repository_id
             or Path(resolved.worktree_root) != Path(repository.worktree_root)
         ):
             raise ValueError("repository_identity_mismatch")

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from zdecision.agent.git_path_evidence import GitPathEvidenceReader
 from zdecision.agent.repository import RepositoryResolver
@@ -228,6 +230,40 @@ class GitPathEvidenceReaderTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "repository_identity_mismatch"):
             self.reader.freeze(mismatched, ())
+
+    def test_repository_reverification_uses_the_capture_timeout(self) -> None:
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        bin_directory = self.root / "slow-bin"
+        bin_directory.mkdir()
+        slow_git = bin_directory / "git"
+        slow_git.write_text(
+            "#!/bin/sh\n"
+            "sleep 0.12\n"
+            f"exec {real_git!s} \"$@\"\n",
+            "utf-8",
+        )
+        slow_git.chmod(0o700)
+        environment = {"PATH": f"{bin_directory}:{os.environ['PATH']}"}
+
+        with patch.dict("os.environ", environment):
+            frozen = GitPathEvidenceReader(timeout_seconds=2.0).freeze(
+                self.repository, ()
+            )
+
+        self.assertEqual(self.repository.repository_id, frozen.repository_id)
+
+    def test_temporarily_unresolved_repository_is_retryable(self) -> None:
+        class UnavailableResolver:
+            def resolve(self, cwd):
+                return None
+
+        reader = GitPathEvidenceReader(
+            resolver=UnavailableResolver(), timeout_seconds=0.5
+        )
+
+        with self.assertRaisesRegex(OSError, "repository_identity_unavailable"):
+            reader.freeze(self.repository, ())
 
 
 if __name__ == "__main__":
