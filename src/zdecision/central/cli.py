@@ -47,7 +47,6 @@ from zdecision.recall.demo.config import (
     load_demo_recall_config,
     recall_demo_config_path,
 )
-from zdecision.recall.demo.publication import DemoBundlePublisher
 
 
 _DEFAULT_CENTRAL_URL = "http://127.0.0.1:8765"
@@ -224,7 +223,12 @@ def _run_server(arguments: argparse.Namespace) -> int:
     except (OSError, ValueError):
         raise CentralCliError("recall_demo_config_invalid") from None
     else:
-        recall_demo_publisher = DemoBundlePublisher(demo_config.publisher)
+        try:
+            from zdecision.recall.demo.publication import DemoBundlePublisher
+
+            recall_demo_publisher = DemoBundlePublisher(demo_config.publisher)
+        except ImportError:
+            raise CentralCliError("recall_demo_config_invalid") from None
 
     from zdecision.central.api import create_app
 

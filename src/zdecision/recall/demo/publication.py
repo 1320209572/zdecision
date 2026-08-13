@@ -22,6 +22,7 @@ from zdecision.recall.demo.bundle import (
 )
 from zdecision.recall.demo.config import DemoProviderConfig, DemoPublisherConfig
 from zdecision.recall.demo.contracts import DemoRetrievalProfile
+from zdecision.recall.demo.errors import RecallDemoPublicationError
 from zdecision.recall.demo.model_store import ModelStoreError, load_installed_models
 
 
@@ -49,14 +50,6 @@ _GENERATION_FIELDS = frozenset(
 )
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
-
-
-class RecallDemoPublicationError(RuntimeError):
-    """A deliberately non-sensitive publication failure."""
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
 
 
 @dataclass(frozen=True)

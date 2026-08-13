@@ -940,7 +940,7 @@ def run_mcp(
             browser_launcher=SystemDefaultBrowserLauncher(),
         )
         recall_clock = lambda: datetime.now(UTC)
-        from zdecision.recall.demo.provider import configured_recall_provider
+        from zdecision.recall.demo.factory import configured_recall_provider
 
         provider = configured_recall_provider(recall_demo_config_path)
         recall_tools = RecallMcpTools(

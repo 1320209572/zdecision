@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+from typing import Protocol
 
 from zdecision.central.auth import Principal
 from zdecision.central.registry_projection import (
@@ -43,10 +44,12 @@ from zdecision.central.web.reviews import (
 from zdecision.central.web.store import CentralWebStore
 from zdecision.registry.catalog import RegistryCatalog
 from zdecision.registry.git import GitRegistryAdapter
-from zdecision.recall.demo.publication import (
-    DemoBundlePublisher,
-    RecallDemoPublicationError,
-)
+from zdecision.recall.demo.errors import RecallDemoPublicationError
+
+
+class RecallDemoPublisher(Protocol):
+    def refresh(self, publication_commit: str) -> object:
+        raise NotImplementedError
 
 
 class RecallDemoRefreshFailed(RuntimeError):
@@ -62,7 +65,7 @@ class CentralWebApplication:
         catalog: RegistryCatalog | None = None,
         git: GitRegistryAdapter | None = None,
         registry_synchronizer: RegistryProjectionSynchronizer | None = None,
-        recall_demo_publisher: DemoBundlePublisher | None = None,
+        recall_demo_publisher: RecallDemoPublisher | None = None,
     ) -> None:
         if not isinstance(store, CentralWebStore):
             raise TypeError("store must be a CentralWebStore")

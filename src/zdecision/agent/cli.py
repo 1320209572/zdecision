@@ -175,7 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "hook":
             from zdecision.agent.hooks import handle_hook
             from zdecision.recall.demo.config import recall_demo_config_path
-            from zdecision.recall.demo.provider import configured_recall_provider
+            from zdecision.recall.demo.factory import configured_recall_provider
 
             raw = sys.stdin.buffer.read()
             provider = configured_recall_provider(recall_demo_config_path(os.environ))
@@ -239,7 +239,7 @@ def _run_recall_demo_command(
             profile_digest, model_digest = _validate_recall_demo_setup(config)
             _prepare_bundle_state_root(config.provider.bundle_state_root)
             write_demo_recall_config(path, config)
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
             _write_recall_demo_error()
             return 1
         _write_recall_demo_status("configured", profile_digest, model_digest)
@@ -258,7 +258,7 @@ def _run_recall_demo_command(
         generation, digest = _current_recall_demo_generation(
             config.provider.bundle_state_root
         )
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         _write_recall_demo_status("invalid", None, None)
         return 0
     _write_recall_demo_status(

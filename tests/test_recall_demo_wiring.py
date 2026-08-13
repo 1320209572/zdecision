@@ -28,7 +28,7 @@ from zdecision.central.decision_spaces import EnabledRepository
 from zdecision.ids import product_id
 from zdecision.jsonio import canonical_json_bytes
 from zdecision.recall.demo.config import DemoRecallConfig, write_demo_recall_config
-from zdecision.recall.demo import provider as demo_provider
+from zdecision.recall.demo import factory as demo_factory
 from zdecision.recall.demo.contracts import DemoRetrievalProfile
 from zdecision.recall.demo.model_store import prepare_models
 from zdecision.recall.demo.publication import DemoBundlePublisher
@@ -263,7 +263,7 @@ class RecallDemoWiringTests(unittest.TestCase):
                 clear=True,
             ),
             patch(
-                "zdecision.recall.demo.provider.configured_recall_provider",
+                "zdecision.recall.demo.factory.configured_recall_provider",
                 return_value=UnavailableRecallProvider(),
             ) as configured,
         ):
@@ -332,8 +332,8 @@ class RecallDemoWiringTests(unittest.TestCase):
                 clear=True,
             ),
             patch(
-                "zdecision.recall.demo.provider.configured_recall_provider",
-                wraps=demo_provider.configured_recall_provider,
+                "zdecision.recall.demo.factory.configured_recall_provider",
+                wraps=demo_factory.configured_recall_provider,
             ) as configured,
         ):
             self._run_hook({"hook_event_name": "PreToolUse", "config_path": str(private_path)})
@@ -377,7 +377,7 @@ class RecallDemoVerticalTests(unittest.TestCase):
             )
         )
         database.put_enabled_repository(EnabledRepository(snapshot.repository_id, True))
-        provider = demo_provider.configured_recall_provider(self.vertical.config_path)
+        provider = demo_factory.configured_recall_provider(self.vertical.config_path)
         self.assertNotIsInstance(provider, UnavailableRecallProvider)
         common = {
             "session_id": "demo-session",
