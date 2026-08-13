@@ -28,6 +28,7 @@ from zdecision.registry.models import DecisionRevision
 
 from zdecision.recall.demo.provider import (
     DemoRecallProvider,
+    GenerationMetadata,
     InstalledModelMetadata,
     VerifiedDemoBundleMetadata,
     configured_recall_provider,
@@ -84,6 +85,13 @@ class RecallDemoProviderTests(unittest.TestCase):
             profile_digest=self.profile.digest,
             install_manifest_digest=self.pointer.model_install_digest,
         )
+        self.generation_metadata = GenerationMetadata(
+            publication_commit=self.pointer.publication_commit,
+            bundle=self.pointer.bundle,
+            manifest_digest=self.pointer.manifest_digest,
+            profile_digest=self.pointer.profile_digest,
+            model_install_digest=self.pointer.model_install_digest,
+        )
         self.revision = DecisionRevision.from_dict(
             json.loads(
                 (
@@ -139,7 +147,12 @@ class RecallDemoProviderTests(unittest.TestCase):
         return patch.object(
             DemoRecallProvider,
             "_current_metadata",
-            return_value=(self.pointer, self.bundle_metadata, self.model_metadata),
+            return_value=(
+                self.pointer,
+                self.generation_metadata,
+                self.bundle_metadata,
+                self.model_metadata,
+            ),
         )
 
     def test_exact_product_preflight_freezes_selected_generation(self) -> None:
@@ -213,6 +226,24 @@ class RecallDemoProviderTests(unittest.TestCase):
                 now=datetime.now(UTC),
             )
         self.assertIsInstance(result, RecallPreflightReady)
+
+    def test_preflight_requires_bound_immutable_generation_metadata(self) -> None:
+        """A missing or conflicting generation.json cannot become ready."""
+        with (
+            patch("zdecision.recall.demo.provider._load_current_pointer", return_value=self.pointer),
+            patch("zdecision.recall.demo.provider._selected_bundle_root", return_value=Path("/bundle")),
+            patch("zdecision.recall.demo.provider.load_verified_bundle_metadata", return_value=self.bundle_metadata),
+            patch("zdecision.recall.demo.provider.load_installed_model_metadata", return_value=self.model_metadata),
+            patch("zdecision.recall.demo.provider.load_generation_metadata", side_effect=ValueError),
+        ):
+            result = self._provider().preflight(
+                repository_id="repo_1",
+                repository_display_name="zstack-ui-next",
+                intent=_intent(),
+                now=datetime.now(UTC),
+            )
+
+        self.assertEqual(RecallPreflightUnavailable(code="recall_not_ready"), result)
 
     def test_preflight_emits_no_decision_text_or_private_path(self) -> None:
         """Preflight serialization exposes only formal public metadata."""
@@ -299,6 +330,9 @@ class RecallDemoProviderTests(unittest.TestCase):
             changed_result,
             pointer=changed,
             bundle=replace(self.bundle_metadata, manifest_digest=changed.manifest_digest),
+            generation=replace(
+                self.generation_metadata, manifest_digest=changed.manifest_digest
+            ),
             build_calls=builds,
         ):
             provider.retrieve(changed_preflight)
@@ -328,11 +362,13 @@ class RecallDemoProviderTests(unittest.TestCase):
         pointer: DemoBundlePointer | None = None,
         bundle: VerifiedDemoBundleMetadata | None = None,
         model: InstalledModelMetadata | None = None,
+        generation: GenerationMetadata | None = None,
         build_calls: list[str] | None = None,
     ):
         pointer = pointer or self.pointer
         bundle = bundle or self.bundle_metadata
         model = model or self.model_metadata
+        generation = generation or self.generation_metadata
         verified_bundle = VerifiedDemoBundle(
             decision_space_id=PRODUCT_ID,
             product_name="third-party-services",
@@ -371,7 +407,7 @@ class RecallDemoProviderTests(unittest.TestCase):
         metadata = patch.object(
             DemoRecallProvider,
             "_current_metadata",
-            return_value=(pointer, bundle, model),
+            return_value=(pointer, generation, bundle, model),
         )
         return _PatchPair(patches, metadata)
 

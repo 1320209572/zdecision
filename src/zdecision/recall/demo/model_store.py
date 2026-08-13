@@ -773,6 +773,30 @@ def _validate_install_metadata(
     _validated_file_records(manifest["files"])
     if manifest["files"] != _expected_file_records(profile):
         raise ModelStoreError("installed_manifest_invalid")
+    _validate_metadata_file_set(install_path, profile)
+
+
+def _validate_metadata_file_set(
+    install_path: Path, profile: DemoRetrievalProfile
+) -> None:
+    expected_files = _expected_file_records(profile)
+    expected_paths = {str(record["path"]) for record in expected_files}
+    _validate_install_tree(
+        install_path, expected_paths, sealed=True, include_manifest=True
+    )
+    for record in expected_files:
+        descriptor = _open_regular(
+            install_path / str(record["path"]), "installed_file_set_invalid"
+        )
+        try:
+            status = os.fstat(descriptor)
+            _require_no_extended_acl_fd(descriptor, "installed_permissions_invalid")
+            if status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) != 0o400:
+                raise ModelStoreError("installed_permissions_invalid")
+            if status.st_size != record["size"]:
+                raise ModelStoreError("installed_file_digest_invalid")
+        finally:
+            os.close(descriptor)
 
 
 def _validate_actual_files(

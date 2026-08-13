@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from collections.abc import Mapping
@@ -217,14 +218,16 @@ def load_verified_bundle_metadata(
             raise DemoBundleError("signature_invalid") from None
 
         _validate_manifest_shape(manifest)
-        snapshot_bytes = _read_bound_payload(bundle_root / "snapshot.json", manifest, "snapshot.json")
+        _require_bound_payload_metadata(
+            bundle_root / "snapshot.json", manifest, "snapshot.json"
+        )
         profile_bytes = _read_bound_payload(
             bundle_root / "retrieval-profile.json", manifest, "retrieval-profile.json"
         )
-        snapshot = _decode_canonical_bytes(snapshot_bytes)
         profile = DemoRetrievalProfile.from_dict(_decode_canonical_bytes(profile_bytes))
-        decision_count, decision_leaves = _validate_snapshot_metadata(
-            snapshot, profile, manifest
+        decision_leaves = tuple(
+            (leaf["decision_id"], leaf["revision"])
+            for leaf in manifest["decision_leaves"]
         )
         return VerifiedDemoBundleMetadata(
             decision_space_id=profile.decision_space_id,
@@ -232,7 +235,7 @@ def load_verified_bundle_metadata(
             repository=profile.repository,
             profile=profile,
             manifest_digest=hashlib.sha256(canonical_json_bytes(manifest)).hexdigest(),
-            decision_count=decision_count,
+            decision_count=manifest["decision_count"],
             decision_leaves=decision_leaves,
         )
     except DemoBundleError:
@@ -426,6 +429,26 @@ def _read_bound_payload(path: Path, manifest: Mapping[str, object], name: str) -
     return content
 
 
+def _require_bound_payload_metadata(
+    path: Path, manifest: Mapping[str, object], name: str
+) -> None:
+    """Check bounded file identity metadata without opening the Decision snapshot."""
+    try:
+        state = path.lstat()
+    except OSError:
+        raise DemoBundleError("payload_invalid") from None
+    binding = manifest["files"]
+    assert isinstance(binding, Mapping)
+    item = binding[name]
+    assert isinstance(item, Mapping)
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(state.st_mode)
+        or state.st_size != item["byte_length"]
+    ):
+        raise DemoBundleError("payload_invalid")
+
+
 def _validate_snapshot(
     snapshot: object,
     profile: DemoRetrievalProfile,
@@ -470,49 +493,6 @@ def _validate_snapshot(
     ):
         raise DemoBundleError("snapshot_invalid")
     return tuple(decisions)
-
-
-def _validate_snapshot_metadata(
-    snapshot: object,
-    profile: DemoRetrievalProfile,
-    manifest: Mapping[str, object],
-) -> tuple[int, tuple[tuple[str, int], ...]]:
-    """Confirm snapshot identity/count/leaves while keeping Decisions opaque."""
-    if not isinstance(snapshot, Mapping) or frozenset(snapshot) != _SNAPSHOT_FIELDS:
-        raise DemoBundleError("snapshot_invalid")
-    if (
-        not _is_exact_integer(snapshot["schema_version"], 1)
-        or snapshot["decision_space_id"] != profile.decision_space_id
-        or snapshot["product_name"] != profile.product_name
-        or snapshot["repository"] != profile.repository
-        or not isinstance(snapshot["decisions"], list)
-    ):
-        raise DemoBundleError("snapshot_invalid")
-    leaves: list[tuple[str, int]] = []
-    for value in snapshot["decisions"]:
-        if (
-            not isinstance(value, Mapping)
-            or not isinstance(value.get("decision_id"), str)
-            or not _is_positive_integer(value.get("revision"))
-        ):
-            raise DemoBundleError("snapshot_invalid")
-        leaves.append((value["decision_id"], value["revision"]))
-    manifest_leaves = manifest["decision_leaves"]
-    assert isinstance(manifest_leaves, list)
-    expected = tuple(
-        (leaf["decision_id"], leaf["revision"])
-        for leaf in manifest_leaves
-        if isinstance(leaf, Mapping)
-    )
-    if (
-        not _valid_active_count(len(leaves))
-        or len(leaves) != manifest["decision_count"]
-        or tuple(leaves) != expected
-        or [decision_id for decision_id, _revision in leaves]
-        != sorted(decision_id for decision_id, _revision in leaves)
-    ):
-        raise DemoBundleError("snapshot_invalid")
-    return len(leaves), tuple(leaves)
 
 
 def _is_exact_integer(value: object, expected: int) -> bool:

@@ -56,6 +56,15 @@ class _RuntimeIndex:
     index: DemoIndex
 
 
+@dataclass(frozen=True)
+class GenerationMetadata:
+    publication_commit: str
+    bundle: str
+    manifest_digest: str
+    profile_digest: str
+    model_install_digest: str
+
+
 def build_demo_index(bundle: VerifiedDemoBundle, runtime: ModelRuntimeBundle) -> DemoIndex:
     return DemoIndex.build(bundle, runtime)
 
@@ -86,8 +95,8 @@ class DemoRecallProvider:
                 )
             if targets != (_DECISION_SPACE_ID,):
                 return RecallPreflightUnavailable(code="recall_not_ready")
-            pointer, bundle_metadata, model_metadata = self._current_metadata()
-            self._validate_metadata(pointer, bundle_metadata, model_metadata)
+            pointer, generation, bundle_metadata, model_metadata = self._current_metadata()
+            self._validate_metadata(pointer, generation, bundle_metadata, model_metadata)
             return RecallPreflightReady(
                 repository_id=repository_id,
                 repository_display_name=repository_display_name,
@@ -107,8 +116,8 @@ class DemoRecallProvider:
 
     def retrieve(self, preflight: RecallPreflightReady) -> RecallShortlist:
         try:
-            pointer, bundle_metadata, model_metadata = self._current_metadata()
-            self._validate_metadata(pointer, bundle_metadata, model_metadata)
+            pointer, generation, bundle_metadata, model_metadata = self._current_metadata()
+            self._validate_metadata(pointer, generation, bundle_metadata, model_metadata)
             self._validate_preflight(preflight, pointer)
 
             bundle = load_verified_bundle(
@@ -155,9 +164,9 @@ class DemoRecallProvider:
                 raise RecallProviderUnavailable("Recall provider is unavailable")
             shortlist = RecallShortlist.create(preflight=preflight, items=items)
 
-            current_pointer, current_bundle, current_model = self._current_metadata()
-            self._validate_metadata(current_pointer, current_bundle, current_model)
-            if current_pointer != pointer or current_bundle != bundle_metadata or current_model != model_metadata:
+            current_pointer, current_generation, current_bundle, current_model = self._current_metadata()
+            self._validate_metadata(current_pointer, current_generation, current_bundle, current_model)
+            if (current_pointer, current_generation, current_bundle, current_model) != (pointer, generation, bundle_metadata, model_metadata):
                 raise RecallProviderUnavailable("Recall provider is unavailable")
             return shortlist
         except RecallProviderUnavailable:
@@ -167,25 +176,32 @@ class DemoRecallProvider:
 
     def _current_metadata(
         self,
-    ) -> tuple[DemoBundlePointer, VerifiedDemoBundleMetadata, InstalledModelMetadata]:
+    ) -> tuple[DemoBundlePointer, GenerationMetadata, VerifiedDemoBundleMetadata, InstalledModelMetadata]:
         pointer = _load_current_pointer(self._config)
         bundle_root = _selected_bundle_root(self._config, pointer)
+        generation = load_generation_metadata(self._config, pointer)
         bundle_metadata = load_verified_bundle_metadata(
             bundle_root=bundle_root, trust_root_path=self._config.trust_root_path
         )
         model_metadata = load_installed_model_metadata(
             bundle_metadata.profile, self._config.model_state_root
         )
-        return pointer, bundle_metadata, model_metadata
+        return pointer, generation, bundle_metadata, model_metadata
 
     def _validate_metadata(
         self,
         pointer: DemoBundlePointer,
+        generation: GenerationMetadata,
         bundle: VerifiedDemoBundleMetadata,
         model: InstalledModelMetadata,
     ) -> None:
         if (
             pointer.profile_digest != bundle.profile.digest
+            or generation.publication_commit != pointer.publication_commit
+            or generation.bundle != pointer.bundle
+            or generation.manifest_digest != pointer.manifest_digest
+            or generation.profile_digest != pointer.profile_digest
+            or generation.model_install_digest != pointer.model_install_digest
             or pointer.manifest_digest != bundle.manifest_digest
             or pointer.model_install_digest != model.install_manifest_digest
             or model.profile_digest != bundle.profile.digest
@@ -273,6 +289,62 @@ def _load_current_pointer(config: DemoProviderConfig) -> DemoBundlePointer:
     if canonical_json_bytes(value) != content:
         raise ValueError("pointer invalid")
     return DemoBundlePointer.from_dict(value)
+
+
+def load_generation_metadata(
+    config: DemoProviderConfig, pointer: DemoBundlePointer
+) -> GenerationMetadata:
+    """Require sealed immutable generation metadata bound exactly to current.json."""
+    path = (
+        Path(config.bundle_state_root)
+        / "bundles"
+        / pointer.publication_commit
+        / "generation.json"
+    )
+    state = path.lstat()
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISREG(state.st_mode)
+        or state.st_uid != os.geteuid()
+        or stat.S_IMODE(state.st_mode) != 0o600
+    ):
+        raise ValueError("generation invalid")
+    content = path.read_bytes()
+    value = json.loads(content)
+    expected_fields = frozenset(
+        (
+            "schema_version",
+            "publication_commit",
+            "bundle",
+            "manifest_digest",
+            "profile_digest",
+            "model_install_digest",
+        )
+    )
+    if not isinstance(value, dict) or frozenset(value) != expected_fields or canonical_json_bytes(value) != content:
+        raise ValueError("generation invalid")
+    if (
+        not isinstance(value["schema_version"], int)
+        or isinstance(value["schema_version"], bool)
+        or value["schema_version"] != 1
+    ):
+        raise ValueError("generation invalid")
+    metadata = GenerationMetadata(
+        publication_commit=value["publication_commit"],
+        bundle=value["bundle"],
+        manifest_digest=value["manifest_digest"],
+        profile_digest=value["profile_digest"],
+        model_install_digest=value["model_install_digest"],
+    )
+    if (
+        metadata.publication_commit != pointer.publication_commit
+        or metadata.bundle != pointer.bundle
+        or metadata.manifest_digest != pointer.manifest_digest
+        or metadata.profile_digest != pointer.profile_digest
+        or metadata.model_install_digest != pointer.model_install_digest
+    ):
+        raise ValueError("generation invalid")
+    return metadata
 
 
 def _selected_bundle_root(config: DemoProviderConfig, pointer: DemoBundlePointer) -> Path:

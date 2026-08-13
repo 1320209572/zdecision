@@ -29,6 +29,7 @@ from zdecision.recall.demo.model_store import (
     _clone_file,
     _fsync_directory,
     _seal_directory,
+    load_installed_model_metadata,
     load_installed_models,
     prepare_models,
 )
@@ -296,6 +297,19 @@ class ModelStoreTests(unittest.TestCase):
                     ),
                     (destination.stat().st_dev, destination.stat().st_ino),
                 )
+
+    def test_metadata_rejects_missing_declared_model_file_before_weight_load(self) -> None:
+        """A preflight-ready installation must contain every sealed declared file."""
+        installed = self._prepare()
+        installed.embedding_path.chmod(0o700)
+        (installed.embedding_path / "config.json").chmod(0o600)
+        (installed.embedding_path / "config.json").unlink()
+        installed.embedding_path.chmod(0o500)
+
+        self._assert_error(
+            "installed_file_set_invalid",
+            lambda: load_installed_model_metadata(self.profile, self.state_root),
+        )
 
         manifest_bytes = installed.install_manifest_path.read_bytes()
         manifest = json.loads(manifest_bytes)

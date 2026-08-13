@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -22,6 +23,7 @@ from zdecision.recall.demo.bundle import (
     DemoBundleError,
     build_signed_bundle,
     load_verified_bundle,
+    load_verified_bundle_metadata,
 )
 from zdecision.recall.demo import bundle as bundle_module
 from zdecision.recall.demo.contracts import DemoRetrievalProfile
@@ -417,6 +419,24 @@ class DemoBundleTests(unittest.TestCase):
         self.assertTrue(
             all(item.repositories == ("zstack-ui-next",) for item in verified.decisions)
         )
+
+    def test_metadata_verification_never_materializes_snapshot_decisions(self) -> None:
+        """Preflight reads only bounded manifest/profile metadata, never snapshot prose."""
+        bundle = self._build()
+        original = bundle_module._read_bound_payload
+
+        def read_bound(path, manifest, name):
+            if name == "snapshot.json":
+                raise AssertionError("snapshot decisions were materialized")
+            return original(path, manifest, name)
+
+        with patch.object(bundle_module, "_read_bound_payload", side_effect=read_bound):
+            metadata = load_verified_bundle_metadata(
+                bundle_root=bundle, trust_root_path=self.trust_root_path
+            )
+
+        self.assertEqual(10, metadata.decision_count)
+        self.assertEqual(10, len(metadata.decision_leaves))
 
     def test_bundle_accepts_an_eleventh_active_head(self) -> None:
         """An additional complete active formal head must be signed and returned."""
