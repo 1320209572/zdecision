@@ -59,6 +59,19 @@ class VerifiedDemoBundle:
     manifest_digest: str
 
 
+@dataclass(frozen=True)
+class VerifiedDemoBundleMetadata:
+    """Signed bundle facts safe to use before consent-time retrieval."""
+
+    decision_space_id: str
+    product_name: str
+    repository: str
+    profile: DemoRetrievalProfile
+    manifest_digest: str
+    decision_count: int
+    decision_leaves: tuple[tuple[str, int], ...]
+
+
 def build_signed_bundle(
     *,
     product_root: Path,
@@ -170,6 +183,57 @@ def load_verified_bundle(
             profile=profile,
             decisions=decisions,
             manifest_digest=hashlib.sha256(canonical_json_bytes(manifest)).hexdigest(),
+        )
+    except DemoBundleError:
+        raise
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise DemoBundleError("bundle_invalid") from None
+
+
+def load_verified_bundle_metadata(
+    *, bundle_root: Path, trust_root_path: Path
+) -> VerifiedDemoBundleMetadata:
+    """Verify signed, bounded bundle metadata without returning Decision prose."""
+    bundle_root = Path(bundle_root)
+    trust_root_path = Path(trust_root_path)
+    try:
+        if not bundle_root.is_dir() or frozenset(path.name for path in bundle_root.iterdir()) != _BUNDLE_FILES:
+            raise DemoBundleError("bundle_invalid")
+        signed = _read_canonical_json(bundle_root / "signed-manifest.json")
+        if not isinstance(signed, Mapping) or frozenset(signed) != _SIGNED_MANIFEST_FIELDS:
+            raise DemoBundleError("manifest_invalid")
+        key_id = signed["key_id"]
+        manifest = signed["manifest"]
+        signature_value = signed["signature"]
+        if not isinstance(key_id, str) or not key_id or not isinstance(manifest, Mapping) or not isinstance(signature_value, str):
+            raise DemoBundleError("manifest_invalid")
+        try:
+            signature = base64.b64decode(signature_value.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError):
+            raise DemoBundleError("manifest_invalid") from None
+        try:
+            _public_key(trust_root_path).verify(signature, canonical_json_bytes(manifest))
+        except InvalidSignature:
+            raise DemoBundleError("signature_invalid") from None
+
+        _validate_manifest_shape(manifest)
+        snapshot_bytes = _read_bound_payload(bundle_root / "snapshot.json", manifest, "snapshot.json")
+        profile_bytes = _read_bound_payload(
+            bundle_root / "retrieval-profile.json", manifest, "retrieval-profile.json"
+        )
+        snapshot = _decode_canonical_bytes(snapshot_bytes)
+        profile = DemoRetrievalProfile.from_dict(_decode_canonical_bytes(profile_bytes))
+        decision_count, decision_leaves = _validate_snapshot_metadata(
+            snapshot, profile, manifest
+        )
+        return VerifiedDemoBundleMetadata(
+            decision_space_id=profile.decision_space_id,
+            product_name=profile.product_name,
+            repository=profile.repository,
+            profile=profile,
+            manifest_digest=hashlib.sha256(canonical_json_bytes(manifest)).hexdigest(),
+            decision_count=decision_count,
+            decision_leaves=decision_leaves,
         )
     except DemoBundleError:
         raise
@@ -406,6 +470,49 @@ def _validate_snapshot(
     ):
         raise DemoBundleError("snapshot_invalid")
     return tuple(decisions)
+
+
+def _validate_snapshot_metadata(
+    snapshot: object,
+    profile: DemoRetrievalProfile,
+    manifest: Mapping[str, object],
+) -> tuple[int, tuple[tuple[str, int], ...]]:
+    """Confirm snapshot identity/count/leaves while keeping Decisions opaque."""
+    if not isinstance(snapshot, Mapping) or frozenset(snapshot) != _SNAPSHOT_FIELDS:
+        raise DemoBundleError("snapshot_invalid")
+    if (
+        not _is_exact_integer(snapshot["schema_version"], 1)
+        or snapshot["decision_space_id"] != profile.decision_space_id
+        or snapshot["product_name"] != profile.product_name
+        or snapshot["repository"] != profile.repository
+        or not isinstance(snapshot["decisions"], list)
+    ):
+        raise DemoBundleError("snapshot_invalid")
+    leaves: list[tuple[str, int]] = []
+    for value in snapshot["decisions"]:
+        if (
+            not isinstance(value, Mapping)
+            or not isinstance(value.get("decision_id"), str)
+            or not _is_positive_integer(value.get("revision"))
+        ):
+            raise DemoBundleError("snapshot_invalid")
+        leaves.append((value["decision_id"], value["revision"]))
+    manifest_leaves = manifest["decision_leaves"]
+    assert isinstance(manifest_leaves, list)
+    expected = tuple(
+        (leaf["decision_id"], leaf["revision"])
+        for leaf in manifest_leaves
+        if isinstance(leaf, Mapping)
+    )
+    if (
+        not _valid_active_count(len(leaves))
+        or len(leaves) != manifest["decision_count"]
+        or tuple(leaves) != expected
+        or [decision_id for decision_id, _revision in leaves]
+        != sorted(decision_id for decision_id, _revision in leaves)
+    ):
+        raise DemoBundleError("snapshot_invalid")
+    return len(leaves), tuple(leaves)
 
 
 def _is_exact_integer(value: object, expected: int) -> bool:

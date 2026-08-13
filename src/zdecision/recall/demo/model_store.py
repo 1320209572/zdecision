@@ -44,6 +44,14 @@ class InstalledModels:
     install_manifest_path: Path
 
 
+@dataclass(frozen=True)
+class InstalledModelMetadata:
+    """Prepared-model facts safe to validate before loading model tensors."""
+
+    profile_digest: str
+    install_manifest_digest: str
+
+
 class ModelStoreError(RuntimeError):
     """A sanitized local model preparation or validation failure."""
 
@@ -214,6 +222,53 @@ def load_installed_models(
         embedding_path=resolved_install / "embedding",
         reranker_path=resolved_install / "reranker",
         install_manifest_path=resolved_install / "model-install.json",
+    )
+
+
+def load_installed_model_metadata(
+    profile: DemoRetrievalProfile, state_root: Path
+) -> InstalledModelMetadata:
+    """Verify owner-only install identity without reading model tensor bytes."""
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise ModelStoreError("model_clone_unavailable")
+    root = _absolute_state_root(state_root)
+    models_root, installs_root = _load_state_directories(root)
+    pointer_path = models_root / "current.json"
+    _require_owned_mode(pointer_path, 0o400, "installed_pointer_invalid")
+    pointer = _read_canonical_mapping(pointer_path, "installed_pointer_invalid")
+    if frozenset(pointer) != frozenset(("schema_version", "profile_digest", "install")):
+        raise ModelStoreError("installed_pointer_invalid")
+    if not _is_schema_version(pointer["schema_version"], 1):
+        raise ModelStoreError("installed_pointer_invalid")
+    if pointer["profile_digest"] != profile.digest:
+        raise ModelStoreError("profile_digest_invalid")
+    install_value = pointer["install"]
+    if not isinstance(install_value, str):
+        raise ModelStoreError("installed_pointer_invalid")
+    relative_install = Path(install_value)
+    if (
+        relative_install.is_absolute()
+        or len(relative_install.parts) != 2
+        or relative_install.parts[0] != "installs"
+        or relative_install.parts[1] in ("", ".", "..")
+    ):
+        raise ModelStoreError("installed_pointer_invalid")
+    install_path = models_root / relative_install
+    try:
+        resolved_install = install_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ModelStoreError("installed_pointer_invalid") from None
+    if (
+        install_path.is_symlink()
+        or resolved_install.parent != installs_root
+        or not resolved_install.is_dir()
+    ):
+        raise ModelStoreError("installed_pointer_invalid")
+    _validate_install_metadata(resolved_install, profile)
+    manifest_path = resolved_install / "model-install.json"
+    return InstalledModelMetadata(
+        profile_digest=profile.digest,
+        install_manifest_digest=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     )
 
 
@@ -687,6 +742,37 @@ def _validate_install(
     _validate_actual_files(
         install_path, expected_files, sealed=sealed, include_manifest=True
     )
+
+
+def _validate_install_metadata(
+    install_path: Path, profile: DemoRetrievalProfile
+) -> None:
+    _require_directory(
+        install_path, 0o500, "installed_permissions_invalid"
+    )
+    manifest_path = install_path / "model-install.json"
+    _require_owned_mode(manifest_path, 0o400, "installed_manifest_invalid")
+    manifest = _read_canonical_mapping(manifest_path, "installed_manifest_invalid")
+    if (
+        frozenset(manifest)
+        != frozenset(
+            (
+                "schema_version",
+                "materialization",
+                "profile_digest",
+                "models",
+                "files",
+            )
+        )
+        or not _is_schema_version(manifest["schema_version"], 2)
+        or manifest["materialization"] != _MATERIALIZATION
+        or manifest["profile_digest"] != profile.digest
+        or manifest["models"] != _expected_models(profile)
+    ):
+        raise ModelStoreError("installed_manifest_invalid")
+    _validated_file_records(manifest["files"])
+    if manifest["files"] != _expected_file_records(profile):
+        raise ModelStoreError("installed_manifest_invalid")
 
 
 def _validate_actual_files(
