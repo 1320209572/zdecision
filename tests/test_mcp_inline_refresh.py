@@ -754,7 +754,7 @@ class McpInlineRefreshTests(unittest.IsolatedAsyncioTestCase):
             ("running", "extracting_candidates", None, "capturing"),
             ("running", "reconciling_candidates", None, "capturing"),
             ("running", "uploading_candidates", None, "syncing"),
-            ("failed_retryable", "temporary_failure", None, "failed"),
+            ("failed_retryable", "temporary_failure", None, "retrying"),
             ("failed_terminal", "capture_failed", None, "failed"),
             ("cancelled", "capture_cancelled", None, "failed"),
             ("succeeded_no_candidates", "capture_succeeded_no_candidates", 0, "empty"),
@@ -1101,7 +1101,34 @@ vm.runInThisContext(shippedScript);
     }},
   }});
   await finalPoll;
-  check(timers.length === 0, "terminal state scheduled another poll");
+  check(
+    elements.status.textContent === "连接暂时中断，正在重试",
+    "first terminal result was not confirmed",
+  );
+  check(timers.length === 1, "first terminal result was not rechecked");
+
+  const confirmationPoll = timers.shift().callback();
+  const confirmationCall = latestToolCall("get_zdecision_candidate_refresh");
+  check(
+    confirmationCall.id !== finalStatusCall.id,
+    "terminal confirmation did not request fresh status",
+  );
+  deliver({{
+    jsonrpc: "2.0",
+    id: confirmationCall.id,
+    result: {{
+      content: [],
+      structuredContent: {{
+        safe_state: "failed",
+        candidate_revision_count: null,
+        candidate_page_url: null,
+        submission_state: "attached",
+        chosen_scope: "current_session",
+      }},
+    }},
+  }});
+  await confirmationPoll;
+  check(timers.length === 0, "confirmed terminal state kept polling");
   process.stdout.write("bridge-regression-ok");
 }})().catch((error) => {{
   process.stderr.write(error.stack || String(error));
@@ -1450,6 +1477,46 @@ __SCENARIO__
   process.stdout.write("card-freshness-ok");
 """,
             "card-freshness-ok",
+        )
+
+    async def test_widget_rechecks_failed_status_and_recovers_success(self) -> None:
+        self._run_widget_recovery_scenario(
+            """
+  const widget = await mount();
+  const restore = widget.latestToolCall("get_zdecision_candidate_refresh");
+  check(restore, "card did not request authoritative status");
+  await widget.respond(
+    restore,
+    state("failed", "attached", "current_session"),
+  );
+  check(
+    widget.elements.status.textContent === "连接暂时中断，正在重试",
+    "first failed status was shown as terminal",
+  );
+  const confirm = widget.takeTimer(1500);
+  check(confirm, "failed status was not confirmed");
+  const confirmation = confirm();
+  const status = widget.latestToolCall("get_zdecision_candidate_refresh");
+  await widget.respond(status, {
+    content: [],
+    structuredContent: {
+      safe_state: "succeeded",
+      candidate_revision_count: 1,
+      candidate_page_url: "http://127.0.0.1:8765/?repository_id=repo",
+      submission_state: "attached",
+      chosen_scope: "current_session",
+    },
+  });
+  await confirmation;
+  check(
+    widget.elements.status.textContent === "本次同步 1 条候选决策",
+    "confirmed success did not replace stale failure",
+  );
+  check(widget.elements["open-page"].hidden === false, "success action stayed hidden");
+  check(widget.timers.length === 0, "terminal success kept polling");
+  process.stdout.write("failed-status-recovered-ok");
+""",
+            "failed-status-recovered-ok",
         )
 
     async def test_widget_bounds_same_mount_pending_retries(

@@ -230,6 +230,7 @@
       let pageUrl = null;
       let pendingRetryIndex = 0;
       let pendingRetryTimer = null;
+      let terminalFailureConfirmations = 0;
 
       function cancelPendingRetry(resetBudget = false) {
         if (pendingRetryTimer !== null) {
@@ -437,6 +438,7 @@
         if (enabled === true && initial.safe_state !== "ready") return;
         if (enabled && typeof metaControl !== "string") return;
         cancelPendingRetry(true);
+        terminalFailureConfirmations = 0;
         initialResultAccepted = true;
         restorationStarted = false;
         submissionState = null;
@@ -521,6 +523,16 @@
           lockActions();
           status.textContent = labels.unavailable;
           return;
+        }
+        if (
+          value.safe_state === "failed"
+          && value.submission_state === "attached"
+          && terminalFailureConfirmations === 0
+        ) {
+          terminalFailureConfirmations = 1;
+          value.safe_state = "retrying";
+        } else if (value.safe_state !== "failed") {
+          terminalFailureConfirmations = 0;
         }
         if (value.safe_state === "expired") {
           cancelPendingRetry();

@@ -984,7 +984,9 @@ def _safe_request_state(view: CaptureRequestView) -> str | None:
         if view.progress_code in _SYNCING_PROGRESS:
             return "syncing"
         return None
-    if view.state in ("failed_retryable", "failed_terminal", "cancelled"):
+    if view.state == "failed_retryable":
+        return "retrying"
+    if view.state in ("failed_terminal", "cancelled"):
         return "failed"
     if view.state in ("succeeded", "succeeded_no_candidates"):
         if view.candidate_revision_count == 0:
