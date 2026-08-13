@@ -10,10 +10,19 @@ dependencies = [
   "uvicorn>=0.34,<1",
 ]
 
+[project.optional-dependencies]
+recall-demo = [
+  "cryptography==49.0.0",
+  "huggingface_hub==0.36.2",
+  "torch==2.13.0",
+  "transformers==4.57.6",
+]
+
 [project.scripts]
 zdecision = "zdecision.cli:main"
 zdecision-agent = "zdecision.agent.cli:main"
 zdecision-central = "zdecision.central.cli:main"
+zdecision-recall-demo = "zdecision.recall.demo.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -26,3 +35,4 @@ where = ["src"]
 "zdecision.capture" = ["prompt_contracts/*.md"]
 "zdecision.central" = ["static/*.html", "static/assets/*"]
 "zdecision.agent" = ["static/*.html"]
+"zdecision.recall.demo" = ["demo-profile.json"]
