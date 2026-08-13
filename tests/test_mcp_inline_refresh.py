@@ -1907,6 +1907,7 @@ vm.runInThisContext(shippedScript);
     ) -> None:
         parameters = set(inspect.signature(mcp_server.run_mcp).parameters)
         self.assertIn("config_locator_path", parameters)
+        self.assertIn("recall_demo_config_path", parameters)
         observed: dict[str, object] = {}
 
         class RecordingServer:
@@ -1936,6 +1937,7 @@ vm.runInThisContext(shippedScript);
             mcp_server.run_mcp(
                 database_path=self.root / "runtime.sqlite3",
                 config_locator_path=self.root / "missing-locator.json",
+                recall_demo_config_path=self.root / "missing-recall-demo.json",
                 cwd=self.cwd,
             )
 
@@ -1994,6 +1996,7 @@ vm.runInThisContext(shippedScript);
                 mcp_server.run_mcp(
                     database_path=self.root / "runtime-client.sqlite3",
                     config_locator_path=self.root / "locator.json",
+                    recall_demo_config_path=self.root / "missing-recall-demo.json",
                     cwd=self.cwd,
                 )
             except RuntimeError as error:

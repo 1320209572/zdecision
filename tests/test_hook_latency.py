@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 import math
 import subprocess
@@ -297,10 +298,24 @@ class HookLatencyTests(unittest.TestCase):
             },
         }
 
+        original_import = builtins.__import__
+
+        def guarded_import(name: str, *arguments: object, **kwargs: object):
+            if name.split(".")[0] in ("torch", "transformers"):
+                raise AssertionError("Hook must not import model libraries")
+            return original_import(name, *arguments, **kwargs)
+
         elapsed_milliseconds: list[float] = []
-        with patch(
-            "socket.socket.connect",
-            side_effect=AssertionError("Hook must not make a network call"),
+        with (
+            patch(
+                "socket.socket.connect",
+                side_effect=AssertionError("network forbidden"),
+            ),
+            patch("builtins.__import__", side_effect=guarded_import),
+            patch(
+                "zdecision.recall.demo.runtime.load_transformers_runtime",
+                side_effect=AssertionError("runtime loading forbidden"),
+            ),
         ):
             for _ in range(200):
                 started = time.perf_counter()

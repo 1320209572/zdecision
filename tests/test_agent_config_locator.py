@@ -79,6 +79,7 @@ class AgentConfigLocatorTests(unittest.TestCase):
         run_mcp.assert_called_once_with(
             database_path=state_root / "agent" / "zdecision.sqlite3",
             config_locator_path=state_root / "agent" / "config-locator.json",
+            recall_demo_config_path=state_root / "agent" / "recall-demo.json",
             cwd=cwd,
         )
 

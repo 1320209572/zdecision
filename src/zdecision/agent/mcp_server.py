@@ -37,7 +37,6 @@ from zdecision.agent.recall_plugin_identity import (
 )
 from zdecision.agent.service import load_agent_config
 from zdecision.jsonio import canonical_json_bytes
-from zdecision.recall.provider import UnavailableRecallProvider
 from zdecision.sync.contracts import (
     CaptureRequestCreate,
     CaptureRequestView,
@@ -906,6 +905,7 @@ def run_mcp(
     *,
     database_path: Path,
     config_locator_path: Path,
+    recall_demo_config_path: Path,
     cwd: str,
 ) -> None:
     """Start the MCP SDK only for the explicit `mcp` subcommand."""
@@ -940,11 +940,14 @@ def run_mcp(
             browser_launcher=SystemDefaultBrowserLauncher(),
         )
         recall_clock = lambda: datetime.now(UTC)
+        from zdecision.recall.demo.provider import configured_recall_provider
+
+        provider = configured_recall_provider(recall_demo_config_path)
         recall_tools = RecallMcpTools(
             host_store=recall_store,
             handoff_service=RecallHandoffService(
                 store=recall_store,
-                provider=UnavailableRecallProvider(),
+                provider=provider,
                 clock=recall_clock,
                 delivery_id_factory=delivery_id_for_attempt,
                 claim_token_factory=lambda: f"claim_{uuid4().hex}",

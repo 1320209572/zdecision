@@ -137,9 +137,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "recall-demo":
         return _run_recall_demo_command(arguments, os.environ)
     if arguments.command == "mcp":
+        from zdecision.recall.demo.config import recall_demo_config_path
+
         run_mcp(
             database_path=state_path,
             config_locator_path=config_locator_path(os.environ),
+            recall_demo_config_path=recall_demo_config_path(os.environ),
             cwd=os.getcwd(),
         )
         return 0
@@ -171,12 +174,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "hook":
             from zdecision.agent.hooks import handle_hook
+            from zdecision.recall.demo.config import recall_demo_config_path
+            from zdecision.recall.demo.provider import configured_recall_provider
 
             raw = sys.stdin.buffer.read()
+            provider = configured_recall_provider(recall_demo_config_path(os.environ))
             response = handle_hook(
                 raw,
                 database=database,
                 clock=lambda: datetime.now(UTC),
+                recall_provider=provider,
             )
             sys.stdout.buffer.write(canonical_json_bytes(dict(response.output)))
             return 0

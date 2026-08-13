@@ -558,6 +558,7 @@ class RecallProductionWiringTests(unittest.TestCase):
             mcp_server.run_mcp(
                 database_path=database_path,
                 config_locator_path=root / "missing-config.json",
+                recall_demo_config_path=root / "missing-recall-demo.json",
                 cwd=str(repository),
             )
 
