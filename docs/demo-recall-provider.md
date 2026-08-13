@@ -133,36 +133,74 @@ approve a different command, matcher, or Plugin root.
 
 ## 8. Leadership flow
 
-1. In an existing changed `zstack-ui-next` Codex task, select **ZDecision
-   Candidate refresh** and send the exact native message `更新候选决策`.
-2. Click the Candidate card's **Decision Center** action. Do not copy a Session
-   ID or start publication from Candidate text.
-3. In Decision Center, review and explicitly publish the
-   `security-services` Candidate.
-4. Verify Central reports both **publication completed** and **Demo refresh
-   succeeded**. Record only the publication state, publication commit prefix,
-   selected generation number, and generation digest prefix. The selected
-   generation must advance from N to N+1 and bind the publication commit.
-5. Open a new Codex task whose working directory is
-   `/Users/zhaohuiying/Desktop/Zstack-repos/zstack-ui-next`, then explicitly
+1. Start with a **pre-publication Recall attempt**. Open a new Codex task whose
+   working directory is
+   `/Users/zhaohuiying/Desktop/Zstack-repos/zstack-ui-next` and explicitly
    select **ZDecision**.
-6. State that the target product is `third-party-services` and the relevant
+2. State that the target product is `third-party-services` and the relevant
    path is
    `packages/products/third-party-services/apps/security-services`.
-7. Click the Recall confirmation card. Verify its visible state changes from
+3. Click the Recall confirmation card and keep the App attachment. Verify the
+   card reaches `host_delivered`, then inspect the complete frozen handoff and
+   verify the prepared target new Decision ID prefix is absent. Record only the
+   recalled Decision count and the bounded absent result; do not record
+   Decision text.
+4. **Stop this pre-publication task** without sending the next native message,
+   classifying or applying the handoff, or invoking any mutation tool. Close
+   the task; do not continue it after publication. Confirm
+   `git status --short` in `zstack-ui-next` is unchanged.
+5. Run the bounded status command and record the selected pre-publication
+   generation as N plus its generation digest prefix:
+
+   ```bash
+   zdecision-agent recall-demo status
+   ```
+
+6. In an existing changed `zstack-ui-next` Codex task, select **ZDecision
+   Candidate refresh** and send the exact native message `更新候选决策`.
+7. Click the Candidate card's shipped **打开决策中心** control exactly once.
+   Observe `已请求使用默认浏览器打开决策中心`, then verify the default browser
+   opens Decision Center for the expected repository and product. Do not copy
+   a Session ID or start publication from Candidate text.
+8. In Decision Center, review and explicitly publish the
+   `security-services` Candidate.
+9. Verify the Decision Center UI reports only the completed publication state
+   **发布完成** and record the publication commit prefix. Do not treat this UI
+   state as evidence of Demo refresh.
+10. Run the exact bounded status command after publication:
+
+    ```bash
+    zdecision-agent recall-demo status
+    ```
+
+11. Verify `current_generation` is exactly N+1 and
+    `current_digest_prefix` differs from the digest prefix recorded for N.
+    Record only the N+1 generation number and digest prefix. Stop the rehearsal
+    if either value fails to advance.
+12. **Open a new Codex task** only after the N to N+1 status check. Its working
+    directory must be
+    `/Users/zhaohuiying/Desktop/Zstack-repos/zstack-ui-next`. Explicitly select
+    **ZDecision**.
+13. State that the target product is `third-party-services` and the relevant
+   path is
+   `packages/products/third-party-services/apps/security-services`.
+14. Click the Recall confirmation card. Verify its visible state changes from
    `pending_confirmation` toward delivery only after the trusted click.
-8. Keep the App attachment and send the next native message. Do not reopen the
+15. Keep the App attachment and send the next native message. Do not reopen the
    card or invent any delivery, Session, Turn, or gate identifier.
-9. Verify the complete handoff contains the newly published Decision ID prefix,
+16. Verify the complete handoff contains the newly published Decision ID prefix,
    every recalled Decision is classified exactly once, and application reaches
    `application_committed`. Verify the mutation guard is released.
-10. Stop before any code modification. Confirm `git status --short` in
+17. Stop before any code modification. Confirm `git status --short` in
     `zstack-ui-next` is byte-for-byte unchanged from its pre-rehearsal output.
 
 For the acceptance note, record only:
 
-- publication state and publication commit prefix;
-- selected generation number and digest prefix;
+- pre-publication recalled Decision count and target new Decision ID prefix
+  absent;
+- pre-publication selected generation N and digest prefix;
+- Decision Center publication state `发布完成` and publication commit prefix;
+- post-publication selected generation N+1 and changed digest prefix;
 - Recall card states `pending_confirmation` then `host_delivered`;
 - recalled Decision count and whether the new Decision ID prefix is present;
 - application state `application_committed` and mutation guard released;

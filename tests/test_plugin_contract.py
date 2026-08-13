@@ -18,6 +18,7 @@ from zdecision.agent.recall_plugin_identity import (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = REPOSITORY_ROOT / "plugins" / "zdecision"
 MARKETPLACE_PATH = REPOSITORY_ROOT / ".agents" / "plugins" / "marketplace.json"
+RECALL_DEMO_RUNBOOK_PATH = REPOSITORY_ROOT / "docs" / "demo-recall-provider.md"
 EXPECTED_LIFECYCLE_HOOKS = {
     "SessionStart",
     "UserPromptSubmit",
@@ -49,6 +50,60 @@ def is_valid_plugin_version(version: object) -> bool:
 
 
 class PluginContractTests(unittest.TestCase):
+    def test_recall_demo_runbook_proves_the_manual_before_after_boundary(self) -> None:
+        """This catches a rehearsal that can only demonstrate post-publish Recall."""
+
+        text = RECALL_DEMO_RUNBOOK_PATH.read_text("utf-8")
+        leadership = text.split("## 8. Leadership flow", 1)[1].split(
+            "## 9. Failure demonstration", 1
+        )[0]
+        normalized = " ".join(leadership.split())
+
+        required_phrases = (
+            "pre-publication Recall attempt",
+            "target new Decision ID prefix is absent",
+            "Stop this pre-publication task",
+            "without sending the next native message",
+            "更新候选决策",
+            "打开决策中心",
+            "default browser",
+            "发布完成",
+            "reports only the completed publication state",
+            "zdecision-agent recall-demo status",
+            "N+1",
+            "digest",
+            "Open a new Codex task",
+        )
+        missing_phrases = [
+            phrase for phrase in required_phrases if phrase not in normalized
+        ]
+        self.assertEqual([], missing_phrases)
+
+        before_attempt = normalized.index("pre-publication Recall attempt")
+        absent = normalized.index("target new Decision ID prefix is absent")
+        safe_stop = normalized.index("Stop this pre-publication task")
+        candidate_refresh = normalized.index("更新候选决策")
+        open_control = normalized.index("打开决策中心")
+        default_browser = normalized.index("default browser")
+        completed = normalized.index("发布完成")
+        status = normalized.index("zdecision-agent recall-demo status", completed)
+        advanced = normalized.index("N+1", status)
+        digest = normalized.index("digest", status)
+        fresh_recall = normalized.index("Open a new Codex task", status)
+
+        self.assertLess(before_attempt, absent)
+        self.assertLess(absent, safe_stop)
+        self.assertLess(safe_stop, candidate_refresh)
+        self.assertLess(candidate_refresh, open_control)
+        self.assertLess(open_control, default_browser)
+        self.assertLess(default_browser, completed)
+        self.assertLess(completed, status)
+        self.assertLess(status, advanced)
+        self.assertLess(status, digest)
+        self.assertLess(advanced, fresh_recall)
+        self.assertLess(digest, fresh_recall)
+        self.assertNotIn("Demo refresh succeeded", leadership)
+
     def test_production_recall_plugin_identity_is_the_installed_contract(self) -> None:
         """This catches production composition drifting from installed Plugin bytes."""
 
