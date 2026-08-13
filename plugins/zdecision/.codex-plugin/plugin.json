@@ -1,6 +1,6 @@
 {
   "name": "zdecision",
-  "version": "0.1.0+codex.20260811184500",
+  "version": "0.1.0+codex.20260813190000",
   "description": "Inline current-task opt-in Recall handoff; Candidate refresh remains explicit",
   "author": {
     "name": "ZDecision"
@@ -10,7 +10,7 @@
   "interface": {
     "displayName": "ZDecision",
     "shortDescription": "Current-task Recall handoff and explicit Candidate refresh",
-    "longDescription": "A trusted confirmation card click authorizes current-task Recall; the App prepares one frozen handoff for the next native message to classify and apply. Formal Decision Recall may report unavailable until the production provider is ready. Candidate refresh remains explicit. Installing the Plugin does not automatically recall Decisions.",
+    "longDescription": "A trusted confirmation card click authorizes current-task Recall; the App prepares one frozen handoff for the next native message to classify and apply. When the local third-party-services leadership Demo is configured and its signed bundle is current, Recall can retrieve that Demo corpus. Other repositories, products, missing Demo state, or invalid generations remain unavailable. This does not claim production Gate B/C readiness. Candidate refresh remains explicit. Installing the Plugin does not automatically recall Decisions.",
     "developerName": "ZDecision",
     "category": "Productivity",
     "capabilities": [

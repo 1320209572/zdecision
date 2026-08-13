@@ -80,6 +80,8 @@ description: "Use when the user explicitly selects ZDecision in this native task
 - When conflict or uncertainty affects work, block only affected work and ask
   the user to resolve it.
 - Recall does not authorize Candidate refresh, Review, or publication.
-- Production may return `recall_not_ready` until Gates B and C provide the real
-  signed distribution and local retrieval provider. Report that outcome as
-  unavailable and do not fabricate Decision content.
+- When the local third-party-services leadership Demo is configured and its
+  signed bundle is current, Recall can retrieve that Demo corpus. Other
+  repositories, products, missing Demo state, or invalid generations remain
+  unavailable. This does not claim production Gate B/C readiness. Report
+  `recall_not_ready` as unavailable and do not fabricate Decision content.

@@ -341,12 +341,17 @@ class PluginContractTests(unittest.TestCase):
         manifest = load_json(PLUGIN_ROOT / ".codex-plugin" / "plugin.json")
         serialized = json.dumps(manifest, sort_keys=True)
 
+        self.assertEqual("0.1.0+codex.20260813190000", manifest["version"])
         self.assertIn("current-task opt-in", serialized)
         self.assertIn("confirmation", serialized.lower())
         self.assertIn("card click", serialized)
         self.assertIn("next native message", serialized)
         self.assertIn("apply", serialized)
-        self.assertIn("may report unavailable", serialized)
+        self.assertIn("local third-party-services leadership Demo", serialized)
+        self.assertIn("signed bundle is current", serialized)
+        self.assertIn("Other repositories", serialized)
+        self.assertIn("invalid generations remain unavailable", serialized)
+        self.assertIn("does not claim production Gate B/C readiness", serialized)
         self.assertIn("Candidate refresh remains explicit", serialized)
         self.assertNotIn("automatically recalls", serialized)
 

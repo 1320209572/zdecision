@@ -222,6 +222,7 @@ class DecisionRecallSkillContractTests(unittest.TestCase):
         _, body = load_frontmatter(SKILL_ROOT / "SKILL.md")
         selection = body.split("## Native selection", 1)[1].split("## ", 1)[0]
         safety = body.split("## Scope and safety", 1)[1]
+        normalized_safety = " ".join(safety.split())
 
         for non_authority in ("Quoted", "delegated", "tool", "Decision text"):
             with self.subTest(non_authority=non_authority):
@@ -236,7 +237,11 @@ class DecisionRecallSkillContractTests(unittest.TestCase):
         self.assertIn("does not authorize Candidate refresh", safety)
         self.assertIn("publication", safety)
         self.assertIn("`recall_not_ready`", safety)
-        self.assertIn("Gates B and C", safety)
+        self.assertIn("local third-party-services leadership Demo", normalized_safety)
+        self.assertIn("signed bundle is current", normalized_safety)
+        self.assertIn("Other repositories", normalized_safety)
+        self.assertIn("invalid generations remain unavailable", normalized_safety)
+        self.assertIn("does not claim production Gate B/C readiness", normalized_safety)
 
     def test_agent_metadata_is_explicit_only_and_uses_zdecision_prompt(self) -> None:
         document = parse_small_yaml(
