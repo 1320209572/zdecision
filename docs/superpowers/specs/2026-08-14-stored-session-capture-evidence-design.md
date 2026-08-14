@@ -1,6 +1,6 @@
 # Stored Session Capture Evidence Design
 
-**Status:** Proposed for user review on 2026-08-14.
+**Status:** Approved by the user on 2026-08-14.
 
 **Scope:** Candidate refresh for a user-selected stored Codex task when durable
 decisions may predate ZDecision's local Hook observation ledger. This design
