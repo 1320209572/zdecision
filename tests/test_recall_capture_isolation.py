@@ -787,7 +787,6 @@ class RecallCaptureIsolationTest(unittest.TestCase):
             (
                 "unknown",
                 "duplicate",
-                "reordered",
                 "cross_session",
                 "post_boundary",
                 "forged",

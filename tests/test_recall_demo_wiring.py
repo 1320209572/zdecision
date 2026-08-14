@@ -416,6 +416,11 @@ class RecallDemoVerticalTests(unittest.TestCase):
         return attempt_id, attempt
 
     def _run_mcp(self, callback) -> None:
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 13, 10, 0, tzinfo=tz or UTC)
+
         class Server:
             def run(self, *, transport: str) -> None:
                 if transport != "stdio":
@@ -429,7 +434,10 @@ class RecallDemoVerticalTests(unittest.TestCase):
             recall_tools = captured_recall_tools
             return Server()
 
-        with patch.object(mcp_server, "create_mcp_server", side_effect=create):
+        with (
+            patch.object(mcp_server, "create_mcp_server", side_effect=create),
+            patch.object(mcp_server, "datetime", FixedDateTime),
+        ):
             mcp_server.run_mcp(
                 database_path=self.database_path,
                 config_locator_path=self.root / "missing-agent-config.json",
