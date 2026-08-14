@@ -253,9 +253,7 @@ def validate_inventory_v5(
             or any(receipt not in receipt_positions for receipt in raw_receipts)
         ):
             raise _invalid()
-        receipts = tuple(raw_receipts)
-        if tuple(sorted(receipts, key=receipt_positions.__getitem__)) != receipts:
-            raise _invalid()
+        receipts = tuple(sorted(raw_receipts, key=receipt_positions.__getitem__))
         if (
             raw_signal["status"] == "current_confirmed"
             and not receipts

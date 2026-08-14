@@ -321,7 +321,25 @@ class InventoryValidationTests(unittest.TestCase):
             "candidate_eligible", uncertain_provenance[0].disposition
         )
 
-    def test_v5_rejects_reordered_cross_manifest_and_noncanonical_ordinals(self) -> None:
+    def test_v5_normalizes_receipts_to_frozen_manifest_order(self) -> None:
+        """This catches rejecting valid evidence solely because its order differs."""
+        from zdecision.capture.inventory import validate_inventory_v5
+
+        manifest = multi_receipt_manifest()
+        value = v5_inventory(manifest)
+        value["signals"][0]["evidence_receipt_ids"] = [
+            manifest.anchors[1].receipt_id,
+            manifest.anchors[0].receipt_id,
+        ]
+
+        _, provenance = validate_inventory_v5(value, manifest)
+
+        self.assertEqual(
+            tuple(anchor.receipt_id for anchor in manifest.anchors),
+            provenance[0].evidence_receipt_ids,
+        )
+
+    def test_v5_rejects_cross_manifest_and_noncanonical_ordinals(self) -> None:
         """This catches receipt borrowing or ordinal rewriting before Extraction."""
         from zdecision.capture.inventory import (
             InventoryValidationError,
@@ -330,14 +348,6 @@ class InventoryValidationTests(unittest.TestCase):
 
         manifest = multi_receipt_manifest()
         for mutation in (
-            lambda value: value["signals"][0].update(
-                {
-                    "evidence_receipt_ids": [
-                        manifest.anchors[1].receipt_id,
-                        manifest.anchors[0].receipt_id,
-                    ]
-                }
-            ),
             lambda value: value["signals"][0].update({"signal_ordinal": 2}),
             lambda value: value["signals"][0].update(
                 {"evidence_receipt_ids": [evidence_manifest().anchors[0].receipt_id]}
